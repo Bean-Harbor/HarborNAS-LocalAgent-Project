@@ -45,7 +45,7 @@ HarborClaw 是基于 ZeroClaw 二次开发的 AI 助手，预装在 HarborOS 中
 ## 5. 当前版本口径
 
 - 产品北极星: HarborOS 个人助手 + 多模态RAG + 智能编排。
-- 用户入口: IM 通道 → HarborClaw → Assistant Runtime → HarborOS。
+- 用户入口: IM 通道 → HarborClaw → Orchestrator Runtime → HarborOS。
 - 路由规则: `middleware API > midcli > browser > MCP`。
 - 自主级别: ReadOnly（只读安全）/ Supervised（需审批）/ Full（完全自主）。
 - 发布门禁: contract/e2e/drift/release gate 必须可执行。

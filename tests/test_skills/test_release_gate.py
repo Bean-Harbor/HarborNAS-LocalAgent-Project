@@ -14,8 +14,8 @@ from dataclasses import dataclass
 
 import pytest
 
-from assistant.audit import AuditLog
-from assistant.contracts import (
+from orchestrator.audit import AuditLog
+from orchestrator.contracts import (
     Action,
     ExecutionResult,
     RiskLevel,
@@ -24,9 +24,9 @@ from assistant.contracts import (
     StepStatus,
     TaskPlan,
 )
-from assistant.policy import ApprovalContext, PolicyViolation, enforce
-from assistant.router import HARBOROS_DOMAINS, Router, allowed_routes
-from assistant.runtime import Runtime
+from orchestrator.policy import ApprovalContext, PolicyViolation, enforce
+from orchestrator.router import HARBOROS_DOMAINS, Router, allowed_routes
+from orchestrator.runtime import Runtime
 
 
 # ── test helpers ─────────────────────────────────────────────────────

@@ -5,7 +5,7 @@
 1. 先交付可运行链路，再扩功能。
 2. 先保证治理与审计，再放开自动化。
 3. 路由优先级固定：API > MidCLI > Browser > MCP。
-4. 用户入口：IM 通道 → HarborClaw → Assistant Runtime → HarborOS。
+4. 用户入口：IM 通道 → HarborClaw → Orchestrator → HarborOS。
 
 ---
 

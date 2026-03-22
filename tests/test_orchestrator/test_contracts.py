@@ -1,5 +1,5 @@
 """Tests for assistant.contracts"""
-from assistant.contracts import (
+from orchestrator.contracts import (
     Action,
     CONFIRMATION_REQUIRED_LEVELS,
     ExecutionResult,

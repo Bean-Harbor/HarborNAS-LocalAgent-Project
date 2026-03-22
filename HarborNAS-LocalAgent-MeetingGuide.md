@@ -95,7 +95,7 @@
 展示 HarborClaw 架构:
 
 ```
-[IM Channels]          [HarborClaw]              [Assistant Runtime]
+[IM Channels]          [HarborClaw]              [Orchestrator]
 飞书/企微/Telegram  →  channels.py (路由)     →   planner / router
 Discord/钉钉/Slack     mcp_adapter.py (MCP桥)     policy / audit
 MQTT                   autonomy.py (自主级别)      executors → HarborOS

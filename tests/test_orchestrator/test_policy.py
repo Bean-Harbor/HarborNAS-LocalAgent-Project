@@ -1,7 +1,7 @@
 """Tests for assistant.policy"""
 import pytest
-from assistant.contracts import Action, RiskLevel
-from assistant.policy import (
+from orchestrator.contracts import Action, RiskLevel
+from orchestrator.policy import (
     ApprovalContext,
     PolicyViolation,
     check_operation,

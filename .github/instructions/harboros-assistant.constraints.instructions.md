@@ -7,9 +7,9 @@ description: "Always enforce HarborNAS assistant architecture constraints: Harbo
 
 ## Product boundary
 
-- Integrate only the assistant core into HarborOS: runtime, planner, router, policy, audit, and HarborOS action adapter.
+- Integrate only the orchestrator core into HarborOS: runtime, planner, router, policy, audit, and HarborOS action adapter.
 - HarborClaw (ZeroClaw fork) is pre-installed in HarborOS and serves as the user-facing IM access layer.
-- Users interact via IM channels (Feishu, WeCom, Telegram, Discord, DingTalk, Slack, MQTT); HarborClaw routes intents to the assistant runtime via MCP/CLI/API.
+- Users interact via IM channels (Feishu, WeCom, Telegram, Discord, DingTalk, Slack, MQTT); HarborClaw routes intents to the orchestrator runtime via MCP/CLI/API.
 - Keep non-core capabilities as plugins (skills): video editing, browser automation, third-party software control.
 - Do not move plugin-specific logic into HarborOS core unless it is required for platform safety or governance.
 

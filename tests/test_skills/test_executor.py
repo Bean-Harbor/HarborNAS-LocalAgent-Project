@@ -1,7 +1,7 @@
 """Tests for skills.executor — BaseExecutor, concrete executors, factory."""
 import pytest
 
-from assistant.contracts import Action, Route, StepStatus
+from orchestrator.contracts import Action, Route, StepStatus
 from skills.executor import (
     BaseExecutor,
     BrowserExecutor,

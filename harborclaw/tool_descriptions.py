@@ -95,5 +95,5 @@ def _toml_bool(v: bool) -> str:
 
 
 def _risk_level_from_str(s: str) -> Any:
-    from assistant.contracts import RiskLevel
+    from orchestrator.contracts import RiskLevel
     return RiskLevel(s)

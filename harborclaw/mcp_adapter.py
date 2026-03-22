@@ -14,8 +14,8 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from assistant.contracts import Action, ExecutionResult, RiskLevel
-from assistant.runtime import Runtime
+from orchestrator.contracts import Action, ExecutionResult, RiskLevel
+from orchestrator.runtime import Runtime
 from skills.manifest import SkillManifest
 from skills.registry import Registry
 

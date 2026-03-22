@@ -1,8 +1,8 @@
 """Tests for harborclaw.autonomy — autonomy ↔ risk level mapping."""
 import pytest
 
-from assistant.contracts import RiskLevel
-from assistant.policy import ApprovalContext
+from orchestrator.contracts import RiskLevel
+from orchestrator.policy import ApprovalContext
 from harborclaw.autonomy import (
     Autonomy,
     autonomy_to_approval,

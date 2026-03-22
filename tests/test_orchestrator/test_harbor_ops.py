@@ -1,6 +1,6 @@
 """Tests for assistant.executors.harbor_ops"""
-from assistant.contracts import Action, RiskLevel, Route, StepStatus
-from assistant.executors.harbor_ops import (
+from orchestrator.contracts import Action, RiskLevel, Route, StepStatus
+from orchestrator.executors.harbor_ops import (
     MiddlewareExecutor,
     MidcliExecutor,
     _build_midcli_command,

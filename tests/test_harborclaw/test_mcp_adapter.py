@@ -3,10 +3,10 @@ import json
 
 import pytest
 
-from assistant.contracts import Action, ExecutionResult, RiskLevel, Route, StepStatus
-from assistant.audit import AuditLog
-from assistant.router import Router
-from assistant.runtime import Runtime
+from orchestrator.contracts import Action, ExecutionResult, RiskLevel, Route, StepStatus
+from orchestrator.audit import AuditLog
+from orchestrator.router import Router
+from orchestrator.runtime import Runtime
 from skills.manifest import SkillManifest, HarborApiConfig, HarborCliConfig, RiskConfig
 from skills.registry import Registry
 

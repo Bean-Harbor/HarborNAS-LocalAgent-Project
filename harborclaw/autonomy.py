@@ -15,8 +15,8 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from assistant.contracts import RiskLevel
-from assistant.policy import ApprovalContext
+from orchestrator.contracts import RiskLevel
+from orchestrator.policy import ApprovalContext
 
 
 class Autonomy(str, Enum):

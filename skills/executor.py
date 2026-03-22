@@ -11,7 +11,7 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any, Callable
 
-from assistant.contracts import Action, ExecutionResult, Route, StepStatus
+from orchestrator.contracts import Action, ExecutionResult, Route, StepStatus
 from .manifest import SkillManifest
 
 

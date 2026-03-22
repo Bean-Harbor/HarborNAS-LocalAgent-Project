@@ -1,6 +1,6 @@
 """Tests for assistant.audit"""
-from assistant.audit import AuditEvent, AuditLog
-from assistant.contracts import Action, ExecutionResult, RiskLevel, StepStatus
+from orchestrator.audit import AuditEvent, AuditLog
+from orchestrator.contracts import Action, ExecutionResult, RiskLevel, StepStatus
 
 
 def test_record_start_creates_event():

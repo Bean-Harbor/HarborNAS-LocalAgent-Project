@@ -23,7 +23,7 @@
 
 交付物:
 
-- V2 统一术语与能力边界（assistant / skill / executor / audit）
+- V2 统一术语与能力边界（orchestrator / skill / executor / audit）
 - 路由与风险策略冻结（API > CLI > Browser > MCP）
 - 发布门禁基线（contract + e2e + drift + release gate）
 

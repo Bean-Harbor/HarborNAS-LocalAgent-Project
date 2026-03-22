@@ -30,11 +30,11 @@ description: "Use when implementing HarborNAS personal assistant capabilities, H
 - `harborclaw.mcp_adapter`: MCP tool bridge with ReadOnly guard and approval tokens.
 - `harborclaw.autonomy`: autonomy level mapping (ReadOnly/Supervised/Full).
 - `harborclaw.tool_descriptions`: skill manifest to MCP/TOML conversion.
-- `assistant.runtime`: task lifecycle and orchestration loop.
-- `assistant.planner`: intent to normalized action list.
-- `assistant.router`: deterministic route selection and fallback.
-- `assistant.policy`: risk, approval, path/service checks.
-- `assistant.audit`: per-step event logging and replay references.
+- `orchestrator.runtime`: task lifecycle and orchestration loop.
+- `orchestrator.planner`: intent to normalized action list.
+- `orchestrator.router`: deterministic route selection and fallback.
+- `orchestrator.policy`: risk, approval, path/service checks.
+- `orchestrator.audit`: per-step event logging and replay references.
 - `skills.registry`: manifest loading and versioning.
 - `skills.executors`: API/CLI/browser/MCP executor adapters.
 

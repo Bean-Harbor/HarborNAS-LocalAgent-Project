@@ -1,6 +1,6 @@
 """Tests for assistant.router"""
-from assistant.contracts import Action, ExecutionResult, RiskLevel, Route, StepStatus
-from assistant.router import Router, allowed_routes
+from orchestrator.contracts import Action, ExecutionResult, RiskLevel, Route, StepStatus
+from orchestrator.router import Router, allowed_routes
 
 
 # --- stub executors ---
