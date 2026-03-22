@@ -53,6 +53,8 @@ class ChannelConfig:
     app_id: str | None = None
     app_secret: str | None = None
     bot_token: str | None = None
+    # Transport mode: "websocket" | "long_poll" | "webhook" (auto-detected if empty)
+    transport_mode: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
 
     def is_configured(self) -> bool:
