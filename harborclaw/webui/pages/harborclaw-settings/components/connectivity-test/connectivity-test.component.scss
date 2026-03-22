@@ -1,0 +1,91 @@
+:host {
+  display: block;
+}
+
+.section-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 18px;
+  font-weight: 500;
+  margin: 0 0 4px;
+}
+
+.section-desc {
+  color: var(--fg2);
+  margin: 0 0 16px;
+  font-size: 13px;
+}
+
+.test-all-btn {
+  margin-bottom: 16px;
+
+  .inline-spinner {
+    display: inline-block;
+    margin-right: 8px;
+    vertical-align: middle;
+  }
+}
+
+.results-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+}
+
+.result-card {
+  padding: 16px;
+}
+
+.result-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.result-label {
+  flex: 1;
+  font-weight: 500;
+}
+
+.result-icon {
+  &.ok {
+    color: #2e7d32;
+  }
+
+  &.fail {
+    color: #c62828;
+  }
+}
+
+.result-detail {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 13px;
+  color: var(--fg2);
+
+  &.not-tested {
+    font-style: italic;
+  }
+}
+
+.latency {
+  color: #2e7d32;
+  font-weight: 500;
+}
+
+.error-msg {
+  color: #c62828;
+}
+
+.tested-at {
+  margin-left: auto;
+  font-size: 11px;
+}
+
+.empty-hint {
+  color: var(--fg2);
+  font-style: italic;
+}

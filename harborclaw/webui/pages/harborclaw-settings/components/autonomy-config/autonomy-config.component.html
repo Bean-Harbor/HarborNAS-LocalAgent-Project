@@ -1,0 +1,61 @@
+<section class="autonomy-config">
+  <h3 class="section-title">
+    <mat-icon>security</mat-icon>
+    Autonomy Level
+  </h3>
+  <p class="section-desc">
+    Control how much freedom HarborClaw has when executing operations on HarborOS.
+  </p>
+
+  <!-- Level radio group -->
+  <mat-radio-group
+    class="level-group"
+    [value]="config.default_level"
+    (change)="onLevelChange($event.value)"
+  >
+    @for (lvl of levels; track lvl.value) {
+      <mat-card class="level-card" [class.selected]="config.default_level === lvl.value">
+        <mat-radio-button [value]="lvl.value">
+          <div class="level-header">
+            <mat-icon>{{ lvl.icon }}</mat-icon>
+            <strong>{{ lvl.label }}</strong>
+          </div>
+          <p class="level-desc">{{ lvl.desc }}</p>
+        </mat-radio-button>
+      </mat-card>
+    }
+  </mat-radio-group>
+
+  <!-- Approval timeout (only when Supervised) -->
+  @if (config.default_level === 'Supervised') {
+    <mat-form-field appearance="outline" class="timeout-field">
+      <mat-label>Approval Timeout (seconds)</mat-label>
+      <input
+        matInput
+        type="number"
+        min="10"
+        [value]="config.approval_timeout_seconds"
+        (input)="onTimeoutChange(+$any($event.target).value)"
+      />
+      <mat-icon matSuffix>timer</mat-icon>
+    </mat-form-field>
+  }
+
+  <!-- Per-channel Full Autonomy allow-list -->
+  @if (config.default_level !== 'Full') {
+    <div class="full-channels">
+      <mat-form-field appearance="outline" class="field-full">
+        <mat-label>Allow Full Autonomy for specific channels</mat-label>
+        <mat-select
+          multiple
+          [value]="config.allow_full_for_channels"
+          (selectionChange)="onFullChannelsChange($event.value)"
+        >
+          @for (ch of allChannels; track ch.channel) {
+            <mat-option [value]="ch.channel">{{ ch.label }}</mat-option>
+          }
+        </mat-select>
+      </mat-form-field>
+    </div>
+  }
+</section>

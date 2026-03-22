@@ -1,0 +1,39 @@
+<section class="route-strategy">
+  <h3 class="section-title">
+    <mat-icon>alt_route</mat-icon>
+    Route Strategy
+  </h3>
+  <p class="section-desc">
+    Drag to reorder execution routes. HarborClaw tries routes top-to-bottom,
+    falling back to the next if unavailable.
+  </p>
+
+  <div
+    cdkDropList
+    class="route-list"
+    (cdkDropListDropped)="onDrop($event)"
+  >
+    @for (route of routePriority; track route; let i = $index) {
+      <div cdkDrag class="route-item">
+        <div class="drag-handle" cdkDragHandle>
+          <mat-icon>drag_indicator</mat-icon>
+        </div>
+
+        <span class="route-priority-badge">{{ i + 1 }}</span>
+
+        <mat-icon class="route-icon">{{ routeIcons[route] }}</mat-icon>
+        <span class="route-label">{{ routeLabels[route] }}</span>
+
+        <mat-chip-set class="route-status">
+          <mat-chip
+            [class.available]="isAvailable(route)"
+            [class.unavailable]="!isAvailable(route)"
+            [highlighted]="isAvailable(route)"
+          >
+            {{ isAvailable(route) ? 'Online' : 'Offline' }}
+          </mat-chip>
+        </mat-chip-set>
+      </div>
+    }
+  </div>
+</section>

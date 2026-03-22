@@ -1,0 +1,42 @@
+:host {
+  display: block;
+}
+
+.section-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 18px;
+  font-weight: 500;
+  margin: 0 0 4px;
+}
+
+.section-desc {
+  color: var(--fg2);
+  margin: 0 0 16px;
+  font-size: 13px;
+}
+
+.channel-icon {
+  margin-right: 8px;
+  color: var(--primary);
+}
+
+.channel-label {
+  font-weight: 500;
+}
+
+.channel-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 8px 0 4px;
+}
+
+.field-full {
+  width: 100%;
+}
+
+.test-btn {
+  align-self: flex-start;
+}

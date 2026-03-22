@@ -41,6 +41,8 @@ HarborClaw 是基于 ZeroClaw 二次开发的 AI 助手，预装在 HarborOS 中
 | `mcp_adapter.py` | MCP 工具列表 / 调用适配器（ReadOnly 守卫、逐次审批令牌） |
 | `autonomy.py` | 自主级别 (ReadOnly / Supervised / Full) 与风险映射 |
 | `tool_descriptions.py` | 将 skill manifest 转换为 MCP / TOML 工具描述 |
+| `api/` | Settings REST API（GET/PUT /settings、连通性测试、路由状态） |
+| `webui/` | Angular 21 Settings 页面（HarborOS WebUI 集成模块） |
 
 ## 5. 当前版本口径
 

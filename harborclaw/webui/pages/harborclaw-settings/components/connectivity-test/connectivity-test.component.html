@@ -1,0 +1,69 @@
+<section class="connectivity-test">
+  <h3 class="section-title">
+    <mat-icon>wifi_tethering</mat-icon>
+    Connectivity Test
+  </h3>
+  <p class="section-desc">
+    Verify that enabled IM channels can reach their respective platforms.
+  </p>
+
+  <button
+    mat-flat-button
+    color="primary"
+    class="test-all-btn"
+    [disabled]="loading || enabledChannels.length === 0"
+    (click)="onTestAll()"
+  >
+    @if (loading) {
+      <mat-spinner diameter="18" class="inline-spinner"></mat-spinner>
+    }
+    Test All Channels
+  </button>
+
+  <div class="results-grid">
+    @for (ch of enabledChannels; track ch.channel) {
+      <mat-card class="result-card">
+        <div class="result-header">
+          <mat-icon>{{ channelIcon(ch.channel) }}</mat-icon>
+          <span class="result-label">{{ channelLabel(ch.channel) }}</span>
+
+          @if (resultFor(ch.channel); as r) {
+            <mat-icon
+              class="result-icon"
+              [class.ok]="r.reachable"
+              [class.fail]="!r.reachable"
+            >
+              {{ r.reachable ? 'check_circle' : 'error' }}
+            </mat-icon>
+          }
+        </div>
+
+        @if (resultFor(ch.channel); as r) {
+          <div class="result-detail">
+            @if (r.reachable) {
+              <span class="latency">{{ r.latency_ms }} ms</span>
+            } @else {
+              <span class="error-msg">{{ r.error }}</span>
+            }
+            <span class="tested-at">{{ r.tested_at | date:'medium' }}</span>
+          </div>
+        } @else {
+          <div class="result-detail not-tested">
+            Not tested yet
+            <button
+              mat-stroked-button
+              (click)="onTestOne(ch.channel)"
+              [disabled]="loading"
+            >
+              Test
+            </button>
+          </div>
+        }
+      </mat-card>
+    }
+  </div>
+
+  @if (enabledChannels.length === 0) {
+    <p class="empty-hint">No channels enabled. Enable at least one channel above to test connectivity.</p>
+  }
+</section>
