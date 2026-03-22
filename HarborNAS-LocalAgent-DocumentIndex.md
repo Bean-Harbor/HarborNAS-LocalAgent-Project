@@ -51,6 +51,13 @@
 - 重点: PR 校验、nightly E2E、预发布漂移兼容、报告产物与责任归属。
 - 输出: 可直接用于搭建持续集成与发布门禁的执行清单。
 
+### 8. **HarborNAS-GitHub-Actions-Workflow-Draft-v1.md**
+**GitHub Actions 工作流草案 v1**
+
+- 目标: 将 CI 清单进一步细化为 GitHub Actions 级别的 workflow 草案。
+- 重点: PR 检查、nightly E2E、release drift 三类 workflow 的 job 结构、产物与失败策略。
+- 输出: 可直接作为 `.github/workflows/` 实施参考的初版草案。
+
 ## 📦 已生成的完整规划包
 
 为你的 HarborNAS 项目生成了 **5 份详细规划文档**，共约 14,000 字。

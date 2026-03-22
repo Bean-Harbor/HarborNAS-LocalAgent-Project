@@ -16,6 +16,7 @@ This repository contains the completed planning deliverables for a HarborNAS loc
 - HarborNAS-Planner-TaskDecompose-Contract-v1.md
 - HarborNAS-Contract-E2E-Test-Plan-v1.md
 - HarborNAS-CI-Contract-Pipeline-Checklist-v1.md
+- HarborNAS-GitHub-Actions-Workflow-Draft-v1.md
 
 ## V2 Additions
 
@@ -26,3 +27,4 @@ This repository contains the completed planning deliverables for a HarborNAS loc
 - `HarborNAS-Planner-TaskDecompose-Contract-v1.md`: executable planner contract for `planner.task_decompose`, including step schema, dependency rules, route-candidate policy, and release gates.
 - `HarborNAS-Contract-E2E-Test-Plan-v1.md`: end-to-end validation plan across planner + execution contracts, including environment matrix, fallback checks, drift checks, and release exit criteria.
 - `HarborNAS-CI-Contract-Pipeline-Checklist-v1.md`: CI job checklist that maps all contract governance to merge, nightly, and pre-release pipeline stages.
+- `HarborNAS-GitHub-Actions-Workflow-Draft-v1.md`: initial GitHub Actions workflow draft mapping contract governance into concrete PR, nightly, and release workflows.
