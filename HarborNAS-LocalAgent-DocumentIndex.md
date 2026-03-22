@@ -28,12 +28,12 @@
 6. HarborNAS-CI-Contract-Pipeline-Checklist-v1.md
 7. HarborNAS-GitHub-Actions-Workflow-Draft-v1.md
 
-## 4. HarborClaw 与 IM 接入层
+## 4. HarborBeacon 与 IM 接入层
 
-HarborClaw 是基于 ZeroClaw 二次开发的 AI 助手，预装在 HarborOS 中（与 HarborOS 运行在同一台机器上）。
-用户通过 IM（飞书 / 企业微信 / Telegram / Discord / 钉钉 / Slack / MQTT）与 HarborClaw 交互，HarborClaw 通过 CLI、MCP、API 等形式控制 HarborOS 各项功能。
+HarborBeacon 是基于 ZeroClaw 二次开发的 AI 助手，预装在 HarborOS 中（与 HarborOS 运行在同一台机器上）。
+用户通过 IM（飞书 / 企业微信 / Telegram / Discord / 钉钉 / Slack / MQTT）与 HarborBeacon 交互，HarborBeacon 通过 CLI、MCP、API 等形式控制 HarborOS 各项功能。
 
-代码包: `harborclaw/`
+代码包: `harborbeacon/`
 
 | 模块 | 职责 |
 |---|---|
@@ -47,7 +47,7 @@ HarborClaw 是基于 ZeroClaw 二次开发的 AI 助手，预装在 HarborOS 中
 ## 5. 当前版本口径
 
 - 产品北极星: HarborOS 个人助手 + 多模态RAG + 智能编排。
-- 用户入口: IM 通道 → HarborClaw → Orchestrator Runtime → HarborOS。
+- 用户入口: IM 通道 → HarborBeacon → Orchestrator Runtime → HarborOS。
 - 路由规则: `middleware API > midcli > browser > MCP`。
 - 自主级别: ReadOnly（只读安全）/ Supervised（需审批）/ Full（完全自主）。
 - 发布门禁: contract/e2e/drift/release gate 必须可执行。

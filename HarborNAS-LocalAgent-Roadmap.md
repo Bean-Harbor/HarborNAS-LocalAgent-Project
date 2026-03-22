@@ -38,14 +38,14 @@
 交付物:
 
 - 多终端统一会话入口（Web/Mobile API + IM 通道）
-- HarborClaw IM 接入：飞书 / 企微 / Telegram / Discord / 钉钉 / Slack / MQTT 一键配置
+- HarborBeacon IM 接入：飞书 / 企微 / Telegram / Discord / 钉钉 / Slack / MQTT 一键配置
 - 任务状态机：`queued -> planned -> executing -> completed/failed`
-- 第一条端到端链路：IM → HarborClaw → Planner → MiddlewareExecutor → Result
+- 第一条端到端链路：IM → HarborBeacon → Planner → MiddlewareExecutor → Result
 
 关键任务:
 
 - 构建 session API 与任务持久化
-- 集成 HarborClaw channels.py，打通 IM → 意图解析 → MCP adapter 链路
+- 集成 HarborBeacon channels.py，打通 IM → 意图解析 → MCP adapter 链路
 - 规范统一任务 envelope（task_id/trace_id/executor_used/risk_level）
 - 打通 HarborOS 常见系统类动作（query/start/stop/restart）
 
@@ -120,7 +120,7 @@
 
 | 工作包 | R | A | C | I |
 |---|---|---|---|---|
-| HarborClaw IM 通道接入 | B | A | C,P | 全员 |
+| HarborBeacon IM 通道接入 | B | A | C,P | 全员 |
 | Assistant 会话与任务状态机 | B | A | C,P | 全员 |
 | Planner 与路由策略 | A | A | B,C | P |
 | MiddlewareExecutor | A | A | B,C | P |
@@ -152,7 +152,7 @@
 
 ### M1（Week 3）
 
-- 用户能通过 IM 通道（飞书/企微/Telegram 等） → HarborClaw → 统一入口触发 HarborOS 系统类操作
+- 用户能通过 IM 通道（飞书/企微/Telegram 等） → HarborBeacon → 统一入口触发 HarborOS 系统类操作
 - 审计字段完整：`task_id`、`trace_id`、`executor_used`
 - 核心回归测试通过
 
@@ -197,7 +197,7 @@
 
 P0:
 
-1. 完成 HarborClaw IM 接入 → Assistant 主链路闭环（IM → HarborClaw → Planner → API executor）
+1. 完成 HarborBeacon IM 接入 → Assistant 主链路闭环（IM → HarborBeacon → Planner → API executor）
 2. 固化 skill manifest 与运行时约束
 3. 完成多模态 RAG 最小可用链路（text + image）
 

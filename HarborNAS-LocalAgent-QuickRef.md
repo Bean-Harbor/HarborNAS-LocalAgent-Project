@@ -2,7 +2,7 @@
 
 ## 1. 一句话目标
 
-在 HarborOS 控制平面上落地个人助手，用户通过 IM（飞书/企微/Telegram/Discord 等）经 HarborClaw 交互，提供多模态 RAG 与智能编排能力。
+在 HarborOS 控制平面上落地个人助手，用户通过 IM（飞书/企微/Telegram/Discord 等）经 HarborBeacon 交互，提供多模态 RAG 与智能编排能力。
 
 ---
 
@@ -10,7 +10,7 @@
 
 ```text
 ┌─────────────────────────────────────────────────────────────────┐
-│ HarborClaw IM 接入层（ZeroClaw 二次开发，预装在 HarborOS）         │
+│ HarborBeacon IM 接入层（ZeroClaw 二次开发，预装在 HarborOS）         │
 │ 飞书 | 企微 | Telegram | Discord | 钉钉 | Slack | MQTT          │
 │ channels.py → 意图解析 → mcp_adapter / autonomy                 │
 └───────────────────────────────┬─────────────────────────────────┘

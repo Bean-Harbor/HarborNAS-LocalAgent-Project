@@ -11,25 +11,25 @@ description: "Use when implementing HarborNAS personal assistant capabilities, H
 - Adding HarborOS operations that must use `middleware_api` first and `midcli` as fallback.
 - Adding plugin skills (video, browser, software automation) with CLI-first strategy.
 - Designing release-safe execution with approvals, dry-run, and observability.
-- Integrating HarborClaw IM channels (Feishu, WeCom, Telegram, Discord, DingTalk, Slack, MQTT) with the assistant runtime.
-- Configuring HarborClaw autonomy levels (ReadOnly / Supervised / Full) and MCP adapter bridging.
+- Integrating HarborBeacon IM channels (Feishu, WeCom, Telegram, Discord, DingTalk, Slack, MQTT) with the assistant runtime.
+- Configuring HarborBeacon autonomy levels (ReadOnly / Supervised / Full) and MCP adapter bridging.
 
 ## Non-negotiable rules
 
 - Core-in-HarborOS, extensions-as-plugins.
-- HarborClaw (ZeroClaw fork) is pre-installed in HarborOS; users interact via IM channels.
+- HarborBeacon (ZeroClaw fork) is pre-installed in HarborOS; users interact via IM channels.
 - Route priority is fixed: `middleware_api -> midcli -> browser -> mcp`.
 - HarborOS domain actions must not skip API/CLI routes.
 - Command-line-first for extensions; `midcli` first for HarborOS CLI operations.
 - High-risk operations require confirmation and approval gates.
-- HarborClaw autonomy levels must align with assistant risk levels.
+- HarborBeacon autonomy levels must align with assistant risk levels.
 
 ## Required architecture outputs
 
-- `harborclaw.channels`: IM channel registration, message routing, intent parsing.
-- `harborclaw.mcp_adapter`: MCP tool bridge with ReadOnly guard and approval tokens.
-- `harborclaw.autonomy`: autonomy level mapping (ReadOnly/Supervised/Full).
-- `harborclaw.tool_descriptions`: skill manifest to MCP/TOML conversion.
+- `harborbeacon.channels`: IM channel registration, message routing, intent parsing.
+- `harborbeacon.mcp_adapter`: MCP tool bridge with ReadOnly guard and approval tokens.
+- `harborbeacon.autonomy`: autonomy level mapping (ReadOnly/Supervised/Full).
+- `harborbeacon.tool_descriptions`: skill manifest to MCP/TOML conversion.
 - `orchestrator.runtime`: task lifecycle and orchestration loop.
 - `orchestrator.planner`: intent to normalized action list.
 - `orchestrator.router`: deterministic route selection and fallback.
@@ -62,7 +62,7 @@ Execution result fields:
 
 ## Implementation sequence
 
-1. Build HarborClaw IM channel integration and one-click configuration.
+1. Build HarborBeacon IM channel integration and one-click configuration.
 2. Build assistant runtime minimum loop for `system.harbor_ops`.
 3. Wire planner -> router -> policy -> executor -> audit with tests.
 4. Add skill registry + manifest loader.

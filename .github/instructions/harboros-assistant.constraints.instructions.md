@@ -8,16 +8,16 @@ description: "Always enforce HarborNAS assistant architecture constraints: Harbo
 ## Product boundary
 
 - Integrate only the orchestrator core into HarborOS: runtime, planner, router, policy, audit, and HarborOS action adapter.
-- HarborClaw (ZeroClaw fork) is pre-installed in HarborOS and serves as the user-facing IM access layer.
-- Users interact via IM channels (Feishu, WeCom, Telegram, Discord, DingTalk, Slack, MQTT); HarborClaw routes intents to the orchestrator runtime via MCP/CLI/API.
+- HarborBeacon (ZeroClaw fork) is pre-installed in HarborOS and serves as the user-facing IM access layer.
+- Users interact via IM channels (Feishu, WeCom, Telegram, Discord, DingTalk, Slack, MQTT); HarborBeacon routes intents to the orchestrator runtime via MCP/CLI/API.
 - Keep non-core capabilities as plugins (skills): video editing, browser automation, third-party software control.
 - Do not move plugin-specific logic into HarborOS core unless it is required for platform safety or governance.
 
-## HarborClaw IM integration
+## HarborBeacon IM integration
 
-- HarborClaw runs on the same machine as HarborOS and is part of the pre-installed image.
+- HarborBeacon runs on the same machine as HarborOS and is part of the pre-installed image.
 - IM channel configuration should be one-click on HarborOS boot.
-- HarborClaw autonomy levels (ReadOnly / Supervised / Full) must align with assistant risk levels (LOW / MEDIUM-HIGH / admin-only).
+- HarborBeacon autonomy levels (ReadOnly / Supervised / Full) must align with assistant risk levels (LOW / MEDIUM-HIGH / admin-only).
 - All IM-originated commands flow through the same policy, audit, and routing pipeline as WebUI/API commands.
 
 ## Execution policy

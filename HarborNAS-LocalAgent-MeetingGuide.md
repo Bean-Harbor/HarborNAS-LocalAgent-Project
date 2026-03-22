@@ -90,19 +90,19 @@
 - Q8: 脱敏粒度: 整个句子 vs 仅 PII 值?
 - Q9: 密钥管理策略? (建议: Fernet 对称加密, 存储在 Secret Manager)
 
-#### 话题 3.5: HarborClaw IM 接入架构 (10 分钟)
+#### 话题 3.5: HarborBeacon IM 接入架构 (10 分钟)
 
-展示 HarborClaw 架构:
+展示 HarborBeacon 架构:
 
 ```
-[IM Channels]          [HarborClaw]              [Orchestrator]
+[IM Channels]          [HarborBeacon]              [Orchestrator]
 飞书/企微/Telegram  →  channels.py (路由)     →   planner / router
 Discord/钉钉/Slack     mcp_adapter.py (MCP桥)     policy / audit
 MQTT                   autonomy.py (自主级别)      executors → HarborOS
 ```
 
 **关键说明**:
-- HarborClaw 是基于 ZeroClaw 的二次开发，预装在 HarborOS 中（同一台机器）
+- HarborBeacon 是基于 ZeroClaw 的二次开发，预装在 HarborOS 中（同一台机器）
 - 开机后一键配置 IM 通道（飞书/企微/Telegram/Discord/钉钉/Slack/MQTT）
 - 自主级别: ReadOnly（只读安全）/ Supervised（需审批）/ Full（完全自主）
 

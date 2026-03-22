@@ -1,0 +1,64 @@
+:host {
+  display: block;
+}
+
+.harborbeacon-settings {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+// --- Header ---
+
+.page-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: 24px;
+}
+
+.header-left {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+}
+
+.header-icon {
+  font-size: 36px;
+  width: 36px;
+  height: 36px;
+  color: var(--primary);
+}
+
+h1 {
+  margin: 0;
+  font-size: 24px;
+  font-weight: 600;
+}
+
+.subtitle {
+  margin: 2px 0 0;
+  color: var(--fg2);
+  font-size: 14px;
+}
+
+.save-btn {
+  flex-shrink: 0;
+}
+
+// --- Tabs ---
+
+.settings-tabs {
+  .mat-mdc-tab-labels {
+    gap: 4px;
+  }
+
+  mat-icon {
+    margin-right: 6px;
+    font-size: 20px;
+  }
+}
+
+.tab-body {
+  padding: 24px 0;
+}

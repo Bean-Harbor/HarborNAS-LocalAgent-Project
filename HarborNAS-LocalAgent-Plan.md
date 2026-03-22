@@ -17,7 +17,7 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│           IM 接入层 (HarborClaw — ZeroClaw 二次开发)         │
+│           IM 接入层 (HarborBeacon — ZeroClaw 二次开发)         │
 │  飞书 | 企微 | Telegram | Discord | 钉钉 | Slack | MQTT    │
 │  channels.py → 意图解析 → mcp_adapter / autonomy            │
 └───────────────────┬─────────────────────────────────────────┘
