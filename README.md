@@ -12,9 +12,11 @@ This repository contains the completed planning deliverables for a HarborNAS loc
 - HarborNAS-LocalAgent-V2-Assistant-Skills-Roadmap.md
 - HarborNAS-Skill-Spec-v1.md
 - HarborNAS-Middleware-Endpoint-Contract-v1.md
+- HarborNAS-Files-BatchOps-Contract-v1.md
 
 ## V2 Additions
 
 - `HarborNAS-LocalAgent-V2-Assistant-Skills-Roadmap.md`: assistant + skills integration roadmap with HarborOS control-plane-first policy (`middleware API > midcli > browser > MCP`).
 - `HarborNAS-Skill-Spec-v1.md`: standard skill contract (manifest schema, runtime envelope, routing, risk and test requirements), including HarborOS `middleware` API binding and `midcli` fallback rules.
 - `HarborNAS-Middleware-Endpoint-Contract-v1.md`: executable endpoint contract for `system.harbor_ops`, including action normalization, API/CLI mapping, error model, and compatibility matrix template.
+- `HarborNAS-Files-BatchOps-Contract-v1.md`: executable endpoint contract for `files.batch_ops`, including path policy, route fallback chain, CLI template constraints, and compatibility matrix template.

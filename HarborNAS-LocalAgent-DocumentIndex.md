@@ -23,6 +23,13 @@
 - 重点: 意图标准化模型、`middleware` API 映射、`midcli` 回退、错误模型、兼容性矩阵。
 - 输出: 可用于实现 `MiddlewareExecutor` 与回归测试的统一基线。
 
+### 4. **HarborNAS-Files-BatchOps-Contract-v1.md**
+**Files 批处理契约 v1（可执行）**
+
+- 目标: 为 `files.batch_ops` 提供可直接开发和测试的接口级契约。
+- 重点: 路径安全策略、`middleware -> midcli -> 受限CLI` 回退链、命令模板约束、兼容性矩阵。
+- 输出: 可用于实现文件类 Skill 的统一执行与风控基线。
+
 ## 📦 已生成的完整规划包
 
 为你的 HarborNAS 项目生成了 **5 份详细规划文档**，共约 14,000 字。
