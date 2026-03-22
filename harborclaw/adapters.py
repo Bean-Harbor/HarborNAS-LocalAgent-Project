@@ -27,7 +27,14 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
-from harborclaw.channels import Channel, InboundMessage, OutboundMessage
+from harborclaw.channels import (
+    Attachment,
+    AttachmentType,
+    Channel,
+    ChatType,
+    InboundMessage,
+    OutboundMessage,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -61,26 +68,109 @@ class ChannelAdapter(ABC):
 # ---------------------------------------------------------------------------
 
 class FeishuAdapter(ChannelAdapter):
-    """Adapter for 飞书 (Feishu / Lark) events API v2."""
+    """Adapter for 飞书 (Feishu / Lark) events API v2.
+
+    Enhanced with OpenClaw-inspired rich message parsing:
+    - text, post (rich text), image, file, audio, media (video)
+    - message_id for dedup and reply-to
+    - chat_type (p2p vs group) for group chat filtering
+    - mentions list for @detection
+    """
 
     @property
     def channel(self) -> Channel:
         return Channel.FEISHU
 
     def parse_inbound(self, raw: dict[str, Any]) -> InboundMessage:
-        # Feishu event structure:
-        # {"header": {...}, "event": {"sender": {"sender_id": {...}}, "message": {"content": ...}}}
         event = raw.get("event", {})
         sender = event.get("sender", {}).get("sender_id", {})
         sender_id = sender.get("open_id", sender.get("user_id", "unknown"))
 
         message = event.get("message", {})
+        message_id = message.get("message_id", "")
+        chat_id = message.get("chat_id", "")
+        chat_type_str = message.get("chat_type", "")
+        message_type = message.get("message_type", "text")
         content_str = message.get("content", "{}")
+
+        # Parse chat type
+        if chat_type_str == "p2p":
+            chat_type = ChatType.P2P
+        elif chat_type_str == "group":
+            chat_type = ChatType.GROUP
+        else:
+            chat_type = ChatType.UNKNOWN
+
+        # Parse mentions
+        raw_mentions = message.get("mentions", [])
+        mentions = []
+        if isinstance(raw_mentions, list):
+            for m in raw_mentions:
+                key = m.get("key", "") if isinstance(m, dict) else ""
+                if key:
+                    mentions.append(key)
+
+        # Parse content based on message_type
+        text = ""
+        attachments: list[Attachment] = []
+
         try:
-            content = json.loads(content_str)
-            text = content.get("text", content_str)
+            content = json.loads(content_str) if content_str else {}
         except (json.JSONDecodeError, TypeError):
-            text = str(content_str)
+            content = {}
+
+        if message_type == "text":
+            text = content.get("text", str(content_str))
+        elif message_type == "post":
+            text, post_images = _extract_post_text(content)
+            for img_key in post_images:
+                attachments.append(Attachment(
+                    type=AttachmentType.IMAGE,
+                    content=img_key,
+                    file_name="feishu_post_image.png",
+                ))
+        elif message_type == "image":
+            image_key = content.get("image_key", "")
+            text = "[图片]"
+            if image_key:
+                attachments.append(Attachment(
+                    type=AttachmentType.IMAGE,
+                    content=image_key,
+                    file_name="feishu_image.png",
+                ))
+        elif message_type == "file":
+            file_key = content.get("file_key", "")
+            file_name = content.get("file_name", "file.bin")
+            text = f"[文件] {file_name}"
+            if file_key:
+                attachments.append(Attachment(
+                    type=AttachmentType.FILE,
+                    content=file_key,
+                    file_name=file_name,
+                ))
+        elif message_type in ("media", "video"):
+            file_key = content.get("file_key", "")
+            file_name = content.get("file_name", "video.mp4")
+            text = f"[视频] {file_name}"
+            if file_key:
+                attachments.append(Attachment(
+                    type=AttachmentType.VIDEO,
+                    content=file_key,
+                    file_name=file_name,
+                ))
+        elif message_type == "audio":
+            file_key = content.get("file_key", "")
+            file_name = content.get("file_name", "audio.opus")
+            text = f"[语音] {file_name}"
+            if file_key:
+                attachments.append(Attachment(
+                    type=AttachmentType.AUDIO,
+                    content=file_key,
+                    file_name=file_name,
+                ))
+        else:
+            # Unknown type — best effort
+            text = content.get("text", str(content_str))
 
         # Strip @bot mention
         text = _strip_at_mention(text)
@@ -90,6 +180,11 @@ class FeishuAdapter(ChannelAdapter):
             sender_id=sender_id,
             text=text.strip(),
             raw=raw,
+            message_id=message_id,
+            chat_type=chat_type,
+            chat_id=chat_id,
+            mentions=mentions,
+            attachments=attachments,
         )
 
     def build_outbound(self, msg: OutboundMessage) -> dict[str, Any]:
@@ -176,6 +271,47 @@ class TelegramAdapter(ChannelAdapter):
         sender = message.get("from", {})
         sender_id = str(sender.get("id", "unknown"))
         text = message.get("text", "")
+        message_id = str(message.get("message_id", ""))
+        chat = message.get("chat", {})
+        chat_id = str(chat.get("id", ""))
+        chat_type_str = chat.get("type", "")
+
+        if chat_type_str in ("private",):
+            chat_type = ChatType.P2P
+        elif chat_type_str in ("group", "supergroup"):
+            chat_type = ChatType.GROUP
+        else:
+            chat_type = ChatType.UNKNOWN
+
+        # Parse mentions from entities
+        mentions = []
+        entities = message.get("entities", [])
+        if isinstance(entities, list):
+            for ent in entities:
+                if isinstance(ent, dict) and ent.get("type") == "mention":
+                    offset = ent.get("offset", 0)
+                    length = ent.get("length", 0)
+                    mentions.append(text[offset:offset + length])
+
+        # Parse photo attachments
+        attachments: list[Attachment] = []
+        photos = message.get("photo", [])
+        if isinstance(photos, list) and photos:
+            best = photos[-1]  # largest resolution
+            attachments.append(Attachment(
+                type=AttachmentType.IMAGE,
+                content=best.get("file_id", ""),
+                file_name="telegram_photo.jpg",
+            ))
+        doc = message.get("document")
+        if isinstance(doc, dict):
+            attachments.append(Attachment(
+                type=AttachmentType.FILE,
+                content=doc.get("file_id", ""),
+                file_name=doc.get("file_name", "file.bin"),
+                mime_type=doc.get("mime_type", "application/octet-stream"),
+            ))
+
         # Strip /command prefix
         if text.startswith("/"):
             parts = text.split(maxsplit=1)
@@ -185,6 +321,11 @@ class TelegramAdapter(ChannelAdapter):
             sender_id=sender_id,
             text=text.strip(),
             raw=raw,
+            message_id=message_id,
+            chat_type=chat_type,
+            chat_id=chat_id,
+            mentions=mentions,
+            attachments=attachments,
         )
 
     def build_outbound(self, msg: OutboundMessage) -> dict[str, Any]:
@@ -208,16 +349,33 @@ class DiscordAdapter(ChannelAdapter):
         return Channel.DISCORD
 
     def parse_inbound(self, raw: dict[str, Any]) -> InboundMessage:
-        # Discord interaction or message create event
         sender = raw.get("author", raw.get("member", {}).get("user", {}))
         sender_id = str(sender.get("id", "unknown"))
         text = raw.get("content", raw.get("data", {}).get("name", ""))
+        message_id = str(raw.get("id", ""))
+        channel_id = str(raw.get("channel_id", ""))
+        # Discord DM channels have type=1, guild channels are 0
+        guild_id = raw.get("guild_id", "")
+        chat_type = ChatType.P2P if not guild_id else ChatType.GROUP
+
+        # Parse mentions
+        mentions = []
+        raw_mentions = raw.get("mentions", [])
+        if isinstance(raw_mentions, list):
+            for m in raw_mentions:
+                if isinstance(m, dict):
+                    mentions.append(m.get("id", ""))
+
         text = _strip_at_mention(text)
         return InboundMessage(
             channel=Channel.DISCORD,
             sender_id=sender_id,
             text=text.strip(),
             raw=raw,
+            message_id=message_id,
+            chat_type=chat_type,
+            chat_id=channel_id,
+            mentions=mentions,
         )
 
     def build_outbound(self, msg: OutboundMessage) -> dict[str, Any]:
@@ -241,12 +399,35 @@ class DingTalkAdapter(ChannelAdapter):
         sender_id = raw.get("senderStaffId", raw.get("senderId", "unknown"))
         text_content = raw.get("text", {})
         text = text_content.get("content", "") if isinstance(text_content, dict) else str(text_content)
+        msg_id = raw.get("msgId", "")
+        conversation_id = raw.get("conversationId", "")
+        conversation_type = raw.get("conversationType", "")
+
+        if conversation_type == "1":
+            chat_type = ChatType.P2P
+        elif conversation_type == "2":
+            chat_type = ChatType.GROUP
+        else:
+            chat_type = ChatType.UNKNOWN
+
+        # DingTalk @mentions in atUsers list
+        mentions = []
+        at_users = raw.get("atUsers", [])
+        if isinstance(at_users, list):
+            for u in at_users:
+                if isinstance(u, dict):
+                    mentions.append(u.get("dingtalkId", ""))
+
         text = _strip_at_mention(text)
         return InboundMessage(
             channel=Channel.DINGTALK,
             sender_id=str(sender_id),
             text=text.strip(),
             raw=raw,
+            message_id=msg_id,
+            chat_type=chat_type,
+            chat_id=conversation_id,
+            mentions=mentions,
         )
 
     def build_outbound(self, msg: OutboundMessage) -> dict[str, Any]:
@@ -286,12 +467,26 @@ class SlackAdapter(ChannelAdapter):
         event = raw.get("event", raw)
         sender_id = event.get("user", "unknown")
         text = event.get("text", "")
+        message_ts = event.get("ts", "")
+        channel_id = event.get("channel", "")
+        channel_type = event.get("channel_type", "")
+
+        if channel_type == "im":
+            chat_type = ChatType.P2P
+        elif channel_type in ("channel", "group", "mpim"):
+            chat_type = ChatType.GROUP
+        else:
+            chat_type = ChatType.UNKNOWN
+
         text = _strip_at_mention(text)
         return InboundMessage(
             channel=Channel.SLACK,
             sender_id=sender_id,
             text=text.strip(),
             raw=raw,
+            message_id=message_ts,
+            chat_type=chat_type,
+            chat_id=channel_id,
         )
 
     def build_outbound(self, msg: OutboundMessage) -> dict[str, Any]:
@@ -397,3 +592,73 @@ def _strip_at_mention(text: str) -> str:
     # Feishu @_user_N patterns
     text = re.sub(r"@_user_\d+", "", text)
     return text.strip()
+
+
+def _extract_post_text(post_json: dict[str, Any]) -> tuple[str, list[str]]:
+    """Extract plain text and image keys from Feishu post (rich text) content.
+
+    Follows OpenClaw's ``extractFromPostJson`` logic: walk paragraphs of
+    inline nodes, collecting text and image_key references.
+
+    Returns ``(text, image_keys)``.
+    """
+    lines: list[str] = []
+    image_keys: list[str] = []
+
+    def inline(node: Any) -> str:
+        if not node:
+            return ""
+        if isinstance(node, list):
+            return "".join(inline(n) for n in node)
+        if not isinstance(node, dict):
+            return ""
+        tag = node.get("tag", "")
+        if tag == "text":
+            return str(node.get("text", ""))
+        if tag == "a":
+            return str(node.get("text", node.get("href", "")))
+        if tag == "at":
+            name = node.get("user_name", "")
+            return f"@{name}" if name else "@"
+        if tag == "md":
+            return str(node.get("text", ""))
+        if tag == "img":
+            key = node.get("image_key", "")
+            if key:
+                image_keys.append(key)
+            return "[图片]"
+        if tag == "file":
+            return "[文件]"
+        if tag == "media":
+            return "[视频]"
+        if tag == "code_block":
+            lang = str(node.get("language", "")).strip()
+            code = str(node.get("text", ""))
+            return f"\n```{lang}\n{code}\n```\n"
+        # Fallback: traverse children
+        acc = ""
+        for v in node.values():
+            if isinstance(v, (dict, list)):
+                acc += inline(v)
+        return acc
+
+    title = post_json.get("title", "")
+    if title:
+        lines.append(str(title).strip())
+
+    content = post_json.get("content")
+    if isinstance(content, list):
+        for paragraph in content:
+            if isinstance(paragraph, list):
+                joined = "".join(inline(n) for n in paragraph).strip()
+            else:
+                joined = inline(paragraph).strip()
+            if joined:
+                lines.append(joined)
+    elif content:
+        joined = inline(content).strip()
+        if joined:
+            lines.append(joined)
+
+    text = "\n".join(lines).strip()
+    return text, list(dict.fromkeys(image_keys))  # dedup preserving order

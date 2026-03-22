@@ -30,6 +30,36 @@ from typing import Any, Callable
 
 
 # ---------------------------------------------------------------------------
+# Attachment (rich media)
+# ---------------------------------------------------------------------------
+
+class AttachmentType(str, Enum):
+    """Attachment media types."""
+    IMAGE = "image"
+    VIDEO = "video"
+    AUDIO = "audio"
+    FILE = "file"
+
+
+@dataclass
+class Attachment:
+    """A media attachment (image, file, etc.) on a message."""
+    type: AttachmentType
+    # For inbound: base64 data-URL, file path, or URL.
+    # For outbound: local file path or URL to send.
+    content: str
+    mime_type: str = "application/octet-stream"
+    file_name: str = ""
+
+
+class ChatType(str, Enum):
+    """Whether a message comes from a 1-on-1 or a group chat."""
+    P2P = "p2p"
+    GROUP = "group"
+    UNKNOWN = "unknown"
+
+
+# ---------------------------------------------------------------------------
 # Channel enum & config
 # ---------------------------------------------------------------------------
 
@@ -81,6 +111,12 @@ class InboundMessage:
     sender_id: str
     text: str
     raw: dict[str, Any] = field(default_factory=dict)
+    # ---- OpenClaw-inspired fields ----
+    message_id: str = ""                        # Platform message ID (for dedup & reply)
+    chat_type: ChatType = ChatType.UNKNOWN       # p2p or group
+    chat_id: str = ""                            # Chat/conversation ID
+    mentions: list[str] = field(default_factory=list)  # Bot/user mentions in message
+    attachments: list[Attachment] = field(default_factory=list)  # Rich media
 
 
 @dataclass
@@ -90,6 +126,10 @@ class OutboundMessage:
     recipient_id: str
     text: str
     payload: dict[str, Any] = field(default_factory=dict)
+    # ---- OpenClaw-inspired fields ----
+    attachments: list[Attachment] = field(default_factory=list)  # Rich media to send
+    reply_to_message_id: str = ""                # Platform message ID to update/replace
+    update_message_id: str = ""                  # Edit existing message instead of new
 
 
 # ---------------------------------------------------------------------------

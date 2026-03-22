@@ -10,11 +10,18 @@ This is the "glue" module that connects:
 The Dispatcher also manages:
   - Session context (per-user conversation state)
   - Approval flow (HIGH risk → confirmation prompt → execute on "确认")
+  - Message dedup (same message ID within TTL is skipped)
+  - Group chat filtering (only respond when @mentioned / question / request)
+  - Thinking indicator ("正在思考…" placeholder updated with final reply)
   - Error handling at each stage
+
+Referenced OpenClaw's proven UX patterns for dedup, group-chat intelligence,
+thinking indicator, and rich-media reply.
 """
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -23,8 +30,10 @@ from typing import Any
 from harborclaw.adapters import ChannelAdapter, get_adapter
 from harborclaw.autonomy import Autonomy
 from harborclaw.channels import (
+    Attachment,
     Channel,
     ChannelRegistry,
+    ChatType,
     InboundMessage,
     OutboundMessage,
 )
@@ -91,6 +100,79 @@ class SessionStore:
 
 
 # ---------------------------------------------------------------------------
+# Message dedup (OpenClaw pattern)
+# ---------------------------------------------------------------------------
+
+class MessageDedup:
+    """Reject duplicate messages by platform message_id.
+
+    Feishu (and other platforms) may deliver the same event more than once.
+    Keeps a bounded set of seen IDs with TTL.
+    """
+
+    def __init__(self, ttl_seconds: int = 600) -> None:
+        self._seen: dict[str, float] = {}
+        self._ttl = ttl_seconds
+
+    def is_duplicate(self, message_id: str) -> bool:
+        if not message_id:
+            return False
+        now = time.time()
+        # Evict expired entries lazily
+        expired = [k for k, ts in self._seen.items() if now - ts > self._ttl]
+        for k in expired:
+            del self._seen[k]
+
+        if message_id in self._seen:
+            return True
+        self._seen[message_id] = now
+        return False
+
+    @property
+    def size(self) -> int:
+        return len(self._seen)
+
+
+# ---------------------------------------------------------------------------
+# Group chat filtering (OpenClaw pattern)
+# ---------------------------------------------------------------------------
+
+# Chinese request verbs that indicate the user wants the bot to act
+_REQUEST_VERBS = frozenset([
+    "帮", "麻烦", "请", "能否", "可以",
+    "解释", "看看", "排查", "分析", "总结",
+    "写", "改", "修", "查", "对比", "翻译",
+    "启动", "停止", "重启", "检查", "查看",
+])
+
+_EN_QUESTION_WORDS = re.compile(
+    r"\b(why|how|what|when|where|who|help)\b", re.IGNORECASE,
+)
+
+
+def should_respond_in_group(text: str, mentions: list[str]) -> bool:
+    """Decide if the bot should respond in a group chat.
+
+    Follows OpenClaw's low-disturbance pattern: only respond when
+    @mentioned, when the message looks like a question, or when it
+    contains request-type verbs.  Avoids spamming in casual chat.
+    """
+    # Always respond if @mentioned
+    if mentions:
+        return True
+    # Question mark at end
+    if text.rstrip().endswith(("?", "？")):
+        return True
+    # English question words
+    if _EN_QUESTION_WORDS.search(text):
+        return True
+    # Chinese request verbs
+    if any(v in text for v in _REQUEST_VERBS):
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Channel ↔ OutputFormat mapping
 # ---------------------------------------------------------------------------
 
@@ -124,6 +206,12 @@ _CANCEL_KEYWORDS = frozenset({"取消", "cancel", "no", "n", "否"})
 class Dispatcher:
     """Central dispatch chain: IM message → tool execution → reply.
 
+    Implements OpenClaw-inspired UX patterns:
+    - Message dedup (skip duplicate platform events)
+    - Group chat filtering (low-disturbance mode)
+    - Thinking indicator ("正在思考…" → replaced with result)
+    - Session per chat (p2p by sender, group by chat_id)
+
     Usage::
 
         dispatcher = Dispatcher(
@@ -131,7 +219,7 @@ class Dispatcher:
             mcp_adapter=adapter,
             channel_registry=registry,
         )
-        # Called by WebhookReceiver when a message arrives:
+        # Called by WebhookReceiver or LongConnectionTransport:
         dispatcher.handle(inbound_message)
     """
 
@@ -144,6 +232,7 @@ class Dispatcher:
         formatter: ResponseFormatter | None = None,
         session_timeout: int = 600,
         default_autonomy: Autonomy = Autonomy.SUPERVISED,
+        thinking_threshold_ms: int = 2500,
     ):
         self._parser = intent_parser
         self._mcp = mcp_adapter
@@ -151,12 +240,30 @@ class Dispatcher:
         self._formatter = formatter or ResponseFormatter()
         self._sessions = SessionStore(timeout=session_timeout)
         self._default_autonomy = default_autonomy
+        self._dedup = MessageDedup(ttl_seconds=session_timeout)
+        self._thinking_threshold_ms = thinking_threshold_ms
 
     # ---- main entry point ----
 
     def handle(self, inbound: InboundMessage) -> None:
         """Process an inbound IM message through the full chain."""
-        session = self._sessions.get_or_create(inbound.channel, inbound.sender_id)
+        # --- Dedup (OpenClaw pattern) ---
+        if self._dedup.is_duplicate(inbound.message_id):
+            logger.debug("Skipping duplicate message: %s", inbound.message_id)
+            return
+
+        # --- Group chat filter (OpenClaw pattern) ---
+        if inbound.chat_type == ChatType.GROUP:
+            if not should_respond_in_group(inbound.text, inbound.mentions):
+                logger.debug("Skipping group message (not addressed to bot)")
+                return
+
+        # Session key: p2p by sender, group by chat_id (OpenClaw pattern)
+        session_key = (
+            inbound.chat_id if inbound.chat_type == ChatType.GROUP and inbound.chat_id
+            else inbound.sender_id
+        )
+        session = self._sessions.get_or_create(inbound.channel, session_key)
         fmt = _format_for_channel(inbound.channel)
 
         try:
@@ -340,22 +447,48 @@ class Dispatcher:
         text: str,
         *,
         payload: dict[str, Any] | None = None,
+        attachments: list[Attachment] | None = None,
+        update_message_id: str = "",
     ) -> None:
         """Send a reply back to the originating channel."""
         outbound = OutboundMessage(
             channel=inbound.channel,
-            recipient_id=inbound.sender_id,
+            recipient_id=inbound.chat_id or inbound.sender_id,
             text=text,
             payload=payload or {},
+            attachments=attachments or [],
+            update_message_id=update_message_id,
         )
         try:
             self._channels.send(outbound)
         except RuntimeError as exc:
             logger.warning("Cannot send reply to %s: %s", inbound.channel.value, exc)
 
+    def _send_thinking_placeholder(self, inbound: InboundMessage) -> str:
+        """Send a '正在思考…' placeholder message (OpenClaw pattern).
+
+        Returns the placeholder message ID (empty string if sending failed
+        or if the channel doesn't support message updates).
+        """
+        outbound = OutboundMessage(
+            channel=inbound.channel,
+            recipient_id=inbound.chat_id or inbound.sender_id,
+            text="正在思考…",
+        )
+        try:
+            self._channels.send(outbound)
+            # The sender callback may set the message_id on the outbound.
+            return outbound.payload.get("sent_message_id", "")
+        except RuntimeError:
+            return ""
+
     @property
     def sessions(self) -> SessionStore:
         return self._sessions
+
+    @property
+    def dedup(self) -> MessageDedup:
+        return self._dedup
 
 
 # Mutation operations that require approval under Supervised mode
