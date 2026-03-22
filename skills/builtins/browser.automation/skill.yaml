@@ -1,0 +1,56 @@
+id: browser.automation
+name: Browser Automation
+version: 1.0.0
+summary: Browser-based automation — navigate, click, scrape, screenshot via headless browser.
+owner: harbor-team
+
+capabilities:
+  - browser.navigate
+  - browser.click
+  - browser.scrape
+  - browser.screenshot
+
+executors:
+  browser:
+    enabled: true
+  cli:
+    enabled: true
+    command: "python -m skills.builtins.browser_automation.handler"
+
+harbor_api:
+  enabled: false
+
+harbor_cli:
+  enabled: false
+
+permissions:
+  - network.outbound
+  - browser.control
+
+risk:
+  default_level: MEDIUM
+  requires_confirmation:
+    - HIGH
+    - CRITICAL
+
+input_schema:
+  type: object
+  properties:
+    operation:
+      type: string
+      enum: [navigate, click, scrape, screenshot]
+    url:
+      type: string
+    selector:
+      type: string
+    output_path:
+      type: string
+  required: [operation]
+
+timeouts:
+  plan_ms: 2000
+  exec_ms: 120000
+
+retries:
+  max_attempts: 2
+  backoff_ms: 3000

@@ -1,0 +1,55 @@
+id: media.video_edit
+name: Video Editing
+version: 1.0.0
+summary: Video editing operations — trim, concat, transcode, thumbnail via CLI tools.
+owner: harbor-team
+
+capabilities:
+  - video.trim
+  - video.concat
+  - video.transcode
+  - video.thumbnail
+
+executors:
+  cli:
+    enabled: true
+    command: "python -m skills.builtins.media_video_edit.handler"
+
+harbor_api:
+  enabled: false
+
+harbor_cli:
+  enabled: false
+
+permissions:
+  - storage.read
+  - storage.write
+  - media.process
+
+risk:
+  default_level: LOW
+  requires_confirmation:
+    - HIGH
+    - CRITICAL
+
+input_schema:
+  type: object
+  properties:
+    operation:
+      type: string
+      enum: [trim, concat, transcode, thumbnail]
+    input_path:
+      type: string
+    output_path:
+      type: string
+    options:
+      type: object
+  required: [operation, input_path]
+
+timeouts:
+  plan_ms: 2000
+  exec_ms: 600000
+
+retries:
+  max_attempts: 1
+  backoff_ms: 0

@@ -1,0 +1,70 @@
+id: files.batch_ops
+name: File Batch Operations
+version: 1.0.0
+summary: Batch file operations — search, copy, move, archive on HarborOS storage pools.
+owner: harbor-team
+
+capabilities:
+  - files.search
+  - files.copy
+  - files.move
+  - files.archive
+
+executors:
+  cli:
+    enabled: true
+    command: "python -m skills.builtins.files_batch_ops.handler"
+
+harbor_api:
+  enabled: true
+  provider: middleware
+  endpoint_group: files
+  allowed_methods:
+    - search
+    - copy
+    - move
+    - archive
+  min_version: v1
+
+harbor_cli:
+  enabled: true
+  tool: midcli
+  command_group: files
+  allowed_subcommands:
+    - search
+    - copy
+    - move
+    - archive
+  require_structured_output: true
+
+permissions:
+  - storage.read
+  - storage.write
+
+risk:
+  default_level: MEDIUM
+  requires_confirmation:
+    - HIGH
+    - CRITICAL
+
+input_schema:
+  type: object
+  properties:
+    operation:
+      type: string
+      enum: [search, copy, move, archive]
+    source:
+      type: string
+    destination:
+      type: string
+    pattern:
+      type: string
+  required: [operation, source]
+
+timeouts:
+  plan_ms: 3000
+  exec_ms: 300000
+
+retries:
+  max_attempts: 2
+  backoff_ms: 2000
