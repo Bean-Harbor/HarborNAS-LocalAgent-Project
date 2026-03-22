@@ -1,12 +1,12 @@
 # HarborNAS Skill Specification v1
 
 ## Purpose
-This document defines the standard contract for Skills so teams can build, test, and run skills consistently with CLI-first execution. For HarborOS-domain capabilities, CLI execution should bind to the existing `midcli` tool.
+This document defines the standard contract for Skills so teams can build, test, and run skills consistently with HarborOS control-plane-first execution. For HarborOS-domain capabilities, execution should bind to `middleware` API first, then `midcli` as fallback.
 
 ## Design Principles
 
-1. CLI first: every skill should expose CLI capability when possible.
-1.1 HarborOS first-party operations should execute through `midcli`.
+1. HarborOS control-plane first: use `middleware` API for first-party operations.
+2. CLI fallback: use `midcli` when API route is unavailable.
 2. Deterministic I/O: strict input and output schema.
 3. Safe by default: explicit permissions and risk metadata.
 4. Observable execution: structured logs and trace IDs.
@@ -137,11 +137,31 @@ retries:
 
 ## Routing and Fallback Rules
 
-1. Router must attempt CLI first if `executors.cli.enabled=true`.
-2. For HarborOS-domain skills, router should bind CLI execution to `midcli` before any generic shell route.
-3. Browser route allowed only when CLI is unavailable for that capability.
-4. MCP route allowed only when both CLI and Browser are unavailable.
-5. If risk level is HIGH/CRITICAL, execution requires explicit approval token.
+1. Router must attempt API first if `executors.api.enabled=true`.
+2. For HarborOS-domain skills, router should bind API execution to `middleware` before any CLI route.
+3. CLI route should bind to `midcli` before any generic shell route.
+4. Browser route allowed only when API and CLI are unavailable for that capability.
+5. MCP route allowed only when API, CLI, and Browser are unavailable.
+6. If risk level is HIGH/CRITICAL, execution requires explicit approval token.
+
+## HarborOS API Binding (middleware)
+
+For skills operating HarborOS services/resources, add a `harbor_api` block in `skill.yaml`:
+
+```yaml
+harbor_api:
+  enabled: true
+  provider: middleware
+  endpoint_group: service
+  allowed_methods: [query, start, stop, restart, update]
+  min_version: "v1"
+```
+
+Rules:
+- `provider` must be `middleware` for HarborOS first-party operations.
+- `allowed_methods` must be explicit and least-privilege.
+- Request and response payloads must pass schema validation before and after execution.
+- API adapter must normalize endpoint-specific fields into common output schema.
 
 ## HarborOS CLI Binding (midcli)
 
@@ -161,6 +181,7 @@ Rules:
 - `allowed_subcommands` must be explicit and least-privilege.
 - `require_structured_output=true` when structured output mode is available.
 - Free-form shell strings are disallowed when `harbor_cli.enabled=true`.
+- CLI route must not bypass API route when `harbor_api.enabled=true` and API is available.
 
 ## Risk Levels
 
@@ -181,7 +202,7 @@ Rules:
 - resource limits (CPU/mem/time).
 
 3. Audit:
-- record requested command, normalized command, executor, user, and outcome.
+- record requested action, resolved endpoint/command, executor, user, and outcome.
 - retain traceability with `task_id` and `trace_id`.
 
 ## Testing Requirements
@@ -198,6 +219,9 @@ Rules:
 4. Failure test:
 - invalid args, timeout, non-zero exit code.
 
+5. Compatibility test:
+- validate API schema and fallback behavior across HarborNAS and upstream versions.
+
 A skill is release-ready only if all tests pass.
 
 ## Versioning and Compatibility
@@ -210,7 +234,7 @@ Registry should keep at least one rollback version.
 
 ## Minimum Built-in Skills (V2)
 
-1. `system.harbor_ops` - service status/start/stop/restart (CLI via `midcli`).
+1. `system.harbor_ops` - service status/start/stop/restart (API via `middleware`, fallback CLI via `midcli`).
 2. `files.batch_ops` - copy/move/archive/search (CLI).
 3. `media.video_edit` - trim/concat/subtitle (CLI via ffmpeg).
 4. `browser.web_automate` - browser fallback automation.
@@ -219,8 +243,10 @@ Registry should keep at least one rollback version.
 ## Implementation Checklist
 
 - [ ] skill.yaml validated by schema.
+- [ ] API execution path implemented for HarborOS skills.
 - [ ] CLI execution path implemented.
 - [ ] permission and risk metadata configured.
 - [ ] contract and smoke tests added.
+- [ ] compatibility matrix checks pass.
 - [ ] audit fields present in response.
 - [ ] registry entry published.

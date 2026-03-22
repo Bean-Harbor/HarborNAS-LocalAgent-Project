@@ -3,20 +3,23 @@
 ## Scope
 This V2 roadmap extends the existing HarborNAS local-agent plan with two priorities:
 1. Multi-terminal natural-language assistant (mobile/web/desktop).
-2. Skills framework with CLI-first execution.
-3. Reuse HarborOS existing CLI tool `midcli` as the default command gateway.
+2. Skills framework with HarborOS control-plane-first execution.
+3. Reuse HarborOS existing `middleware` API as primary execution route.
+4. Reuse HarborOS existing CLI tool `midcli` as the secondary fallback route.
 
 Execution priority is strict:
-1. MidCLI executor (CLI via `midcli`)
-2. Browser executor
-3. MCP executor (fallback only)
+1. Middleware API executor
+2. MidCLI executor (CLI via `midcli`)
+3. Browser executor
+4. MCP executor (fallback only)
 
 ## V2 Objectives
 
 1. Users can control HarborOS from phone and other terminals using natural language.
 2. Skills are hot-pluggable and governed by permissions.
-3. Most tasks are completed through deterministic command-line execution.
-4. Browser and MCP are used only when CLI is unavailable.
+3. Most HarborOS tasks are completed through deterministic API execution.
+4. `midcli` is used when API route is unavailable or lacks capability parity.
+5. Browser and MCP are used only when API and CLI are unavailable.
 5. All actions are auditable and replayable.
 
 ## Architecture Delta (V2)
@@ -32,16 +35,23 @@ Execution priority is strict:
 - Skill router with policy-based executor selection.
 - Confirmation policy for risky operations.
 
+### 2.1) Middleware API Integration Baseline
+- HarborOS domain skills must resolve API route first.
+- Planner outputs normalized action objects (`domain`, `operation`, `resource`, `args`).
+- Router maps normalized actions to middleware endpoints with versioned adapters.
+- API responses are normalized into a common result envelope for audit and replay.
+
 ### 3) Skills Runtime Layer
 - Skill registry (manifest, version, capability tags).
 - Skill runtime (sandbox, timeout, retries, output schema).
 - Executors:
-  - `MidCLIExecutor` (default for HarborOS operations)
+  - `MiddlewareExecutor` (default for HarborOS operations)
+  - `MidCLIExecutor` (secondary fallback)
   - `BrowserExecutor` (secondary)
   - `MCPExecutor` (final fallback)
 
 ### 3.1) MidCLI Integration Baseline
-- HarborOS domain skills must execute through `midcli` first.
+- HarborOS domain skills use `midcli` as fallback when API mapping is unavailable.
 - Natural-language intents are mapped to approved `midcli` subcommands.
 - Command execution should use structured output mode when available (for stable parsing and audit).
 - Keep an allowlist of accepted command groups and arguments to prevent unsafe shell expansion.
@@ -52,12 +62,14 @@ Execution priority is strict:
 - Success rate, latency, and cost metrics.
 - Policy violations and high-risk alerts.
 
-## CLI-first Routing Policy
+## Control-plane-first Routing Policy
 
 Pseudo policy:
 
 ```text
-if skill.supports_cli and host.cli_available:
+if skill.supports_api and middleware.available:
+  route = MIDDLEWARE_API
+elif skill.supports_cli and host.cli_available:
   route = MIDCLI
 elif skill.supports_browser and browser.available:
   route = BROWSER
@@ -71,23 +83,24 @@ if command.risk_level in [HIGH, CRITICAL]:
 ```
 
 Hard rules:
-- Never choose MCP if CLI route is available.
+- Never choose CLI if API route is available for the same capability.
+- Never choose Browser/MCP if API or CLI route is available.
 - Never execute destructive commands without explicit confirmation.
-- Always dry-run when `risk_level >= HIGH` and command allows preview.
+- Always dry-run when `risk_level >= HIGH` and route supports preview.
 
 ## 8-Week Incremental Plan (for current 3-person team)
 
 ### Week 1-2: Assistant Entry + Session Backbone
 - Build mobile/web chat entry and unified session API.
 - Define task state machine (`queued -> planned -> executing -> completed/failed`).
-- Introduce `MidCLIExecutor` v1 and command audit logging.
+- Introduce `MiddlewareExecutor` v1, then `MidCLIExecutor` fallback and command audit logging.
 
 Deliverable:
-- End-to-end NL -> `midcli` -> result loop for basic HarborOS operations.
+- End-to-end NL -> middleware API -> result loop for basic HarborOS operations.
 
 ### Week 3-4: Skills Contract + Router
 - Implement skill registry and manifest loader.
-- Implement router with fixed priority `CLI > Browser > MCP`.
+- Implement router with fixed priority `API > CLI > Browser > MCP`.
 - Add approval flow for high-risk commands.
 
 Deliverable:
@@ -117,7 +130,8 @@ Deliverable:
 
 ## KPIs for V2
 
-- CLI route ratio >= 80% for automatable tasks.
+- API route ratio >= 70% for HarborOS domain tasks.
+- CLI route ratio <= 25% for HarborOS domain tasks (excluding fallback-only capabilities).
 - Task success rate >= 95% (excluding external dependency failures).
 - P95 orchestration latency <= 2s before execution start.
 - High-risk actions with confirmation coverage = 100%.
@@ -137,9 +151,33 @@ Deliverable:
 4. Browser/MCP overuse.
 - Control: hard routing policy and route-ratio alerting.
 
+5. Upstream sync drift between HarborNAS and upstream TrueNAS.
+- Control: compatibility matrix tests for endpoint/field changes and fallback validation.
+
+## HarborOS Action Mapping (system.harbor_ops)
+
+| Intent | Primary Route (Middleware API) | Secondary Route (midcli) | Risk |
+|---|---|---|---|
+| Query service status | `service.query` | `service <name> show` | LOW |
+| Start service | `service.start` | `service start service=<name>` | MEDIUM |
+| Stop service | `service.stop` | `service stop service=<name>` | HIGH |
+| Restart service | `service.restart` | `service restart service=<name>` | HIGH |
+| Enable service on boot | `service.update(enable=true)` | `service update id_or_name=<name> enable=true` | MEDIUM |
+
+## Upstream Compatibility Test Matrix (Template)
+
+| Capability | HarborNAS Branch | Upstream Ref | API Contract Test | MidCLI Fallback Test | Result |
+|---|---|---|---|---|---|
+| service.status | develop | truenas/master | pass/fail | pass/fail | pending |
+| service.start | develop | truenas/master | pass/fail | pass/fail | pending |
+| service.stop | develop | truenas/master | pass/fail | pass/fail | pending |
+| service.restart | develop | truenas/master | pass/fail | pass/fail | pending |
+
 ## Immediate Next Tasks
 
 1. Implement skill manifest parser and registry CRUD.
-2. Implement `MidCLIExecutor` with dry-run and risk tagging.
+2. Implement `MiddlewareExecutor` with API schema validation and response normalization.
+3. Implement `MidCLIExecutor` fallback with dry-run and risk tagging.
 3. Add approval API for high-risk actions.
 4. Add first two skills and contract tests.
+5. Add compatibility matrix CI job for HarborNAS/upstream drift.

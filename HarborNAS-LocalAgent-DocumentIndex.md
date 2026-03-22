@@ -6,7 +6,7 @@
 **智能助手 + Skills + CLI 优先执行路线图**
 
 - 目标: 将多终端自然语言助手与 Skills 扩展能力并入现有规划。
-- 重点: 固化执行优先级 `CLI > Browser > MCP`，并将 HarborOS 既有命令行工具 `midcli` 作为默认 CLI 执行后端。
+- 重点: 调整为 HarborOS 控制面优先执行，固化优先级 `Middleware API > midcli > Browser > MCP`。
 - 输出: 8 周增量实施路径、角色分工、KPI 与风控。
 
 ### 2. **HarborNAS-Skill-Spec-v1.md**
