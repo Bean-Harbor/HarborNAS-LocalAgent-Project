@@ -58,6 +58,13 @@
 - 重点: PR 检查、nightly E2E、release drift 三类 workflow 的 job 结构、产物与失败策略。
 - 输出: 可直接作为 `.github/workflows/` 实施参考的初版草案。
 
+### 9. **`.github/workflows/` + `scripts/` + `tests/`**
+**契约治理 CI 可执行骨架 v1**
+
+- 目标: 将 workflow 草案落成仓库内可执行的第一版 CI 骨架。
+- 重点: 三套 GitHub Actions 工作流、四个最小脚本、三类 pytest 契约测试与开发依赖。
+- 输出: 当前仓库已经可以对“文档化契约是否仍然自洽”进行自动校验，并产出 schema、fallback、policy、E2E、drift、release gate 报告。
+
 ## 📦 已生成的完整规划包
 
 为你的 HarborNAS 项目生成了 **5 份详细规划文档**，共约 14,000 字。

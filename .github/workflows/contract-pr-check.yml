@@ -1,0 +1,80 @@
+name: Contract PR Check
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - main
+      - develop
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  schema_check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements-dev.txt
+      - run: python scripts/validate_contract_schemas.py --report validate-contract-report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: schema-check-report
+          path: validate-contract-report.json
+
+  contract_unit_tests:
+    runs-on: ubuntu-latest
+    needs: schema_check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements-dev.txt
+      - run: pytest tests/contracts -q --json-report --json-report-file=contract-test-report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: contract-reports
+          path: contract-test-report.json
+
+  fallback_chain_tests:
+    runs-on: ubuntu-latest
+    needs: schema_check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements-dev.txt
+      - run: pytest tests/fallback -q --json-report --json-report-file=fallback-report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fallback-reports
+          path: fallback-report.json
+
+  policy_risk_gates:
+    runs-on: ubuntu-latest
+    needs: schema_check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements-dev.txt
+      - run: pytest tests/policy -q --json-report --json-report-file=policy-enforcement-report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: policy-reports
+          path: policy-enforcement-report.json

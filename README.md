@@ -28,3 +28,16 @@ This repository contains the completed planning deliverables for a HarborNAS loc
 - `HarborNAS-Contract-E2E-Test-Plan-v1.md`: end-to-end validation plan across planner + execution contracts, including environment matrix, fallback checks, drift checks, and release exit criteria.
 - `HarborNAS-CI-Contract-Pipeline-Checklist-v1.md`: CI job checklist that maps all contract governance to merge, nightly, and pre-release pipeline stages.
 - `HarborNAS-GitHub-Actions-Workflow-Draft-v1.md`: initial GitHub Actions workflow draft mapping contract governance into concrete PR, nightly, and release workflows.
+
+## Executable CI Scaffold
+
+- `.github/workflows/contract-pr-check.yml`: PR and branch validation for contract schema checks plus contract, fallback, and policy test suites.
+- `.github/workflows/contract-nightly-e2e.yml`: nightly/manual E2E matrix scaffold for `env-a` and `env-b`.
+- `.github/workflows/contract-release-drift.yml`: release-branch drift matrix and release gate workflow.
+- `scripts/validate_contract_schemas.py`: validates that required contract documents and route-priority rules stay aligned.
+- `scripts/run_e2e_suite.py`: emits scaffolded E2E, latency, and audit reports for workflow wiring.
+- `scripts/run_drift_matrix.py`: emits the initial drift-matrix artifact for release gating.
+- `scripts/evaluate_release_gate.py`: converts drift output into a blocking/non-blocking release decision.
+- `tests/contracts`, `tests/fallback`, `tests/policy`: minimal pytest suites that keep the documented routing, fallback, and governance rules from regressing.
+
+Current scope note: this scaffold validates documentation-backed contracts and CI wiring. It does not yet execute against a live HarborNAS middleware or `midcli` environment.
