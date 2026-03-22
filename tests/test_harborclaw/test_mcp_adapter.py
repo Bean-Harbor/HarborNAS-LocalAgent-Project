@@ -1,4 +1,4 @@
-"""Tests for zeroclaw.mcp_adapter — MCP server adapter."""
+"""Tests for harborclaw.mcp_adapter — MCP server adapter."""
 import json
 
 import pytest
@@ -10,8 +10,8 @@ from assistant.runtime import Runtime
 from skills.manifest import SkillManifest, HarborApiConfig, HarborCliConfig, RiskConfig
 from skills.registry import Registry
 
-from zeroclaw.autonomy import Autonomy
-from zeroclaw.mcp_adapter import McpServerAdapter, McpToolSchema, McpToolResult
+from harborclaw.autonomy import Autonomy
+from harborclaw.mcp_adapter import McpServerAdapter, McpToolSchema, McpToolResult
 
 
 # ---------------------------------------------------------------------------

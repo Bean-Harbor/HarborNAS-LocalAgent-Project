@@ -1,10 +1,10 @@
-"""Tests for zeroclaw.tool_descriptions — TOML generation."""
+"""Tests for harborclaw.tool_descriptions — TOML generation."""
 import pytest
 
 from skills.manifest import SkillManifest, HarborApiConfig, HarborCliConfig, RiskConfig
 from skills.registry import Registry
 
-from zeroclaw.tool_descriptions import (
+from harborclaw.tool_descriptions import (
     manifest_to_tool_descriptions,
     registry_to_toml,
     manifest_to_skill_toml,

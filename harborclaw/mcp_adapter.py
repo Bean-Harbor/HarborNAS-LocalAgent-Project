@@ -1,7 +1,7 @@
 """MCP server adapter: expose HarborOS skills as MCP tools.
 
 Implements the Model Context Protocol (MCP) tool interface so that
-ZeroClaw (or any MCP client) can:
+HarborClaw (running locally inside HarborOS) can:
   1. List available tools  →  ``list_tools()``
   2. Call a tool           →  ``call_tool(name, arguments)``
 
@@ -23,7 +23,7 @@ from .autonomy import Autonomy, autonomy_to_approval, is_read_only_safe
 
 
 # ---------------------------------------------------------------------------
-# MCP tool schema types (subset of the MCP spec that ZeroClaw uses)
+# MCP tool schema types (subset of the MCP spec)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -47,6 +47,9 @@ class McpToolResult:
 
 class McpServerAdapter:
     """Bridges our Runtime+Registry to the MCP tool interface.
+
+    Runs locally inside HarborOS alongside HarborClaw.  The ChannelRouter
+    calls ``call_tool()`` after parsing user intent from IM messages.
 
     Usage::
 
@@ -125,7 +128,7 @@ class McpServerAdapter:
                 isError=True,
             )
 
-        # Build approval context from ZeroClaw autonomy
+        # Build approval context from HarborClaw autonomy
         approval = autonomy_to_approval(autonomy, token=token)
 
         # Patch runtime approval for this call

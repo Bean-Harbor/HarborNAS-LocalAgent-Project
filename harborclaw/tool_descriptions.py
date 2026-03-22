@@ -1,8 +1,8 @@
-"""Generate ZeroClaw-compatible TOML tool descriptions from skill manifests.
+"""Generate HarborClaw TOML tool descriptions from skill manifests.
 
-ZeroClaw discovers tools via ``tool_descriptions/<lang>.toml`` files.
+HarborClaw discovers tools via ``tool_descriptions/<lang>.toml`` files.
 This module converts our SkillManifest capabilities into that format,
-enabling ZeroClaw to display localised tool descriptions to users.
+enabling HarborClaw to display localised tool descriptions to users.
 """
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ def manifest_to_tool_descriptions(
 def registry_to_toml(registry: Registry, *, lang: str = "en") -> str:
     """Generate a TOML string with tool descriptions for all registered skills.
 
-    Compatible with ZeroClaw's ``tool_descriptions/<lang>.toml`` format.
+    Compatible with HarborClaw's ``tool_descriptions/<lang>.toml`` format.
     """
     lines = [f"# Auto-generated HarborOS tool descriptions ({lang})", ""]
     for manifest in registry.skills:
@@ -47,9 +47,9 @@ def registry_to_toml(registry: Registry, *, lang: str = "en") -> str:
 
 
 def manifest_to_skill_toml(manifest: SkillManifest) -> str:
-    """Generate a ZeroClaw SKILL.toml for a single skill manifest.
+    """Generate a HarborClaw SKILL.toml for a single skill manifest.
 
-    ZeroClaw skills live at ``~/.zeroclaw/workspace/skills/<name>/SKILL.toml``.
+    Skills live at ``/etc/harborclaw/skills/<name>/SKILL.toml``.
     """
     min_autonomy = risk_to_autonomy(
         _risk_level_from_str(manifest.risk.default_level)

@@ -1,6 +1,6 @@
-"""Autonomy level mapping between ZeroClaw and HarborOS assistant.
+"""Autonomy level mapping for HarborClaw.
 
-ZeroClaw uses three autonomy levels:
+HarborClaw uses three autonomy levels (inherited from ZeroClaw):
   - ReadOnly:   observe only, no mutations
   - Supervised: needs user confirmation for risky ops
   - Full:       autonomous execution, all ops allowed
@@ -20,7 +20,7 @@ from assistant.policy import ApprovalContext
 
 
 class Autonomy(str, Enum):
-    """ZeroClaw autonomy levels."""
+    """HarborClaw autonomy levels (ReadOnly / Supervised / Full)."""
     READ_ONLY = "ReadOnly"
     SUPERVISED = "Supervised"
     FULL = "Full"
@@ -31,7 +31,7 @@ def autonomy_to_approval(
     token: str | None = None,
     approver_id: str | None = None,
 ) -> ApprovalContext | None:
-    """Convert a ZeroClaw autonomy level to an ApprovalContext.
+    """Convert a HarborClaw autonomy level to an ApprovalContext.
 
     - ReadOnly:   returns None (no approval, but mutations will be blocked by policy)
     - Supervised: returns ApprovalContext without token (will trigger approval prompt)
@@ -49,7 +49,7 @@ def autonomy_to_approval(
 
 
 def risk_to_autonomy(risk: RiskLevel) -> Autonomy:
-    """Suggest the minimum ZeroClaw autonomy level needed for a risk level."""
+    """Suggest the minimum HarborClaw autonomy level needed for a risk level."""
     if risk in (RiskLevel.LOW, RiskLevel.MEDIUM):
         return Autonomy.SUPERVISED
     return Autonomy.FULL

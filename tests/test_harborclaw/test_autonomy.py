@@ -1,9 +1,9 @@
-"""Tests for zeroclaw.autonomy — autonomy ↔ risk level mapping."""
+"""Tests for harborclaw.autonomy — autonomy ↔ risk level mapping."""
 import pytest
 
 from assistant.contracts import RiskLevel
 from assistant.policy import ApprovalContext
-from zeroclaw.autonomy import (
+from harborclaw.autonomy import (
     Autonomy,
     autonomy_to_approval,
     is_read_only_safe,
