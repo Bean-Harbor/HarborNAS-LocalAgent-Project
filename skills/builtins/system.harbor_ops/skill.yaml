@@ -1,0 +1,79 @@
+id: system.harbor_ops
+name: HarborOS Service Operations
+version: 1.0.0
+summary: Query, start, stop, restart, and enable HarborOS services
+owner: harbor-team
+
+capabilities:
+  - service.status
+  - service.start
+  - service.stop
+  - service.restart
+  - service.enable
+
+harbor_api:
+  enabled: true
+  provider: middleware
+  endpoint_group: service
+  allowed_methods: [query, start, stop, restart, update]
+  min_version: "v1"
+
+harbor_cli:
+  enabled: true
+  tool: midcli
+  command_group: service
+  allowed_subcommands: [status, start, stop, restart, enable]
+  require_structured_output: true
+
+executors:
+  cli:
+    enabled: false
+  browser:
+    enabled: false
+  mcp:
+    enabled: false
+
+permissions:
+  fs_read: []
+  fs_write: []
+  network: false
+  process_spawn: true
+
+risk:
+  default_level: LOW
+  requires_confirmation:
+    - HIGH
+    - CRITICAL
+
+input_schema:
+  type: object
+  required: [domain, operation, resource]
+  properties:
+    domain:
+      type: string
+      enum: [service]
+    operation:
+      type: string
+      enum: [status, start, stop, restart, enable]
+    resource:
+      type: object
+      required: [service_name]
+      properties:
+        service_name:
+          type: string
+          pattern: "^[a-z0-9_-]{1,64}$"
+
+output_schema:
+  type: object
+  required: [ok, result]
+  properties:
+    ok: { type: boolean }
+    result: { type: object }
+
+timeouts:
+  plan_ms: 2000
+  exec_ms: 30000
+
+retries:
+  max_attempts: 1
+  backoff_ms: 0
