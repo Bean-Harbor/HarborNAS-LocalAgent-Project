@@ -1,11 +1,12 @@
 # HarborNAS Skill Specification v1
 
 ## Purpose
-This document defines the standard contract for Skills so teams can build, test, and run skills consistently with CLI-first execution.
+This document defines the standard contract for Skills so teams can build, test, and run skills consistently with CLI-first execution. For HarborOS-domain capabilities, CLI execution should bind to the existing `midcli` tool.
 
 ## Design Principles
 
 1. CLI first: every skill should expose CLI capability when possible.
+1.1 HarborOS first-party operations should execute through `midcli`.
 2. Deterministic I/O: strict input and output schema.
 3. Safe by default: explicit permissions and risk metadata.
 4. Observable execution: structured logs and trace IDs.
@@ -137,9 +138,29 @@ retries:
 ## Routing and Fallback Rules
 
 1. Router must attempt CLI first if `executors.cli.enabled=true`.
-2. Browser route allowed only when CLI is unavailable for that capability.
-3. MCP route allowed only when both CLI and Browser are unavailable.
-4. If risk level is HIGH/CRITICAL, execution requires explicit approval token.
+2. For HarborOS-domain skills, router should bind CLI execution to `midcli` before any generic shell route.
+3. Browser route allowed only when CLI is unavailable for that capability.
+4. MCP route allowed only when both CLI and Browser are unavailable.
+5. If risk level is HIGH/CRITICAL, execution requires explicit approval token.
+
+## HarborOS CLI Binding (midcli)
+
+For skills operating HarborOS services/resources, add a `harbor_cli` block in `skill.yaml`:
+
+```yaml
+harbor_cli:
+  enabled: true
+  tool: midcli
+  command_group: service
+  allowed_subcommands: [status, start, stop, restart]
+  require_structured_output: true
+```
+
+Rules:
+- `tool` must be `midcli` for HarborOS first-party operations.
+- `allowed_subcommands` must be explicit and least-privilege.
+- `require_structured_output=true` when structured output mode is available.
+- Free-form shell strings are disallowed when `harbor_cli.enabled=true`.
 
 ## Risk Levels
 
@@ -189,7 +210,7 @@ Registry should keep at least one rollback version.
 
 ## Minimum Built-in Skills (V2)
 
-1. `system.harbor_ops` - service status/start/stop/restart (CLI).
+1. `system.harbor_ops` - service status/start/stop/restart (CLI via `midcli`).
 2. `files.batch_ops` - copy/move/archive/search (CLI).
 3. `media.video_edit` - trim/concat/subtitle (CLI via ffmpeg).
 4. `browser.web_automate` - browser fallback automation.

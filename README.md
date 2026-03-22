@@ -14,5 +14,5 @@ This repository contains the completed planning deliverables for a HarborNAS loc
 
 ## V2 Additions
 
-- `HarborNAS-LocalAgent-V2-Assistant-Skills-Roadmap.md`: assistant + skills integration roadmap with CLI-first execution policy.
-- `HarborNAS-Skill-Spec-v1.md`: standard skill contract (manifest schema, runtime envelope, routing, risk and test requirements).
+- `HarborNAS-LocalAgent-V2-Assistant-Skills-Roadmap.md`: assistant + skills integration roadmap with CLI-first execution policy, using `midcli` as HarborOS default CLI backend.
+- `HarborNAS-Skill-Spec-v1.md`: standard skill contract (manifest schema, runtime envelope, routing, risk and test requirements), including HarborOS `midcli` binding rules.

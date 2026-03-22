@@ -4,9 +4,10 @@
 This V2 roadmap extends the existing HarborNAS local-agent plan with two priorities:
 1. Multi-terminal natural-language assistant (mobile/web/desktop).
 2. Skills framework with CLI-first execution.
+3. Reuse HarborOS existing CLI tool `midcli` as the default command gateway.
 
 Execution priority is strict:
-1. CLI executor
+1. MidCLI executor (CLI via `midcli`)
 2. Browser executor
 3. MCP executor (fallback only)
 
@@ -35,9 +36,15 @@ Execution priority is strict:
 - Skill registry (manifest, version, capability tags).
 - Skill runtime (sandbox, timeout, retries, output schema).
 - Executors:
-  - `CLIExecutor` (default)
+  - `MidCLIExecutor` (default for HarborOS operations)
   - `BrowserExecutor` (secondary)
   - `MCPExecutor` (final fallback)
+
+### 3.1) MidCLI Integration Baseline
+- HarborOS domain skills must execute through `midcli` first.
+- Natural-language intents are mapped to approved `midcli` subcommands.
+- Command execution should use structured output mode when available (for stable parsing and audit).
+- Keep an allowlist of accepted command groups and arguments to prevent unsafe shell expansion.
 
 ### 4) Governance & Observability Layer
 - Structured logs for every task and substep.
@@ -51,7 +58,7 @@ Pseudo policy:
 
 ```text
 if skill.supports_cli and host.cli_available:
-  route = CLI
+  route = MIDCLI
 elif skill.supports_browser and browser.available:
   route = BROWSER
 elif skill.supports_mcp and mcp.available:
@@ -73,10 +80,10 @@ Hard rules:
 ### Week 1-2: Assistant Entry + Session Backbone
 - Build mobile/web chat entry and unified session API.
 - Define task state machine (`queued -> planned -> executing -> completed/failed`).
-- Introduce `CLIExecutor` v1 and command audit logging.
+- Introduce `MidCLIExecutor` v1 and command audit logging.
 
 Deliverable:
-- End-to-end NL -> CLI -> result loop for basic HarborOS operations.
+- End-to-end NL -> `midcli` -> result loop for basic HarborOS operations.
 
 ### Week 3-4: Skills Contract + Router
 - Implement skill registry and manifest loader.
@@ -133,6 +140,6 @@ Deliverable:
 ## Immediate Next Tasks
 
 1. Implement skill manifest parser and registry CRUD.
-2. Implement `CLIExecutor` with dry-run and risk tagging.
+2. Implement `MidCLIExecutor` with dry-run and risk tagging.
 3. Add approval API for high-risk actions.
 4. Add first two skills and contract tests.
