@@ -6,7 +6,7 @@ use serde_json::json;
 
 use harbornas_local_agent::orchestrator::approval::{AutonomyConfig, AutonomyLevel};
 use harbornas_local_agent::orchestrator::executors::harbor_ops::{
-    MiddlewareExecutor, MidcliExecutor,
+    MiddlewareExecutor, MiddlewareHttpExecutor, MidcliExecutor,
 };
 use harbornas_local_agent::orchestrator::tool_loop::{
     ToolCall, ToolLoopConfig, ToolLoopEngine, ToolRegistry,
@@ -48,6 +48,18 @@ struct Cli {
 
     #[arg(long, help = "Force all actions to run as dry-run")]
     force_dry_run: bool,
+
+    #[arg(long, help = "HarborOS API base URL, e.g. http://192.168.3.61")]
+    harbor_url: Option<String>,
+
+    #[arg(long, help = "HarborOS API key (Bearer token auth)")]
+    harbor_api_key: Option<String>,
+
+    #[arg(long, help = "HarborOS API username (basic auth, used with --harbor-password)")]
+    harbor_user: Option<String>,
+
+    #[arg(long, help = "HarborOS API password (basic auth)")]
+    harbor_password: Option<String>,
 
     #[arg(long, value_enum, default_value_t = AutonomyArg::Supervised, help = "Autonomy level")]
     autonomy: AutonomyArg,
@@ -114,9 +126,29 @@ fn main() {
 
 fn run_plan_mode(cli: &Cli, plan: TaskPlan) {
     let mut router = Router::new();
-    if !cli.disable_middleware {
+
+    // If --harbor-url is provided, use HTTP executor for real API calls;
+    // otherwise fall back to local preview/passthrough executors.
+    if let Some(ref url) = cli.harbor_url {
+        let http_executor = if let Some(ref api_key) = cli.harbor_api_key {
+            MiddlewareHttpExecutor::with_api_key(url, api_key)
+        } else if let (Some(ref user), Some(ref pass)) = (&cli.harbor_user, &cli.harbor_password) {
+            MiddlewareHttpExecutor::with_basic_auth(url, user, pass)
+        } else {
+            eprintln!("--harbor-url requires --harbor-api-key or --harbor-user/--harbor-password");
+            std::process::exit(1);
+        };
+        match http_executor {
+            Ok(exec) => router.register(Box::new(exec)),
+            Err(e) => {
+                eprintln!("failed to create HTTP executor: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else if !cli.disable_middleware {
         router.register(Box::new(MiddlewareExecutor::new(true)));
     }
+
     if !cli.disable_midcli {
         router.register(Box::new(MidcliExecutor::new(
             true,

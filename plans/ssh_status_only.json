@@ -1,0 +1,15 @@
+{
+  "task_id": "live-test-ssh-status-only",
+  "goal": "Verify connectivity to HarborOS API (read-only, safe)",
+  "steps": [
+    {
+      "domain": "service",
+      "operation": "status",
+      "resource": { "service_name": "ssh" },
+      "args": {},
+      "risk_level": "LOW",
+      "requires_approval": false,
+      "dry_run": false
+    }
+  ]
+}

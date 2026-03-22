@@ -1,0 +1,33 @@
+{
+  "task_id": "live-test-ssh-restart",
+  "goal": "Verify assistant can restart SSH service on HarborOS",
+  "steps": [
+    {
+      "domain": "service",
+      "operation": "status",
+      "resource": { "service_name": "ssh" },
+      "args": {},
+      "risk_level": "LOW",
+      "requires_approval": false,
+      "dry_run": false
+    },
+    {
+      "domain": "service",
+      "operation": "restart",
+      "resource": { "service_name": "ssh" },
+      "args": {},
+      "risk_level": "HIGH",
+      "requires_approval": true,
+      "dry_run": false
+    },
+    {
+      "domain": "service",
+      "operation": "status",
+      "resource": { "service_name": "ssh" },
+      "args": {},
+      "risk_level": "LOW",
+      "requires_approval": false,
+      "dry_run": false
+    }
+  ]
+}
