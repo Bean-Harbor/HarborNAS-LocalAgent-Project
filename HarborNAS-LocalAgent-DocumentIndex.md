@@ -1,5 +1,21 @@
 # HarborNAS 本地智能体 - 规划文档汇总
 
+## 🆕 V2 新增文档
+
+### 1. **HarborNAS-LocalAgent-V2-Assistant-Skills-Roadmap.md**
+**智能助手 + Skills + CLI 优先执行路线图**
+
+- 目标: 将多终端自然语言助手与 Skills 扩展能力并入现有规划。
+- 重点: 固化执行优先级 `CLI > Browser > MCP`。
+- 输出: 8 周增量实施路径、角色分工、KPI 与风控。
+
+### 2. **HarborNAS-Skill-Spec-v1.md**
+**Skills 标准规范 v1**
+
+- 目标: 统一 Skill 的清单、运行、权限、风险、测试和版本策略。
+- 重点: `skill.yaml` 规范、请求/响应 envelope、路由与回退规则。
+- 输出: 可直接按模板开发并上线首批 Skills。
+
 ## 📦 已生成的完整规划包
 
 为你的 HarborNAS 项目生成了 **5 份详细规划文档**，共约 14,000 字。

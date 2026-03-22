@@ -9,3 +9,10 @@ This repository contains the completed planning deliverables for a HarborNAS loc
 - HarborNAS-LocalAgent-MeetingGuide.md
 - HarborNAS-LocalAgent-LaunchChecklist.md
 - HarborNAS-LocalAgent-DocumentIndex.md
+- HarborNAS-LocalAgent-V2-Assistant-Skills-Roadmap.md
+- HarborNAS-Skill-Spec-v1.md
+
+## V2 Additions
+
+- `HarborNAS-LocalAgent-V2-Assistant-Skills-Roadmap.md`: assistant + skills integration roadmap with CLI-first execution policy.
+- `HarborNAS-Skill-Spec-v1.md`: standard skill contract (manifest schema, runtime envelope, routing, risk and test requirements).
