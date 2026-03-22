@@ -14,6 +14,7 @@ This repository contains the completed planning deliverables for a HarborNAS loc
 - HarborNAS-Middleware-Endpoint-Contract-v1.md
 - HarborNAS-Files-BatchOps-Contract-v1.md
 - HarborNAS-Planner-TaskDecompose-Contract-v1.md
+- HarborNAS-Contract-E2E-Test-Plan-v1.md
 
 ## V2 Additions
 
@@ -22,3 +23,4 @@ This repository contains the completed planning deliverables for a HarborNAS loc
 - `HarborNAS-Middleware-Endpoint-Contract-v1.md`: executable endpoint contract for `system.harbor_ops`, including action normalization, API/CLI mapping, error model, and compatibility matrix template.
 - `HarborNAS-Files-BatchOps-Contract-v1.md`: executable endpoint contract for `files.batch_ops`, including path policy, route fallback chain, CLI template constraints, and compatibility matrix template.
 - `HarborNAS-Planner-TaskDecompose-Contract-v1.md`: executable planner contract for `planner.task_decompose`, including step schema, dependency rules, route-candidate policy, and release gates.
+- `HarborNAS-Contract-E2E-Test-Plan-v1.md`: end-to-end validation plan across planner + execution contracts, including environment matrix, fallback checks, drift checks, and release exit criteria.

@@ -37,6 +37,13 @@
 - 重点: 计划步骤 schema、依赖 DAG 规则、路由候选优先级、风险标注与确认策略。
 - 输出: 可用于实现从用户意图到可执行计划的统一规划基线。
 
+### 6. **HarborNAS-Contract-E2E-Test-Plan-v1.md**
+**跨契约端到端测试计划 v1**
+
+- 目标: 统一验证 `system.harbor_ops`、`files.batch_ops`、`planner.task_decompose` 三份契约的联动正确性。
+- 重点: 环境矩阵、回退链验证、策略合规、漂移兼容与发布退出标准。
+- 输出: 可直接作为 nightly 与 pre-release 的测试门禁基线。
+
 ## 📦 已生成的完整规划包
 
 为你的 HarborNAS 项目生成了 **5 份详细规划文档**，共约 14,000 字。
