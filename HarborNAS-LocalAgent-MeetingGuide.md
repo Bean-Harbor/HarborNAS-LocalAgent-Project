@@ -90,6 +90,27 @@
 - Q8: 脱敏粒度: 整个句子 vs 仅 PII 值?
 - Q9: 密钥管理策略? (建议: Fernet 对称加密, 存储在 Secret Manager)
 
+#### 话题 3.5: HarborClaw IM 接入架构 (10 分钟)
+
+展示 HarborClaw 架构:
+
+```
+[IM Channels]          [HarborClaw]              [Assistant Runtime]
+飞书/企微/Telegram  →  channels.py (路由)     →   planner / router
+Discord/钉钉/Slack     mcp_adapter.py (MCP桥)     policy / audit
+MQTT                   autonomy.py (自主级别)      executors → HarborOS
+```
+
+**关键说明**:
+- HarborClaw 是基于 ZeroClaw 的二次开发，预装在 HarborOS 中（同一台机器）
+- 开机后一键配置 IM 通道（飞书/企微/Telegram/Discord/钉钉/Slack/MQTT）
+- 自主级别: ReadOnly（只读安全）/ Supervised（需审批）/ Full（完全自主）
+
+**讨论问题**:
+- Q9.1: IM 通道优先级？哪些通道作为 P0 首批支持？
+- Q9.2: 自主级别默认值？建议 Supervised 作为默认。
+- Q9.3: IM 消息中的凭证（webhook token 等）如何安全存储？
+
 ---
 
 ### 第 2 部分: 技术栈与工具选型 (30 分钟)

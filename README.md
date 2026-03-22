@@ -29,6 +29,47 @@ This repository contains the completed planning deliverables for a HarborNAS loc
 - `HarborNAS-CI-Contract-Pipeline-Checklist-v1.md`: CI job checklist that maps all contract governance to merge, nightly, and pre-release pipeline stages.
 - `HarborNAS-GitHub-Actions-Workflow-Draft-v1.md`: initial GitHub Actions workflow draft mapping contract governance into concrete PR, nightly, and release workflows.
 
+## HarborClaw — IM 接入与用户交互层
+
+HarborClaw 是基于 [ZeroClaw](https://github.com/punkpeye/zeroclaw) 二次开发的 AI 助手，**预装在 HarborOS 中**（与 HarborOS 运行在同一台机器上）。用户通过即时通讯工具与 HarborClaw 交互，HarborClaw 通过 CLI、MCP、API 控制 HarborOS 各项功能。
+
+### 架构总览
+
+```text
+[IM Channels]          [HarborClaw]                [Assistant Runtime]       [HarborOS]
+  飞书 / 企微            channels.py                 router / planner         middleware API
+  Telegram / Discord  →  mcp_adapter.py           →  policy / audit        →  midcli
+  钉钉 / Slack / MQTT    autonomy.py                 skills / executors       system services
+                         tool_descriptions.py
+```
+
+### 支持的 IM 通道
+
+| 通道 | 枚举值 | 说明 |
+|---|---|---|
+| 飞书 | `FEISHU` | Lark/飞书机器人 webhook |
+| 企业微信 | `WECOM` | 企业微信应用消息 |
+| Telegram | `TELEGRAM` | Telegram Bot API |
+| Discord | `DISCORD` | Discord Bot gateway |
+| 钉钉 | `DINGTALK` | 钉钉机器人 |
+| Slack | `SLACK` | Slack App / Bot |
+| MQTT | `MQTT` | 轻量级 IoT 消息协议 |
+
+### 自主级别
+
+| 级别 | 说明 | 对应风险 |
+|---|---|---|
+| `ReadOnly` | 只读操作，无需审批 | LOW |
+| `Supervised` | 需逐次审批令牌 | MEDIUM / HIGH |
+| `Full` | 完全自主执行 | 仅限管理员配置 |
+
+### 代码包: `harborclaw/`
+
+- `channels.py`: IM 通道注册、消息路由、意图解析
+- `mcp_adapter.py`: MCP 工具适配（ReadOnly 守卫、审批令牌）
+- `autonomy.py`: 自主级别与风险等级映射
+- `tool_descriptions.py`: skill manifest → MCP/TOML 工具描述转换
+
 ## Executable CI Scaffold
 
 - `.github/workflows/contract-pr-check.yml`: PR and branch validation for contract schema checks plus contract, fallback, and policy test suites.

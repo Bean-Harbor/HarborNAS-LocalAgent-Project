@@ -5,6 +5,7 @@
 1. 先交付可运行链路，再扩功能。
 2. 先保证治理与审计，再放开自动化。
 3. 路由优先级固定：API > MidCLI > Browser > MCP。
+4. 用户入口：IM 通道 → HarborClaw → Assistant Runtime → HarborOS。
 
 ---
 
@@ -12,6 +13,7 @@
 
 - [ ] 冻结 V2 范围（个人助手、多模态RAG、智能编排）
 - [ ] 确认 P0 技能清单（system/file/rag）
+- [ ] 确认 HarborClaw IM 通道优先级（飞书/企微/Telegram 作为 P0）
 - [ ] 确认角色分工与 owner
 - [ ] 确认 Beta 时间窗口（Week 12）
 
@@ -20,8 +22,9 @@
 ## 3. T+7（第一周完成）
 
 - [ ] Assistant 统一入口 API 可用
+- [ ] HarborClaw 至少一个 IM 通道跟通（飞书或 Telegram）
 - [ ] 任务状态机与审计字段落库
-- [ ] 第一条 `NL -> Planner -> MiddlewareExecutor` 跑通
+- [ ] 第一条 `IM → HarborClaw → Planner → MiddlewareExecutor` 跑通
 - [ ] CI 可自动产出 contract/e2e/drift/release gate 报告
 
 验收:

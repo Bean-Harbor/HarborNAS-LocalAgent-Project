@@ -7,10 +7,11 @@ This document defines the standard contract for Skills so teams can build, test,
 
 1. HarborOS control-plane first: use `middleware` API for first-party operations.
 2. CLI fallback: use `midcli` when API route is unavailable.
-2. Deterministic I/O: strict input and output schema.
-3. Safe by default: explicit permissions and risk metadata.
-4. Observable execution: structured logs and trace IDs.
-5. Versioned compatibility: semantic versioning with rollback.
+3. HarborClaw IM integration: skills are invokable via HarborClaw IM channels (Feishu, WeCom, Telegram, Discord, DingTalk, Slack, MQTT) through the MCP adapter; skill manifests are auto-converted to MCP tool descriptions.
+4. Deterministic I/O: strict input and output schema.
+5. Safe by default: explicit permissions and risk metadata; autonomy levels (ReadOnly/Supervised/Full) align with risk.
+6. Observable execution: structured logs and trace IDs.
+7. Versioned compatibility: semantic versioning with rollback.
 
 ## Skill Package Layout
 

@@ -24,9 +24,19 @@ Execution priority is strict:
 
 ## Architecture Delta (V2)
 
+### 0) HarborClaw IM Access Layer (New)
+- HarborClaw is a ZeroClaw fork pre-installed in HarborOS (same machine).
+- Users interact via IM channels: Feishu, WeCom, Telegram, Discord, DingTalk, Slack, MQTT.
+- `channels.py` handles channel registration, inbound message parsing, and outbound reply dispatch.
+- `mcp_adapter.py` bridges HarborClaw to assistant runtime via MCP tool calls (ReadOnly guard, per-call approval token).
+- `autonomy.py` maps risk levels to autonomy tiers: ReadOnly / Supervised / Full.
+- `tool_descriptions.py` converts skill manifests into MCP-compatible tool descriptions.
+- One-click IM configuration on HarborOS boot.
+
 ### 1) Multi-terminal Access Layer
 - Mobile PWA chat client.
 - HarborOS WebUI chat panel.
+- IM channels via HarborClaw (飞书 / 企微 / Telegram / Discord / 钉钉 / Slack / MQTT).
 - Unified API gateway for auth, session, rate limit, and streaming responses.
 
 ### 2) Assistant Orchestration Layer
@@ -91,12 +101,12 @@ Hard rules:
 ## 8-Week Incremental Plan (for current 3-person team)
 
 ### Week 1-2: Assistant Entry + Session Backbone
-- Build mobile/web chat entry and unified session API.
+- Build mobile/web chat entry, IM channel integration via HarborClaw, and unified session API.
 - Define task state machine (`queued -> planned -> executing -> completed/failed`).
 - Introduce `MiddlewareExecutor` v1, then `MidCLIExecutor` fallback and command audit logging.
 
 Deliverable:
-- End-to-end NL -> middleware API -> result loop for basic HarborOS operations.
+- End-to-end IM -> HarborClaw -> middleware API -> result loop for basic HarborOS operations.
 
 ### Week 3-4: Skills Contract + Router
 - Implement skill registry and manifest loader.
