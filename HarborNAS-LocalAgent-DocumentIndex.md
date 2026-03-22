@@ -16,6 +16,13 @@
 - 重点: `skill.yaml` 规范、请求/响应 envelope、路由与回退规则。
 - 输出: 可直接按模板开发并上线首批 Skills。
 
+### 3. **HarborNAS-Middleware-Endpoint-Contract-v1.md**
+**Middleware 接口契约 v1（可执行）**
+
+- 目标: 为 `system.harbor_ops` 提供可直接开发和测试的接口级契约。
+- 重点: 意图标准化模型、`middleware` API 映射、`midcli` 回退、错误模型、兼容性矩阵。
+- 输出: 可用于实现 `MiddlewareExecutor` 与回归测试的统一基线。
+
 ## 📦 已生成的完整规划包
 
 为你的 HarborNAS 项目生成了 **5 份详细规划文档**，共约 14,000 字。
