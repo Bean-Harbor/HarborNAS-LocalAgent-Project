@@ -1,0 +1,134 @@
+<!-- Extension Detail — 4-tab edit view -->
+@if (draft) {
+  <div class="detail-header">
+    <button mat-icon-button (click)="onBack()">
+      <mat-icon>arrow_back</mat-icon>
+    </button>
+    <h2>{{ draft.name || draft.id }}</h2>
+    <span class="type-badge" [attr.data-type]="draft.type">{{ draft.type }}</span>
+    <span class="spacer"></span>
+    <button mat-raised-button color="primary" [disabled]="!dirty" (click)="onSave()">
+      <mat-icon>save</mat-icon> Save
+    </button>
+  </div>
+
+  <mat-tab-group>
+    <!-- Tab 1: Overview -->
+    <mat-tab label="Overview">
+      <div class="tab-content">
+        <mat-form-field appearance="outline" class="full-width">
+          <mat-label>ID</mat-label>
+          <input matInput [value]="draft.id" disabled />
+        </mat-form-field>
+
+        <mat-form-field appearance="outline" class="full-width">
+          <mat-label>Name</mat-label>
+          <input matInput [(ngModel)]="draft.name" (ngModelChange)="markDirty()" />
+        </mat-form-field>
+
+        <mat-form-field appearance="outline">
+          <mat-label>Type</mat-label>
+          <mat-select [(ngModel)]="draft.type" (ngModelChange)="markDirty()">
+            @for (t of types; track t) {
+              <mat-option [value]="t">{{ t }}</mat-option>
+            }
+          </mat-select>
+        </mat-form-field>
+
+        <mat-form-field appearance="outline">
+          <mat-label>Version</mat-label>
+          <input matInput [(ngModel)]="draft.version" (ngModelChange)="markDirty()" />
+        </mat-form-field>
+
+        <mat-form-field appearance="outline" class="full-width">
+          <mat-label>Summary</mat-label>
+          <textarea matInput [(ngModel)]="draft.summary" (ngModelChange)="markDirty()" rows="3"></textarea>
+        </mat-form-field>
+
+        <mat-form-field appearance="outline">
+          <mat-label>Owner</mat-label>
+          <input matInput [(ngModel)]="draft.owner" (ngModelChange)="markDirty()" />
+        </mat-form-field>
+
+        <mat-form-field appearance="outline" class="full-width">
+          <mat-label>Capabilities (comma-separated)</mat-label>
+          <input matInput [value]="capabilitiesText" (input)="onCapabilitiesChange($any($event.target).value)" />
+        </mat-form-field>
+      </div>
+    </mat-tab>
+
+    <!-- Tab 2: Executors & Routes -->
+    <mat-tab label="Executors & Routes">
+      <div class="tab-content">
+        <h3>Harbor API</h3>
+        <mat-slide-toggle [(ngModel)]="draft.harbor_api.enabled" (ngModelChange)="markDirty()">
+          Enabled
+        </mat-slide-toggle>
+        @if (draft.harbor_api.enabled) {
+          <mat-form-field appearance="outline">
+            <mat-label>Endpoint Group</mat-label>
+            <input matInput [(ngModel)]="draft.harbor_api.endpoint_group" (ngModelChange)="markDirty()" />
+          </mat-form-field>
+          <mat-form-field appearance="outline">
+            <mat-label>Min Version</mat-label>
+            <input matInput [(ngModel)]="draft.harbor_api.min_version" (ngModelChange)="markDirty()" />
+          </mat-form-field>
+        }
+
+        <mat-divider></mat-divider>
+
+        <h3>Harbor CLI (midcli)</h3>
+        <mat-slide-toggle [(ngModel)]="draft.harbor_cli.enabled" (ngModelChange)="markDirty()">
+          Enabled
+        </mat-slide-toggle>
+        @if (draft.harbor_cli.enabled) {
+          <mat-form-field appearance="outline">
+            <mat-label>Command Group</mat-label>
+            <input matInput [(ngModel)]="draft.harbor_cli.command_group" (ngModelChange)="markDirty()" />
+          </mat-form-field>
+        }
+
+        <mat-divider></mat-divider>
+
+        <h3>Other Executors</h3>
+        @for (key of executorKeys; track key) {
+          @if (draft.executors[key]) {
+            <div class="executor-row">
+              <span class="executor-name">{{ key }}</span>
+              <mat-slide-toggle [(ngModel)]="draft.executors[key].enabled" (ngModelChange)="markDirty()">
+              </mat-slide-toggle>
+            </div>
+          }
+        }
+      </div>
+    </mat-tab>
+
+    <!-- Tab 3: Permissions & Risk -->
+    <mat-tab label="Permissions & Risk">
+      <div class="tab-content">
+        <mat-form-field appearance="outline">
+          <mat-label>Default Risk Level</mat-label>
+          <mat-select [(ngModel)]="draft.risk.default_level" (ngModelChange)="markDirty()">
+            @for (r of risks; track r) {
+              <mat-option [value]="r">{{ r }}</mat-option>
+            }
+          </mat-select>
+        </mat-form-field>
+
+        <h3>Permissions</h3>
+        <pre class="json-block">{{ draft.permissions | json }}</pre>
+      </div>
+    </mat-tab>
+
+    <!-- Tab 4: YAML Source -->
+    <mat-tab label="YAML Source">
+      <div class="tab-content">
+        <mat-form-field appearance="outline" class="full-width yaml-editor">
+          <mat-label>skill.yaml</mat-label>
+          <textarea matInput [value]="yamlSource" (input)="onYamlChange($any($event.target).value)"
+                    rows="24" class="mono"></textarea>
+        </mat-form-field>
+      </div>
+    </mat-tab>
+  </mat-tab-group>
+}

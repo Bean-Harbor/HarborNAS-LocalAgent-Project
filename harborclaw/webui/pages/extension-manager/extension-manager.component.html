@@ -1,0 +1,34 @@
+<!-- Extension Manager — container with list / detail / import views -->
+
+@if (loading) {
+  <mat-progress-bar mode="indeterminate"></mat-progress-bar>
+}
+
+@switch (viewMode) {
+  @case ('list') {
+    <ix-extension-list
+      [extensions]="extensions"
+      (selectExtension)="onSelectExtension($event)"
+      (toggleEnabled)="onToggleEnabled($event)"
+      (deleteExtension)="onDeleteExtension($event)"
+      (importExtension)="onShowImport()">
+    </ix-extension-list>
+  }
+
+  @case ('detail') {
+    <ix-extension-detail
+      [extension]="selectedExtension"
+      (save)="onSaveExtension($event)"
+      (back)="onBackToList()">
+    </ix-extension-detail>
+  }
+
+  @case ('import') {
+    <ix-extension-import
+      [validationResult]="validationResult"
+      (validate)="onValidateYaml($event)"
+      (import)="onImportExtension($event)"
+      (cancel)="onBackToList()">
+    </ix-extension-import>
+  }
+}

@@ -1,0 +1,135 @@
+<!-- Extension List — card grid + table toggle -->
+<div class="extension-list-toolbar">
+  <mat-form-field appearance="outline" class="search-field">
+    <mat-label>Search extensions</mat-label>
+    <input matInput [(ngModel)]="filter.search" placeholder="Name, ID, capability…" />
+    <mat-icon matSuffix>search</mat-icon>
+  </mat-form-field>
+
+  <mat-form-field appearance="outline" class="filter-field">
+    <mat-label>Type</mat-label>
+    <mat-select [(ngModel)]="filter.types" multiple>
+      @for (t of allTypes; track t) {
+        <mat-option [value]="t">{{ t }}</mat-option>
+      }
+    </mat-select>
+  </mat-form-field>
+
+  <mat-form-field appearance="outline" class="filter-field">
+    <mat-label>Risk</mat-label>
+    <mat-select [(ngModel)]="filter.riskLevels" multiple>
+      @for (r of allRisks; track r) {
+        <mat-option [value]="r">{{ r }}</mat-option>
+      }
+    </mat-select>
+  </mat-form-field>
+
+  <button mat-icon-button (click)="viewMode = viewMode === 'cards' ? 'table' : 'cards'"
+          [matTooltip]="viewMode === 'cards' ? 'Switch to table' : 'Switch to cards'">
+    <mat-icon>{{ viewMode === 'cards' ? 'view_list' : 'grid_view' }}</mat-icon>
+  </button>
+
+  <button mat-raised-button color="primary" (click)="onImport()">
+    <mat-icon>add</mat-icon> Import
+  </button>
+</div>
+
+<!-- Card view -->
+@if (viewMode === 'cards') {
+  <div class="extension-cards">
+    @for (ext of filtered; track ext.id) {
+      <mat-card class="extension-card" (click)="onSelect(ext)">
+        <mat-card-header>
+          <mat-icon mat-card-avatar>{{ getTypeMeta(ext.type).icon }}</mat-icon>
+          <mat-card-title>{{ ext.name || ext.id }}</mat-card-title>
+          <mat-card-subtitle>
+            <span class="type-badge" [attr.data-type]="ext.type">{{ ext.type }}</span>
+            &middot; v{{ ext.version }}
+          </mat-card-subtitle>
+        </mat-card-header>
+        <mat-card-content>
+          <p class="summary">{{ ext.summary }}</p>
+          <mat-chip-set>
+            @for (cap of ext.capabilities | slice:0:4; track cap) {
+              <mat-chip>{{ cap }}</mat-chip>
+            }
+            @if (ext.capabilities.length > 4) {
+              <mat-chip>+{{ ext.capabilities.length - 4 }}</mat-chip>
+            }
+          </mat-chip-set>
+        </mat-card-content>
+        <mat-card-actions align="end">
+          <span class="risk-chip" [attr.data-risk]="ext.risk_level">{{ ext.risk_level }}</span>
+          <mat-slide-toggle [checked]="ext.enabled"
+                            (change)="onToggle(ext)"
+                            (click)="$event.stopPropagation()">
+          </mat-slide-toggle>
+          <button mat-icon-button color="warn" (click)="onDelete(ext, $event)" matTooltip="Delete">
+            <mat-icon>delete</mat-icon>
+          </button>
+        </mat-card-actions>
+      </mat-card>
+    }
+  </div>
+}
+
+<!-- Table view -->
+@if (viewMode === 'table') {
+  <table mat-table [dataSource]="filtered" class="extension-table">
+    <ng-container matColumnDef="name">
+      <th mat-header-cell *matHeaderCellDef>Name</th>
+      <td mat-cell *matCellDef="let ext" (click)="onSelect(ext)" class="clickable">{{ ext.name || ext.id }}</td>
+    </ng-container>
+
+    <ng-container matColumnDef="type">
+      <th mat-header-cell *matHeaderCellDef>Type</th>
+      <td mat-cell *matCellDef="let ext">
+        <span class="type-badge" [attr.data-type]="ext.type">{{ ext.type }}</span>
+      </td>
+    </ng-container>
+
+    <ng-container matColumnDef="version">
+      <th mat-header-cell *matHeaderCellDef>Version</th>
+      <td mat-cell *matCellDef="let ext">{{ ext.version }}</td>
+    </ng-container>
+
+    <ng-container matColumnDef="capabilities">
+      <th mat-header-cell *matHeaderCellDef>Capabilities</th>
+      <td mat-cell *matCellDef="let ext">{{ ext.capabilities.join(', ') }}</td>
+    </ng-container>
+
+    <ng-container matColumnDef="risk">
+      <th mat-header-cell *matHeaderCellDef>Risk</th>
+      <td mat-cell *matCellDef="let ext">
+        <span class="risk-chip" [attr.data-risk]="ext.risk_level">{{ ext.risk_level }}</span>
+      </td>
+    </ng-container>
+
+    <ng-container matColumnDef="enabled">
+      <th mat-header-cell *matHeaderCellDef>Enabled</th>
+      <td mat-cell *matCellDef="let ext">
+        <mat-slide-toggle [checked]="ext.enabled" (change)="onToggle(ext)"></mat-slide-toggle>
+      </td>
+    </ng-container>
+
+    <ng-container matColumnDef="actions">
+      <th mat-header-cell *matHeaderCellDef></th>
+      <td mat-cell *matCellDef="let ext">
+        <button mat-icon-button color="warn" (click)="onDelete(ext, $event)" matTooltip="Delete">
+          <mat-icon>delete</mat-icon>
+        </button>
+      </td>
+    </ng-container>
+
+    <tr mat-header-row *matHeaderRowDef="displayedColumns"></tr>
+    <tr mat-row *matRowDef="let row; columns: displayedColumns;"></tr>
+  </table>
+}
+
+@if (filtered.length === 0) {
+  <div class="empty-state">
+    <mat-icon>extension_off</mat-icon>
+    <p>No extensions found.</p>
+    <button mat-stroked-button (click)="onImport()">Import your first extension</button>
+  </div>
+}

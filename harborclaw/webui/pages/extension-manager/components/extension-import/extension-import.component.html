@@ -1,0 +1,77 @@
+<!-- Extension Import dialog -->
+<div class="import-container">
+  <h2>Import Extension</h2>
+
+  <mat-tab-group>
+    <!-- Tab 1: Upload file -->
+    <mat-tab label="Upload File">
+      <div class="tab-content">
+        <input type="file" accept=".yaml,.yml" (change)="onFileSelected($event)" class="file-input" #fileInput />
+        <button mat-stroked-button (click)="fileInput.click()">
+          <mat-icon>upload_file</mat-icon>
+          {{ fileName || 'Choose skill.yaml' }}
+        </button>
+      </div>
+    </mat-tab>
+
+    <!-- Tab 2: Paste YAML -->
+    <mat-tab label="Paste YAML">
+      <div class="tab-content">
+        <mat-form-field appearance="outline" class="full-width">
+          <mat-label>Paste YAML content</mat-label>
+          <textarea matInput [(ngModel)]="yamlText" rows="16" class="mono"
+                    placeholder="id: my.extension&#10;name: My Extension&#10;version: 1.0.0&#10;..."></textarea>
+        </mat-form-field>
+      </div>
+    </mat-tab>
+  </mat-tab-group>
+
+  <!-- Validation result -->
+  @if (validationResult) {
+    <div class="validation-result" [class.valid]="validationResult.valid" [class.invalid]="!validationResult.valid">
+      <h3>
+        <mat-icon>{{ validationResult.valid ? 'check_circle' : 'error' }}</mat-icon>
+        {{ validationResult.valid ? 'Valid' : 'Invalid' }}
+        @if (validationResult.extension_name) {
+          — {{ validationResult.extension_name }}
+        }
+      </h3>
+
+      @if (validationResult.errors.length) {
+        <mat-list>
+          @for (err of validationResult.errors; track err) {
+            <mat-list-item>
+              <mat-icon matListItemIcon color="warn">error</mat-icon>
+              <span>{{ err }}</span>
+            </mat-list-item>
+          }
+        </mat-list>
+      }
+
+      @if (validationResult.warnings.length) {
+        <mat-list>
+          @for (warn of validationResult.warnings; track warn) {
+            <mat-list-item>
+              <mat-icon matListItemIcon>warning</mat-icon>
+              <span>{{ warn }}</span>
+            </mat-list-item>
+          }
+        </mat-list>
+      }
+    </div>
+  }
+
+  @if (importing) {
+    <mat-progress-bar mode="indeterminate"></mat-progress-bar>
+  }
+
+  <div class="import-actions">
+    <button mat-button (click)="onCancel()">Cancel</button>
+    <button mat-stroked-button (click)="onValidate()" [disabled]="!yamlText.trim()">
+      <mat-icon>verified</mat-icon> Validate
+    </button>
+    <button mat-raised-button color="primary" (click)="onImport()" [disabled]="!canImport || importing">
+      <mat-icon>add_circle</mat-icon> Import
+    </button>
+  </div>
+</div>

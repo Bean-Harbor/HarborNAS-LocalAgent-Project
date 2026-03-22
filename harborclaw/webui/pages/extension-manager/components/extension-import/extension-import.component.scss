@@ -1,0 +1,41 @@
+.import-container {
+  padding: 16px;
+  max-width: 720px;
+}
+
+.tab-content {
+  padding: 16px 0;
+}
+
+.full-width { width: 100%; }
+
+.file-input { display: none; }
+
+.mono {
+  font-family: 'SF Mono', 'Monaco', 'Menlo', 'Consolas', monospace;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.validation-result {
+  margin: 16px 0;
+  padding: 12px;
+  border-radius: 8px;
+
+  &.valid   { background: #e8f5e9; }
+  &.invalid { background: #fce4ec; }
+
+  h3 {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 0 8px 0;
+  }
+}
+
+.import-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
