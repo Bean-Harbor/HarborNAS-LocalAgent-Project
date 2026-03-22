@@ -1,0 +1,15 @@
+{
+  "goal": "query ssh service status",
+  "steps": [
+    {
+      "domain": "service",
+      "operation": "status",
+      "resource": {
+        "service_name": "ssh"
+      },
+      "args": {},
+      "risk_level": "LOW",
+      "dry_run": false
+    }
+  ]
+}

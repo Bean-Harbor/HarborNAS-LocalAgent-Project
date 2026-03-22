@@ -2,6 +2,37 @@
 
 This repository contains the completed planning deliverables for a HarborNAS local-first AI agent project, including architecture, roadmap, quick reference, meeting guide, launch checklist, and document index.
 
+## Rust Runtime (New)
+
+The project now includes a Rust runtime that compiles into a standalone binary for easier HarborOS integration.
+
+- Binary name: `harbornas-agent`
+- Entry point: `src/main.rs`
+- Core modules: `src/orchestrator/` and `src/skills/`
+- Planner module: `src/planner/`
+- Migrated scripts module: `src/scripts/`
+- Route priority: `middleware_api -> midcli -> browser -> mcp`
+
+Build and run:
+
+- `cargo build --release`
+- `./target/release/harbornas-agent --plan examples/plan_service_status.json`
+
+Additional migrated script binaries:
+
+- `./target/release/validate-contract-schemas --skip-live --report validate-contract-report.rust.json`
+- `./target/release/run-e2e-suite --env env-a --report e2e-report.rust.json`
+- `./target/release/run-drift-matrix --harbor-ref develop --upstream-ref master --report drift-matrix-report.rust.json`
+- `./target/release/evaluate-release-gate drift-matrix-report.rust.json --output release-gate-summary.rust.json`
+
+Useful flags:
+
+- `--disable-middleware`: skip `middleware_api` route
+- `--disable-midcli`: skip `midcli` route
+- `--midcli-passthrough`: execute real `midcli` command instead of preview mode
+- `--approval-token` and `--required-approval-token`: pass HIGH/CRITICAL approval gate
+- `--force-dry-run`: force all actions into dry-run mode
+
 ## Documents
 - HarborNAS-LocalAgent-Plan.md
 - HarborNAS-LocalAgent-Roadmap.md
@@ -75,17 +106,17 @@ HarborBeacon 是基于 [ZeroClaw](https://github.com/punkpeye/zeroclaw) 二次�
 - `.github/workflows/contract-pr-check.yml`: PR and branch validation for contract schema checks plus contract, fallback, and policy test suites.
 - `.github/workflows/contract-nightly-e2e.yml`: nightly/manual E2E matrix scaffold for `env-a` and `env-b`.
 - `.github/workflows/contract-release-drift.yml`: release-branch drift matrix and release gate workflow.
-- `scripts/validate_contract_schemas.py`: validates that required contract documents and route-priority rules stay aligned.
-- `scripts/run_e2e_suite.py`: emits scaffolded E2E, latency, and audit reports for workflow wiring.
-- `scripts/run_drift_matrix.py`: emits the initial drift-matrix artifact for release gating.
-- `scripts/evaluate_release_gate.py`: converts drift output into a blocking/non-blocking release decision.
+- `target/release/validate-contract-schemas`: validates that required contract documents and route-priority rules stay aligned.
+- `target/release/run-e2e-suite`: emits scaffolded E2E, latency, and audit reports for workflow wiring.
+- `target/release/run-drift-matrix`: emits the initial drift-matrix artifact for release gating.
+- `target/release/evaluate-release-gate`: converts drift output into a blocking/non-blocking release decision.
 - `tests/contracts`, `tests/fallback`, `tests/policy`: minimal pytest suites that keep the documented routing, fallback, and governance rules from regressing.
 
-Current scope note: the default CI path still works in documentation-only mode, but the same scripts can now switch into live HarborNAS integration mode when `midclt` and/or `cli` are available.
+Current scope note: the default CI path runs Rust binaries in documentation-only mode, and the same binaries can switch into live HarborNAS integration mode when `midclt` and/or `cli` are available.
 
 ## Live Integration Mode
 
-The four scripts under `scripts/` now support live HarborNAS probing through `middleware` and `midcli`.
+The four Rust binaries now support live HarborNAS probing through `middleware` and `midcli`.
 
 - Middleware transport: local `midclt call ...`
 - MidCLI transport: non-interactive `cli -m csv -c ...`
@@ -98,7 +129,7 @@ Key environment variables:
 - `HARBOR_MIDCLI_URL`, `HARBOR_MIDCLI_USER`, `HARBOR_MIDCLI_PASSWORD`: remote midcli connection parameters when probing over websocket
 - `HARBOR_PROBE_SERVICE`: safe service probe target, default `ssh`
 - `HARBOR_FILESYSTEM_PATH`: safe filesystem probe path, default `/mnt`
-- `HARBOR_SOURCE_REPO_PATH`, `UPSTREAM_SOURCE_REPO_PATH`: optional source trees used by `run_drift_matrix.py` for source-level capability comparison
+- `HARBOR_SOURCE_REPO_PATH`, `UPSTREAM_SOURCE_REPO_PATH`: optional source trees used by `run-drift-matrix` for source-level capability comparison
 - `HARBOR_ALLOW_MUTATIONS`: set to `1` to let E2E execute approved write operations instead of preview-only
 - `HARBOR_APPROVAL_TOKEN`: approval token passed into HIGH-risk operations such as service restart and file move
 - `HARBOR_REQUIRED_APPROVAL_TOKEN`: optional expected token value for the local script gate
@@ -107,11 +138,11 @@ Key environment variables:
 
 Typical usage:
 
-- `python scripts/validate_contract_schemas.py --require-live`
-- `python scripts/run_e2e_suite.py --env env-a --require-live`
-- `python scripts/run_drift_matrix.py --harbor-ref develop --upstream-ref master`
-- `python scripts/evaluate_release_gate.py drift-matrix-report.json --require-live`
+- `./target/release/validate-contract-schemas --require-live`
+- `./target/release/run-e2e-suite --env env-a --require-live`
+- `./target/release/run-drift-matrix --harbor-ref develop --upstream-ref master`
+- `./target/release/evaluate-release-gate drift-matrix-report.json --require-live`
 
 Controlled mutation example:
 
-- `HARBOR_ALLOW_MUTATIONS=1 HARBOR_APPROVAL_TOKEN=approved HARBOR_REQUIRED_APPROVAL_TOKEN=approved HARBOR_MUTATION_ROOT=/mnt/tank/agent-ci python scripts/run_e2e_suite.py --env env-a --require-live`
+- `HARBOR_ALLOW_MUTATIONS=1 HARBOR_APPROVAL_TOKEN=approved HARBOR_REQUIRED_APPROVAL_TOKEN=approved HARBOR_MUTATION_ROOT=/mnt/tank/agent-ci ./target/release/run-e2e-suite --env env-a --require-live`

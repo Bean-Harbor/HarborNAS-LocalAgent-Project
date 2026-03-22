@@ -20,11 +20,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - run: pip install -r requirements-dev.txt
-      - run: python scripts/validate_contract_schemas.py --report validate-contract-report.json
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --bin validate-contract-schemas
+      - run: ./target/release/validate-contract-schemas --report validate-contract-report.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:

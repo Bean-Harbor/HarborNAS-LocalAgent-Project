@@ -1,0 +1,33 @@
+[package]
+name = "harbornas_local_agent"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "harbornas-agent"
+path = "src/main.rs"
+
+[[bin]]
+name = "validate-contract-schemas"
+path = "src/bin/validate_contract_schemas.rs"
+
+[[bin]]
+name = "run-e2e-suite"
+path = "src/bin/run_e2e_suite.rs"
+
+[[bin]]
+name = "run-drift-matrix"
+path = "src/bin/run_drift_matrix.rs"
+
+[[bin]]
+name = "evaluate-release-gate"
+path = "src/bin/evaluate_release_gate.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+glob = "0.3"
+which = "8.0"
