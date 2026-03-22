@@ -197,13 +197,15 @@ def main() -> int:
             )
         )
 
-    mutation_root = ensure_directory(config.mutation_root)
+    mutation_root = config.mutation_root
     copy_src = str(Path(mutation_root) / "copy-source.txt")
     copy_dst = str(Path(mutation_root) / "copy-destination.txt")
     move_src = str(Path(mutation_root) / "move-source.txt")
-    move_dst_dir = ensure_directory(str(Path(mutation_root) / "move-destination"))
+    move_dst_dir = str(Path(mutation_root) / "move-destination")
 
     if config.allow_mutations:
+        mutation_root = ensure_directory(config.mutation_root)
+        move_dst_dir = ensure_directory(move_dst_dir)
         ensure_mutation_fixture(mutation_root, filename="copy-source.txt", content="copy payload\n")
         ensure_mutation_fixture(mutation_root, filename="move-source.txt", content="move payload\n")
 

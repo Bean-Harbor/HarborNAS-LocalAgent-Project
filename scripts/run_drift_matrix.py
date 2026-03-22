@@ -94,6 +94,12 @@ def main() -> int:
     harbor_source_caps = discover_source_capabilities(harbor_repo_path)
     upstream_source_caps = discover_source_capabilities(upstream_repo_path)
 
+    service_live_available = bool(middleware_caps.get("service.query") or midcli_caps.get("service.query"))
+    files_live_available = bool(
+        all(middleware_caps.get(name, False) for name in ["filesystem.listdir", "filesystem.copy", "filesystem.move"])
+        or all(midcli_caps.get(name, False) for name in ["filesystem.listdir", "filesystem.copy", "filesystem.move"])
+    )
+
     rows = [
         {
             "capability": "system.harbor_ops",
@@ -107,8 +113,8 @@ def main() -> int:
                 "query": service_operation_risk("status"),
                 "control": service_operation_risk("restart"),
             },
-            "status": "ok" if middleware_caps.get("service.query") else "missing",
-            "blocking": not middleware_caps.get("service.query", False),
+            "status": "ok" if middleware_caps.get("service.query") else ("degraded" if midcli_caps.get("service.query") else "missing"),
+            "blocking": not service_live_available,
         },
         {
             "capability": "files.batch_ops",
@@ -122,8 +128,8 @@ def main() -> int:
                 "copy": file_operation_risk("copy"),
                 "move": file_operation_risk("move"),
             },
-            "status": "ok" if middleware_caps.get("filesystem.listdir") else "missing",
-            "blocking": not middleware_caps.get("filesystem.listdir", False),
+            "status": "ok" if all(middleware_caps.get(name, False) for name in ["filesystem.listdir", "filesystem.copy", "filesystem.move"]) else ("degraded" if all(midcli_caps.get(name, False) for name in ["filesystem.listdir", "filesystem.copy", "filesystem.move"]) else "missing"),
+            "blocking": not files_live_available,
         },
         {
             "capability": "planner.task_decompose",
