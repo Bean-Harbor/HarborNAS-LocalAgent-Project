@@ -68,6 +68,7 @@
 补充状态:
 - `validate_contract_schemas.py`、`run_e2e_suite.py`、`run_drift_matrix.py`、`evaluate_release_gate.py` 已升级为可选 live integration 模式。
 - 当 HarborNAS 主机上具备 `midclt` / `cli` 时，脚本会真实探测 middleware 方法、midcli 命令能力与安全读路径，而不是只生成占位报告。
+- `run_e2e_suite.py` 现在还会覆盖受控写路径预演与执行门禁，包括 `service.restart`、`filesystem.copy`、`filesystem.move` 的 approval、dry-run 与路径策略校验。
 
 ## 📦 已生成的完整规划包
 

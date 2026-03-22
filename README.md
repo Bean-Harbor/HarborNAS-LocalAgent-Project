@@ -58,6 +58,11 @@ Key environment variables:
 - `HARBOR_PROBE_SERVICE`: safe service probe target, default `ssh`
 - `HARBOR_FILESYSTEM_PATH`: safe filesystem probe path, default `/mnt`
 - `HARBOR_SOURCE_REPO_PATH`, `UPSTREAM_SOURCE_REPO_PATH`: optional source trees used by `run_drift_matrix.py` for source-level capability comparison
+- `HARBOR_ALLOW_MUTATIONS`: set to `1` to let E2E execute approved write operations instead of preview-only
+- `HARBOR_APPROVAL_TOKEN`: approval token passed into HIGH-risk operations such as service restart and file move
+- `HARBOR_REQUIRED_APPROVAL_TOKEN`: optional expected token value for the local script gate
+- `HARBOR_APPROVER_ID`: approver identity written into mutation results for audit correlation
+- `HARBOR_MUTATION_ROOT`: sandbox root for mutation fixtures, default `/mnt/agent-ci`
 
 Typical usage:
 
@@ -65,3 +70,7 @@ Typical usage:
 - `python scripts/run_e2e_suite.py --env env-a --require-live`
 - `python scripts/run_drift_matrix.py --harbor-ref develop --upstream-ref master`
 - `python scripts/evaluate_release_gate.py drift-matrix-report.json --require-live`
+
+Controlled mutation example:
+
+- `HARBOR_ALLOW_MUTATIONS=1 HARBOR_APPROVAL_TOKEN=approved HARBOR_REQUIRED_APPROVAL_TOKEN=approved HARBOR_MUTATION_ROOT=/mnt/tank/agent-ci python scripts/run_e2e_suite.py --env env-a --require-live`

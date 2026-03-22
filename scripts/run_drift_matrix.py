@@ -14,6 +14,8 @@ if __package__ in {None, ""}:
         discover_source_capabilities,
         default_midcli_filesystem_command,
         default_midcli_service_query,
+        file_operation_risk,
+        service_operation_risk,
     )
 else:
     from .harbor_integration import (
@@ -23,6 +25,8 @@ else:
         discover_source_capabilities,
         default_midcli_filesystem_command,
         default_midcli_service_query,
+        file_operation_risk,
+        service_operation_risk,
     )
 
 
@@ -99,6 +103,10 @@ def main() -> int:
             "midcli_live": midcli_caps.get("service.query"),
             "harbor_source": harbor_source_caps.get("service.query"),
             "upstream_source": upstream_source_caps.get("service.query"),
+            "risk_levels": {
+                "query": service_operation_risk("status"),
+                "control": service_operation_risk("restart"),
+            },
             "status": "ok" if middleware_caps.get("service.query") else "missing",
             "blocking": not middleware_caps.get("service.query", False),
         },
@@ -110,6 +118,10 @@ def main() -> int:
             "midcli_live": all(midcli_caps.get(name, False) for name in ["filesystem.listdir", "filesystem.copy", "filesystem.move"]),
             "harbor_source": all(harbor_source_caps.get(name, False) for name in ["filesystem.listdir", "filesystem.copy", "filesystem.move"]),
             "upstream_source": all(upstream_source_caps.get(name, False) for name in ["filesystem.listdir", "filesystem.copy", "filesystem.move"]),
+            "risk_levels": {
+                "copy": file_operation_risk("copy"),
+                "move": file_operation_risk("move"),
+            },
             "status": "ok" if middleware_caps.get("filesystem.listdir") else "missing",
             "blocking": not middleware_caps.get("filesystem.listdir", False),
         },

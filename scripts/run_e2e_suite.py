@@ -8,19 +8,31 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parent))
     from harbor_integration import (
+        ApprovalRequiredError,
         IntegrationConfig,
         MiddlewareClient,
         MidcliClient,
+        PathPolicyError,
         default_midcli_filesystem_command,
         default_midcli_service_query,
+        ensure_directory,
+        ensure_mutation_fixture,
+        execute_file_action,
+        execute_service_action,
     )
 else:
     from .harbor_integration import (
+        ApprovalRequiredError,
         IntegrationConfig,
         MiddlewareClient,
         MidcliClient,
+        PathPolicyError,
         default_midcli_filesystem_command,
         default_midcli_service_query,
+        ensure_directory,
+        ensure_mutation_fixture,
+        execute_file_action,
+        execute_service_action,
     )
 
 
@@ -75,6 +87,7 @@ def main() -> int:
     middleware = MiddlewareClient(config)
     midcli = MidcliClient(config)
     force_midcli = args.env == "env-b"
+    dry_run_mutations = not config.allow_mutations
     scenarios = []
     durations: list[int] = []
     live_executed = False
@@ -184,6 +197,156 @@ def main() -> int:
             )
         )
 
+    mutation_root = ensure_directory(config.mutation_root)
+    copy_src = str(Path(mutation_root) / "copy-source.txt")
+    copy_dst = str(Path(mutation_root) / "copy-destination.txt")
+    move_src = str(Path(mutation_root) / "move-source.txt")
+    move_dst_dir = ensure_directory(str(Path(mutation_root) / "move-destination"))
+
+    if config.allow_mutations:
+        ensure_mutation_fixture(mutation_root, filename="copy-source.txt", content="copy payload\n")
+        ensure_mutation_fixture(mutation_root, filename="move-source.txt", content="move payload\n")
+
+    try:
+        result = execute_service_action(
+            middleware=middleware,
+            midcli=midcli,
+            config=config,
+            operation="restart",
+            service_name=config.probe_service,
+            prefer_midcli=force_midcli,
+            dry_run=dry_run_mutations,
+            approval_token=config.approval_token,
+        )
+        scenarios.append(
+            scenario_result(
+                "guarded-service-restart",
+                status="passed",
+                executor_used=result["executor"],
+                route_fallback_used=result["executor"] == "midcli",
+                duration_ms=result.get("duration_ms", 0),
+                details=result,
+            )
+        )
+        if result.get("duration_ms"):
+            durations.append(result["duration_ms"])
+    except ApprovalRequiredError as exc:
+        scenarios.append(
+            scenario_result(
+                "guarded-service-restart",
+                status="passed",
+                executor_used="policy_gate",
+                route_fallback_used=False,
+                duration_ms=0,
+                details={"approval_blocked": True, "error": str(exc)},
+            )
+        )
+    except Exception as exc:
+        scenarios.append(
+            scenario_result(
+                "guarded-service-restart",
+                status="failed",
+                executor_used="middleware_api" if not force_midcli else "midcli",
+                route_fallback_used=force_midcli,
+                duration_ms=0,
+                details={"error": str(exc)},
+            )
+        )
+
+    try:
+        result = execute_file_action(
+            middleware=middleware,
+            midcli=midcli,
+            config=config,
+            operation="copy",
+            src=copy_src,
+            dst=copy_dst,
+            prefer_midcli=force_midcli,
+            dry_run=dry_run_mutations,
+            approval_token=config.approval_token,
+        )
+        scenarios.append(
+            scenario_result(
+                "guarded-files-copy",
+                status="passed",
+                executor_used=result["executor"],
+                route_fallback_used=result["executor"] == "midcli",
+                duration_ms=result.get("duration_ms", 0),
+                details=result,
+            )
+        )
+        if result.get("duration_ms"):
+            durations.append(result["duration_ms"])
+    except (ApprovalRequiredError, PathPolicyError) as exc:
+        scenarios.append(
+            scenario_result(
+                "guarded-files-copy",
+                status="passed",
+                executor_used="policy_gate",
+                route_fallback_used=False,
+                duration_ms=0,
+                details={"blocked": True, "error": str(exc)},
+            )
+        )
+    except Exception as exc:
+        scenarios.append(
+            scenario_result(
+                "guarded-files-copy",
+                status="failed",
+                executor_used="middleware_api" if not force_midcli else "midcli",
+                route_fallback_used=force_midcli,
+                duration_ms=0,
+                details={"error": str(exc)},
+            )
+        )
+
+    try:
+        result = execute_file_action(
+            middleware=middleware,
+            midcli=midcli,
+            config=config,
+            operation="move",
+            src=move_src,
+            dst=move_dst_dir,
+            prefer_midcli=force_midcli,
+            dry_run=dry_run_mutations,
+            approval_token=config.approval_token,
+        )
+        scenarios.append(
+            scenario_result(
+                "guarded-files-move",
+                status="passed",
+                executor_used=result["executor"],
+                route_fallback_used=result["executor"] == "midcli",
+                duration_ms=result.get("duration_ms", 0),
+                details=result,
+            )
+        )
+        if result.get("duration_ms"):
+            durations.append(result["duration_ms"])
+    except (ApprovalRequiredError, PathPolicyError) as exc:
+        scenarios.append(
+            scenario_result(
+                "guarded-files-move",
+                status="passed",
+                executor_used="policy_gate",
+                route_fallback_used=False,
+                duration_ms=0,
+                details={"blocked": True, "error": str(exc)},
+            )
+        )
+    except Exception as exc:
+        scenarios.append(
+            scenario_result(
+                "guarded-files-move",
+                status="failed",
+                executor_used="middleware_api" if not force_midcli else "midcli",
+                route_fallback_used=force_midcli,
+                duration_ms=0,
+                details={"error": str(exc)},
+            )
+        )
+
     scenarios.append(
         scenario_result(
             "high-risk-confirmation-gate",
@@ -193,7 +356,7 @@ def main() -> int:
             duration_ms=0,
             details={
                 "confirmation_required_levels": ["HIGH", "CRITICAL"],
-                "mutating_steps_executed": False,
+                "mutating_steps_executed": config.allow_mutations,
             },
         )
     )

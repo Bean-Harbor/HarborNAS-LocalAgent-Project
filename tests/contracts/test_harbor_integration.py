@@ -7,7 +7,17 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from harbor_integration import IntegrationConfig, MiddlewareClient, MidcliClient, discover_source_capabilities, parse_csv_rows  # noqa: E402
+from harbor_integration import (  # noqa: E402
+    ApprovalRequiredError,
+    IntegrationConfig,
+    MiddlewareClient,
+    MidcliClient,
+    PathPolicyError,
+    discover_source_capabilities,
+    execute_file_action,
+    execute_service_action,
+    parse_csv_rows,
+)
 
 
 def test_parse_csv_rows_returns_structured_rows() -> None:
@@ -82,3 +92,66 @@ def test_discover_source_capabilities_reads_repo_files(tmp_path) -> None:
     assert caps["filesystem.listdir"] is True
     assert caps["filesystem.copy"] is True
     assert caps["filesystem.move"] is True
+
+
+def test_execute_service_action_requires_approval_for_restart(monkeypatch) -> None:
+    config = IntegrationConfig(required_approval_token="approved")
+    middleware = MiddlewareClient(config)
+    midcli = MidcliClient(config)
+    monkeypatch.setattr("harbor_integration.command_exists", lambda name: False)
+
+    try:
+        execute_service_action(
+            middleware=middleware,
+            midcli=midcli,
+            config=config,
+            operation="restart",
+            service_name="ssh",
+            dry_run=False,
+            approval_token=None,
+        )
+    except ApprovalRequiredError:
+        pass
+    else:
+        raise AssertionError("restart without approval token should be blocked")
+
+
+def test_execute_file_action_blocks_denied_path(monkeypatch) -> None:
+    config = IntegrationConfig()
+    middleware = MiddlewareClient(config)
+    midcli = MidcliClient(config)
+    monkeypatch.setattr("harbor_integration.command_exists", lambda name: False)
+
+    try:
+        execute_file_action(
+            middleware=middleware,
+            midcli=midcli,
+            config=config,
+            operation="copy",
+            src="/etc/passwd",
+            dst="/mnt/agent-ci/out.txt",
+            dry_run=True,
+        )
+    except PathPolicyError:
+        pass
+    else:
+        raise AssertionError("denied read path should be blocked")
+
+
+def test_execute_file_action_dry_run_returns_preview(monkeypatch) -> None:
+    config = IntegrationConfig()
+    middleware = MiddlewareClient(config)
+    midcli = MidcliClient(config)
+    monkeypatch.setattr("harbor_integration.command_exists", lambda name: False)
+
+    payload = execute_file_action(
+        middleware=middleware,
+        midcli=midcli,
+        config=config,
+        operation="move",
+        src="/mnt/agent-ci/source.txt",
+        dst="/mnt/agent-ci/dst",
+        dry_run=True,
+    )
+    assert payload["preview"] is True
+    assert payload["risk_level"] == "HIGH"
