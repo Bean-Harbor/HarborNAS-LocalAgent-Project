@@ -10,6 +10,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("report_path")
     parser.add_argument("--output", default="release-gate-summary.json")
+    parser.add_argument("--require-live", action="store_true")
     args = parser.parse_args()
 
     report = json.loads(Path(args.report_path).read_text(encoding="utf-8"))
@@ -20,9 +21,11 @@ def main() -> int:
         reasons.append("required contract documents are missing")
     if blocking_rows:
         reasons.append("drift matrix contains blocking rows")
+    if args.require_live and report.get("mode") != "live-integration":
+        reasons.append("live middleware or midcli probes were not executed")
 
     payload = {
-        "mode": "spec-scaffold",
+        "mode": report.get("mode", "spec-scaffold"),
         "allowed": not reasons,
         "reasons": reasons,
         "evaluated_rows": len(report.get("rows", [])),

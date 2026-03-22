@@ -27,3 +27,10 @@ def test_v2_roadmap_preserves_executor_order() -> None:
 def test_planner_contract_contains_route_priority_schema() -> None:
     content = read_doc("HarborNAS-Planner-TaskDecompose-Contract-v1.md")
     assert '"route_priority": ["middleware_api", "midcli", "browser", "mcp"]' in content
+
+
+def test_readme_mentions_live_integration_scaffold() -> None:
+    content = read_doc("README.md")
+    lowered = content.lower()
+    assert "middleware" in lowered
+    assert "midcli" in lowered

@@ -65,6 +65,10 @@
 - 重点: 三套 GitHub Actions 工作流、四个最小脚本、三类 pytest 契约测试与开发依赖。
 - 输出: 当前仓库已经可以对“文档化契约是否仍然自洽”进行自动校验，并产出 schema、fallback、policy、E2E、drift、release gate 报告。
 
+补充状态:
+- `validate_contract_schemas.py`、`run_e2e_suite.py`、`run_drift_matrix.py`、`evaluate_release_gate.py` 已升级为可选 live integration 模式。
+- 当 HarborNAS 主机上具备 `midclt` / `cli` 时，脚本会真实探测 middleware 方法、midcli 命令能力与安全读路径，而不是只生成占位报告。
+
 ## 📦 已生成的完整规划包
 
 为你的 HarborNAS 项目生成了 **5 份详细规划文档**，共约 14,000 字。

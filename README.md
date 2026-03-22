@@ -40,4 +40,28 @@ This repository contains the completed planning deliverables for a HarborNAS loc
 - `scripts/evaluate_release_gate.py`: converts drift output into a blocking/non-blocking release decision.
 - `tests/contracts`, `tests/fallback`, `tests/policy`: minimal pytest suites that keep the documented routing, fallback, and governance rules from regressing.
 
-Current scope note: this scaffold validates documentation-backed contracts and CI wiring. It does not yet execute against a live HarborNAS middleware or `midcli` environment.
+Current scope note: the default CI path still works in documentation-only mode, but the same scripts can now switch into live HarborNAS integration mode when `midclt` and/or `cli` are available.
+
+## Live Integration Mode
+
+The four scripts under `scripts/` now support live HarborNAS probing through `middleware` and `midcli`.
+
+- Middleware transport: local `midclt call ...`
+- MidCLI transport: non-interactive `cli -m csv -c ...`
+- Safe default probes: `service.query` for the configured probe service and `filesystem.listdir` for a configured path
+
+Key environment variables:
+
+- `HARBOR_MIDDLEWARE_BIN`: middleware CLI binary, default `midclt`
+- `HARBOR_MIDCLI_BIN`: midcli binary, default `cli`
+- `HARBOR_MIDCLI_URL`, `HARBOR_MIDCLI_USER`, `HARBOR_MIDCLI_PASSWORD`: remote midcli connection parameters when probing over websocket
+- `HARBOR_PROBE_SERVICE`: safe service probe target, default `ssh`
+- `HARBOR_FILESYSTEM_PATH`: safe filesystem probe path, default `/mnt`
+- `HARBOR_SOURCE_REPO_PATH`, `UPSTREAM_SOURCE_REPO_PATH`: optional source trees used by `run_drift_matrix.py` for source-level capability comparison
+
+Typical usage:
+
+- `python scripts/validate_contract_schemas.py --require-live`
+- `python scripts/run_e2e_suite.py --env env-a --require-live`
+- `python scripts/run_drift_matrix.py --harbor-ref develop --upstream-ref master`
+- `python scripts/evaluate_release_gate.py drift-matrix-report.json --require-live`
