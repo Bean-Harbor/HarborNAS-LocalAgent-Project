@@ -1,0 +1,14 @@
+{
+  "task_id": "live-policy-gate-test",
+  "goal": "Verify HIGH risk restart is blocked without approval token",
+  "steps": [
+    {
+      "domain": "service",
+      "operation": "restart",
+      "resource": { "service_name": "ssh" },
+      "args": {},
+      "risk_level": "HIGH",
+      "dry_run": false
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "task_id": "live-multi-service-query",
+  "goal": "Query multiple service statuses via WebSocket middleware API",
+  "steps": [
+    {
+      "domain": "service",
+      "operation": "status",
+      "resource": { "service_name": "ssh" },
+      "args": {},
+      "risk_level": "LOW",
+      "dry_run": false
+    },
+    {
+      "domain": "service",
+      "operation": "status",
+      "resource": { "service_name": "cifs" },
+      "args": {},
+      "risk_level": "LOW",
+      "dry_run": false
+    },
+    {
+      "domain": "service",
+      "operation": "status",
+      "resource": { "service_name": "nfs" },
+      "args": {},
+      "risk_level": "LOW",
+      "dry_run": false
+    },
+    {
+      "domain": "service",
+      "operation": "status",
+      "resource": { "service_name": "smart" },
+      "args": {},
+      "risk_level": "LOW",
+      "dry_run": false
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "mode": "live-integration",
+  "env_profile": "env-a",
+  "coverage": 1.0,
+  "required_fields": [
+    "executor_used",
+    "route_fallback_used",
+    "task_id",
+    "trace_id"
+  ],
+  "live_executed": true
+}

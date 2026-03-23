@@ -1,0 +1,93 @@
+{
+  "mode": "live-integration",
+  "env_profile": "env-a",
+  "ok": true,
+  "missing_docs": [],
+  "scenarios": [
+    {
+      "name": "planner-to-harbor-ops",
+      "status": "passed",
+      "executor_used": "midcli",
+      "route_fallback_used": true,
+      "duration_ms": 507,
+      "details": {
+        "row_count": 1,
+        "service": "ssh"
+      }
+    },
+    {
+      "name": "planner-to-files-batch-ops",
+      "status": "passed",
+      "executor_used": "midcli",
+      "route_fallback_used": true,
+      "duration_ms": 501,
+      "details": {
+        "path": "/mnt",
+        "row_count": 0
+      }
+    },
+    {
+      "name": "guarded-service-restart",
+      "status": "passed",
+      "executor_used": "middleware_api",
+      "route_fallback_used": false,
+      "duration_ms": 0,
+      "details": {
+        "domain": "service",
+        "executor": "middleware_api",
+        "operation": "restart",
+        "preview": true,
+        "risk_level": "HIGH",
+        "service_name": "ssh"
+      }
+    },
+    {
+      "name": "guarded-files-copy",
+      "status": "passed",
+      "executor_used": "middleware_api",
+      "route_fallback_used": false,
+      "duration_ms": 0,
+      "details": {
+        "domain": "files",
+        "dst": "/mnt/agent-ci/copy-destination.txt",
+        "executor": "middleware_api",
+        "operation": "copy",
+        "overwrite": false,
+        "preview": true,
+        "risk_level": "MEDIUM",
+        "src": "/mnt/agent-ci/copy-source.txt"
+      }
+    },
+    {
+      "name": "guarded-files-move",
+      "status": "passed",
+      "executor_used": "middleware_api",
+      "route_fallback_used": false,
+      "duration_ms": 0,
+      "details": {
+        "domain": "files",
+        "dst": "/mnt/agent-ci/move-destination",
+        "executor": "middleware_api",
+        "operation": "move",
+        "overwrite": false,
+        "preview": true,
+        "risk_level": "HIGH",
+        "src": "/mnt/agent-ci/move-source.txt"
+      }
+    },
+    {
+      "name": "high-risk-confirmation-gate",
+      "status": "passed",
+      "executor_used": "policy_gate",
+      "route_fallback_used": false,
+      "duration_ms": 0,
+      "details": {
+        "confirmation_required_levels": [
+          "HIGH",
+          "CRITICAL"
+        ],
+        "mutating_steps_executed": false
+      }
+    }
+  ]
+}

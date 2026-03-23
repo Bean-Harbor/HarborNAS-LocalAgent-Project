@@ -1,3 +1,4 @@
+use std::net::TcpStream;
 use std::process::Command;
 use std::time::Instant;
 
@@ -5,6 +6,8 @@ use base64::Engine as _;
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::json;
+use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{connect, Message, WebSocket};
 
 use crate::orchestrator::contracts::{Action, ExecutionResult, Route, StepStatus};
 use crate::orchestrator::router::Executor;
@@ -293,7 +296,7 @@ impl Executor for MiddlewareHttpExecutor {
         let (method, url, body) = match action.operation.as_str() {
             "status" => (
                 "GET",
-                format!("{}/api/v2.0/service?service={service_name}", self.base_url),
+                format!("{}/api/v2.0/service/id/{service_name}", self.base_url),
                 None,
             ),
             "start" => (
@@ -403,5 +406,232 @@ impl Executor for MiddlewareHttpExecutor {
                 "response": resp_json,
             }),
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MiddlewareWsExecutor — calls HarborOS via WebSocket middleware protocol
+// This is the primary live integration path when REST API is not available.
+// Protocol: connect to ws://host/websocket, auth.login, then call methods.
+// ---------------------------------------------------------------------------
+
+pub struct MiddlewareWsExecutor {
+    ws_url: String,
+    username: String,
+    password: String,
+}
+
+impl MiddlewareWsExecutor {
+    pub fn new(base_url: &str, username: &str, password: &str) -> Self {
+        // Convert http://host to ws://host/websocket
+        let ws_url = base_url
+            .trim_end_matches('/')
+            .replace("https://", "wss://")
+            .replace("http://", "ws://")
+            + "/websocket";
+        Self {
+            ws_url,
+            username: username.to_string(),
+            password: password.to_string(),
+        }
+    }
+
+    fn connect_and_auth(
+        &self,
+    ) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, String> {
+        let (mut ws, _resp) =
+            connect(&self.ws_url).map_err(|e| format!("ws connect failed: {e}"))?;
+
+        // Handshake: {"msg":"connect","version":"1","support":["1"]}
+        ws.send(Message::Text(
+            json!({"msg": "connect", "version": "1", "support": ["1"]})
+                .to_string()
+                .into(),
+        ))
+        .map_err(|e| format!("ws handshake send failed: {e}"))?;
+
+        let hs_resp = ws
+            .read()
+            .map_err(|e| format!("ws handshake recv failed: {e}"))?;
+        let hs_json: serde_json::Value = serde_json::from_str(
+            hs_resp.to_text().unwrap_or(""),
+        )
+        .unwrap_or_default();
+        if hs_json.get("msg").and_then(|v| v.as_str()) != Some("connected") {
+            return Err(format!("ws handshake unexpected: {hs_json}"));
+        }
+
+        // Auth: auth.login
+        ws.send(Message::Text(
+            json!({
+                "id": 1,
+                "msg": "method",
+                "method": "auth.login",
+                "params": [self.username, self.password]
+            })
+            .to_string()
+            .into(),
+        ))
+        .map_err(|e| format!("ws auth send failed: {e}"))?;
+
+        let auth_resp = ws
+            .read()
+            .map_err(|e| format!("ws auth recv failed: {e}"))?;
+        let auth_json: serde_json::Value = serde_json::from_str(
+            auth_resp.to_text().unwrap_or(""),
+        )
+        .unwrap_or_default();
+        if auth_json.get("msg").and_then(|v| v.as_str()) != Some("result") {
+            return Err(format!("ws auth failed: {auth_json}"));
+        }
+        // auth.login returns result=true on success
+        let auth_result = &auth_json["result"];
+        if auth_result != &serde_json::Value::Bool(true) {
+            return Err(format!("ws auth rejected: {auth_json}"));
+        }
+
+        Ok(ws)
+    }
+
+    fn ws_call(
+        &self,
+        ws: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        ws.send(Message::Text(
+            json!({
+                "id": 2,
+                "msg": "method",
+                "method": method,
+                "params": params
+            })
+            .to_string()
+            .into(),
+        ))
+        .map_err(|e| format!("ws call send failed: {e}"))?;
+
+        let resp = ws
+            .read()
+            .map_err(|e| format!("ws call recv failed: {e}"))?;
+        let resp_json: serde_json::Value = serde_json::from_str(
+            resp.to_text().unwrap_or(""),
+        )
+        .unwrap_or_default();
+
+        if resp_json.get("msg").and_then(|v| v.as_str()) != Some("result") {
+            return Err(format!("ws method call failed: {resp_json}"));
+        }
+        if let Some(err) = resp_json.get("error") {
+            return Err(format!("ws method error: {err}"));
+        }
+
+        Ok(resp_json["result"].clone())
+    }
+}
+
+impl Executor for MiddlewareWsExecutor {
+    fn route(&self) -> Route {
+        Route::MiddlewareApi
+    }
+
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn execute(
+        &self,
+        action: &Action,
+        task_id: &str,
+        step_id: &str,
+    ) -> Result<ExecutionResult, String> {
+        let started = Instant::now();
+
+        let service_name = action
+            .resource
+            .get("service_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if service_name.is_empty() {
+            return Err("service_name is required".to_string());
+        }
+        if service_name.len() > 64
+            || !service_name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        {
+            return Err(format!("invalid service name: {service_name:?}"));
+        }
+
+        if action.dry_run {
+            let (method, _params) =
+                map_ws_service_operation(&action.operation, service_name, &action.args)?;
+            return Ok(ExecutionResult {
+                task_id: task_id.to_string(),
+                step_id: step_id.to_string(),
+                executor_used: Route::MiddlewareApi.as_str().to_string(),
+                fallback_used: false,
+                status: StepStatus::Success,
+                duration_ms: started.elapsed().as_millis() as u64,
+                error_code: None,
+                error_message: None,
+                audit_ref: String::new(),
+                result_payload: json!({
+                    "dry_run": true,
+                    "transport": "websocket",
+                    "method": method,
+                    "service_name": service_name,
+                }),
+            });
+        }
+
+        let mut ws = self.connect_and_auth()?;
+        let (method, params) =
+            map_ws_service_operation(&action.operation, service_name, &action.args)?;
+        let result = self.ws_call(&mut ws, &method, params)?;
+        let _ = ws.close(None);
+
+        Ok(ExecutionResult {
+            task_id: task_id.to_string(),
+            step_id: step_id.to_string(),
+            executor_used: Route::MiddlewareApi.as_str().to_string(),
+            fallback_used: false,
+            status: StepStatus::Success,
+            duration_ms: started.elapsed().as_millis() as u64,
+            error_code: None,
+            error_message: None,
+            audit_ref: String::new(),
+            result_payload: json!({
+                "transport": "websocket",
+                "method": method,
+                "response": result,
+            }),
+        })
+    }
+}
+
+fn map_ws_service_operation(
+    operation: &str,
+    service_name: &str,
+    args: &serde_json::Value,
+) -> Result<(String, serde_json::Value), String> {
+    match operation {
+        "status" => Ok((
+            "service.query".to_string(),
+            json!([[["service", "=", service_name]], {"select": ["service", "state", "enable"]}]),
+        )),
+        "start" | "stop" | "restart" => Ok((
+            "service.control".to_string(),
+            json!([operation.to_uppercase(), service_name, {}]),
+        )),
+        "enable" => {
+            let enable_val = args.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
+            Ok((
+                "service.update".to_string(),
+                json!([service_name, {"enable": enable_val}]),
+            ))
+        }
+        _ => Err(format!("unsupported ws service operation: {operation}")),
     }
 }

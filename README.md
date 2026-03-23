@@ -146,3 +146,25 @@ Typical usage:
 Controlled mutation example:
 
 - `HARBOR_ALLOW_MUTATIONS=1 HARBOR_APPROVAL_TOKEN=approved HARBOR_REQUIRED_APPROVAL_TOKEN=approved HARBOR_MUTATION_ROOT=/mnt/tank/agent-ci ./target/release/run-e2e-suite --env env-a --require-live`
+
+### Windows Remote MidCLI Shim
+
+For Windows workstations that do not have HarborOS native `cli` installed locally,
+use the repository shim in `tools/` to proxy midcli-compatible commands over
+WebSocket to a remote HarborOS host.
+
+- Shim entry command: `tools/cli.cmd`
+- Python implementation: `tools/harbor_cli_shim.py`
+- Supported commands:
+  - `service query ... WHERE service == '...'`
+  - `filesystem listdir path=...`
+  - `service restart|start|stop service=...`
+  - `filesystem copy ...` and `filesystem move ...`
+
+Example (PowerShell):
+
+- `$env:HARBOR_MIDCLI_BIN = (Resolve-Path .\tools\cli.cmd).Path`
+- `$env:HARBOR_MIDCLI_URL = 'ws://<harbor-host>/websocket'`
+- `$env:HARBOR_MIDCLI_USER = '<username>'`
+- `$env:HARBOR_MIDCLI_PASSWORD = '<password>'`
+- `./target/release/run-e2e-suite.exe --env env-a --require-live --report rust-live-e2e-report.json`
