@@ -31,6 +31,10 @@ path = "src/bin/feishu_connectivity.rs"
 name = "feishu-echo-bot"
 path = "src/bin/feishu_echo_bot.rs"
 
+[[bin]]
+name = "feishu-harbor-bot"
+path = "src/bin/feishu_harbor_bot.rs"
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }

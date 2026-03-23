@@ -16,6 +16,7 @@ description: "Use when implementing HarborNAS personal assistant capabilities, H
 
 ## Non-negotiable rules
 
+- **Rust-only implementation**: All new code must be written in Rust. Do not use Python for new features. Existing Python code is legacy reference only — all active development, binaries, and executors must be Rust.
 - Core-in-HarborOS, extensions-as-plugins.
 - HarborBeacon (ZeroClaw fork) is pre-installed in HarborOS; users interact via IM channels.
 - Route priority is fixed: `middleware_api -> midcli -> browser -> mcp`.
