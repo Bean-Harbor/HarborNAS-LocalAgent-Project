@@ -9,6 +9,7 @@ capabilities:
   - browser.click
   - browser.scrape
   - browser.screenshot
+  - browser.feishu_setup
 
 executors:
   browser:
@@ -38,7 +39,7 @@ input_schema:
   properties:
     operation:
       type: string
-      enum: [navigate, click, scrape, screenshot]
+      enum: [navigate, click, scrape, screenshot, feishu_setup]
     url:
       type: string
     selector:

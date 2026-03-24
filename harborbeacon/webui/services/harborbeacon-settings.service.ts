@@ -6,6 +6,11 @@ import {
   Channel,
   ChannelConfig,
   ConnectivityResult,
+  FeishuBrowserSetupResumeRequest,
+  FeishuBrowserSetupSession,
+  FeishuBrowserSetupStartRequest,
+  FeishuOneClickSetupRequest,
+  FeishuOneClickSetupResult,
   HarborBeaconSettings,
   RouteStatus,
 } from '../interfaces/harborbeacon-settings.interface';
@@ -18,6 +23,7 @@ import {
  *   GET  /api/v2.0/harborbeacon/settings
  *   PUT  /api/v2.0/harborbeacon/settings
  *   POST /api/v2.0/harborbeacon/settings/test_channel
+ *   POST /api/v2.0/harborbeacon/settings/feishu/one_click_setup
  *   GET  /api/v2.0/harborbeacon/routes/status
  */
 @Injectable({ providedIn: 'root' })
@@ -49,6 +55,44 @@ export class HarborBeaconSettingsService {
     return this.http.post<ConnectivityResult[]>(
       `${this.base}/settings/test_channels`,
       {},
+    );
+  }
+
+  oneClickSetupFeishu(
+    payload: FeishuOneClickSetupRequest,
+  ): Observable<FeishuOneClickSetupResult> {
+    return this.http.post<FeishuOneClickSetupResult>(
+      `${this.base}/settings/feishu/one_click_setup`,
+      payload,
+    );
+  }
+
+  // ---- Feishu browser-assisted setup ----
+
+  browserSetupFeishuStart(
+    payload: FeishuBrowserSetupStartRequest,
+  ): Observable<FeishuBrowserSetupSession> {
+    return this.http.post<FeishuBrowserSetupSession>(
+      `${this.base}/settings/feishu/browser_setup/start`,
+      payload,
+    );
+  }
+
+  browserSetupFeishuResume(
+    payload: FeishuBrowserSetupResumeRequest,
+  ): Observable<FeishuBrowserSetupSession> {
+    return this.http.post<FeishuBrowserSetupSession>(
+      `${this.base}/settings/feishu/browser_setup/resume`,
+      payload,
+    );
+  }
+
+  browserSetupFeishuStatus(
+    sessionId: string,
+  ): Observable<FeishuBrowserSetupSession> {
+    return this.http.get<FeishuBrowserSetupSession>(
+      `${this.base}/settings/feishu/browser_setup/status`,
+      { params: { session_id: sessionId } },
     );
   }
 

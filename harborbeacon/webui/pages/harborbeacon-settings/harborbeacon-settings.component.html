@@ -40,9 +40,94 @@
       <div class="tab-body">
         <ix-harborbeacon-channel-config
           [channels]="channels"
+          [oneClickSetupRunning]="feishuSetupRunning"
+          [browserSetupRunning]="feishuBrowserSetupRunning"
           (channelsChange)="onChannelsChange($event)"
           (testChannel)="onTestChannel($event)"
+          (oneClickSetupFeishu)="onOneClickSetupFeishu($event)"
+          (browserSetupFeishuStart)="onBrowserSetupFeishuStart()"
         ></ix-harborbeacon-channel-config>
+
+        <!-- Browser-assisted setup wizard -->
+        @if (feishuBrowserSession) {
+          <div class="browser-setup-wizard">
+            <div class="wizard-header">
+              <mat-icon>qr_code_scanner</mat-icon>
+              <strong>飞书扫码配置向导</strong>
+              <button mat-icon-button class="wizard-close" (click)="onBrowserSetupDismiss()">
+                <mat-icon>close</mat-icon>
+              </button>
+            </div>
+
+            <!-- Steps -->
+            <div class="wizard-steps">
+              @for (step of feishuBrowserSession.steps; track step.key) {
+                <div class="wizard-step"
+                     [class.running]="step.status === 'running'"
+                     [class.wait-user]="step.status === 'wait_user'"
+                     [class.success]="step.status === 'success'"
+                     [class.failed]="step.status === 'failed'"
+                     [class.skipped]="step.status === 'skipped'"
+                >
+                  <div class="step-icon">
+                    @switch (step.status) {
+                      @case ('success')   { <mat-icon>check_circle</mat-icon> }
+                      @case ('running')   { <mat-icon>sync</mat-icon> }
+                      @case ('wait_user') { <mat-icon>hourglass_top</mat-icon> }
+                      @case ('failed')    { <mat-icon>error</mat-icon> }
+                      @case ('skipped')   { <mat-icon>skip_next</mat-icon> }
+                      @default            { <mat-icon>radio_button_unchecked</mat-icon> }
+                    }
+                  </div>
+                  <div class="step-text">
+                    <span class="step-label">{{ step.label_zh }}</span>
+                    @if (step.detail) {
+                      <span class="step-detail">{{ step.detail }}</span>
+                    }
+                  </div>
+                </div>
+              }
+            </div>
+
+            <!-- Action area -->
+            <div class="wizard-actions">
+              @if (feishuBrowserSession.status === 'running' || feishuBrowserSession.status === 'wait_user') {
+                <p class="wizard-hint">请在飞书 App 中扫描浏览器窗口的二维码，扫码后将自动继续配置。</p>
+                <mat-progress-bar mode="indeterminate"></mat-progress-bar>
+              }
+              @if (feishuBrowserSession.status === 'done') {
+                <div class="wizard-done">
+                  <mat-icon>celebration</mat-icon>
+                  <span>配置完成！凭证已自动保存至 HarborBeacon。</span>
+                </div>
+              }
+              @if (feishuBrowserSession.status === 'error') {
+                <div class="wizard-error">
+                  <mat-icon>error_outline</mat-icon>
+                  <span>{{ feishuBrowserSession.error }}</span>
+                </div>
+              }
+            </div>
+          </div>
+        }
+
+        @if (feishuSetupResult) {
+          <div class="feishu-setup-result" [class.error]="!feishuSetupResult.success">
+            <div class="result-title">
+              <mat-icon>{{ feishuSetupResult.success ? 'check_circle' : 'error' }}</mat-icon>
+              <strong>{{ feishuSetupResult.success ? 'Feishu setup completed' : 'Feishu setup failed' }}</strong>
+            </div>
+            <p class="result-message">{{ feishuSetupResult.message }}</p>
+            @if (feishuSetupResult.next_steps.length > 0) {
+              <p class="result-subtitle">Next steps:</p>
+              <ul>
+                @for (step of feishuSetupResult.next_steps; track step) {
+                  <li>{{ step }}</li>
+                }
+              </ul>
+            }
+          </div>
+        }
       </div>
     </mat-tab>
 

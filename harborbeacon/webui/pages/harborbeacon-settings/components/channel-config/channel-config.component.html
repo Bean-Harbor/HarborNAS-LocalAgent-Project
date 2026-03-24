@@ -51,6 +51,38 @@
             <mat-icon>wifi_tethering</mat-icon>
             Test Connection
           </button>
+
+          @if (m.channel === Channel.Feishu) {
+            <button
+              mat-flat-button
+              color="accent"
+              class="test-btn"
+              [disabled]="oneClickSetupRunning || !canOneClickSetupFeishu(getConfig(m.channel))"
+              (click)="onOneClickSetupFeishu()"
+            >
+              <mat-icon>auto_fix_high</mat-icon>
+              @if (oneClickSetupRunning) {
+                Configuring...
+              } @else {
+                One-Click Setup
+              }
+            </button>
+
+            <button
+              mat-flat-button
+              color="primary"
+              class="test-btn browser-setup-btn"
+              [disabled]="browserSetupRunning"
+              (click)="onBrowserSetupFeishu()"
+            >
+              <mat-icon>qr_code_scanner</mat-icon>
+              @if (browserSetupRunning) {
+                配置中…
+              } @else {
+                扫码配置飞书
+              }
+            </button>
+          }
         </div>
       </mat-expansion-panel>
     }

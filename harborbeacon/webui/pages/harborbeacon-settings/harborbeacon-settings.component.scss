@@ -62,3 +62,165 @@ h1 {
 .tab-body {
   padding: 24px 0;
 }
+
+.feishu-setup-result {
+  margin-top: 16px;
+  padding: 12px 16px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--primary) 30%, transparent);
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
+
+  &.error {
+    border-color: color-mix(in srgb, var(--error) 40%, transparent);
+    background: color-mix(in srgb, var(--error) 12%, transparent);
+  }
+}
+
+.result-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.result-message,
+.result-subtitle {
+  margin: 8px 0 0;
+}
+
+.feishu-setup-result ul {
+  margin: 6px 0 0;
+  padding-left: 20px;
+}
+
+// --- Browser-assisted setup wizard ---
+
+.browser-setup-wizard {
+  margin-top: 20px;
+  border: 1px solid color-mix(in srgb, var(--primary) 30%, transparent);
+  border-radius: 12px;
+  padding: 16px 20px;
+  background: color-mix(in srgb, var(--primary) 4%, transparent);
+}
+
+.wizard-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+
+  strong {
+    flex: 1;
+    font-size: 15px;
+  }
+
+  .wizard-close {
+    opacity: 0.6;
+  }
+}
+
+.wizard-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.wizard-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  transition: background 0.2s;
+
+  &.running {
+    background: color-mix(in srgb, var(--primary) 10%, transparent);
+
+    .step-icon mat-icon {
+      animation: spin 1.2s linear infinite;
+      color: var(--primary);
+    }
+  }
+
+  &.wait-user {
+    background: color-mix(in srgb, var(--warn) 10%, transparent);
+
+    .step-icon mat-icon {
+      color: var(--warn);
+    }
+  }
+
+  &.success .step-icon mat-icon {
+    color: var(--green);
+  }
+
+  &.failed .step-icon mat-icon {
+    color: var(--error);
+  }
+
+  &.skipped {
+    opacity: 0.5;
+  }
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+.step-icon {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  mat-icon {
+    font-size: 20px;
+    width: 20px;
+    height: 20px;
+  }
+}
+
+.step-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.step-label {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.step-detail {
+  font-size: 12px;
+  color: var(--fg2);
+}
+
+.wizard-actions {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid color-mix(in srgb, var(--fg3) 15%, transparent);
+}
+
+.wizard-hint {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: var(--fg2);
+}
+
+.wizard-done {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--green);
+  font-weight: 500;
+}
+
+.wizard-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--error);
+}
