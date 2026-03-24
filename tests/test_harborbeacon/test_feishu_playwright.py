@@ -119,6 +119,53 @@ class TestPlaywrightDriverMocked:
         driver.enable_bot()  # should not raise
         page.evaluate.assert_called()
 
+    def test_enable_bot_prefers_internal_api(self, mock_pw: dict) -> None:
+        driver = PlaywrightFeishuDriver(headless=True)
+        driver.launch()
+        driver._last_app_id = "cli_test123"
+        driver._console_api_post = MagicMock(return_value={"ok": True, "data": {}})
+
+        driver.enable_bot()
+
+        driver._console_api_post.assert_called_once_with(
+            "developers/v1/robot/switch/cli_test123",
+            {"enable": True},
+            require_csrf=True,
+        )
+
+    def test_set_callback_url_prefers_internal_event_api(self, mock_pw: dict) -> None:
+        driver = PlaywrightFeishuDriver(headless=True)
+        driver.launch()
+        driver._last_app_id = "cli_test123"
+        driver._console_api_post = MagicMock(side_effect=[
+            {"ok": True, "data": {"data": {"appEvents": []}}},
+            {"ok": True, "data": {}},
+            {"ok": True, "data": {}},
+        ])
+
+        driver.set_callback_url("https://example.invalid/webhook/feishu")
+
+        assert driver._console_api_post.call_args_list[0].args[0] == "developers/v1/event/cli_test123"
+        assert driver._console_api_post.call_args_list[1].args[0] == "developers/v1/event/update/cli_test123"
+        assert driver._console_api_post.call_args_list[1].args[1]["appEvents"] == ["im.message.receive_v1"]
+        assert driver._console_api_post.call_args_list[2].args[0] == "developers/v1/event/switch/cli_test123"
+        assert driver._console_api_post.call_args_list[2].args[1] == {"eventMode": 4}
+
+    def test_try_create_app_via_internal_api(self, mock_pw: dict) -> None:
+        driver = PlaywrightFeishuDriver(headless=True)
+        driver.launch()
+        driver._console_api_post = MagicMock(return_value={
+            "ok": True,
+            "data": {"ClientID": "cli_internal123"},
+        })
+
+        app_id = driver._try_create_app_via_api("TestBot", "desc")
+
+        assert app_id == "cli_internal123"
+        called_body = driver._console_api_post.call_args.args[1]
+        assert called_body["avatar"]
+        assert called_body["primaryLang"] == "en_us"
+
     def test_extract_credentials(self, mock_pw: dict) -> None:
         page = mock_pw["page"]
         # page.content() returns HTML with credentials
@@ -134,6 +181,47 @@ class TestPlaywrightDriverMocked:
         driver.launch()
         creds = driver.extract_credentials()
         assert creds["app_id"] == "cli_test1234567890ab"
+
+    def test_extract_credentials_prefers_internal_api(self, mock_pw: dict) -> None:
+        driver = PlaywrightFeishuDriver(headless=True)
+        driver.launch()
+        driver._last_app_id = "cli_pw_123"
+        driver._console_api_get = MagicMock(return_value={
+            "ok": True,
+            "data": {"data": {"secret": "sec_pw_internal_456"}},
+        })
+
+        creds = driver.extract_credentials()
+
+        assert creds == {
+            "app_id": "cli_pw_123",
+            "app_secret": "sec_pw_internal_456",
+        }
+
+    def test_grant_permissions_prefers_internal_api(self, mock_pw: dict) -> None:
+        driver = PlaywrightFeishuDriver(headless=True)
+        driver.launch()
+        driver._last_app_id = "cli_pw_123"
+        driver._console_api_post = MagicMock(side_effect=[
+            {
+                "ok": True,
+                "data": {
+                    "data": {
+                        "scopes": [
+                            {"id": 101, "name": "im:message:readonly", "scopeType": [2]},
+                            {"id": 102, "name": "im:message:send_as_bot", "scopeType": [2]},
+                        ]
+                    }
+                },
+            },
+            {"ok": True, "data": {"data": {"scopes": []}}},
+            {"ok": True, "data": {}},
+        ])
+
+        granted = driver.grant_permissions(["im:message:readonly", "im:message:send_as_bot"])
+
+        assert granted == 2
+        assert driver._console_api_post.call_args_list[1].args[0] == "developers/v1/scope/list/cli_pw_123"
 
     def test_screenshot(self, mock_pw: dict) -> None:
         driver = PlaywrightFeishuDriver(headless=True)

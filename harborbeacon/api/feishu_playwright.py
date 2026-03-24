@@ -46,6 +46,8 @@ log = logging.getLogger("harborbeacon.playwright")
 
 _SCREENSHOT_DIR = "/tmp"
 _FEISHU_OPEN_URL = "https://open.feishu.cn/app"
+_DEFAULT_AVATAR = "https://s1-imfile.feishucdn.com/static-resource/v1/v3_00s0_576232a3-1abe-46bf-8298-e0966ecd2eeg"
+_DEFAULT_EVENTS = ["im.message.receive_v1"]
 
 
 class PlaywrightFeishuDriver:
@@ -80,6 +82,7 @@ class PlaywrightFeishuDriver:
         # Network request capture for API discovery
         self._captured_requests: list[dict[str, Any]] = []
         self._last_app_id: str = ""
+        self._x_csrf_token: str = ""
 
     # ================================================================
     # Lifecycle
@@ -269,17 +272,26 @@ class PlaywrightFeishuDriver:
         log.warning("JS fill: no input for %s after %ds", hints, timeout_sec)
         return {"found": False}
 
-    def _js_fetch(self, url: str, method: str = "GET", body: Any = None) -> dict[str, Any]:
+    def _js_fetch(
+        self,
+        url: str,
+        method: str = "GET",
+        body: Any = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         """Execute a fetch() call from within the page context.
 
         Inherits all session cookies, CSRF tokens, and headers automatically.
         """
         result: dict[str, Any] = self.page.evaluate(
-            """async ([url, method, body]) => {
+            """async ([url, method, body, headers]) => {
                 try {
-                    const opts = {method, credentials: 'include', headers: {}};
+                    const opts = {
+                        method,
+                        credentials: 'include',
+                        headers: {...(headers || {})},
+                    };
                     if (body !== null && body !== undefined) {
-                        opts.headers['Content-Type'] = 'application/json';
                         opts.body = JSON.stringify(body);
                     }
                     const resp = await fetch(url, opts);
@@ -290,10 +302,103 @@ class PlaywrightFeishuDriver:
                     return {status: 0, ok: false, error: e.message};
                 }
             }""",
-            [url, method, body],
+            [url, method, body, headers or {}],
         )
         log.info("JS fetch: %s %s → %s", method, url, result.get("status"))
         return result
+
+    def _current_app_id(self) -> str:
+        if self._last_app_id:
+            return self._last_app_id
+        match = re.search(r"/app/(cli_[a-zA-Z0-9]+)", self.page.url)
+        if match:
+            self._last_app_id = match.group(1)
+        return self._last_app_id
+
+    def _ensure_console_csrf_token(self, force_refresh: bool = False) -> str:
+        if self._x_csrf_token and not force_refresh:
+            return self._x_csrf_token
+
+        token = ""
+        try:
+            token = str(self.page.evaluate(
+                """() => {
+                    return window.csrfToken || window._csrfToken || window.__csrfToken || '';
+                }"""
+            ) or "")
+        except Exception:
+            token = ""
+
+        if not token:
+            try:
+                token = str(self.page.evaluate(
+                    f"""async () => {{
+                        try {{
+                            const resp = await fetch('{_FEISHU_OPEN_URL}?lang=zh-CN', {{
+                                method: 'GET',
+                                credentials: 'include',
+                            }});
+                            const html = await resp.text();
+                            const match = html.match(/window\\.csrfToken=\"([^\"]+)\";/);
+                            return match ? match[1] : '';
+                        }} catch (e) {{
+                            return '';
+                        }}
+                    }}"""
+                ) or "")
+            except Exception:
+                token = ""
+
+        self._x_csrf_token = token
+        if token:
+            log.info("Resolved Feishu console CSRF token")
+        else:
+            log.warning("Failed to resolve Feishu console CSRF token")
+        return token
+
+    def _console_api_request(
+        self,
+        path: str,
+        *,
+        method: str = "GET",
+        body: Any = None,
+        require_csrf: bool = False,
+    ) -> dict[str, Any]:
+        url = path if path.startswith("http") else f"https://open.feishu.cn/{path.lstrip('/')}"
+        headers: dict[str, str] = {}
+        if require_csrf:
+            token = self._ensure_console_csrf_token()
+            if token:
+                headers["x-csrf-token"] = token
+        return self._js_fetch(url, method=method, body=body, headers=headers)
+
+    def _console_api_post(self, path: str, body: Any = None, *, require_csrf: bool = False) -> dict[str, Any]:
+        return self._console_api_request(
+            path,
+            method="POST",
+            body=body,
+            require_csrf=require_csrf,
+        )
+
+    def _console_api_get(self, path: str, *, require_csrf: bool = False) -> dict[str, Any]:
+        return self._console_api_request(path, method="GET", require_csrf=require_csrf)
+
+    def _unwrap_result_data(self, result: dict[str, Any]) -> dict[str, Any]:
+        payload = result.get("data")
+        if not isinstance(payload, dict):
+            return {}
+        nested = payload.get("data")
+        if isinstance(nested, dict):
+            return nested
+        return payload
+
+    def _normalize_scope_types(self, scope: dict[str, Any]) -> list[int]:
+        raw_types = scope.get("scopeType")
+        if isinstance(raw_types, list):
+            return [int(item) for item in raw_types if isinstance(item, (int, str)) and str(item).isdigit()]
+        if isinstance(raw_types, (int, str)) and str(raw_types).isdigit():
+            return [int(raw_types)]
+        return []
 
     def _js_page_info(self) -> dict[str, Any]:
         """Collect current page info for debugging."""
@@ -343,6 +448,27 @@ class PlaywrightFeishuDriver:
             recover_url = _FEISHU_OPEN_URL
         self.page.goto(recover_url, wait_until="domcontentloaded")
         self.page.wait_for_timeout(3000)
+
+    def _extract_app_id_from_result(self, result: dict[str, Any]) -> str:
+        data = result.get("data")
+        candidates: list[Any] = []
+        if isinstance(data, dict):
+            candidates.extend([
+                data.get("ClientID"),
+                data.get("client_id"),
+                data.get("app_id"),
+            ])
+        nested = self._unwrap_result_data(result)
+        if nested:
+            candidates.extend([
+                nested.get("ClientID"),
+                nested.get("client_id"),
+                nested.get("app_id"),
+            ])
+        for value in candidates:
+            if isinstance(value, str) and value.startswith("cli_"):
+                return value
+        return ""
 
     def _js_click_in_dialog(self, *texts: str, timeout_sec: int = 8) -> dict[str, Any]:
         """Click a button by text inside the currently visible modal dialog."""
@@ -551,6 +677,26 @@ class PlaywrightFeishuDriver:
 
     def _try_create_app_via_api(self, name: str, desc: str) -> str:
         """Try known Feishu console API patterns."""
+        description = desc or f"{name} - HarborNAS AI"
+        body = {
+            "appSceneType": 0,
+            "name": name,
+            "desc": description,
+            "avatar": _DEFAULT_AVATAR,
+            "i18n": {
+                "zh_cn": {"name": name, "description": description, "help_use": ""},
+                "en_us": {"name": name, "description": description, "help_use": ""},
+            },
+            "primaryLang": "en_us",
+        }
+
+        result = self._console_api_post("developers/v1/app/create", body, require_csrf=True)
+        if result.get("ok"):
+            aid = self._extract_app_id_from_result(result)
+            if aid:
+                log.info("App created via internal API: %s", aid)
+                return aid
+
         create_apis = [
             r for r in self._captured_requests
             if "create" in r["url"].lower() and r["method"] == "POST"
@@ -558,10 +704,11 @@ class PlaywrightFeishuDriver:
         if create_apis:
             api_url = create_apis[-1]["url"]
             log.info("Trying captured create API: %s", api_url)
-            result = self._js_fetch(api_url, "POST", {"name": name, "desc": desc})
+            result = self._js_fetch(api_url, "POST", body, headers={
+                "x-csrf-token": self._ensure_console_csrf_token(),
+            })
             if result.get("ok"):
-                data = result.get("data", {})
-                aid = data.get("app_id", "") or data.get("data", {}).get("app_id", "")
+                aid = self._extract_app_id_from_result(result)
                 if aid:
                     log.info("App created via API: %s", aid)
                     return aid
@@ -570,14 +717,11 @@ class PlaywrightFeishuDriver:
             "https://open.feishu.cn/open-apis/app/v1/create",
             "https://open.feishu.cn/api/app/create",
         ]:
-            result = self._js_fetch(api_path, "POST", {
-                "app_name": name,
-                "description": desc or f"{name} - HarborNAS AI",
-                "app_type": 0,
+            result = self._js_fetch(api_path, "POST", body, headers={
+                "x-csrf-token": self._ensure_console_csrf_token(),
             })
-            if result.get("ok") and isinstance(result.get("data"), dict):
-                data = result["data"]
-                aid = data.get("app_id", "") or data.get("data", {}).get("app_id", "")
+            if result.get("ok"):
+                aid = self._extract_app_id_from_result(result)
                 if aid:
                     log.info("App via known API: %s", aid)
                     return aid
@@ -694,6 +838,17 @@ class PlaywrightFeishuDriver:
     def enable_bot(self) -> None:
         """Enable the bot capability on the current app."""
         self._ensure_not_internal_error_page()
+        app_id = self._current_app_id()
+        if app_id:
+            result = self._console_api_post(
+                f"developers/v1/robot/switch/{app_id}",
+                {"enable": True},
+                require_csrf=True,
+            )
+            if result.get("ok"):
+                log.info("Bot enabled via internal API for %s", app_id)
+                return
+
         self._screenshot_step("enable_bot_0")
         info = self._js_page_info()
         log.info("Page before enable_bot: %s", json.dumps(info, ensure_ascii=False))
@@ -735,17 +890,92 @@ class PlaywrightFeishuDriver:
     # ================================================================
 
     def set_callback_url(self, url: str) -> None:
-        """Set the event subscription callback URL."""
+        """Configure event subscription for the current app.
+
+        Feishu's current console no longer exposes a stable callback URL form
+        without first configuring subscription mode. Follow the reference
+        implementation instead: add required events via internal API and switch
+        the app to WebSocket long-connection mode.
+        """
         self._ensure_not_internal_error_page()
+        app_id = self._current_app_id()
+        if app_id:
+            event_info = self._console_api_post(
+                f"developers/v1/event/{app_id}",
+                {},
+                require_csrf=True,
+            )
+            event_data = self._unwrap_result_data(event_info)
+
+            existing_events: set[str] = set()
+            for key in ("appEvents", "events"):
+                items = event_data.get(key)
+                if isinstance(items, list):
+                    existing_events.update(item for item in items if isinstance(item, str))
+
+            desired_events = set(_DEFAULT_EVENTS)
+            to_add = sorted(desired_events - existing_events)
+
+            if to_add:
+                update_result = self._console_api_post(
+                    f"developers/v1/event/update/{app_id}",
+                    {
+                        "operation": "add",
+                        "events": [],
+                        "appEvents": to_add,
+                        "userEvents": [],
+                        "eventMode": 4,
+                    },
+                    require_csrf=True,
+                )
+                if not update_result.get("ok"):
+                    log.warning("Failed to add Feishu events via internal API: %s", update_result)
+                else:
+                    log.info("Added Feishu events via internal API: %s", to_add)
+
+            switch_result = self._console_api_post(
+                f"developers/v1/event/switch/{app_id}",
+                {"eventMode": 4},
+                require_csrf=True,
+            )
+            if switch_result.get("ok"):
+                if url:
+                    log.info(
+                        "Configured Feishu event subscription via WebSocket mode for %s; callback URL not required: %s",
+                        app_id,
+                        url,
+                    )
+                else:
+                    log.info("Configured Feishu event subscription via WebSocket mode for %s", app_id)
+                return
+
         self._screenshot_step("set_callback_0")
-        self._js_click("事件订阅", "Event Subscriptions", "Events", timeout_sec=5)
+        click_result = self._js_click(
+            "事件与回调",
+            "事件订阅",
+            "Event Subscriptions",
+            "Events",
+            "Callbacks",
+            timeout_sec=5,
+        )
+        if not click_result.get("found"):
+            self._save_page_html("set_callback_ERR_no_nav")
+            raise RuntimeError("找不到「事件与回调」入口，且内部事件订阅接口调用失败")
         self.page.wait_for_timeout(2000)
 
         fr = self._js_fill(url, "请求地址", "URL", "Request URL", "callback", "request_url")
-        if fr["found"]:
-            self.page.wait_for_timeout(500)
-            self._js_click("保存", "Save", timeout_sec=3)
-            self.page.wait_for_timeout(2000)
+        if not fr["found"]:
+            self._screenshot_step("set_callback_ERR_no_input")
+            self._save_page_html("set_callback_ERR_no_input")
+            raise RuntimeError("内部事件订阅接口调用失败，且当前页面找不到事件回调地址输入框")
+
+        self.page.wait_for_timeout(500)
+        save_result = self._js_click("保存", "Save", timeout_sec=3)
+        if not save_result.get("found"):
+            self._screenshot_step("set_callback_ERR_no_save")
+            self._save_page_html("set_callback_ERR_no_save")
+            raise RuntimeError("找不到保存按钮，无法提交事件回调地址")
+        self.page.wait_for_timeout(2000)
 
         self._screenshot_step("set_callback_1_done")
         log.info("Callback URL set to %s", url)
@@ -757,6 +987,91 @@ class PlaywrightFeishuDriver:
     def grant_permissions(self, scopes: list[str]) -> int:
         """Navigate to permissions page and enable listed scopes."""
         self._ensure_not_internal_error_page()
+        app_id = self._current_app_id()
+        if app_id:
+            all_scopes = self._console_api_post(
+                f"developers/v1/scope/all/{app_id}",
+                {},
+                require_csrf=True,
+            )
+            all_scope_data = self._unwrap_result_data(all_scopes)
+            scope_items = all_scope_data.get("scopes") if isinstance(all_scope_data.get("scopes"), list) else []
+            if scope_items:
+                scope_map: dict[str, dict[str, Any]] = {}
+                for item in scope_items:
+                    if not isinstance(item, dict):
+                        continue
+                    name = item.get("name")
+                    scope_id = item.get("id")
+                    if not isinstance(name, str) or not scope_id:
+                        continue
+                    scope_map[name] = {
+                        "id": scope_id,
+                        "scopeType": self._normalize_scope_types(item),
+                    }
+
+                app_scopes_result = self._console_api_post(
+                    f"developers/v1/scope/list/{app_id}",
+                    {},
+                    require_csrf=True,
+                )
+                app_scope_data = self._unwrap_result_data(app_scopes_result)
+                app_scope_items = app_scope_data.get("scopes") if isinstance(app_scope_data.get("scopes"), list) else []
+
+                current_tenant_scopes: set[str] = set()
+                current_user_scopes: set[str] = set()
+                for item in app_scope_items:
+                    if not isinstance(item, dict):
+                        continue
+                    name = item.get("name")
+                    if not isinstance(name, str):
+                        continue
+                    info = scope_map.get(name)
+                    if not info:
+                        continue
+                    scope_types = info.get("scopeType") or []
+                    if 2 in scope_types:
+                        current_tenant_scopes.add(name)
+                    if 1 in scope_types:
+                        current_user_scopes.add(name)
+
+                desired_tenant_scopes: set[str] = set()
+                desired_user_scopes: set[str] = set()
+                for name in scopes:
+                    info = scope_map.get(name)
+                    if not info:
+                        log.warning("Scope not found in Feishu catalog: %s", name)
+                        continue
+                    scope_types = info.get("scopeType") or []
+                    if 2 in scope_types or not scope_types:
+                        desired_tenant_scopes.add(name)
+                    if 1 in scope_types:
+                        desired_user_scopes.add(name)
+
+                to_add = {
+                    "tenant": sorted(desired_tenant_scopes - current_tenant_scopes),
+                    "user": sorted(desired_user_scopes - current_user_scopes),
+                }
+
+                added_scope_names: set[str] = set()
+                for scope_names in (to_add["tenant"], to_add["user"]):
+                    if not scope_names:
+                        continue
+                    scope_ids = [scope_map[name]["id"] for name in scope_names if name in scope_map]
+                    if not scope_ids:
+                        continue
+                    result = self._console_api_post(
+                        f"developers/v1/scope/update/{app_id}",
+                        {"scopeIds": scope_ids, "operation": "add"},
+                        require_csrf=True,
+                    )
+                    if result.get("ok"):
+                        added_scope_names.update(scope_names)
+
+                if added_scope_names:
+                    log.info("Granted %d permissions via internal API", len(added_scope_names))
+                    return len(added_scope_names)
+
         self._screenshot_step("grant_perms_0")
         self._js_click("权限管理", "Permissions", timeout_sec=5)
         self.page.wait_for_timeout(2000)
@@ -781,6 +1096,18 @@ class PlaywrightFeishuDriver:
     def extract_credentials(self) -> dict[str, str]:
         """Extract app_id + app_secret from the credentials page."""
         self._ensure_not_internal_error_page()
+        app_id = self._current_app_id()
+        if app_id:
+            result = self._console_api_get(f"developers/v1/secret/{app_id}", require_csrf=True)
+            data = self._unwrap_result_data(result)
+            app_secret = ""
+            if isinstance(data, dict):
+                app_secret = str(data.get("secret") or data.get("app_secret") or "")
+            if result.get("ok") and app_secret:
+                self._screenshot_step("extract_creds_2_result")
+                log.info("Extracted credentials via internal API for %s", app_id)
+                return {"app_id": app_id, "app_secret": app_secret}
+
         self._screenshot_step("extract_creds_0")
         self._js_click("凭证与基础信息", "凭证", "Credentials", timeout_sec=5)
         self.page.wait_for_timeout(2000)

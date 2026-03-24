@@ -10,8 +10,8 @@ Flow (fully automatic after QR scan)
 2. **Auto-detect login** — poll until the URL leaves the passport domain.
 3. Create a new custom app for HarborBeacon.
 4. Enable bot capability.
-5. Configure event-subscription callback URL.
-6. Grant required permissions (``im:message``, ``im:message.group_at_msg``).
+5. Configure event subscription (WebSocket long-connection mode).
+6. Grant required permissions (``im:message:readonly``, ``im:message.group_at_msg:readonly``).
 7. Extract ``app_id`` and ``app_secret`` from the credentials page.
 8. Save credentials into HarborBeacon settings.
 
@@ -86,7 +86,7 @@ STEP_DEFINITIONS: list[tuple[str, str, str]] = [
     ("wait_qr_scan",     "Wait for QR code scan",         "等待扫码登录"),
     ("create_app",       "Create custom app",             "创建自建应用"),
     ("enable_bot",       "Enable bot capability",         "启用机器人能力"),
-    ("set_callback_url", "Set event callback URL",        "配置事件回调地址"),
+    ("set_callback_url", "Configure event subscription",  "配置事件订阅"),
     ("grant_permissions","Grant required permissions",     "授予所需权限"),
     ("extract_creds",    "Extract app credentials",       "提取应用凭证"),
     ("save_settings",    "Save to HarborBeacon settings", "保存至 HarborBeacon 配置"),
@@ -163,15 +163,15 @@ class FeishuBrowserSetupFlow:
     FEISHU_CREATE_APP_URL = "https://open.feishu.cn/app?lang=zh-CN"
 
     REQUIRED_PERMISSIONS = [
-        "im:message",
-        "im:message.group_at_msg",
+        "im:message:readonly",
+        "im:message.group_at_msg:readonly",
         "im:message:send_as_bot",
     ]
 
     def __init__(
         self,
         browser_handler: Any | None = None,
-        callback_url: str = "",
+        callback_url: str = "",  # event subscription callback URL (optional, ignored when WebSocket mode is used)
         app_name: str = "HarborBeacon-Bot",
         use_playwright: bool = False,
         headless: bool = False,
@@ -382,11 +382,11 @@ class FeishuBrowserSetupFlow:
         url = self._callback_url or "https://<your-nas-ip>:8443/api/v2.0/harborbeacon/webhook/feishu"
         if self._use_playwright and self._driver:
             self._driver.set_callback_url(url)
-            return f"事件回调已设为 {url}"
+            return "事件订阅已配置为长连接模式"
         if self._browser:
             self._browser.handle("click", selector='input[name="callback_url"]')
             return f"事件回调已设为 {url}"
-        return f"[stub] 事件回调已设为 {url}"
+        return "[stub] 事件订阅已配置为长连接模式"
 
     def _step_grant_permissions(self, session: FeishuBrowserSetupSession) -> str:
         permissions = self.REQUIRED_PERMISSIONS

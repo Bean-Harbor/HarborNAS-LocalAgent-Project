@@ -7,7 +7,7 @@ Flow:
   1. Launches Chromium (non-headless) → navigates to Feishu Open Platform
   2. Shows QR code — user scans with Feishu App
   3. **Auto-detects login** (no Enter key or button click required)
-  4. Attempts automated: create app → enable bot → set callback → permissions → extract creds
+    4. Attempts automated: create app → enable bot → configure events → permissions → extract creds
 
 Each step saves a debug screenshot to /tmp/feishu_step_*.png regardless of
 success or failure, so you can inspect what the browser saw.
@@ -48,7 +48,7 @@ def main() -> None:
         use_playwright=True,
         headless=False,
         app_name="HarborBeacon-Bot",
-        callback_url="https://192.168.1.100:8443/api/v2.0/harborbeacon/webhook/feishu",
+        callback_url="",
     )
 
     # run_blocking() does everything: open browser → wait for QR scan → auto-continue
