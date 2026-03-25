@@ -133,21 +133,22 @@ class TestPlaywrightDriverMocked:
             require_csrf=True,
         )
 
-    def test_set_callback_url_prefers_internal_event_api(self, mock_pw: dict) -> None:
+    def test_set_callback_url_prefers_dom_then_verifies_with_api(self, mock_pw: dict) -> None:
         driver = PlaywrightFeishuDriver(headless=True)
         driver.launch()
         driver._last_app_id = "cli_test123"
+        driver._add_events_via_dom = MagicMock(return_value=True)
         driver._console_api_post = MagicMock(side_effect=[
             {"ok": True, "data": {"data": {"appEvents": []}}},
-            {"ok": True, "data": {}},
+            {"ok": True, "data": {"data": {"appEvents": ["im.message.receive_v1"]}}},
             {"ok": True, "data": {}},
         ])
 
         driver.set_callback_url("https://example.invalid/webhook/feishu")
 
         assert driver._console_api_post.call_args_list[0].args[0] == "developers/v1/event/cli_test123"
-        assert driver._console_api_post.call_args_list[1].args[0] == "developers/v1/event/update/cli_test123"
-        assert driver._console_api_post.call_args_list[1].args[1]["appEvents"] == ["im.message.receive_v1"]
+        driver._add_events_via_dom.assert_called_once_with(["im.message.receive_v1"], "cli_test123")
+        assert driver._console_api_post.call_args_list[1].args[0] == "developers/v1/event/cli_test123"
         assert driver._console_api_post.call_args_list[2].args[0] == "developers/v1/event/switch/cli_test123"
         assert driver._console_api_post.call_args_list[2].args[1] == {"eventMode": 4}
 

@@ -198,6 +198,18 @@ class FeishuBrowserSetupFlow:
         # Step 1: open login page
         self._run_step(session, "open_login", self._step_open_login)
 
+        # If browser startup failed, keep the session in error state and do
+        # not advance QR/login-related states.
+        if session.status == "error":
+            self._mark_step(
+                session,
+                "wait_qr_scan",
+                SetupStepStatus.FAILED,
+                detail="登录页未打开，无法继续扫码。",
+            )
+            _save_session(session)
+            return session
+
         if not self._use_playwright:
             # Non-Playwright: pause for manual resume
             self._mark_step(session, "wait_qr_scan", SetupStepStatus.WAIT_USER,
@@ -252,12 +264,18 @@ class FeishuBrowserSetupFlow:
         Useful for scripts and tests.
         """
         session = self.start()
-        if self._use_playwright:
+        # If startup already failed (e.g. browser launch), do not continue and
+        # overwrite the root cause with follow-up errors.
+        if self._use_playwright and session.status != "error":
             self._auto_login_and_continue(session)
         return session
 
     def _auto_login_and_continue(self, session: FeishuBrowserSetupSession) -> None:
         """Wait for login polling, then run all remaining steps."""
+        if session.status == "error":
+            self._cleanup_driver(session.session_id)
+            return
+
         # Step 2: auto-detect login via Playwright polling
         if self._driver:
             try:
@@ -275,6 +293,16 @@ class FeishuBrowserSetupFlow:
                                 detail=str(exc))
                 session.status = "error"
                 session.error = str(exc)
+                _save_session(session)
+                self._cleanup_driver(session.session_id)
+                return
+            except Exception as exc:  # noqa: BLE001
+                # Browser window may be closed manually while waiting for QR scan.
+                # Keep a user-friendly error state instead of bubbling traceback.
+                self._mark_step(session, "wait_qr_scan", SetupStepStatus.FAILED,
+                                detail=f"扫码流程中断: {exc}")
+                session.status = "error"
+                session.error = f"扫码流程中断: {exc}"
                 _save_session(session)
                 self._cleanup_driver(session.session_id)
                 return

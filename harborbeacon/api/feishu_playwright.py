@@ -799,6 +799,13 @@ class PlaywrightFeishuDriver:
             app_id = result["app_id"]
             log.info("Found new app in list: %s", app_id)
             return app_id
+        if result.get("clicked"):
+            self.page.wait_for_timeout(3000)
+            match = re.search(r"/app/(cli_[a-zA-Z0-9]+)", self.page.url)
+            if match:
+                app_id = match.group(1)
+                log.info("Opened newly-created app from list, extracted ID: %s", app_id)
+                return app_id
         
         # Do not fabricate app_id; this causes downstream navigation failures.
         log.warning("Could not extract app_id after app creation")
@@ -809,20 +816,53 @@ class PlaywrightFeishuDriver:
         try:
             result = self.page.evaluate(
                 r"""(target_name) => {
-                    // 在列表中查找包含应用名称的元素
-                    const matches = [];
-                    document.querySelectorAll('a, div, span').forEach(el => {
-                        const text = (el.innerText || el.textContent || '').trim();
-                        if (text.includes(target_name)) {
-                            // 尝试从 href 或 data 属性获取 app_id
-                            const href = el.href || el.closest('a')?.href || '';
-                            const match = href.match(/[?&/]app[?/=]?(cli_[^?&\/ ]+)/);
-                            if (match) {
-                                matches.push({name: text, app_id: match[1]});
-                            }
+                    const normalize = (s) => (s || '').replace(/\s+/g, ' ').trim();
+
+                    // Prefer visible table/list rows. Feishu currently sorts the newest app first.
+                    const rows = Array.from(document.querySelectorAll('tr, [role="row"], a, div'))
+                        .filter(el => el && el.offsetParent !== null);
+
+                    const candidates = [];
+                    for (const el of rows) {
+                        const text = normalize(el.innerText || el.textContent || '');
+                        if (!text || !text.includes(target_name)) continue;
+
+                        const anchor = el.tagName === 'A' ? el : el.closest('a') || el.querySelector('a');
+                        const href = anchor?.href || '';
+                        const match = href.match(/\/app\/(cli_[a-zA-Z0-9]+)/);
+                        if (match) {
+                            candidates.push({name: text, app_id: match[1], href, clickable: false});
+                            continue;
                         }
+
+                        // Keep clickable row candidates even when href is not directly exposed.
+                        if (el.tagName === 'TR' || el.getAttribute('role') === 'row' || text.startsWith(target_name)) {
+                            candidates.push({name: text, app_id: '', href: '', clickable: true});
+                        }
+                    }
+
+                    if (candidates.length === 0) {
+                        return {app_id: '', clicked: false};
+                    }
+
+                    if (candidates[0].app_id) {
+                        return {app_id: candidates[0].app_id, clicked: false};
+                    }
+
+                    // Fallback: click the first matching visible row/card and let caller extract app_id from URL.
+                    const row = rows.find(el => {
+                        const text = normalize(el.innerText || el.textContent || '');
+                        return text && text.includes(target_name) &&
+                            (el.tagName === 'TR' || el.getAttribute('role') === 'row' || text.startsWith(target_name));
                     });
-                    return matches.length > 0 ? matches[0] : {app_id: ''};
+                    if (!row) {
+                        return {app_id: '', clicked: false};
+                    }
+
+                    const clickable = row.querySelector('a, button, [role="button"]') || row;
+                    clickable.scrollIntoView({block: 'center'});
+                    clickable.click();
+                    return {app_id: '', clicked: true};
                 }""",
                 app_name
             )
@@ -892,19 +932,36 @@ class PlaywrightFeishuDriver:
     def set_callback_url(self, url: str) -> None:
         """Configure event subscription for the current app.
 
-        Feishu's current console no longer exposes a stable callback URL form
-        without first configuring subscription mode. Follow the reference
-        implementation instead: add required events via internal API and switch
-        the app to WebSocket long-connection mode.
+        Strategy (in order):
+        1. Navigate to the event-subscribe page so the API runs in correct page context.
+        2. Try internal API (developers/v1/event/update) — log full error on failure.
+        3. Re-verify whether events persisted regardless of API status code.
+        4. If events still missing, use DOM automation (_add_events_via_dom).
+        5. Set event mode to WebSocket long-connection (eventMode=4) via event/switch.
         """
         self._ensure_not_internal_error_page()
         app_id = self._current_app_id()
         if app_id:
+            # ── Step 0: navigate to event subscription page first ──────────────
+            event_sub_url = f"https://open.feishu.cn/app/{app_id}/event-subscribe"
+            log.info("Navigating to event subscription page: %s", event_sub_url)
+            try:
+                self.page.goto(event_sub_url, wait_until="domcontentloaded", timeout=15_000)
+            except Exception as e:
+                log.warning("Navigation to event-subscribe page failed: %s", e)
+            self.page.wait_for_timeout(2500)
+            # Force CSRF refresh after page navigation
+            self._x_csrf_token = ""
+            self._ensure_console_csrf_token(force_refresh=True)
+            self._screenshot_step("set_callback_event_page")
+
+            # ── Step 1: fetch current event state ─────────────────────────────
             event_info = self._console_api_post(
                 f"developers/v1/event/{app_id}",
                 {},
                 require_csrf=True,
             )
+            log.info("Event info response: status=%s raw=%s", event_info.get("status"), event_info.get("data"))
             event_data = self._unwrap_result_data(event_info)
 
             existing_events: set[str] = set()
@@ -915,70 +972,433 @@ class PlaywrightFeishuDriver:
 
             desired_events = set(_DEFAULT_EVENTS)
             to_add = sorted(desired_events - existing_events)
+            events_configured = True
+            missing_after_api: list[str] = []
 
             if to_add:
-                update_result = self._console_api_post(
-                    f"developers/v1/event/update/{app_id}",
-                    {
-                        "operation": "add",
-                        "events": [],
-                        "appEvents": to_add,
-                        "userEvents": [],
-                        "eventMode": 4,
-                    },
+                # Public GitHub Feishu bot projects document event setup as a
+                # manual developer-console flow. Prefer DOM automation first,
+                # then use the undocumented internal API only as a fallback.
+                dom_added = self._add_events_via_dom(to_add, app_id)
+
+                # ── Step 3: re-verify whether events persisted ─────────────────
+                verify_info = self._console_api_post(
+                    f"developers/v1/event/{app_id}",
+                    {},
                     require_csrf=True,
                 )
-                if not update_result.get("ok"):
-                    log.warning("Failed to add Feishu events via internal API: %s", update_result)
-                else:
-                    log.info("Added Feishu events via internal API: %s", to_add)
+                verify_data = self._unwrap_result_data(verify_info)
+                verify_existing: set[str] = set()
+                for key in ("appEvents", "events"):
+                    items = verify_data.get(key)
+                    if isinstance(items, list):
+                        verify_existing.update(item for item in items if isinstance(item, str))
+                missing_after_api = sorted(desired_events - verify_existing)
 
+                if missing_after_api:
+                    log.warning("Events still missing after DOM attempt: %s — trying internal API fallback", missing_after_api)
+                    # ── Step 4: try event/update (multiple payload shapes) ─────
+                    # NOTE: `event/update` is an undocumented internal console API.
+                    update_payloads: list[dict[str, Any]] = [
+                        {
+                            "operation": "add",
+                            "events": [],
+                            "appEvents": missing_after_api,
+                            "userEvents": [],
+                            "eventMode": 4,
+                        },
+                        {"operation": "add", "appEvents": missing_after_api},
+                        {"operation": "add", "events": missing_after_api},
+                        {"appEvents": missing_after_api},
+                        {"events": missing_after_api},
+                        {"appEvents": [{"eventType": event_name} for event_name in missing_after_api]},
+                        {"eventTypes": missing_after_api},
+                    ]
+
+                    for payload in update_payloads:
+                        update_result = self._console_api_post(
+                            f"developers/v1/event/update/{app_id}",
+                            payload,
+                            require_csrf=True,
+                        )
+                        if update_result.get("ok"):
+                            log.info("Added Feishu events via internal API payload=%s: %s", payload, missing_after_api)
+                            break
+                        resp_data = update_result.get("data") or {}
+                        log.warning(
+                            "event/update rejected: status=%s code=%s msg=%s | payload=%s",
+                            update_result.get("status"),
+                            resp_data.get("code") if isinstance(resp_data, dict) else resp_data,
+                            resp_data.get("msg") if isinstance(resp_data, dict) else "",
+                            payload,
+                        )
+
+                    verify_info = self._console_api_post(
+                        f"developers/v1/event/{app_id}",
+                        {},
+                        require_csrf=True,
+                    )
+                    verify_data = self._unwrap_result_data(verify_info)
+                    verify_existing = set()
+                    for key in ("appEvents", "events"):
+                        items = verify_data.get(key)
+                        if isinstance(items, list):
+                            verify_existing.update(item for item in items if isinstance(item, str))
+                    missing_after_api = sorted(desired_events - verify_existing)
+                    if missing_after_api:
+                        events_configured = False
+                elif not dom_added:
+                    events_configured = False
+
+            # ── Step 5: switch event mode to WebSocket long-connection ─────────
             switch_result = self._console_api_post(
                 f"developers/v1/event/switch/{app_id}",
                 {"eventMode": 4},
                 require_csrf=True,
             )
+            log.info("event/switch result: %s", switch_result.get("status"))
             if switch_result.get("ok"):
-                if url:
-                    log.info(
-                        "Configured Feishu event subscription via WebSocket mode for %s; callback URL not required: %s",
-                        app_id,
-                        url,
+                if not events_configured:
+                    raise RuntimeError(
+                        "事件订阅模式已切换，但事件未成功添加。"
+                        f" 缺失事件: {', '.join(missing_after_api or to_add)}"
                     )
-                else:
-                    log.info("Configured Feishu event subscription via WebSocket mode for %s", app_id)
+                log.info("Configured Feishu event subscription via WebSocket mode for %s", app_id)
                 return
+            log.warning("event/switch failed: %s — will try DOM mode switch", switch_result)
 
+        # ── Fallback: DOM-based full configuration ─────────────────────────────
         self._screenshot_step("set_callback_0")
-        click_result = self._js_click(
-            "事件与回调",
-            "事件订阅",
-            "Event Subscriptions",
-            "Events",
-            "Callbacks",
-            timeout_sec=5,
+        log.warning("Internal API path unavailable; falling back to DOM-only event subscription")
+        dom_ok = self._add_events_via_dom(_DEFAULT_EVENTS, app_id or "")
+        if not dom_ok:
+            self._save_page_html("set_callback_ERR_dom_failed")
+            raise RuntimeError(
+                "事件订阅配置失败：内部 API 和 DOM 操作均未能添加事件。"
+                " 请手动进入「事件与回调」页面配置 im.message.receive_v1。"
+            )
+
+    def _add_events_via_dom(self, events: list[str], app_id: str = "") -> bool:
+        """Add events via UI DOM automation.
+
+        Steps:
+        1. Navigate directly to event-subscribe page URL (more reliable than clicking nav).
+        2. Set event subscription mode to "长连接" (WebSocket) via UI if not already set.
+        3. Click "添加事件" button.
+        4. Search by event type string (works in the console search box).
+        5. Click the event item (may be a checkbox or list row).
+        6. Confirm.
+        """
+        if not events:
+            return True
+
+        # ── Step 1: navigate to event page via direct URL ──────────────────────
+        target_app_id = app_id or self._current_app_id() or ""
+        if target_app_id:
+            event_url = f"https://open.feishu.cn/app/{target_app_id}/event-subscribe"
+            log.info("DOM fallback: navigating to %s", event_url)
+            try:
+                self.page.goto(event_url, wait_until="domcontentloaded", timeout=15_000)
+            except Exception as e:
+                log.warning("DOM fallback: page navigation failed: %s", e)
+        self.page.wait_for_timeout(2500)
+        self._screenshot_step("dom_event_page_load")
+
+        # ── Step 2: log page state to diagnose available UI elements ──────────
+        info = self._js_page_info()
+        log.info("DOM fallback: page buttons=%s", info.get("buttons", []))
+
+        # Some app pages redirect to the capability page first. If that happens,
+        # explicitly click the left-nav entry for event subscriptions before
+        # searching for add-event controls.
+        if any("添加应用能力" in button for button in info.get("buttons", [])):
+            nav_result = self._js_click("事件与回调", timeout_sec=4)
+            if nav_result.get("found"):
+                log.info("DOM fallback: navigated to event page via sidebar")
+                self.page.wait_for_timeout(2000)
+                self._screenshot_step("dom_event_page_after_nav")
+                info = self._js_page_info()
+                log.info("DOM fallback: page buttons after nav=%s", info.get("buttons", []))
+
+        # Ensure we are on the event config tab and remove intro overlays that
+        # can block the "添加事件" button and subscription settings controls.
+        self._js_click("事件配置", timeout_sec=2)
+        self.page.wait_for_timeout(600)
+        self._dismiss_event_intro_overlay()
+
+        # Configure subscription type first when page shows "订阅方式 未配置".
+        self._ensure_subscription_type_configured()
+        self._dismiss_event_intro_overlay()
+
+        # ── Step 3: try to activate long-connection (WebSocket) mode in the UI ─
+        # The mode selector might be a radio button, dropdown, or toggle.
+        # Common labels: "长连接" / "长连接模式" / "WebSocket" / "长连接订阅"
+        mode_clicked = self._js_click(
+            "长连接", "长连接模式", "WebSocket", "长连接订阅",
+            timeout_sec=3,
         )
-        if not click_result.get("found"):
-            self._save_page_html("set_callback_ERR_no_nav")
-            raise RuntimeError("找不到「事件与回调」入口，且内部事件订阅接口调用失败")
-        self.page.wait_for_timeout(2000)
+        if mode_clicked.get("found"):
+            log.info("DOM fallback: switched to long-connection mode via UI")
+            self.page.wait_for_timeout(1500)
+            self._screenshot_step("dom_event_mode_set")
+        else:
+            log.info("DOM fallback: long-connection mode UI element not found (may already be set)")
 
-        fr = self._js_fill(url, "请求地址", "URL", "Request URL", "callback", "request_url")
-        if not fr["found"]:
-            self._screenshot_step("set_callback_ERR_no_input")
-            self._save_page_html("set_callback_ERR_no_input")
-            raise RuntimeError("内部事件订阅接口调用失败，且当前页面找不到事件回调地址输入框")
+        # ── Step 4: add each event via the dialog ─────────────────────────────
+        added = 0
+        for event_type in events:
+            log.info("DOM fallback: adding event %s", event_type)
 
-        self.page.wait_for_timeout(500)
-        save_result = self._js_click("保存", "Save", timeout_sec=3)
-        if not save_result.get("found"):
-            self._screenshot_step("set_callback_ERR_no_save")
-            self._save_page_html("set_callback_ERR_no_save")
-            raise RuntimeError("找不到保存按钮，无法提交事件回调地址")
-        self.page.wait_for_timeout(2000)
+            # Click "添加事件" to open the event picker dialog
+            add_btn = self.page.evaluate(
+                """() => {
+                    const normalize = (s) => (s || '').replace(/\\s+/g, '').trim();
+                    const exactTargets = ['添加事件', '+添加事件', 'AddEvent', '添加事件类型'];
+                    const els = Array.from(document.querySelectorAll(
+                        'button, a, [role="button"], span[class*="btn"], div[class*="btn"]'
+                    )).filter(el => el.offsetParent !== null);
 
-        self._screenshot_step("set_callback_1_done")
-        log.info("Callback URL set to %s", url)
+                    for (const el of els) {
+                        const text = normalize(el.innerText || el.textContent || '');
+                        if (!text) continue;
+                        if (exactTargets.includes(text)) {
+                            el.scrollIntoView({block: 'center'});
+                            el.click();
+                            return {found: true, text};
+                        }
+                    }
+
+                    for (const el of els) {
+                        const text = normalize(el.innerText || el.textContent || '');
+                        if (!text || text.includes('添加应用能力')) continue;
+                        if (text.includes('添加事件')) {
+                            el.scrollIntoView({block: 'center'});
+                            el.click();
+                            return {found: true, text};
+                        }
+                    }
+                    return {found: false};
+                }"""
+            )
+            if not add_btn.get("found"):
+                log.warning("DOM fallback: '添加事件' button not found; page buttons: %s",
+                            self._js_page_info().get("buttons", []))
+                self._screenshot_step("dom_event_no_add_btn")
+                continue
+
+            self.page.wait_for_timeout(800)
+
+            # Some pages do not use a formal modal dialog. Detect whether an
+            # add-event panel is actually open before trying to fill fields.
+            panel_open = bool(self.page.evaluate(
+                """() => {
+                    const dialogs = Array.from(document.querySelectorAll('[role="dialog"], .ant-modal, .semi-modal'))
+                        .filter(el => el.offsetParent !== null);
+                    if (dialogs.length > 0) return true;
+                    const hasSearch = Array.from(document.querySelectorAll('input, textarea'))
+                        .some(el => {
+                            if (el.offsetParent === null) return false;
+                            const ph = (el.placeholder || '').toLowerCase();
+                            const nm = (el.name || '').toLowerCase();
+                            return ph.includes('搜索') || ph.includes('search') || ph.includes('事件') || nm.includes('event');
+                        });
+                    return hasSearch;
+                }"""
+            ))
+            if not panel_open:
+                log.warning("DOM fallback: add-event panel did not open after click")
+                self._screenshot_step("dom_event_panel_not_open")
+                continue
+
+            self._screenshot_step(f"dom_event_dialog_{event_type.replace('.', '_')}")
+
+            # Search by event type string — the Feishu console search accepts the API name
+            filled = self._js_fill_in_dialog(
+                event_type,
+                "搜索", "Search", "搜索事件", "事件名称", "event",
+                timeout_sec=3,
+            )
+            if filled.get("found"):
+                self.page.wait_for_timeout(1000)  # wait for search results
+            else:
+                # Fallback to global fill when the panel is not a strict dialog.
+                filled = self._js_fill(
+                    event_type,
+                    "搜索", "Search", "搜索事件", "事件名称", "event",
+                    timeout_sec=2,
+                )
+                if not filled.get("found"):
+                    log.warning("DOM fallback: search input not found for %s", event_type)
+
+            self._screenshot_step(f"dom_event_search_{event_type.replace('.', '_')}")
+
+            # Try clicking the event in the list by various strategies:
+            # Strategy A: click a row/item containing the event type string exactly
+            item_clicked = self.page.evaluate(
+                """(eventType) => {
+                    const dialogs = Array.from(document.querySelectorAll('[role="dialog"], .ant-modal, .semi-modal'))
+                        .filter(el => el && el.offsetParent !== null);
+                    const root = dialogs.length ? dialogs[dialogs.length - 1] : document;
+                    const candidates = Array.from(
+                        root.querySelectorAll('li, tr, [role="option"], [role="row"], .event-item, [class*="list-item"], [class*="eventItem"]')
+                    ).filter(el => el.offsetParent !== null && el.textContent && el.textContent.includes(eventType));
+                    if (candidates.length > 0) {
+                        candidates[0].click();
+                        return {found: true, text: candidates[0].innerText?.slice(0, 60), mode: 'row'};
+                    }
+
+                    const exactButtons = Array.from(root.querySelectorAll('button, [role="button"], a'))
+                        .filter(el => el.offsetParent !== null && (el.innerText || '').includes(eventType));
+                    if (exactButtons.length > 0) {
+                        exactButtons[0].click();
+                        return {found: true, text: exactButtons[0].innerText?.slice(0, 60), mode: 'button'};
+                    }
+
+                    const checkboxes = Array.from(root.querySelectorAll('input[type="checkbox"]'))
+                        .filter(c => c.offsetParent !== null && !c.checked);
+                    if (checkboxes.length > 0) {
+                        checkboxes[0].click();
+                        return {found: true, text: 'checkbox', mode: 'checkbox'};
+                    }
+                    return {found: false};
+                }""",
+                event_type,
+            )
+            if not item_clicked.get("found"):
+                log.warning("DOM fallback: event item not found in search results for %s", event_type)
+                self._screenshot_step(f"dom_event_notfound_{event_type.replace('.', '_')}")
+                # Don't give up — still try to confirm what's selected
+            else:
+                log.info("DOM fallback: clicked event item via %s: %s", item_clicked.get("mode"), event_type)
+
+            self.page.wait_for_timeout(500)
+
+            # Confirm the selection
+            confirm = self._js_click_in_dialog("确定", "确认", "添加", "Add", "OK", timeout_sec=4)
+            if confirm.get("found"):
+                added += 1
+                log.info("DOM fallback: confirmed event %s", event_type)
+                self.page.wait_for_timeout(800)
+                self._screenshot_step(f"dom_event_confirmed_{event_type.replace('.', '_')}")
+            else:
+                log.warning("DOM fallback: confirm button not found after selecting %s; page buttons=%s",
+                            event_type, self._js_page_info().get("buttons", []))
+                self._screenshot_step(f"dom_event_no_confirm_{event_type.replace('.', '_')}")
+                # Try pressing Enter as alternative confirmation
+                self.page.keyboard.press("Enter")
+                self.page.wait_for_timeout(500)
+
+        ok = added == len(events)
+        if ok:
+            log.info("DOM fallback successfully added all events: %s", events)
+        else:
+            log.warning("DOM fallback added %d/%d events; screenshot saved", added, len(events))
+        return ok
+
+    def _dismiss_event_intro_overlay(self) -> None:
+        """Best-effort dismissal of floating guide/intro overlays on event page."""
+        try:
+            result = self.page.evaluate(
+                """() => {
+                    const clicked = [];
+                    const texts = ['收起介绍', '我知道了', '知道了', '关闭', 'Close', 'Got it'];
+                    const els = Array.from(document.querySelectorAll('button, a, [role="button"], span'))
+                        .filter(el => el.offsetParent !== null);
+
+                    for (const el of els) {
+                        const t = (el.innerText || el.textContent || '').trim();
+                        if (!t) continue;
+                        if (texts.some(txt => t.includes(txt))) {
+                            el.click();
+                            clicked.push(t.slice(0, 40));
+                        }
+                    }
+
+                    // Generic close icon in tooltip/popover/card.
+                    const closeEls = Array.from(document.querySelectorAll(
+                        '[aria-label*="关闭"], [aria-label*="close"], .ant-popover-close, .semi-popover-close, .ant-tooltip-close'
+                    )).filter(el => el.offsetParent !== null);
+                    for (const el of closeEls) {
+                        el.click();
+                        clicked.push('close-icon');
+                    }
+                    return clicked;
+                }"""
+            )
+            if result:
+                log.info("Dismissed event intro overlay controls: %s", result)
+        except Exception as e:
+            log.debug("Dismiss overlay failed: %s", e)
+        try:
+            self.page.keyboard.press("Escape")
+        except Exception:
+            pass
+        self.page.wait_for_timeout(300)
+
+    def _ensure_subscription_type_configured(self) -> None:
+        """Configure event subscription type when UI reports '未配置'."""
+        try:
+            state = self.page.evaluate(
+                """() => {
+                    const rootText = (document.body?.innerText || '');
+                    const needConfig = rootText.includes('订阅方式') && rootText.includes('未配置');
+                    if (!needConfig) return {needConfig: false, clickedEdit: false};
+
+                    const clickable = Array.from(document.querySelectorAll('button, a, [role="button"], span, i'))
+                        .filter(el => el.offsetParent !== null);
+
+                    // Prefer controls near the subscription section.
+                    for (const el of clickable) {
+                        const t = (el.innerText || el.textContent || '').trim();
+                        if (t.includes('编辑') || t.includes('配置') || t.includes('修改')) {
+                            el.click();
+                            return {needConfig: true, clickedEdit: true, by: t};
+                        }
+                    }
+
+                    // Fallback: click pencil/edit icon by class names.
+                    const icon = document.querySelector('[class*="edit"], [class*="pen"], [aria-label*="编辑"]');
+                    if (icon && icon.offsetParent !== null) {
+                        icon.click();
+                        return {needConfig: true, clickedEdit: true, by: 'icon'};
+                    }
+                    return {needConfig: true, clickedEdit: false};
+                }"""
+            )
+        except Exception as e:
+            log.warning("Failed to inspect subscription type state: %s", e)
+            return
+
+        if not state.get("needConfig"):
+            return
+
+        if state.get("clickedEdit"):
+            log.info("Subscription type is unconfigured, opened editor via %s", state.get("by"))
+            self.page.wait_for_timeout(800)
+
+        # Select app-level subscription type and confirm.
+        selected = self._js_click_in_dialog(
+            "应用身份订阅", "应用身份", "tenant_access_token",
+            timeout_sec=4,
+        )
+        if not selected.get("found"):
+            selected = self._js_click(
+                "应用身份订阅", "应用身份", "tenant_access_token",
+                timeout_sec=3,
+            )
+        if selected.get("found"):
+            log.info("Selected subscription type control: %s", selected.get("text"))
+
+        confirmed = self._js_click_in_dialog("确定", "保存", "完成", "Confirm", "Save", timeout_sec=4)
+        if not confirmed.get("found"):
+            confirmed = self._js_click("确定", "保存", "完成", "Confirm", "Save", timeout_sec=3)
+
+        if confirmed.get("found"):
+            log.info("Subscription type configured via DOM")
+            self.page.wait_for_timeout(1000)
+            self._screenshot_step("dom_event_subscription_configured")
+        else:
+            log.warning("Could not confirm subscription type dialog")
 
     # ================================================================
     # Permissions
