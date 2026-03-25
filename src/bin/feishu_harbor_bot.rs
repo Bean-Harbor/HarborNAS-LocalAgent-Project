@@ -14,6 +14,7 @@ use clap::Parser;
 use prost::Message;
 use serde_json::{json, Value};
 use std::net::TcpStream;
+use std::thread;
 use std::time::Duration;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::WebSocket;
@@ -509,10 +510,6 @@ fn main() {
     println!("  OK");
 
     println!("[3/3] Connecting to Feishu WebSocket ...");
-    let (mut ws, resp) = tungstenite::connect(&ws_url).unwrap_or_else(|e| {
-        eprintln!("FAIL: {e}"); std::process::exit(1);
-    });
-    println!("  OK — HTTP {}", resp.status());
     println!();
     println!("╔═══════════════════════════════════════════════════════════╗");
     println!("║  HarborOS Command Bot running!                           ║");
@@ -521,43 +518,59 @@ fn main() {
     println!("╚═══════════════════════════════════════════════════════════╝");
     println!();
 
-    let ping = build_ping_frame(service_id);
-    ws.send(tungstenite::Message::Binary(ping.into())).ok();
-
-    let mut msg_count = 0u64;
-
     loop {
-        match ws.read() {
-            Ok(tungstenite::Message::Binary(data)) => {
-                match PbFrame::decode(data.as_ref()) {
-                    Ok(frame) => bot.handle_frame(&frame, &mut ws),
-                    Err(e) => println!("[WARN] decode failed: {e}"),
-                }
-                println!("---");
-                msg_count += 1;
-                if msg_count % 10 == 0 {
-                    let ping = build_ping_frame(service_id);
-                    ws.send(tungstenite::Message::Binary(ping.into())).ok();
-                }
-            }
-            Ok(tungstenite::Message::Text(text)) => {
-                println!("[TEXT] {text}");
-                println!("---");
-            }
-            Ok(tungstenite::Message::Ping(data)) => {
-                ws.send(tungstenite::Message::Pong(data)).ok();
-            }
-            Ok(tungstenite::Message::Close(frame)) => {
-                println!("[CLOSE] {:?}", frame);
-                break;
-            }
-            Ok(_) => {}
+        let (mut ws, resp) = match tungstenite::connect(&ws_url) {
+            Ok(pair) => pair,
             Err(e) => {
-                eprintln!("[ERROR] WebSocket: {e}");
-                break;
+                eprintln!("[ERROR] Connect failed: {e}; retrying in 3s...");
+                thread::sleep(Duration::from_secs(3));
+                continue;
             }
+        };
+
+        println!("[WS] connected (HTTP {})", resp.status());
+        let ping = build_ping_frame(service_id);
+        ws.send(tungstenite::Message::Binary(ping.into())).ok();
+
+        let mut msg_count = 0u64;
+
+        let should_reconnect = loop {
+            match ws.read() {
+                Ok(tungstenite::Message::Binary(data)) => {
+                    match PbFrame::decode(data.as_ref()) {
+                        Ok(frame) => bot.handle_frame(&frame, &mut ws),
+                        Err(e) => println!("[WARN] decode failed: {e}"),
+                    }
+                    println!("---");
+                    msg_count += 1;
+                    if msg_count % 10 == 0 {
+                        let ping = build_ping_frame(service_id);
+                        ws.send(tungstenite::Message::Binary(ping.into())).ok();
+                    }
+                }
+                Ok(tungstenite::Message::Text(text)) => {
+                    println!("[TEXT] {text}");
+                    println!("---");
+                }
+                Ok(tungstenite::Message::Ping(data)) => {
+                    ws.send(tungstenite::Message::Pong(data)).ok();
+                }
+                Ok(tungstenite::Message::Close(frame)) => {
+                    println!("[CLOSE] {:?}", frame);
+                    break true;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("[ERROR] WebSocket: {e}");
+                    break true;
+                }
+            }
+        };
+
+        if should_reconnect {
+            println!("[WS] disconnected; reconnecting in 3s...");
+            thread::sleep(Duration::from_secs(3));
+            continue;
         }
     }
-
-    println!("Bot stopped.");
 }
