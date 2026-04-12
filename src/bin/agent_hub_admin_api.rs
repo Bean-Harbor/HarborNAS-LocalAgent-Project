@@ -11,11 +11,11 @@ use serde_json::json;
 use tiny_http::{Header, Method, Request, Response, ResponseBox, Server, StatusCode};
 
 use harbornas_local_agent::runtime::admin_console::{
-    AdminConsoleStore, AdminDefaults, FeishuUserBinding,
+    AdminConsoleState, AdminConsoleStore, AdminDefaults, FeishuUserBinding, FeishuBotConfig,
 };
 use harbornas_local_agent::runtime::hub::{
-    CameraConnectRequest, CameraHubService, HubManualAddSummary, HubScanRequest, HubScanSummary,
-    HubStateSnapshot,
+    build_mobile_setup_url, CameraConnectRequest, CameraHubService, HubManualAddSummary,
+    HubScanRequest, HubScanSummary, HubStateSnapshot,
 };
 use harbornas_local_agent::runtime::remote_view;
 use harbornas_local_agent::runtime::registry::DeviceRegistryStore;
@@ -126,6 +126,14 @@ impl AdminApi {
         let method = request.method().clone();
         let path = request.url().split('?').next().unwrap_or("/");
         let remote_addr = request.remote_addr().copied();
+        let headers = request.headers().to_vec();
+
+        if is_admin_surface_path(path) {
+            if let Err(error) = ensure_local_admin_access(remote_addr, &headers) {
+                let _ = request.respond(error_json(StatusCode(403), &error).boxed());
+                return;
+            }
+        }
 
         let response = match method {
             Method::Get if path == "/healthz" => ok_json(&json!({"status":"ok"})).boxed(),
@@ -144,13 +152,13 @@ impl AdminApi {
                 self.handle_shared_live_view_page(path).boxed()
             }
             Method::Get if path.starts_with("/live/cameras/") => {
-                self.handle_live_view_page(path, remote_addr).boxed()
+                self.handle_live_view_page(path, remote_addr, &headers).boxed()
             }
             Method::Get if path.starts_with("/api/cameras/") && path.ends_with("/live.mjpeg") => {
-                self.handle_camera_live_mjpeg(path, remote_addr)
+                self.handle_camera_live_mjpeg(path, remote_addr, &headers)
             }
             Method::Get if path.starts_with("/api/cameras/") && path.ends_with("/snapshot.jpg") => {
-                self.handle_camera_snapshot(path, remote_addr).boxed()
+                self.handle_camera_snapshot(path, remote_addr, &headers).boxed()
             }
             Method::Post if path == "/api/binding/refresh" => self.handle_refresh_binding().boxed(),
             Method::Post if path == "/api/binding/demo-bind" => self.handle_demo_bind().boxed(),
@@ -176,7 +184,7 @@ impl AdminApi {
 
     fn handle_state(&self) -> Response<std::io::Cursor<Vec<u8>>> {
         match self.current_state() {
-            Ok(payload) => ok_json(&payload),
+            Ok(payload) => ok_json(&redact_state_snapshot(payload)),
             Err(error) => error_json(StatusCode(500), &error),
         }
     }
@@ -232,13 +240,18 @@ impl AdminApi {
     }
 
     fn handle_mobile_setup_page(&self, url: &str) -> Response<std::io::Cursor<Vec<u8>>> {
-        let state = match self.current_state() {
+        let state = match self.admin_store.load_or_create_state() {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(500), &error),
         };
         let session_code =
             parse_query_param(url, "session").unwrap_or_else(|| state.binding.session_code.clone());
-        let body = render_mobile_setup_page(&state, &session_code);
+        let body = render_mobile_setup_page(
+            &state,
+            &build_mobile_setup_url(&self.public_origin, Some(&session_code)),
+            &build_mobile_setup_url(&self.public_origin, None),
+            &session_code,
+        );
         let mut response = Response::from_string(body).with_status_code(StatusCode(200));
         add_common_headers(&mut response);
         response.add_header(
@@ -255,8 +268,9 @@ impl AdminApi {
         &self,
         path: &str,
         remote_addr: Option<SocketAddr>,
+        headers: &[Header],
     ) -> Response<Cursor<Vec<u8>>> {
-        if let Err(error) = ensure_local_camera_access(remote_addr) {
+        if let Err(error) = ensure_local_camera_access(remote_addr, headers) {
             return error_json(StatusCode(403), &error);
         }
 
@@ -468,8 +482,9 @@ impl AdminApi {
         &self,
         path: &str,
         remote_addr: Option<SocketAddr>,
+        headers: &[Header],
     ) -> Response<std::io::Cursor<Vec<u8>>> {
-        if let Err(error) = ensure_local_camera_access(remote_addr) {
+        if let Err(error) = ensure_local_camera_access(remote_addr, headers) {
             return error_json(StatusCode(403), &error);
         }
 
@@ -485,8 +500,13 @@ impl AdminApi {
         }
     }
 
-    fn handle_camera_live_mjpeg(&self, path: &str, remote_addr: Option<SocketAddr>) -> ResponseBox {
-        if let Err(error) = ensure_local_camera_access(remote_addr) {
+    fn handle_camera_live_mjpeg(
+        &self,
+        path: &str,
+        remote_addr: Option<SocketAddr>,
+        headers: &[Header],
+    ) -> ResponseBox {
+        if let Err(error) = ensure_local_camera_access(remote_addr, headers) {
             return error_json(StatusCode(403), &error).boxed();
         }
 
@@ -659,9 +679,13 @@ fn parse_query_param(url: &str, key: &str) -> Option<String> {
     None
 }
 
-fn render_mobile_setup_page(state: &StateResponse, session_code: &str) -> String {
+fn render_mobile_setup_page(
+    state: &AdminConsoleState,
+    setup_url: &str,
+    static_setup_url: &str,
+    session_code: &str,
+) -> String {
     let app_id = html_escape(&state.feishu_bot.app_id);
-    let app_secret = html_escape(&state.feishu_bot.app_secret);
     let bot_name = if state.feishu_bot.app_name.trim().is_empty() {
         "尚未配置".to_string()
     } else {
@@ -669,6 +693,8 @@ fn render_mobile_setup_page(state: &StateResponse, session_code: &str) -> String
     };
     let status = html_escape(&state.binding.metric);
     let session_code = html_escape(session_code);
+    let setup_url = html_escape(setup_url);
+    let static_setup_url = html_escape(static_setup_url);
     format!(
         r#"<!DOCTYPE html>
 <html lang="zh-CN">
@@ -703,12 +729,14 @@ fn render_mobile_setup_page(state: &StateResponse, session_code: &str) -> String
         <div><strong>当前会话：</strong>{session_code}</div>
         <div><strong>已连接 Bot：</strong><span id="bot-name">{bot_name}</span></div>
       </div>
+      <p class="hint">当前打开的是本地配置入口：<code>{setup_url}</code></p>
       <label for="app-id">App ID</label>
       <input id="app-id" value="{app_id}" autocomplete="off" />
       <label for="app-secret">App Secret</label>
-      <input id="app-secret" type="password" value="{app_secret}" autocomplete="off" />
+      <input id="app-secret" type="password" value="" autocomplete="off" placeholder="为安全起见，这里不会回显已保存的 secret" />
       <button id="submit-btn">保存并验证飞书连接</button>
-      <p class="hint">保存时会立即调用飞书 Open API 校验凭证，并读取 Bot 信息。成功后桌面端后台会同步显示“Bot 已连接”。你也可以把这台机器上贴的静态二维码固定为 <code>{}</code>。</p>
+      <p class="hint">保存时会立即调用飞书 Open API 校验凭证，并读取 Bot 信息。成功后桌面端后台会同步显示“Bot 已连接”。你也可以把这台机器上贴的静态二维码固定为 <code>{static_setup_url}</code>。</p>
+      <p class="hint">如果当前已经配过 Bot，但你没有要更换凭证，请不要把空白的 secret 直接提交；这里不会显示历史 secret，是为了避免硬件二维码泄露后被他人看到现有密钥。</p>
       <p id="result" class="hint"></p>
     </div>
   </div>
@@ -741,8 +769,7 @@ fn render_mobile_setup_page(state: &StateResponse, session_code: &str) -> String
     }});
   </script>
 </body>
-</html>"#,
-        html_escape(&state.binding.static_setup_url)
+</html>"#
     )
 }
 
@@ -1269,7 +1296,43 @@ fn add_common_headers<R: Read>(response: &mut Response<R>) {
     }
 }
 
-fn ensure_local_camera_access(remote_addr: Option<SocketAddr>) -> Result<(), String> {
+fn is_admin_surface_path(path: &str) -> bool {
+    path == "/api/state"
+        || path == "/api/binding/qr.svg"
+        || path == "/api/binding/static-qr.svg"
+        || path == "/setup/mobile"
+        || path == "/api/binding/refresh"
+        || path == "/api/binding/demo-bind"
+        || path == "/api/binding/test-bind"
+        || path == "/api/feishu/configure"
+        || path == "/api/discovery/scan"
+        || path == "/api/devices/manual"
+        || path == "/api/defaults"
+}
+
+fn ensure_local_admin_access(
+    remote_addr: Option<SocketAddr>,
+    headers: &[Header],
+) -> Result<(), String> {
+    if has_forwarding_headers(headers) {
+        return Err("当前管理后台接口只允许在本机或局域网内直连访问，不能通过公网反向代理转发。".to_string());
+    }
+
+    if remote_addr.is_none() || remote_addr.is_some_and(is_local_socket_addr) {
+        return Ok(());
+    }
+
+    Err("当前管理后台接口只允许本机或局域网内访问。".to_string())
+}
+
+fn ensure_local_camera_access(
+    remote_addr: Option<SocketAddr>,
+    headers: &[Header],
+) -> Result<(), String> {
+    if has_forwarding_headers(headers) {
+        return Err("当前摄像头直连预览只允许本机或局域网直连访问；如果要给外网用户观看，请使用带签名的共享链接。".to_string());
+    }
+
     if remote_addr.is_none() || remote_addr.is_some_and(is_local_socket_addr) {
         return Ok(());
     }
@@ -1289,6 +1352,27 @@ fn is_private_ipv4(ip: Ipv4Addr) -> bool {
     octets[0] == 10
         || (octets[0] == 172 && (16..=31).contains(&octets[1]))
         || (octets[0] == 192 && octets[1] == 168)
+}
+
+fn has_forwarding_headers(headers: &[Header]) -> bool {
+    headers.iter().any(|header| {
+        header.field.equiv("Forwarded")
+            || header.field.equiv("X-Forwarded-For")
+            || header.field.equiv("X-Forwarded-Host")
+            || header.field.equiv("X-Forwarded-Proto")
+            || header.field.equiv("X-Real-Ip")
+    })
+}
+
+fn redact_state_snapshot(mut state: StateResponse) -> StateResponse {
+    state.defaults.rtsp_password.clear();
+    state.feishu_bot = redact_feishu_bot_config(state.feishu_bot);
+    state
+}
+
+fn redact_feishu_bot_config(mut config: FeishuBotConfig) -> FeishuBotConfig {
+    config.app_secret.clear();
+    config
 }
 
 fn parse_camera_snapshot_path(path: &str) -> Option<String> {
@@ -1449,12 +1533,13 @@ impl Drop for FfmpegMjpegStream {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_local_camera_access, parse_camera_live_page_path, parse_camera_live_stream_path,
-        parse_camera_snapshot_path, parse_shared_camera_live_page_path,
-        parse_shared_camera_live_stream_path, percent_decode_path_segment,
-        url_encode_path_segment,
+        ensure_local_admin_access, ensure_local_camera_access, has_forwarding_headers,
+        parse_camera_live_page_path, parse_camera_live_stream_path, parse_camera_snapshot_path,
+        parse_shared_camera_live_page_path, parse_shared_camera_live_stream_path,
+        percent_decode_path_segment, redact_feishu_bot_config, url_encode_path_segment,
     };
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use tiny_http::Header;
 
     #[test]
     fn camera_paths_decode_percent_encoded_device_ids() {
@@ -1497,7 +1582,34 @@ mod tests {
     fn direct_camera_access_is_restricted_to_local_clients() {
         let local = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 3, 12), 4567));
         let remote = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 4567));
-        assert!(ensure_local_camera_access(Some(local)).is_ok());
-        assert!(ensure_local_camera_access(Some(remote)).is_err());
+        assert!(ensure_local_camera_access(Some(local), &[]).is_ok());
+        assert!(ensure_local_camera_access(Some(remote), &[]).is_err());
+    }
+
+    #[test]
+    fn forwarded_headers_block_local_only_routes() {
+        let forwarded = vec![
+            Header::from_bytes(b"X-Forwarded-For".as_slice(), b"198.51.100.10".as_slice())
+                .expect("header"),
+        ];
+        let local = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4567));
+        assert!(has_forwarding_headers(&forwarded));
+        assert!(ensure_local_admin_access(Some(local), &forwarded).is_err());
+        assert!(ensure_local_camera_access(Some(local), &forwarded).is_err());
+    }
+
+    #[test]
+    fn feishu_bot_config_redacts_secret() {
+        let redacted = redact_feishu_bot_config(
+            harbornas_local_agent::runtime::admin_console::FeishuBotConfig {
+                configured: true,
+                app_id: "cli_xxx".to_string(),
+                app_secret: "super-secret".to_string(),
+                app_name: "HarborNAS Bot".to_string(),
+                bot_open_id: "ou_xxx".to_string(),
+                status: "已连接".to_string(),
+            },
+        );
+        assert_eq!(redacted.app_secret, "");
     }
 }
