@@ -10,11 +10,12 @@ use crate::adapters::onvif::{
 };
 use crate::adapters::rtsp::RtspProbeAdapter;
 use crate::adapters::ssdp::SsdpDiscoveryAdapter;
+use crate::connectors::ezviz::{EzvizCloudConfig, EzvizCloudPtzConnector, EzvizPtzRequest};
 use crate::domains::device::{
     DeviceDiscoverArgs, DeviceDiscoverPayload, DeviceGetArgs, DeviceGetPayload, DeviceListArgs,
     DeviceListPayload, DeviceOpenStreamArgs, DeviceOpenStreamPayload, DevicePtzArgs,
-    DevicePtzDirection, DevicePtzPayload, DeviceSnapshotArgs, DeviceSnapshotPayload,
-    DeviceUpdateArgs, DeviceUpdatePayload,
+    DevicePtzDirection, DevicePtzPayload, DevicePtzProvider, DeviceSnapshotArgs,
+    DeviceSnapshotPayload, DeviceUpdateArgs, DeviceUpdatePayload,
 };
 use crate::orchestrator::contracts::{Action, ExecutionResult, Route, StepStatus};
 use crate::orchestrator::router::Executor;
@@ -146,6 +147,39 @@ impl DeviceDiscoveryExecutor {
 
     fn ptz_device(&self, args: &DevicePtzArgs) -> Result<DevicePtzPayload, String> {
         let device = self.find_device(&args.device_id)?;
+        if args.provider == DevicePtzProvider::EzvizCloud {
+            let config = EzvizCloudConfig::from_env().ok_or_else(|| {
+                "EZVIZ cloud PTZ requires HARBOR_EZVIZ_APP_KEY and HARBOR_EZVIZ_APP_SECRET"
+                    .to_string()
+            })?;
+            let connector = EzvizCloudPtzConnector::new(config)?;
+            let device_serial = args
+                .ezviz_device_serial
+                .clone()
+                .or(device.ezviz_device_serial.clone())
+                .ok_or_else(|| {
+                    "EZVIZ cloud PTZ requires ezviz_device_serial in args or registry".to_string()
+                })?;
+            let camera_no = args
+                .ezviz_camera_no
+                .or(device.ezviz_camera_no)
+                .ok_or_else(|| {
+                    "EZVIZ cloud PTZ requires ezviz_camera_no in args or registry".to_string()
+                })?;
+            let result = connector.control_ptz(&EzvizPtzRequest {
+                device_serial: device_serial.clone(),
+                camera_no,
+                direction: args.direction.clone().into(),
+                speed: args.ezviz_speed,
+            })?;
+            return Ok(DevicePtzPayload {
+                device_id: device.device_id,
+                profile_token: String::new(),
+                ptz_service_url: result.provider,
+                action: result.action,
+            });
+        }
+
         let device_service_url = default_onvif_device_service_url(&device).ok_or_else(|| {
             format!(
                 "device {} is missing ONVIF device_service url and IP address",

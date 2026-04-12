@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::connectors::storage::StorageTarget;
+use crate::connectors::ezviz::EzvizPtzDirection;
 use crate::runtime::discovery::{
     DiscoveryBatchResult, DiscoveryProtocol, DiscoveryRequest, RtspProbeResult,
 };
@@ -121,18 +122,33 @@ pub enum DevicePtzDirection {
     Stop,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DevicePtzProvider {
+    Onvif,
+    EzvizCloud,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DevicePtzArgs {
     pub device_id: String,
     pub direction: DevicePtzDirection,
+    #[serde(default = "default_ptz_provider")]
+    pub provider: DevicePtzProvider,
     #[serde(default)]
     pub username: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
+    #[serde(default)]
+    pub ezviz_device_serial: Option<String>,
+    #[serde(default)]
+    pub ezviz_camera_no: Option<u32>,
     #[serde(default = "default_pan_speed")]
     pub pan_speed: f32,
     #[serde(default = "default_tilt_speed")]
     pub tilt_speed: f32,
+    #[serde(default = "default_ezviz_speed")]
+    pub ezviz_speed: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -197,6 +213,26 @@ fn default_pan_speed() -> f32 {
 
 fn default_tilt_speed() -> f32 {
     0.4
+}
+
+fn default_ezviz_speed() -> u8 {
+    2
+}
+
+fn default_ptz_provider() -> DevicePtzProvider {
+    DevicePtzProvider::Onvif
+}
+
+impl From<DevicePtzDirection> for EzvizPtzDirection {
+    fn from(value: DevicePtzDirection) -> Self {
+        match value {
+            DevicePtzDirection::Left => EzvizPtzDirection::Left,
+            DevicePtzDirection::Right => EzvizPtzDirection::Right,
+            DevicePtzDirection::Up => EzvizPtzDirection::Up,
+            DevicePtzDirection::Down => EzvizPtzDirection::Down,
+            DevicePtzDirection::Stop => EzvizPtzDirection::Stop,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -302,5 +338,7 @@ mod tests {
         assert_eq!(args.direction, DevicePtzDirection::Left);
         assert_eq!(args.pan_speed, 0.4);
         assert_eq!(args.tilt_speed, 0.4);
+        assert_eq!(args.provider, super::DevicePtzProvider::Onvif);
+        assert_eq!(args.ezviz_speed, 2);
     }
 }

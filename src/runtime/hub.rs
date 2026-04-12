@@ -659,6 +659,8 @@ pub fn merge_camera(existing: CameraDevice, incoming: CameraDevice) -> CameraDev
         onvif_device_service_url: incoming
             .onvif_device_service_url
             .or(existing.onvif_device_service_url),
+        ezviz_device_serial: incoming.ezviz_device_serial.or(existing.ezviz_device_serial),
+        ezviz_camera_no: incoming.ezviz_camera_no.or(existing.ezviz_camera_no),
         capabilities: incoming.capabilities,
         last_seen_at: incoming.last_seen_at.or(existing.last_seen_at),
     })

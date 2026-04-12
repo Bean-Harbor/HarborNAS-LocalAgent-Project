@@ -70,6 +70,10 @@ pub struct CameraDevice {
     #[serde(default)]
     pub onvif_device_service_url: Option<String>,
     #[serde(default)]
+    pub ezviz_device_serial: Option<String>,
+    #[serde(default)]
+    pub ezviz_camera_no: Option<u32>,
+    #[serde(default)]
     pub capabilities: CameraCapabilities,
     #[serde(default)]
     pub last_seen_at: Option<String>,
@@ -98,6 +102,8 @@ impl CameraDevice {
                 requires_auth: false,
             },
             onvif_device_service_url: None,
+            ezviz_device_serial: None,
+            ezviz_camera_no: None,
             capabilities: CameraCapabilities::default(),
             last_seen_at: None,
         }
