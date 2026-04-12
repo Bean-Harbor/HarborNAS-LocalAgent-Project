@@ -85,7 +85,11 @@ struct Cli {
     #[arg(long, help = "Feishu app_secret")]
     app_secret: String,
 
-    #[arg(long, default_value = "https://open.feishu.cn", help = "Feishu Open API domain")]
+    #[arg(
+        long,
+        default_value = "https://open.feishu.cn",
+        help = "Feishu Open API domain"
+    )]
     domain: String,
 }
 
@@ -117,9 +121,14 @@ impl FeishuBot {
             self.domain
         );
         let body = json!({"app_id": app_id, "app_secret": app_secret});
-        let resp = self.http.post(&url).json(&body).send()
+        let resp = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
             .map_err(|e| format!("token request failed: {e}"))?;
-        let data: Value = resp.json()
+        let data: Value = resp
+            .json()
             .map_err(|e| format!("token parse failed: {e}"))?;
 
         let code = data.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
@@ -127,9 +136,11 @@ impl FeishuBot {
             let msg = data.get("msg").and_then(|v| v.as_str()).unwrap_or("?");
             return Err(format!("code={code}, msg={msg}"));
         }
-        self.token = data.get("tenant_access_token")
+        self.token = data
+            .get("tenant_access_token")
             .and_then(|v| v.as_str())
-            .ok_or("no token")?.to_string();
+            .ok_or("no token")?
+            .to_string();
         Ok(())
     }
 
@@ -138,15 +149,20 @@ impl FeishuBot {
         println!("  POST {url}");
 
         let body = json!({"AppID": app_id, "AppSecret": app_secret});
-        let resp = self.http.post(&url).header("locale", "zh").json(&body).send()
+        let resp = self
+            .http
+            .post(&url)
+            .header("locale", "zh")
+            .json(&body)
+            .send()
             .map_err(|e| format!("request failed: {e}"))?;
 
         let status = resp.status();
         let text = resp.text().unwrap_or_default();
         println!("  HTTP {status}");
 
-        let resp_body: Value = serde_json::from_str(&text)
-            .map_err(|e| format!("parse failed: {e}"))?;
+        let resp_body: Value =
+            serde_json::from_str(&text).map_err(|e| format!("parse failed: {e}"))?;
 
         let code = resp_body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
         if code != 0 {
@@ -155,11 +171,14 @@ impl FeishuBot {
         }
 
         let data = resp_body.get("data").ok_or("no data")?;
-        let ws_url = data.get("URL").or_else(|| data.get("url"))
+        let ws_url = data
+            .get("URL")
+            .or_else(|| data.get("url"))
             .and_then(|v| v.as_str())
             .ok_or("no URL in data")?;
 
-        let service_id = ws_url.split("service_id=")
+        let service_id = ws_url
+            .split("service_id=")
             .nth(1)
             .and_then(|s| s.split('&').next())
             .and_then(|s| s.parse::<i32>().ok())
@@ -182,9 +201,12 @@ impl FeishuBot {
             "content": json!({"text": text}).to_string(),
             "msg_type": "text",
         });
-        let resp = self.http.post(&url)
+        let resp = self
+            .http
+            .post(&url)
             .header("Authorization", format!("Bearer {}", self.token))
-            .json(&body).send()
+            .json(&body)
+            .send()
             .map_err(|e| format!("reply failed: {e}"))?;
         let data: Value = resp.json().map_err(|e| format!("parse failed: {e}"))?;
 
@@ -206,9 +228,12 @@ impl FeishuBot {
             "content": json!({"text": text}).to_string(),
             "msg_type": "text",
         });
-        let resp = self.http.post(&url)
+        let resp = self
+            .http
+            .post(&url)
             .header("Authorization", format!("Bearer {}", self.token))
-            .json(&body).send()
+            .json(&body)
+            .send()
             .map_err(|e| format!("send failed: {e}"))?;
         let data: Value = resp.json().map_err(|e| format!("parse failed: {e}"))?;
 
@@ -224,13 +249,11 @@ impl FeishuBot {
         let msg_type = frame.header("type").unwrap_or("");
 
         match frame.method {
-            METHOD_CONTROL => {
-                match msg_type {
-                    "pong" => println!("[PONG]"),
-                    "ping" => println!("[SERVER-PING]"),
-                    other => println!("[CONTROL] type={other}"),
-                }
-            }
+            METHOD_CONTROL => match msg_type {
+                "pong" => println!("[PONG]"),
+                "ping" => println!("[SERVER-PING]"),
+                other => println!("[CONTROL] type={other}"),
+            },
             METHOD_DATA => {
                 println!("[DATA] type={msg_type} payload_len={}", frame.payload.len());
                 if msg_type == "event" {
@@ -254,11 +277,15 @@ impl FeishuBot {
             }
         };
 
-        let event_type = payload.pointer("/header/event_type")
+        let event_type = payload
+            .pointer("/header/event_type")
             .and_then(|v| v.as_str())
             .unwrap_or("(unknown)");
         println!("[EVENT] type={event_type}");
-        println!("  payload: {}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+        println!(
+            "  payload: {}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
 
         // Send ACK (protobuf frame with payload = {"code": 200})
         let mut resp_frame = frame.clone();
@@ -278,18 +305,34 @@ impl FeishuBot {
         let event = payload.get("event").unwrap_or(payload);
         let message = match event.get("message") {
             Some(m) => m,
-            None => { println!("[WARN] no 'message' in event"); return; }
+            None => {
+                println!("[WARN] no 'message' in event");
+                return;
+            }
         };
 
-        let message_id = message.get("message_id").and_then(|v| v.as_str()).unwrap_or("");
-        let chat_id = message.get("chat_id").and_then(|v| v.as_str()).unwrap_or("");
-        let msg_type = message.get("message_type").and_then(|v| v.as_str()).unwrap_or("");
+        let message_id = message
+            .get("message_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let chat_id = message
+            .get("chat_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let msg_type = message
+            .get("message_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
-        let content_str = message.get("content").and_then(|v| v.as_str()).unwrap_or("{}");
+        let content_str = message
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("{}");
         let content: Value = serde_json::from_str(content_str).unwrap_or_default();
         let text = content.get("text").and_then(|v| v.as_str()).unwrap_or("");
 
-        let clean_text = text.split_whitespace()
+        let clean_text = text
+            .split_whitespace()
             .filter(|w| !w.starts_with("@_"))
             .collect::<Vec<_>>()
             .join(" ");
@@ -306,7 +349,10 @@ impl FeishuBot {
 
         if !message_id.is_empty() {
             match self.reply_text(message_id, clean_text) {
-                Ok(()) => { println!("[REPLY] OK (reply API)"); return; }
+                Ok(()) => {
+                    println!("[REPLY] OK (reply API)");
+                    return;
+                }
                 Err(e) => println!("[REPLY] reply API failed: {e}, trying send_to_chat..."),
             }
         }
@@ -361,15 +407,17 @@ fn main() {
     let mut bot = FeishuBot::new(&cli.domain);
 
     println!("[1/3] Getting tenant_access_token ...");
-    bot.acquire_token(&cli.app_id, &cli.app_secret).unwrap_or_else(|e| {
-        eprintln!("FAIL: {e}");
-        std::process::exit(1);
-    });
+    bot.acquire_token(&cli.app_id, &cli.app_secret)
+        .unwrap_or_else(|e| {
+            eprintln!("FAIL: {e}");
+            std::process::exit(1);
+        });
     println!("  OK — token length={}", bot.token.len());
     println!();
 
     println!("[2/3] Getting WebSocket endpoint ...");
-    let (ws_url, service_id) = bot.get_ws_endpoint(&cli.app_id, &cli.app_secret)
+    let (ws_url, service_id) = bot
+        .get_ws_endpoint(&cli.app_id, &cli.app_secret)
         .unwrap_or_else(|e| {
             eprintln!("FAIL: {e}");
             std::process::exit(1);

@@ -5,4 +5,5 @@ target/
 *.rust.json
 .venv/
 .harborbeacon/
+.harbornas/
 .cache/

@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use crate::scripts::integration::{
     default_midcli_filesystem_command, default_midcli_service_query, ensure_directory,
     ensure_mutation_fixture, execute_file_action, execute_service_action, IntegrationConfig,
-    MiddlewareClient, MidcliClient,
+    MidcliClient, MiddlewareClient,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,7 +70,12 @@ fn scenario_result(
     }
 }
 
-pub fn run_e2e(root: &Path, env_profile: &str, config: &IntegrationConfig, require_live: bool) -> (E2ePayload, LatencyPayload, AuditPayload) {
+pub fn run_e2e(
+    root: &Path,
+    env_profile: &str,
+    config: &IntegrationConfig,
+    require_live: bool,
+) -> (E2ePayload, LatencyPayload, AuditPayload) {
     let required_docs = [
         "HarborNAS-Contract-E2E-Test-Plan-v1.md",
         "HarborNAS-Middleware-Endpoint-Contract-v1.md",
@@ -95,7 +100,10 @@ pub fn run_e2e(root: &Path, env_profile: &str, config: &IntegrationConfig, requi
     if !force_midcli && middleware.is_available() {
         match middleware.call(
             "service.query",
-            &[json!([["service", "=", config.probe_service]]), json!({"get": true})],
+            &[
+                json!([["service", "=", config.probe_service]]),
+                json!({"get": true}),
+            ],
         ) {
             Ok((payload, result)) => {
                 scenarios.push(scenario_result(
@@ -159,7 +167,11 @@ pub fn run_e2e(root: &Path, env_profile: &str, config: &IntegrationConfig, requi
     if !force_midcli && middleware.is_available() {
         match middleware.call(
             "filesystem.listdir",
-            &[json!(config.filesystem_path), json!([]), json!({"limit": 5, "select": ["path", "type"]})],
+            &[
+                json!(config.filesystem_path),
+                json!([]),
+                json!({"limit": 5, "select": ["path", "type"]}),
+            ],
         ) {
             Ok((payload, result)) => {
                 let entry_count = payload.as_array().map(|rows| rows.len()).unwrap_or(0);
@@ -228,10 +240,13 @@ pub fn run_e2e(root: &Path, env_profile: &str, config: &IntegrationConfig, requi
     let mut move_dst_dir = format!("{mutation_root}/move-destination");
 
     if config.allow_mutations {
-        mutation_root = ensure_directory(&config.mutation_root).unwrap_or(config.mutation_root.clone());
+        mutation_root =
+            ensure_directory(&config.mutation_root).unwrap_or(config.mutation_root.clone());
         move_dst_dir = ensure_directory(&move_dst_dir).unwrap_or(move_dst_dir);
-        copy_src = ensure_mutation_fixture(&mutation_root, "copy-source.txt", "copy payload\n").unwrap_or(copy_src);
-        move_src = ensure_mutation_fixture(&mutation_root, "move-source.txt", "move payload\n").unwrap_or(move_src);
+        copy_src = ensure_mutation_fixture(&mutation_root, "copy-source.txt", "copy payload\n")
+            .unwrap_or(copy_src);
+        move_src = ensure_mutation_fixture(&mutation_root, "move-source.txt", "move payload\n")
+            .unwrap_or(move_src);
     }
 
     let service_restart = execute_service_action(
@@ -276,7 +291,11 @@ pub fn run_e2e(root: &Path, env_profile: &str, config: &IntegrationConfig, requi
                 scenarios.push(scenario_result(
                     "guarded-service-restart",
                     "failed",
-                    if force_midcli { "midcli" } else { "middleware_api" },
+                    if force_midcli {
+                        "midcli"
+                    } else {
+                        "middleware_api"
+                    },
                     force_midcli,
                     0,
                     json!({"error": as_text}),
@@ -286,8 +305,18 @@ pub fn run_e2e(root: &Path, env_profile: &str, config: &IntegrationConfig, requi
     }
 
     for (name, operation, src, dst) in [
-        ("guarded-files-copy", "copy", copy_src.clone(), copy_dst.clone()),
-        ("guarded-files-move", "move", move_src.clone(), move_dst_dir.clone()),
+        (
+            "guarded-files-copy",
+            "copy",
+            copy_src.clone(),
+            copy_dst.clone(),
+        ),
+        (
+            "guarded-files-move",
+            "move",
+            move_src.clone(),
+            move_dst_dir.clone(),
+        ),
     ] {
         let outcome = execute_file_action(
             &middleware,
@@ -322,7 +351,10 @@ pub fn run_e2e(root: &Path, env_profile: &str, config: &IntegrationConfig, requi
             }
             Err(err) => {
                 let as_text = err.to_string();
-                if as_text.contains("approval") || as_text.contains("path policy") || as_text.contains("denied") {
+                if as_text.contains("approval")
+                    || as_text.contains("path policy")
+                    || as_text.contains("denied")
+                {
                     scenarios.push(scenario_result(
                         name,
                         "passed",
@@ -335,7 +367,11 @@ pub fn run_e2e(root: &Path, env_profile: &str, config: &IntegrationConfig, requi
                     scenarios.push(scenario_result(
                         name,
                         "failed",
-                        if force_midcli { "midcli" } else { "middleware_api" },
+                        if force_midcli {
+                            "midcli"
+                        } else {
+                            "middleware_api"
+                        },
                         force_midcli,
                         0,
                         json!({"error": as_text}),
@@ -357,7 +393,10 @@ pub fn run_e2e(root: &Path, env_profile: &str, config: &IntegrationConfig, requi
         }),
     ));
 
-    let mut ok = missing_docs.is_empty() && scenarios.iter().all(|s| s.status == "passed" || s.status == "skipped");
+    let mut ok = missing_docs.is_empty()
+        && scenarios
+            .iter()
+            .all(|s| s.status == "passed" || s.status == "skipped");
     if require_live && !live_executed {
         ok = false;
     }
@@ -394,7 +433,11 @@ pub fn run_e2e(root: &Path, env_profile: &str, config: &IntegrationConfig, requi
     let audit_payload = AuditPayload {
         mode,
         env_profile: env_profile.to_string(),
-        coverage: if e2e_payload.scenarios.is_empty() { 0.0 } else { 1.0 },
+        coverage: if e2e_payload.scenarios.is_empty() {
+            0.0
+        } else {
+            1.0
+        },
         required_fields: vec![
             "executor_used".to_string(),
             "route_fallback_used".to_string(),

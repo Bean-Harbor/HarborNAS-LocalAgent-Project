@@ -106,7 +106,8 @@ impl IntegrationConfig {
         config.midcli_password = std::env::var("HARBOR_MIDCLI_PASSWORD").ok();
         config.probe_service = env_or("HARBOR_PROBE_SERVICE", &config.probe_service);
         config.filesystem_path = env_or("HARBOR_FILESYSTEM_PATH", &config.filesystem_path);
-        config.midcli_service_query_command = std::env::var("HARBOR_MIDCLI_SERVICE_QUERY_COMMAND").ok();
+        config.midcli_service_query_command =
+            std::env::var("HARBOR_MIDCLI_SERVICE_QUERY_COMMAND").ok();
         config.midcli_filesystem_command = std::env::var("HARBOR_MIDCLI_FILESYSTEM_COMMAND").ok();
         config.harbor_repo_path = std::env::var("HARBOR_SOURCE_REPO_PATH").ok();
         config.upstream_repo_path = std::env::var("UPSTREAM_SOURCE_REPO_PATH").ok();
@@ -128,7 +129,10 @@ pub fn env_to_bool(value: Option<String>) -> bool {
     let Some(v) = value else {
         return false;
     };
-    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 pub fn parse_loose_value(text: &str) -> Value {
@@ -149,7 +153,10 @@ pub fn parse_csv_rows(text: &str) -> Vec<HashMap<String, String>> {
         return Vec::new();
     };
 
-    let headers: Vec<String> = header_line.split(',').map(|s| s.trim().to_string()).collect();
+    let headers: Vec<String> = header_line
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
     lines
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
@@ -176,7 +183,9 @@ pub fn run_command(argv: &[String], timeout_ms: u64) -> Result<CommandResult, In
     );
     cmd.args(&argv[1..]);
 
-    let output = cmd.output().map_err(|e| IntegrationError::Generic(e.to_string()))?;
+    let output = cmd
+        .output()
+        .map_err(|e| IntegrationError::Generic(e.to_string()))?;
     let duration_ms = started.elapsed().as_millis() as u64;
 
     let result = CommandResult {
@@ -188,7 +197,9 @@ pub fn run_command(argv: &[String], timeout_ms: u64) -> Result<CommandResult, In
     };
 
     if duration_ms > timeout_ms {
-        return Err(IntegrationError::Generic("command timeout exceeded".to_string()));
+        return Err(IntegrationError::Generic(
+            "command timeout exceeded".to_string(),
+        ));
     }
 
     Ok(result)
@@ -210,7 +221,9 @@ fn ensure_service_name(service_name: &str) -> Result<(), IntegrationError> {
             .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-');
 
     if !valid {
-        return Err(IntegrationError::Generic(format!("invalid service name: {service_name:?}")));
+        return Err(IntegrationError::Generic(format!(
+            "invalid service name: {service_name:?}"
+        )));
     }
     Ok(())
 }
@@ -267,13 +280,17 @@ pub fn validate_path_policy(
 
     for path in &normalized_reads {
         if !is_under_any(path, &ALLOWED_READ_ROOTS) {
-            return Err(IntegrationError::PathPolicy(format!("read path outside allowlist: {path}")));
+            return Err(IntegrationError::PathPolicy(format!(
+                "read path outside allowlist: {path}"
+            )));
         }
     }
 
     for path in &normalized_writes {
         if !is_under_any(path, &ALLOWED_WRITE_ROOTS) {
-            return Err(IntegrationError::PathPolicy(format!("write path outside allowlist: {path}")));
+            return Err(IntegrationError::PathPolicy(format!(
+                "write path outside allowlist: {path}"
+            )));
         }
     }
 
@@ -298,11 +315,16 @@ pub fn service_operation_risk(operation: &str) -> Result<&'static str, Integrati
         "status" => Ok("LOW"),
         "start" | "enable" => Ok("MEDIUM"),
         "stop" | "restart" => Ok("HIGH"),
-        _ => Err(IntegrationError::Generic(format!("unsupported service operation: {operation}"))),
+        _ => Err(IntegrationError::Generic(format!(
+            "unsupported service operation: {operation}"
+        ))),
     }
 }
 
-pub fn file_operation_risk(operation: &str, overwrite: bool) -> Result<&'static str, IntegrationError> {
+pub fn file_operation_risk(
+    operation: &str,
+    overwrite: bool,
+) -> Result<&'static str, IntegrationError> {
     match operation {
         "search" => Ok("LOW"),
         "copy" => {
@@ -314,11 +336,18 @@ pub fn file_operation_risk(operation: &str, overwrite: bool) -> Result<&'static 
         }
         "move" => Ok("HIGH"),
         "archive" => Ok("MEDIUM"),
-        _ => Err(IntegrationError::Generic(format!("unsupported file operation: {operation}"))),
+        _ => Err(IntegrationError::Generic(format!(
+            "unsupported file operation: {operation}"
+        ))),
     }
 }
 
-pub fn build_service_preview(operation: &str, service_name: &str, executor: &str, risk_level: &str) -> Value {
+pub fn build_service_preview(
+    operation: &str,
+    service_name: &str,
+    executor: &str,
+    risk_level: &str,
+) -> Value {
     json!({
         "preview": true,
         "domain": "service",
@@ -349,7 +378,11 @@ pub fn build_file_preview(
     })
 }
 
-pub fn ensure_mutation_fixture(root: &str, filename: &str, content: &str) -> Result<String, IntegrationError> {
+pub fn ensure_mutation_fixture(
+    root: &str,
+    filename: &str,
+    content: &str,
+) -> Result<String, IntegrationError> {
     let root_path = PathBuf::from(normalize_path(root));
     fs::create_dir_all(&root_path).map_err(|e| IntegrationError::Generic(e.to_string()))?;
     let file_path = root_path.join(filename);
@@ -381,7 +414,8 @@ pub fn discover_source_capabilities(repo_path: Option<&str>) -> HashMap<String, 
     let mut caps = HashMap::new();
     caps.insert(
         "service.query".to_string(),
-        plugin_service_text.contains("query") && plugin_service_text.contains("class ServiceService"),
+        plugin_service_text.contains("query")
+            && plugin_service_text.contains("class ServiceService"),
     );
     caps.insert(
         "service.control".to_string(),
@@ -389,15 +423,18 @@ pub fn discover_source_capabilities(repo_path: Option<&str>) -> HashMap<String, 
     );
     caps.insert(
         "filesystem.listdir".to_string(),
-        filesystem_text.contains("FilesystemListdirArgs") && plugin_filesystem_text.contains("def listdir"),
+        filesystem_text.contains("FilesystemListdirArgs")
+            && plugin_filesystem_text.contains("def listdir"),
     );
     caps.insert(
         "filesystem.copy".to_string(),
-        filesystem_text.contains("FilesystemCopyArgs") && plugin_filesystem_text.contains("def copy"),
+        filesystem_text.contains("FilesystemCopyArgs")
+            && plugin_filesystem_text.contains("def copy"),
     );
     caps.insert(
         "filesystem.move".to_string(),
-        filesystem_text.contains("FilesystemMoveArgs") && plugin_filesystem_text.contains("def move"),
+        filesystem_text.contains("FilesystemMoveArgs")
+            && plugin_filesystem_text.contains("def move"),
     );
     caps
 }
@@ -433,12 +470,23 @@ impl MiddlewareClient {
     }
 
     pub fn build_call_argv(&self, method: &str, args: &[Value]) -> Vec<String> {
-        let mut argv = vec![self.config.middleware_bin.clone(), "call".to_string(), method.to_string()];
-        argv.extend(args.iter().map(|arg| serde_json::to_string(arg).unwrap_or_else(|_| "null".to_string())));
+        let mut argv = vec![
+            self.config.middleware_bin.clone(),
+            "call".to_string(),
+            method.to_string(),
+        ];
+        argv.extend(
+            args.iter()
+                .map(|arg| serde_json::to_string(arg).unwrap_or_else(|_| "null".to_string())),
+        );
         argv
     }
 
-    pub fn call(&self, method: &str, args: &[Value]) -> Result<(Value, CommandResult), IntegrationError> {
+    pub fn call(
+        &self,
+        method: &str,
+        args: &[Value],
+    ) -> Result<(Value, CommandResult), IntegrationError> {
         if !self.is_available() {
             return Err(IntegrationError::CapabilityUnavailable(format!(
                 "middleware command not found: {}",
@@ -461,8 +509,14 @@ impl MiddlewareClient {
         Ok((parse_loose_value(&result.stdout), result))
     }
 
-    pub fn get_methods(&self, target: &str) -> Result<(HashMap<String, Value>, CommandResult), IntegrationError> {
-        let (payload, result) = self.call("core.get_methods", &[Value::Null, Value::String(target.to_string())])?;
+    pub fn get_methods(
+        &self,
+        target: &str,
+    ) -> Result<(HashMap<String, Value>, CommandResult), IntegrationError> {
+        let (payload, result) = self.call(
+            "core.get_methods",
+            &[Value::Null, Value::String(target.to_string())],
+        )?;
         let map = payload
             .as_object()
             .cloned()
@@ -472,7 +526,11 @@ impl MiddlewareClient {
         Ok((map, result))
     }
 
-    pub fn service_control(&self, operation: &str, service_name: &str) -> Result<(Value, CommandResult), IntegrationError> {
+    pub fn service_control(
+        &self,
+        operation: &str,
+        service_name: &str,
+    ) -> Result<(Value, CommandResult), IntegrationError> {
         self.call(
             "service.control",
             &[
@@ -500,7 +558,12 @@ impl MiddlewareClient {
         )
     }
 
-    pub fn filesystem_move(&self, src: &str, dst_dir: &str, recursive: bool) -> Result<(Value, CommandResult), IntegrationError> {
+    pub fn filesystem_move(
+        &self,
+        src: &str,
+        dst_dir: &str,
+        recursive: bool,
+    ) -> Result<(Value, CommandResult), IntegrationError> {
         self.call(
             "filesystem.move",
             &[
@@ -526,7 +589,12 @@ impl MidcliClient {
         command_exists(&self.config.midcli_bin)
     }
 
-    pub fn build_run_argv(&self, command: &str, mode: Option<&str>, print_template: bool) -> Vec<String> {
+    pub fn build_run_argv(
+        &self,
+        command: &str,
+        mode: Option<&str>,
+        print_template: bool,
+    ) -> Vec<String> {
         let mut argv = vec![self.config.midcli_bin.clone()];
         if let Some(url) = &self.config.midcli_url {
             argv.extend(["--url".to_string(), url.clone()]);
@@ -548,7 +616,12 @@ impl MidcliClient {
         argv
     }
 
-    pub fn run(&self, command: &str, mode: Option<&str>, print_template: bool) -> Result<CommandResult, IntegrationError> {
+    pub fn run(
+        &self,
+        command: &str,
+        mode: Option<&str>,
+        print_template: bool,
+    ) -> Result<CommandResult, IntegrationError> {
         if !self.is_available() {
             return Err(IntegrationError::CapabilityUnavailable(format!(
                 "midcli command not found: {}",
@@ -570,16 +643,32 @@ impl MidcliClient {
         Ok(result)
     }
 
-    pub fn run_csv_query(&self, command: &str) -> Result<(Vec<HashMap<String, String>>, CommandResult), IntegrationError> {
+    pub fn run_csv_query(
+        &self,
+        command: &str,
+    ) -> Result<(Vec<HashMap<String, String>>, CommandResult), IntegrationError> {
         let result = self.run(command, Some("csv"), false)?;
         Ok((parse_csv_rows(&result.stdout), result))
     }
 
-    pub fn service_control(&self, operation: &str, service_name: &str) -> Result<CommandResult, IntegrationError> {
-        self.run(&format!("service {operation} service={service_name}"), None, false)
+    pub fn service_control(
+        &self,
+        operation: &str,
+        service_name: &str,
+    ) -> Result<CommandResult, IntegrationError> {
+        self.run(
+            &format!("service {operation} service={service_name}"),
+            None,
+            false,
+        )
     }
 
-    pub fn filesystem_copy(&self, src: &str, dst: &str, recursive: bool) -> Result<CommandResult, IntegrationError> {
+    pub fn filesystem_copy(
+        &self,
+        src: &str,
+        dst: &str,
+        recursive: bool,
+    ) -> Result<CommandResult, IntegrationError> {
         let mut command = format!("filesystem copy src={} dst={}", json!(src), json!(dst));
         if recursive {
             command.push_str(" recursive=true");
@@ -587,7 +676,12 @@ impl MidcliClient {
         self.run(&command, None, false)
     }
 
-    pub fn filesystem_move(&self, src: &str, dst: &str, recursive: bool) -> Result<CommandResult, IntegrationError> {
+    pub fn filesystem_move(
+        &self,
+        src: &str,
+        dst: &str,
+        recursive: bool,
+    ) -> Result<CommandResult, IntegrationError> {
         let mut command = format!("filesystem move src={} dst={}", json!(src), json!(dst));
         if recursive {
             command.push_str(" recursive=true");
@@ -600,7 +694,12 @@ pub fn default_midcli_service_query(config: &IntegrationConfig) -> String {
     config
         .midcli_service_query_command
         .clone()
-        .unwrap_or_else(|| format!("service query service,state,enable WHERE service == '{}'", config.probe_service))
+        .unwrap_or_else(|| {
+            format!(
+                "service query service,state,enable WHERE service == '{}'",
+                config.probe_service
+            )
+        })
 }
 
 pub fn default_midcli_filesystem_command(config: &IntegrationConfig) -> String {
@@ -622,13 +721,27 @@ pub fn execute_service_action(
 ) -> Result<Value, IntegrationError> {
     ensure_service_name(service_name)?;
     let risk_level = service_operation_risk(operation)?;
-    let executor = if prefer_midcli { "midcli" } else { "middleware_api" };
+    let executor = if prefer_midcli {
+        "midcli"
+    } else {
+        "middleware_api"
+    };
 
     if dry_run {
-        return Ok(build_service_preview(operation, service_name, executor, risk_level));
+        return Ok(build_service_preview(
+            operation,
+            service_name,
+            executor,
+            risk_level,
+        ));
     }
 
-    ensure_approved(risk_level, config, approval_token, &format!("service.{operation}"))?;
+    ensure_approved(
+        risk_level,
+        config,
+        approval_token,
+        &format!("service.{operation}"),
+    )?;
 
     if !prefer_midcli && middleware.is_available() {
         let (payload, result) = middleware.service_control(operation, service_name)?;
@@ -680,7 +793,11 @@ pub fn execute_file_action(
     let src_normalized = policy.read_paths[0].clone();
     let dst_normalized = policy.write_paths[0].clone();
     let risk_level = file_operation_risk(operation, overwrite)?;
-    let executor = if prefer_midcli { "midcli" } else { "middleware_api" };
+    let executor = if prefer_midcli {
+        "midcli"
+    } else {
+        "middleware_api"
+    };
 
     if dry_run {
         return Ok(build_file_preview(
@@ -693,12 +810,22 @@ pub fn execute_file_action(
         ));
     }
 
-    ensure_approved(risk_level, config, approval_token, &format!("files.{operation}"))?;
+    ensure_approved(
+        risk_level,
+        config,
+        approval_token,
+        &format!("files.{operation}"),
+    )?;
 
     match operation {
         "copy" => {
             if !prefer_midcli && middleware.is_available() {
-                let (payload, result) = middleware.filesystem_copy(&src_normalized, &dst_normalized, recursive, false)?;
+                let (payload, result) = middleware.filesystem_copy(
+                    &src_normalized,
+                    &dst_normalized,
+                    recursive,
+                    false,
+                )?;
                 return Ok(json!({
                     "preview": false,
                     "executor": "middleware_api",
@@ -728,7 +855,8 @@ pub fn execute_file_action(
         }
         "move" => {
             if !prefer_midcli && middleware.is_available() {
-                let (payload, result) = middleware.filesystem_move(&src_normalized, &dst_normalized, recursive)?;
+                let (payload, result) =
+                    middleware.filesystem_move(&src_normalized, &dst_normalized, recursive)?;
                 return Ok(json!({
                     "preview": false,
                     "executor": "middleware_api",
@@ -770,12 +898,12 @@ pub fn execute_file_action(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use serde_json::Value;
+    use std::fs;
 
     use super::{
         discover_source_capabilities, execute_file_action, execute_service_action, parse_csv_rows,
-        IntegrationConfig, MiddlewareClient, MidcliClient,
+        IntegrationConfig, MidcliClient, MiddlewareClient,
     };
 
     #[test]
@@ -790,8 +918,14 @@ mod tests {
     fn middleware_client_builds_midclt_call() {
         let config = IntegrationConfig::default();
         let client = MiddlewareClient::new(config);
-        let argv = client.build_call_argv("core.get_methods", &[Value::Null, Value::String("REST".to_string())]);
-        assert_eq!(argv, vec!["midclt", "call", "core.get_methods", "null", "\"REST\""]);
+        let argv = client.build_call_argv(
+            "core.get_methods",
+            &[Value::Null, Value::String("REST".to_string())],
+        );
+        assert_eq!(
+            argv,
+            vec!["midclt", "call", "core.get_methods", "null", "\"REST\""]
+        );
     }
 
     #[test]
@@ -802,7 +936,11 @@ mod tests {
         config.midcli_password = Some("secret".to_string());
 
         let client = MidcliClient::new(config);
-        let argv = client.build_run_argv("service query service,state WHERE service == 'ssh'", Some("csv"), false);
+        let argv = client.build_run_argv(
+            "service query service,state WHERE service == 'ssh'",
+            Some("csv"),
+            false,
+        );
         assert_eq!(
             argv,
             vec![
@@ -825,7 +963,8 @@ mod tests {
     fn discover_source_capabilities_reads_repo_files() {
         let temp_root = std::env::temp_dir().join(format!("harbor-caps-{}", uuid::Uuid::new_v4()));
         let service_api = temp_root.join("src/middlewared/middlewared/api/v27_0_0/service.py");
-        let filesystem_api = temp_root.join("src/middlewared/middlewared/api/v27_0_0/filesystem.py");
+        let filesystem_api =
+            temp_root.join("src/middlewared/middlewared/api/v27_0_0/filesystem.py");
         let service_plugin = temp_root.join("src/middlewared/middlewared/plugins/service.py");
         let filesystem_plugin = temp_root.join("src/middlewared/middlewared/plugins/filesystem.py");
 
@@ -835,9 +974,17 @@ mod tests {
         fs::create_dir_all(filesystem_plugin.parent().unwrap()).unwrap();
 
         fs::write(&service_api, "class ServiceControlArgs: pass\n").unwrap();
-        fs::write(&filesystem_api, "FilesystemListdirArgs\nFilesystemCopyArgs\nFilesystemMoveArgs\n").unwrap();
+        fs::write(
+            &filesystem_api,
+            "FilesystemListdirArgs\nFilesystemCopyArgs\nFilesystemMoveArgs\n",
+        )
+        .unwrap();
         fs::write(&service_plugin, "class ServiceService:\n    def control(self):\n        pass\n    def query(self):\n        pass\n").unwrap();
-        fs::write(&filesystem_plugin, "def listdir(self):\n    pass\ndef copy(self):\n    pass\ndef move(self):\n    pass\n").unwrap();
+        fs::write(
+            &filesystem_plugin,
+            "def listdir(self):\n    pass\ndef copy(self):\n    pass\ndef move(self):\n    pass\n",
+        )
+        .unwrap();
 
         let caps = discover_source_capabilities(Some(temp_root.to_string_lossy().as_ref()));
         assert_eq!(caps.get("service.query"), Some(&true));

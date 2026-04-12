@@ -61,7 +61,12 @@ pub fn plan_task(intent: PlannerIntent) -> Vec<PlannedStep> {
     let route_candidates = if matches!(action.domain.as_str(), "service" | "files") {
         vec![Route::MiddlewareApi, Route::Midcli]
     } else {
-        vec![Route::MiddlewareApi, Route::Midcli, Route::Browser, Route::Mcp]
+        vec![
+            Route::MiddlewareApi,
+            Route::Midcli,
+            Route::Browser,
+            Route::Mcp,
+        ]
     };
 
     vec![PlannedStep {
@@ -87,7 +92,10 @@ mod tests {
         });
 
         assert_eq!(steps.len(), 1);
-        assert_eq!(steps[0].route_candidates, vec![Route::MiddlewareApi, Route::Midcli]);
+        assert_eq!(
+            steps[0].route_candidates,
+            vec![Route::MiddlewareApi, Route::Midcli]
+        );
     }
 
     #[test]

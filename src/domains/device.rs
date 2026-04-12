@@ -2,8 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::connectors::storage::StorageTarget;
 use crate::runtime::discovery::{
     DiscoveryBatchResult, DiscoveryProtocol, DiscoveryRequest, RtspProbeResult,
+};
+use crate::runtime::media::{
+    SnapshotCaptureRequest, SnapshotCaptureResult, SnapshotFormat, StreamOpenRequest,
+    StreamOpenResult,
 };
 use crate::runtime::registry::CameraDevice;
 
@@ -11,6 +16,9 @@ pub const DOMAIN: &str = "device";
 pub const OP_DISCOVER: &str = "discover";
 pub const OP_LIST: &str = "list";
 pub const OP_GET: &str = "get";
+pub const OP_UPDATE: &str = "update";
+pub const OP_SNAPSHOT: &str = "snapshot";
+pub const OP_OPEN_STREAM: &str = "open_stream";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceDiscoverArgs {
@@ -20,6 +28,14 @@ pub struct DeviceDiscoverArgs {
     pub protocols: Vec<DiscoveryProtocol>,
     #[serde(default = "default_true")]
     pub include_rtsp_probe: bool,
+    #[serde(default)]
+    pub rtsp_port: Option<u16>,
+    #[serde(default)]
+    pub rtsp_username: Option<String>,
+    #[serde(default)]
+    pub rtsp_password: Option<String>,
+    #[serde(default)]
+    pub rtsp_paths: Vec<String>,
 }
 
 impl DeviceDiscoverArgs {
@@ -29,6 +45,10 @@ impl DeviceDiscoverArgs {
             network_cidr: self.network_cidr,
             protocols: self.protocols,
             include_rtsp_probe: self.include_rtsp_probe,
+            rtsp_port: self.rtsp_port,
+            rtsp_username: self.rtsp_username,
+            rtsp_password: self.rtsp_password,
+            rtsp_paths: self.rtsp_paths,
         }
     }
 }
@@ -42,6 +62,52 @@ pub struct DeviceListArgs {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceGetArgs {
     pub device_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceUpdateArgs {
+    pub device_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub room: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceSnapshotArgs {
+    pub device_id: String,
+    #[serde(default)]
+    pub format: SnapshotFormat,
+    #[serde(default)]
+    pub storage_target: StorageTarget,
+}
+
+impl DeviceSnapshotArgs {
+    pub fn into_request(self, device: &CameraDevice) -> SnapshotCaptureRequest {
+        SnapshotCaptureRequest::new(
+            self.device_id,
+            device.primary_stream.url.clone(),
+            self.format,
+            self.storage_target,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceOpenStreamArgs {
+    pub device_id: String,
+    #[serde(default)]
+    pub preferred_player: Option<String>,
+}
+
+impl DeviceOpenStreamArgs {
+    pub fn into_request(self, device: &CameraDevice) -> StreamOpenRequest {
+        StreamOpenRequest::new(
+            self.device_id,
+            device.primary_stream.url.clone(),
+            self.preferred_player,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,8 +126,23 @@ pub struct DeviceGetPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceUpdatePayload {
+    pub device: CameraDevice,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceProbePayload {
     pub result: RtspProbeResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceSnapshotPayload {
+    pub snapshot: SnapshotCaptureResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceOpenStreamPayload {
+    pub stream: StreamOpenResult,
 }
 
 fn default_discovery_protocols() -> Vec<DiscoveryProtocol> {
@@ -79,9 +160,15 @@ fn default_true() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceDiscoverArgs, OP_DISCOVER};
+    use super::{
+        DeviceDiscoverArgs, DeviceOpenStreamArgs, DeviceSnapshotArgs, DeviceUpdateArgs,
+        OP_DISCOVER, OP_OPEN_STREAM, OP_SNAPSHOT, OP_UPDATE,
+    };
+    use crate::connectors::storage::StorageTarget;
     use crate::domains::device::DOMAIN;
     use crate::runtime::discovery::DiscoveryProtocol;
+    use crate::runtime::media::SnapshotFormat;
+    use crate::runtime::registry::CameraDevice;
 
     #[test]
     fn discover_args_default_to_auto_discovery_stack() {
@@ -90,6 +177,10 @@ mod tests {
             network_cidr: "192.168.1.0/24".to_string(),
             protocols: vec![],
             include_rtsp_probe: true,
+            rtsp_port: None,
+            rtsp_username: None,
+            rtsp_password: None,
+            rtsp_paths: vec![],
         };
         let request = args.into_request();
         assert_eq!(DOMAIN, "device");
@@ -100,10 +191,63 @@ mod tests {
 
     #[test]
     fn default_protocols_include_rtsp_probe() {
+        let args: DeviceDiscoverArgs =
+            serde_json::from_str(r#"{"scan_id":"scan-1","network_cidr":"192.168.1.0/24"}"#)
+                .expect("parse args");
+        assert!(args.protocols.contains(&DiscoveryProtocol::RtspProbe));
+    }
+
+    #[test]
+    fn snapshot_args_default_to_local_jpeg_capture() {
+        let args: DeviceSnapshotArgs =
+            serde_json::from_str(r#"{"device_id":"cam-1"}"#).expect("parse snapshot args");
+        assert_eq!(OP_SNAPSHOT, "snapshot");
+        assert_eq!(args.format, SnapshotFormat::Jpeg);
+        assert_eq!(args.storage_target, StorageTarget::LocalDisk);
+    }
+
+    #[test]
+    fn open_stream_args_can_override_player() {
+        let args: DeviceOpenStreamArgs =
+            serde_json::from_str(r#"{"device_id":"cam-1","preferred_player":"mpv"}"#)
+                .expect("parse stream args");
+        let device = CameraDevice::new("cam-1", "Front Door", "rtsp://192.168.1.50/live");
+        let request = args.into_request(&device);
+
+        assert_eq!(OP_OPEN_STREAM, "open_stream");
+        assert_eq!(request.preferred_player.as_deref(), Some("mpv"));
+        assert_eq!(request.stream_url, "rtsp://192.168.1.50/live");
+    }
+
+    #[test]
+    fn discover_args_preserve_rtsp_probe_configuration() {
         let args: DeviceDiscoverArgs = serde_json::from_str(
-            r#"{"scan_id":"scan-1","network_cidr":"192.168.1.0/24"}"#,
+            r#"{
+                "scan_id":"scan-1",
+                "network_cidr":"192.168.3.0/24",
+                "rtsp_port":554,
+                "rtsp_username":"admin",
+                "rtsp_password":"MZBEHH",
+                "rtsp_paths":["/ch1/main","/h264/ch1/main/av_stream"]
+            }"#,
         )
         .expect("parse args");
-        assert!(args.protocols.contains(&DiscoveryProtocol::RtspProbe));
+
+        let request = args.into_request();
+        assert_eq!(request.rtsp_port, Some(554));
+        assert_eq!(request.rtsp_username.as_deref(), Some("admin"));
+        assert_eq!(request.rtsp_password.as_deref(), Some("MZBEHH"));
+        assert_eq!(request.rtsp_paths.len(), 2);
+    }
+
+    #[test]
+    fn update_args_allow_setting_name_and_room() {
+        let args: DeviceUpdateArgs =
+            serde_json::from_str(r#"{"device_id":"cam-1","name":"Living Room","room":"Home"}"#)
+                .expect("parse args");
+
+        assert_eq!(OP_UPDATE, "update");
+        assert_eq!(args.name.as_deref(), Some("Living Room"));
+        assert_eq!(args.room.as_deref(), Some("Home"));
     }
 }

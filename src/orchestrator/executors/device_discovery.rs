@@ -1,3 +1,4 @@
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde_json::json;
@@ -8,16 +9,19 @@ use crate::adapters::rtsp::RtspProbeAdapter;
 use crate::adapters::ssdp::SsdpDiscoveryAdapter;
 use crate::domains::device::{
     DeviceDiscoverArgs, DeviceDiscoverPayload, DeviceGetArgs, DeviceGetPayload, DeviceListArgs,
-    DeviceListPayload,
+    DeviceListPayload, DeviceOpenStreamArgs, DeviceOpenStreamPayload, DeviceSnapshotArgs,
+    DeviceSnapshotPayload, DeviceUpdateArgs, DeviceUpdatePayload,
 };
 use crate::orchestrator::contracts::{Action, ExecutionResult, Route, StepStatus};
 use crate::orchestrator::router::Executor;
 use crate::runtime::discovery::DiscoveryService;
-use crate::runtime::registry::CameraDevice;
+use crate::runtime::hub::{merge_camera, normalize_camera_metadata, same_camera};
+use crate::runtime::registry::{CameraDevice, DeviceRegistryStore};
 
 pub struct DeviceDiscoveryExecutor {
     service: DiscoveryService,
-    devices: Vec<CameraDevice>,
+    devices: Arc<Mutex<Vec<CameraDevice>>>,
+    registry_store: Option<DeviceRegistryStore>,
 }
 
 impl DeviceDiscoveryExecutor {
@@ -29,13 +33,109 @@ impl DeviceDiscoveryExecutor {
     ) -> Self {
         Self {
             service: DiscoveryService::new(rtsp, onvif, ssdp, mdns),
-            devices: Vec::new(),
+            devices: Arc::new(Mutex::new(Vec::new())),
+            registry_store: None,
         }
     }
 
     pub fn with_devices(mut self, devices: Vec<CameraDevice>) -> Self {
-        self.devices = devices;
+        self.devices = Arc::new(Mutex::new(devices));
         self
+    }
+
+    pub fn with_registry_store(mut self, store: DeviceRegistryStore) -> Result<Self, String> {
+        let devices = store
+            .load_devices()?
+            .into_iter()
+            .map(normalize_camera_metadata)
+            .collect();
+        self.devices = Arc::new(Mutex::new(devices));
+        self.registry_store = Some(store);
+        Ok(self)
+    }
+
+    fn devices_snapshot(&self) -> Result<Vec<CameraDevice>, String> {
+        self.devices
+            .lock()
+            .map(|devices| devices.clone())
+            .map_err(|_| "device registry lock poisoned".to_string())
+    }
+
+    fn find_device(&self, device_id: &str) -> Result<CameraDevice, String> {
+        let devices = self
+            .devices
+            .lock()
+            .map_err(|_| "device registry lock poisoned".to_string())?;
+        devices
+            .iter()
+            .find(|d| d.device_id == device_id)
+            .cloned()
+            .ok_or_else(|| format!("device not found: {device_id}"))
+    }
+
+    fn upsert_discovered_devices(
+        &self,
+        discovered: &[CameraDevice],
+    ) -> Result<Vec<CameraDevice>, String> {
+        let mut devices = self
+            .devices
+            .lock()
+            .map_err(|_| "device registry lock poisoned".to_string())?;
+
+        for incoming in discovered {
+            if let Some(existing) = devices
+                .iter_mut()
+                .find(|existing| same_camera(existing, incoming))
+            {
+                *existing = merge_camera(existing.clone(), incoming.clone());
+            } else {
+                devices.push(incoming.clone());
+            }
+        }
+
+        if let Some(store) = &self.registry_store {
+            store.save_devices(&devices)?;
+        }
+
+        Ok(devices.clone())
+    }
+
+    fn update_device(&self, args: &DeviceUpdateArgs) -> Result<CameraDevice, String> {
+        let mut devices = self
+            .devices
+            .lock()
+            .map_err(|_| "device registry lock poisoned".to_string())?;
+        let device = devices
+            .iter_mut()
+            .find(|d| d.device_id == args.device_id)
+            .ok_or_else(|| format!("device not found: {}", args.device_id))?;
+
+        if let Some(name) = &args.name {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                device.name = trimmed.to_string();
+            }
+        }
+        if let Some(room) = &args.room {
+            let trimmed = room.trim();
+            device.room = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+        }
+
+        let updated = device.clone();
+        if let Some(store) = &self.registry_store {
+            let normalized: Vec<_> = devices
+                .iter()
+                .cloned()
+                .map(normalize_camera_metadata)
+                .collect();
+            *devices = normalized;
+            store.save_devices(&devices)?;
+        }
+        Ok(normalize_camera_metadata(updated))
     }
 }
 
@@ -59,31 +159,54 @@ impl Executor for DeviceDiscoveryExecutor {
         let payload = match action.operation.as_str() {
             "discover" => {
                 let merged = merge_resource_and_args(action);
-                let args: DeviceDiscoverArgs =
-                    serde_json::from_value(merged).map_err(|e| format!("invalid discover args: {e}"))?;
-                let result = self.service.discover(&args.into_request())?;
+                let args: DeviceDiscoverArgs = serde_json::from_value(merged)
+                    .map_err(|e| format!("invalid discover args: {e}"))?;
+                let mut result = self.service.discover(&args.into_request())?;
+                result.connected_devices =
+                    self.upsert_discovered_devices(&result.connected_devices)?;
                 serde_json::to_value(DeviceDiscoverPayload { discovery: result })
                     .map_err(|e| format!("discover payload serialize failed: {e}"))?
             }
             "list" => {
-                let _args: DeviceListArgs = serde_json::from_value(merge_resource_and_args(action))
-                    .unwrap_or_default();
+                let _args: DeviceListArgs =
+                    serde_json::from_value(merge_resource_and_args(action)).unwrap_or_default();
                 serde_json::to_value(DeviceListPayload {
-                    devices: self.devices.clone(),
+                    devices: self.devices_snapshot()?,
                 })
                 .map_err(|e| format!("list payload serialize failed: {e}"))?
             }
             "get" => {
                 let args: DeviceGetArgs = serde_json::from_value(merge_resource_and_args(action))
                     .map_err(|e| format!("invalid get args: {e}"))?;
-                let device = self
-                    .devices
-                    .iter()
-                    .find(|d| d.device_id == args.device_id)
-                    .cloned()
-                    .ok_or_else(|| format!("device not found: {}", args.device_id))?;
+                let device = self.find_device(&args.device_id)?;
                 serde_json::to_value(DeviceGetPayload { device })
                     .map_err(|e| format!("get payload serialize failed: {e}"))?
+            }
+            "update" => {
+                let args: DeviceUpdateArgs =
+                    serde_json::from_value(merge_resource_and_args(action))
+                        .map_err(|e| format!("invalid update args: {e}"))?;
+                let device = self.update_device(&args)?;
+                serde_json::to_value(DeviceUpdatePayload { device })
+                    .map_err(|e| format!("update payload serialize failed: {e}"))?
+            }
+            "snapshot" => {
+                let args: DeviceSnapshotArgs =
+                    serde_json::from_value(merge_resource_and_args(action))
+                        .map_err(|e| format!("invalid snapshot args: {e}"))?;
+                let device = self.find_device(&args.device_id)?;
+                let snapshot = self.service.capture_snapshot(&args.into_request(&device))?;
+                serde_json::to_value(DeviceSnapshotPayload { snapshot })
+                    .map_err(|e| format!("snapshot payload serialize failed: {e}"))?
+            }
+            "open_stream" => {
+                let args: DeviceOpenStreamArgs =
+                    serde_json::from_value(merge_resource_and_args(action))
+                        .map_err(|e| format!("invalid open_stream args: {e}"))?;
+                let device = self.find_device(&args.device_id)?;
+                let stream = self.service.open_stream(&args.into_request(&device))?;
+                serde_json::to_value(DeviceOpenStreamPayload { stream })
+                    .map_err(|e| format!("open_stream payload serialize failed: {e}"))?
             }
             other => return Err(format!("unsupported device operation: {other}")),
         };
@@ -122,13 +245,17 @@ mod tests {
     use crate::adapters::onvif::OnvifDiscoveryAdapter;
     use crate::adapters::rtsp::RtspProbeAdapter;
     use crate::adapters::ssdp::SsdpDiscoveryAdapter;
+    use crate::connectors::storage::StorageTarget;
     use crate::orchestrator::contracts::Action;
     use crate::orchestrator::router::Executor;
     use crate::runtime::discovery::{
         DiscoveryCandidate, DiscoveryCandidateStatus, DiscoveryProtocol, DiscoveryRequest,
         RtspProbeRequest, RtspProbeResult,
     };
-    use crate::runtime::registry::{CameraDevice, StreamTransport};
+    use crate::runtime::media::{
+        SnapshotCaptureRequest, SnapshotCaptureResult, StreamOpenRequest, StreamOpenResult,
+    };
+    use crate::runtime::registry::{CameraDevice, DeviceRegistryStore, StreamTransport};
 
     use super::DeviceDiscoveryExecutor;
 
@@ -177,6 +304,32 @@ mod tests {
                 error_message: None,
             })
         }
+
+        fn capture_snapshot(
+            &self,
+            request: &SnapshotCaptureRequest,
+        ) -> Result<SnapshotCaptureResult, String> {
+            Ok(SnapshotCaptureResult::new(
+                request.device_id.clone(),
+                request.format,
+                "ZmFrZS1qcGVn",
+                9,
+                request.storage_target,
+            ))
+        }
+
+        fn open_stream(&self, request: &StreamOpenRequest) -> Result<StreamOpenResult, String> {
+            Ok(StreamOpenResult::new(
+                request.device_id.clone(),
+                request.stream_url.clone(),
+                request
+                    .preferred_player
+                    .clone()
+                    .unwrap_or_else(|| "ffplay".to_string()),
+                "/usr/bin/ffplay".into(),
+                5151,
+            ))
+        }
     }
 
     #[test]
@@ -197,9 +350,14 @@ mod tests {
             dry_run: false,
         };
 
-        let result = executor.execute(&action, "t1", "s1").expect("discover result");
+        let result = executor
+            .execute(&action, "t1", "s1")
+            .expect("discover result");
         assert_eq!(result.executor_used, "mcp");
-        assert_eq!(result.status, crate::orchestrator::contracts::StepStatus::Success);
+        assert_eq!(
+            result.status,
+            crate::orchestrator::contracts::StepStatus::Success
+        );
         assert_eq!(
             result.result_payload["discovery"]["connected_devices"][0]["primary_stream"]["url"],
             "rtsp://192.168.1.50/live"
@@ -207,15 +365,26 @@ mod tests {
     }
 
     #[test]
-    fn list_and_get_return_registered_devices() {
-        let device = CameraDevice::new("cam-1", "Front Door", "rtsp://192.168.1.50/live");
+    fn discover_auto_registers_devices_for_later_list_and_get() {
         let executor = DeviceDiscoveryExecutor::new(
             Box::new(StaticRtspAdapter),
-            None,
-            None,
-            None,
-        )
-        .with_devices(vec![device]);
+            Some(Box::new(StaticOnvifAdapter)),
+            Some(Box::new(EmptySsdpAdapter)),
+            Some(Box::new(EmptyMdnsAdapter)),
+        );
+
+        let discover_action = Action {
+            domain: "device".to_string(),
+            operation: "discover".to_string(),
+            resource: json!({"scan_id":"scan-1","network_cidr":"192.168.1.0/24"}),
+            args: json!({}),
+            risk_level: crate::orchestrator::contracts::RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+        executor
+            .execute(&discover_action, "t1", "s1")
+            .expect("discover result");
 
         let list_action = Action {
             domain: "device".to_string(),
@@ -226,8 +395,152 @@ mod tests {
             requires_approval: false,
             dry_run: false,
         };
-        let list_result = executor.execute(&list_action, "t1", "s1").expect("list result");
-        assert_eq!(list_result.result_payload["devices"][0]["device_id"], "cam-1");
+        let list_result = executor
+            .execute(&list_action, "t1", "s2")
+            .expect("list result");
+        assert_eq!(
+            list_result.result_payload["devices"][0]["ip_address"],
+            "192.168.1.50"
+        );
+
+        let device_id = list_result.result_payload["devices"][0]["device_id"]
+            .as_str()
+            .expect("device id")
+            .to_string();
+        let get_action = Action {
+            domain: "device".to_string(),
+            operation: "get".to_string(),
+            resource: json!({"device_id": device_id}),
+            args: json!({}),
+            risk_level: crate::orchestrator::contracts::RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+        let get_result = executor
+            .execute(&get_action, "t1", "s3")
+            .expect("get result");
+        assert_eq!(get_result.result_payload["device"]["name"], "Front Door");
+    }
+
+    #[test]
+    fn update_changes_name_and_room_for_registered_device() {
+        let device = CameraDevice::new("cam-1", "Front Door", "rtsp://192.168.1.50/live");
+        let executor = DeviceDiscoveryExecutor::new(Box::new(StaticRtspAdapter), None, None, None)
+            .with_devices(vec![device]);
+
+        let update_action = Action {
+            domain: "device".to_string(),
+            operation: "update".to_string(),
+            resource: json!({"device_id":"cam-1"}),
+            args: json!({"name":"Living Room Cam","room":"Living Room"}),
+            risk_level: crate::orchestrator::contracts::RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+        let update_result = executor
+            .execute(&update_action, "t1", "s1")
+            .expect("update result");
+
+        assert_eq!(
+            update_result.result_payload["device"]["name"],
+            "Living Room Cam"
+        );
+        assert_eq!(
+            update_result.result_payload["device"]["room"],
+            "Living Room"
+        );
+
+        let list_action = Action {
+            domain: "device".to_string(),
+            operation: "list".to_string(),
+            resource: json!({}),
+            args: json!({}),
+            risk_level: crate::orchestrator::contracts::RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+        let list_result = executor
+            .execute(&list_action, "t1", "s2")
+            .expect("list result");
+        assert_eq!(
+            list_result.result_payload["devices"][0]["name"],
+            "Living Room Cam"
+        );
+        assert_eq!(
+            list_result.result_payload["devices"][0]["room"],
+            "Living Room"
+        );
+    }
+
+    #[test]
+    fn discover_upserts_existing_device_without_duplication() {
+        let mut device = CameraDevice::new("cam-existing", "Old Name", "rtsp://192.168.1.50/live");
+        device.ip_address = Some("192.168.1.50".to_string());
+        device.room = Some("Garage".to_string());
+
+        let executor = DeviceDiscoveryExecutor::new(
+            Box::new(StaticRtspAdapter),
+            Some(Box::new(StaticOnvifAdapter)),
+            Some(Box::new(EmptySsdpAdapter)),
+            Some(Box::new(EmptyMdnsAdapter)),
+        )
+        .with_devices(vec![device]);
+
+        let discover_action = Action {
+            domain: "device".to_string(),
+            operation: "discover".to_string(),
+            resource: json!({"scan_id":"scan-1","network_cidr":"192.168.1.0/24"}),
+            args: json!({}),
+            risk_level: crate::orchestrator::contracts::RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+        executor
+            .execute(&discover_action, "t1", "s1")
+            .expect("discover result");
+
+        let list_action = Action {
+            domain: "device".to_string(),
+            operation: "list".to_string(),
+            resource: json!({}),
+            args: json!({}),
+            risk_level: crate::orchestrator::contracts::RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+        let list_result = executor
+            .execute(&list_action, "t1", "s2")
+            .expect("list result");
+        let devices = list_result.result_payload["devices"]
+            .as_array()
+            .expect("devices");
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0]["room"], "Garage");
+        assert_eq!(devices[0]["name"], "Front Door");
+    }
+
+    #[test]
+    fn list_and_get_return_registered_devices() {
+        let device = CameraDevice::new("cam-1", "Front Door", "rtsp://192.168.1.50/live");
+        let executor = DeviceDiscoveryExecutor::new(Box::new(StaticRtspAdapter), None, None, None)
+            .with_devices(vec![device]);
+
+        let list_action = Action {
+            domain: "device".to_string(),
+            operation: "list".to_string(),
+            resource: json!({}),
+            args: json!({}),
+            risk_level: crate::orchestrator::contracts::RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+        let list_result = executor
+            .execute(&list_action, "t1", "s1")
+            .expect("list result");
+        assert_eq!(
+            list_result.result_payload["devices"][0]["device_id"],
+            "cam-1"
+        );
 
         let get_action = Action {
             domain: "device".to_string(),
@@ -238,7 +551,104 @@ mod tests {
             requires_approval: false,
             dry_run: false,
         };
-        let get_result = executor.execute(&get_action, "t1", "s2").expect("get result");
+        let get_result = executor
+            .execute(&get_action, "t1", "s2")
+            .expect("get result");
         assert_eq!(get_result.result_payload["device"]["name"], "Front Door");
+    }
+
+    #[test]
+    fn snapshot_returns_capture_payload_for_registered_device() {
+        let mut device = CameraDevice::new("cam-1", "Front Door", "rtsp://192.168.1.50/live");
+        device.capabilities.snapshot = true;
+        let executor = DeviceDiscoveryExecutor::new(Box::new(StaticRtspAdapter), None, None, None)
+            .with_devices(vec![device]);
+
+        let snapshot_action = Action {
+            domain: "device".to_string(),
+            operation: "snapshot".to_string(),
+            resource: json!({"device_id":"cam-1"}),
+            args: json!({"storage_target":"local_disk"}),
+            risk_level: crate::orchestrator::contracts::RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+        let snapshot_result = executor
+            .execute(&snapshot_action, "t1", "s3")
+            .expect("snapshot result");
+
+        assert_eq!(
+            snapshot_result.result_payload["snapshot"]["device_id"],
+            "cam-1"
+        );
+        assert_eq!(
+            snapshot_result.result_payload["snapshot"]["mime_type"],
+            "image/jpeg"
+        );
+        assert_eq!(
+            snapshot_result.result_payload["snapshot"]["storage"]["target"],
+            json!(StorageTarget::LocalDisk)
+        );
+    }
+
+    #[test]
+    fn open_stream_returns_launch_payload_for_registered_device() {
+        let device = CameraDevice::new("cam-1", "Front Door", "rtsp://192.168.1.50/live");
+        let executor = DeviceDiscoveryExecutor::new(Box::new(StaticRtspAdapter), None, None, None)
+            .with_devices(vec![device]);
+
+        let open_action = Action {
+            domain: "device".to_string(),
+            operation: "open_stream".to_string(),
+            resource: json!({"device_id":"cam-1"}),
+            args: json!({"preferred_player":"mpv"}),
+            risk_level: crate::orchestrator::contracts::RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+        let open_result = executor
+            .execute(&open_action, "t1", "s4")
+            .expect("open stream result");
+
+        assert_eq!(open_result.result_payload["stream"]["device_id"], "cam-1");
+        assert_eq!(open_result.result_payload["stream"]["player"], "mpv");
+        assert_eq!(open_result.result_payload["stream"]["process_id"], 5151);
+    }
+
+    #[test]
+    fn discover_persists_registry_to_disk_when_store_is_configured() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("harbornas-device-executor-{unique}.json"));
+        let store = DeviceRegistryStore::new(&path);
+        let executor = DeviceDiscoveryExecutor::new(
+            Box::new(StaticRtspAdapter),
+            Some(Box::new(StaticOnvifAdapter)),
+            Some(Box::new(EmptySsdpAdapter)),
+            Some(Box::new(EmptyMdnsAdapter)),
+        )
+        .with_registry_store(store.clone())
+        .expect("attach registry store");
+
+        let discover_action = Action {
+            domain: "device".to_string(),
+            operation: "discover".to_string(),
+            resource: json!({"scan_id":"scan-1","network_cidr":"192.168.1.0/24"}),
+            args: json!({}),
+            risk_level: crate::orchestrator::contracts::RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+        executor
+            .execute(&discover_action, "t1", "s1")
+            .expect("discover result");
+
+        let persisted = store.load_devices().expect("load persisted devices");
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].ip_address.as_deref(), Some("192.168.1.50"));
+
+        let _ = std::fs::remove_file(&path);
     }
 }

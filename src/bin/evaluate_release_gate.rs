@@ -16,7 +16,8 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
     let report = std::fs::read_to_string(&cli.report_path).expect("failed to read drift report");
-    let report_json: serde_json::Value = serde_json::from_str(&report).expect("invalid drift report json");
+    let report_json: serde_json::Value =
+        serde_json::from_str(&report).expect("invalid drift report json");
 
     let payload = evaluate_release_gate(&report_json, cli.require_live);
     std::fs::write(

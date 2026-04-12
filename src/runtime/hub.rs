@@ -1,0 +1,882 @@
+//! Shared Agent Hub application services for onboarding, discovery, and registry updates.
+
+use std::collections::HashSet;
+use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+use std::thread;
+use std::time::Duration;
+
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
+
+use crate::adapters::onvif::WsDiscoveryOnvifAdapter;
+use crate::adapters::rtsp::{CommandRtspAdapter, RtspProbeAdapter};
+use crate::connectors::storage::StorageTarget;
+use crate::runtime::admin_console::{
+    sanitize_defaults, AdminBindingState, AdminConsoleState, AdminConsoleStore, AdminDefaults,
+    FeishuBotConfig,
+};
+use crate::runtime::discovery::{
+    DiscoveryProtocol, DiscoveryRequest, DiscoveryService, RtspProbeRequest,
+};
+use crate::runtime::media::{SnapshotCaptureRequest, SnapshotFormat};
+use crate::runtime::registry::{CameraDevice, DeviceRegistryStore, DeviceStatus, StreamTransport};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HubStateSnapshot {
+    pub binding: AdminBindingState,
+    pub defaults: AdminDefaults,
+    pub feishu_bot: FeishuBotConfig,
+    pub devices: Vec<CameraDevice>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct HubScanRequest {
+    #[serde(default)]
+    pub cidr: Option<String>,
+    #[serde(default)]
+    pub protocol: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HubScanResultItem {
+    pub candidate_id: String,
+    pub device_id: Option<String>,
+    pub name: String,
+    pub room: String,
+    pub ip: String,
+    pub port: u16,
+    pub protocol: String,
+    pub note: String,
+    pub reachable: bool,
+    pub registered: bool,
+    #[serde(default)]
+    pub requires_auth: bool,
+    #[serde(default)]
+    pub vendor: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub rtsp_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HubScanSummary {
+    pub binding: AdminBindingState,
+    pub defaults: AdminDefaults,
+    pub devices: Vec<CameraDevice>,
+    pub results: Vec<HubScanResultItem>,
+    pub scanned_hosts: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CameraConnectRequest {
+    pub name: String,
+    #[serde(default)]
+    pub room: Option<String>,
+    pub ip: String,
+    #[serde(default)]
+    pub path_candidates: Vec<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub discovery_source: String,
+    #[serde(default)]
+    pub vendor: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HubManualAddSummary {
+    pub binding: AdminBindingState,
+    pub defaults: AdminDefaults,
+    pub device: CameraDevice,
+    pub devices: Vec<CameraDevice>,
+    pub note: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CameraHubService {
+    admin_store: AdminConsoleStore,
+}
+
+impl CameraHubService {
+    pub fn new(admin_store: AdminConsoleStore) -> Self {
+        Self { admin_store }
+    }
+
+    pub fn admin_store(&self) -> &AdminConsoleStore {
+        &self.admin_store
+    }
+
+    pub fn load_admin_state(&self) -> Result<AdminConsoleState, String> {
+        self.admin_store.load_or_create_state()
+    }
+
+    pub fn load_registered_cameras(&self) -> Result<Vec<CameraDevice>, String> {
+        self.admin_store.registry_store().load_devices()
+    }
+
+    pub fn state_snapshot(&self, public_origin: Option<&str>) -> Result<HubStateSnapshot, String> {
+        let state = self.load_admin_state()?;
+        let devices = self.load_registered_cameras()?;
+        Ok(HubStateSnapshot {
+            binding: enrich_binding_urls(state.binding, public_origin),
+            defaults: state.defaults,
+            feishu_bot: state.feishu_bot,
+            devices,
+        })
+    }
+
+    pub fn save_defaults(
+        &self,
+        defaults: AdminDefaults,
+        public_origin: Option<&str>,
+    ) -> Result<HubStateSnapshot, String> {
+        self.admin_store.save_defaults(defaults)?;
+        self.state_snapshot(public_origin)
+    }
+
+    pub fn configure_feishu_bot(
+        &self,
+        app_id: &str,
+        app_secret: &str,
+        public_origin: Option<&str>,
+    ) -> Result<HubStateSnapshot, String> {
+        let app_id = app_id.trim();
+        let app_secret = app_secret.trim();
+        if app_id.is_empty() || app_secret.is_empty() {
+            return Err("app_id 和 app_secret 都不能为空".to_string());
+        }
+
+        let (app_name, bot_open_id) = validate_feishu_bot(app_id, app_secret)?;
+        self.admin_store.save_feishu_bot_config(FeishuBotConfig {
+            configured: true,
+            app_id: app_id.to_string(),
+            app_secret: app_secret.to_string(),
+            app_name,
+            bot_open_id,
+            status: "已连接".to_string(),
+        })?;
+
+        self.state_snapshot(public_origin)
+    }
+
+    pub fn scan(
+        &self,
+        request: HubScanRequest,
+        public_origin: Option<&str>,
+    ) -> Result<HubScanSummary, String> {
+        let mut state = self.load_admin_state()?;
+        if let Some(cidr) = request.cidr {
+            let trimmed = cidr.trim();
+            if !trimmed.is_empty() {
+                state.defaults.cidr = trimmed.to_string();
+            }
+        }
+        if let Some(protocol) = request.protocol {
+            let trimmed = protocol.trim();
+            if !trimmed.is_empty() {
+                state.defaults.discovery = trimmed.to_string();
+            }
+        }
+        state.defaults = sanitize_defaults(state.defaults);
+        self.admin_store.save_state(&state)?;
+
+        if prefers_onvif_discovery(&state.defaults.discovery) {
+            return self.scan_with_onvif(&state, public_origin);
+        }
+
+        self.scan_with_rtsp_probe(&state, public_origin)
+    }
+
+    pub fn manual_add(
+        &self,
+        request: CameraConnectRequest,
+        public_origin: Option<&str>,
+    ) -> Result<HubManualAddSummary, String> {
+        let state = self.load_admin_state()?;
+        let ip = request.ip.trim();
+        if ip.is_empty() {
+            return Err("IP 地址不能为空".to_string());
+        }
+
+        let name = if request.name.trim().is_empty() {
+            format!("Camera {ip}")
+        } else {
+            request.name.trim().to_string()
+        };
+
+        let port = request.port.unwrap_or(state.defaults.rtsp_port);
+        let path_candidates = if request.path_candidates.is_empty() {
+            state.defaults.rtsp_paths.clone()
+        } else {
+            request.path_candidates
+        };
+        let path_candidates = crate::runtime::admin_console::dedupe_rtsp_paths(path_candidates);
+        let username = request
+            .username
+            .and_then(|value| non_empty_opt(&value))
+            .or_else(|| non_empty_opt(&state.defaults.rtsp_username));
+        let password = request
+            .password
+            .and_then(|value| non_empty_opt(&value))
+            .or_else(|| non_empty_opt(&state.defaults.rtsp_password));
+
+        let adapter = CommandRtspAdapter::default();
+        let probe = adapter.probe(&RtspProbeRequest {
+            candidate_id: format!("manual-{}", ip.replace('.', "-")),
+            ip_address: ip.to_string(),
+            port,
+            username,
+            password,
+            path_candidates: path_candidates.clone(),
+        })?;
+        if !probe.reachable {
+            return Err(probe
+                .error_message
+                .unwrap_or_else(|| "RTSP 验证失败，未发现可用视频流".to_string()));
+        }
+
+        let stream_url = probe
+            .stream_url
+            .ok_or_else(|| "RTSP 验证成功，但返回的主流地址为空".to_string())?;
+        let mut device = CameraDevice::new(device_id_for_ip(ip), name, stream_url);
+        device.status = DeviceStatus::Online;
+        device.room = request
+            .room
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        device.vendor = request.vendor.filter(|value| !value.trim().is_empty());
+        device.model = request.model.filter(|value| !value.trim().is_empty());
+        device.ip_address = Some(ip.to_string());
+        device.discovery_source = if request.discovery_source.trim().is_empty() {
+            "manual_entry".to_string()
+        } else {
+            request.discovery_source
+        };
+        device.primary_stream.transport = StreamTransport::Rtsp;
+        device.primary_stream.requires_auth = probe.requires_auth;
+        device.capabilities = probe.capabilities;
+
+        let devices = upsert_devices(self.admin_store.registry_store(), &[device.clone()])?;
+        let saved = devices
+            .iter()
+            .find(|item| item.ip_address.as_deref() == Some(ip))
+            .cloned()
+            .unwrap_or(device);
+
+        Ok(HubManualAddSummary {
+            binding: enrich_binding_urls(state.binding, public_origin),
+            defaults: state.defaults,
+            device: saved,
+            devices,
+            note: "设备已通过 RTSP 验证并写入设备库".to_string(),
+        })
+    }
+
+    pub fn capture_camera_snapshot(&self, device_id: &str) -> Result<Vec<u8>, String> {
+        let device = self
+            .load_registered_cameras()?
+            .into_iter()
+            .find(|device| device.device_id == device_id)
+            .ok_or_else(|| format!("device not found: {device_id}"))?;
+
+        let adapter = CommandRtspAdapter::default();
+        let result = adapter.capture_snapshot(&SnapshotCaptureRequest::new(
+            device.device_id,
+            device.primary_stream.url,
+            SnapshotFormat::Jpeg,
+            StorageTarget::LocalDisk,
+        ))?;
+
+        base64::engine::general_purpose::STANDARD
+            .decode(result.bytes_base64.as_bytes())
+            .map_err(|error| format!("snapshot bytes decode failed: {error}"))
+    }
+
+    fn scan_with_rtsp_probe(
+        &self,
+        state: &AdminConsoleState,
+        public_origin: Option<&str>,
+    ) -> Result<HubScanSummary, String> {
+        let existing_devices = self.load_registered_cameras()?;
+        let candidate_ips = collect_candidate_ips(
+            &state.defaults.cidr,
+            &existing_devices,
+            state.defaults.rtsp_port,
+        )?;
+        let adapter = CommandRtspAdapter::default();
+        let mut discovered = Vec::new();
+        let mut results = Vec::new();
+
+        for ip in &candidate_ips {
+            let probe_request = RtspProbeRequest {
+                candidate_id: format!("rtsp-{}", ip.replace('.', "-")),
+                ip_address: ip.clone(),
+                port: state.defaults.rtsp_port,
+                username: non_empty_opt(&state.defaults.rtsp_username),
+                password: non_empty_opt(&state.defaults.rtsp_password),
+                path_candidates: state.defaults.rtsp_paths.clone(),
+            };
+            let probe = adapter.probe(&probe_request)?;
+            let existing = existing_devices
+                .iter()
+                .find(|device| device.ip_address.as_deref() == Some(ip.as_str()))
+                .cloned();
+            let requires_auth = probe.requires_auth
+                || probe
+                    .error_message
+                    .as_deref()
+                    .is_some_and(looks_like_auth_error);
+
+            if probe.reachable {
+                let stream_url = probe
+                    .stream_url
+                    .clone()
+                    .ok_or_else(|| format!("reachable RTSP probe missing stream url for {ip}"))?;
+                let mut device = CameraDevice::new(
+                    device_id_for_ip(ip),
+                    existing
+                        .as_ref()
+                        .map(|device| device.name.clone())
+                        .unwrap_or_else(|| format!("Camera {ip}")),
+                    stream_url,
+                );
+                device.status = DeviceStatus::Online;
+                device.room = existing.as_ref().and_then(|device| device.room.clone());
+                device.vendor = existing.as_ref().and_then(|device| device.vendor.clone());
+                device.model = existing.as_ref().and_then(|device| device.model.clone());
+                device.ip_address = Some(ip.clone());
+                device.discovery_source = "rtsp_probe".to_string();
+                device.primary_stream.transport = StreamTransport::Rtsp;
+                device.primary_stream.requires_auth = probe.requires_auth;
+                device.capabilities = probe.capabilities;
+                discovered.push(device.clone());
+
+                results.push(HubScanResultItem {
+                    candidate_id: probe_request.candidate_id.clone(),
+                    device_id: Some(device.device_id.clone()),
+                    name: device.name.clone(),
+                    room: device
+                        .room
+                        .clone()
+                        .unwrap_or_else(|| "未分配房间".to_string()),
+                    ip: ip.clone(),
+                    port: state.defaults.rtsp_port,
+                    protocol: "RTSP / 已验证".to_string(),
+                    note: "RTSP 链路已验证，可直接加入设备库并在飞书中调用。".to_string(),
+                    reachable: true,
+                    registered: true,
+                    requires_auth,
+                    vendor: device.vendor.clone(),
+                    model: device.model.clone(),
+                    rtsp_paths: state.defaults.rtsp_paths.clone(),
+                });
+            } else {
+                results.push(HubScanResultItem {
+                    candidate_id: probe_request.candidate_id.clone(),
+                    device_id: existing.as_ref().map(|device| device.device_id.clone()),
+                    name: existing
+                        .as_ref()
+                        .map(|device| device.name.clone())
+                        .unwrap_or_else(|| format!("Camera {ip}")),
+                    room: existing
+                        .as_ref()
+                        .and_then(|device| device.room.clone())
+                        .unwrap_or_else(|| "待识别".to_string()),
+                    ip: ip.clone(),
+                    port: state.defaults.rtsp_port,
+                    protocol: if requires_auth {
+                        "RTSP / 需密码".to_string()
+                    } else {
+                        "RTSP / 未通过".to_string()
+                    },
+                    note: probe
+                        .error_message
+                        .clone()
+                        .map(|value| humanize_probe_error(&value))
+                        .unwrap_or_else(|| "未发现可用视频流".to_string()),
+                    reachable: false,
+                    registered: existing.is_some(),
+                    requires_auth,
+                    vendor: existing.as_ref().and_then(|device| device.vendor.clone()),
+                    model: existing.as_ref().and_then(|device| device.model.clone()),
+                    rtsp_paths: state.defaults.rtsp_paths.clone(),
+                });
+            }
+        }
+
+        let devices = upsert_devices(self.admin_store.registry_store(), &discovered)?;
+        Ok(HubScanSummary {
+            binding: enrich_binding_urls(state.binding.clone(), public_origin),
+            defaults: state.defaults.clone(),
+            devices,
+            results,
+            scanned_hosts: candidate_ips.len(),
+        })
+    }
+
+    fn scan_with_onvif(
+        &self,
+        state: &AdminConsoleState,
+        public_origin: Option<&str>,
+    ) -> Result<HubScanSummary, String> {
+        let service = DiscoveryService::new(
+            Box::new(CommandRtspAdapter::default()),
+            Some(Box::new(WsDiscoveryOnvifAdapter::default())),
+            None,
+            None,
+        );
+        let discovery = service.discover(&DiscoveryRequest {
+            scan_id: "hub-onvif-scan".to_string(),
+            network_cidr: state.defaults.cidr.clone(),
+            protocols: vec![DiscoveryProtocol::Onvif, DiscoveryProtocol::RtspProbe],
+            include_rtsp_probe: true,
+            rtsp_port: Some(state.defaults.rtsp_port),
+            rtsp_username: non_empty_opt(&state.defaults.rtsp_username),
+            rtsp_password: non_empty_opt(&state.defaults.rtsp_password),
+            rtsp_paths: state.defaults.rtsp_paths.clone(),
+        })?;
+
+        let devices = upsert_devices(
+            self.admin_store.registry_store(),
+            &discovery.connected_devices,
+        )?;
+
+        let mut results = Vec::new();
+        for candidate in &discovery.candidates {
+            let device = devices
+                .iter()
+                .find(|device| device.ip_address.as_deref() == Some(candidate.ip_address.as_str()));
+            let probe = discovery
+                .probe_results
+                .iter()
+                .find(|probe| probe.candidate_id == candidate.candidate_id);
+            let reachable = probe.is_some_and(|probe| probe.reachable);
+            let requires_auth = probe.is_some_and(|probe| {
+                probe.requires_auth
+                    || probe
+                        .error_message
+                        .as_deref()
+                        .is_some_and(looks_like_auth_error)
+            });
+            let port = candidate.port.unwrap_or(state.defaults.rtsp_port);
+            let rtsp_paths = if candidate.rtsp_paths.is_empty() {
+                state.defaults.rtsp_paths.clone()
+            } else {
+                candidate.rtsp_paths.clone()
+            };
+
+            results.push(HubScanResultItem {
+                candidate_id: candidate.candidate_id.clone(),
+                device_id: device.map(|device| device.device_id.clone()),
+                name: candidate
+                    .name
+                    .clone()
+                    .or_else(|| device.map(|item| item.name.clone()))
+                    .unwrap_or_else(|| format!("Camera {}", candidate.ip_address)),
+                room: device
+                    .and_then(|device| device.room.clone())
+                    .unwrap_or_else(|| "待确认".to_string()),
+                ip: candidate.ip_address.clone(),
+                port,
+                protocol: if reachable {
+                    "ONVIF + RTSP / 已验证".to_string()
+                } else if requires_auth {
+                    "ONVIF / 需密码".to_string()
+                } else {
+                    "ONVIF / 已发现".to_string()
+                },
+                note: if reachable {
+                    "已通过 ONVIF 发现并完成 RTSP 验证，可直接加入设备库。".to_string()
+                } else if requires_auth {
+                    "已发现摄像头，但 RTSP 认证失败。回复“接入 序号”后，再发送“密码 xxxxxx”即可继续。".to_string()
+                } else {
+                    probe
+                        .and_then(|probe| probe.error_message.clone())
+                        .map(|value| humanize_probe_error(&value))
+                        .unwrap_or_else(|| "已发现 ONVIF 设备，但 RTSP 尚未验证成功；可以继续确认接入。".to_string())
+                },
+                reachable,
+                registered: device.is_some(),
+                requires_auth,
+                vendor: candidate.vendor.clone().or_else(|| device.and_then(|item| item.vendor.clone())),
+                model: candidate.model.clone().or_else(|| device.and_then(|item| item.model.clone())),
+                rtsp_paths,
+            });
+        }
+
+        Ok(HubScanSummary {
+            binding: enrich_binding_urls(state.binding.clone(), public_origin),
+            defaults: state.defaults.clone(),
+            devices,
+            results,
+            scanned_hosts: discovery.candidates.len(),
+        })
+    }
+}
+
+pub fn build_mobile_setup_url(public_origin: &str, session_code: Option<&str>) -> String {
+    let origin = public_origin.trim_end_matches('/');
+    match session_code {
+        Some(session_code) if !session_code.trim().is_empty() => {
+            format!("{origin}/setup/mobile?session={session_code}")
+        }
+        _ => format!("{origin}/setup/mobile"),
+    }
+}
+
+pub fn enrich_binding_urls(
+    mut binding: AdminBindingState,
+    public_origin: Option<&str>,
+) -> AdminBindingState {
+    if let Some(public_origin) = public_origin {
+        binding.setup_url = build_mobile_setup_url(public_origin, Some(&binding.session_code));
+        binding.static_setup_url = build_mobile_setup_url(public_origin, None);
+    }
+    binding
+}
+
+pub fn prefers_onvif_discovery(value: &str) -> bool {
+    value.to_lowercase().contains("onvif")
+}
+
+pub fn non_empty_opt(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+pub fn device_id_for_ip(ip: &str) -> String {
+    format!("cam-rtsp-{}", ip.replace('.', "-"))
+}
+
+pub fn looks_like_auth_error(error: &str) -> bool {
+    let normalized = error.to_lowercase();
+    normalized.contains("401")
+        || normalized.contains("unauthorized")
+        || normalized.contains("authorization failed")
+        || normalized.contains("auth failed")
+}
+
+pub fn humanize_probe_error(error: &str) -> String {
+    if looks_like_auth_error(error) {
+        "RTSP 返回 401，说明摄像头需要密码。".to_string()
+    } else {
+        error.to_string()
+    }
+}
+
+pub fn upsert_devices(
+    store: &DeviceRegistryStore,
+    discovered: &[CameraDevice],
+) -> Result<Vec<CameraDevice>, String> {
+    let mut devices = store.load_devices()?;
+    for incoming in discovered {
+        if let Some(existing) = devices
+            .iter_mut()
+            .find(|existing| same_camera(existing, incoming))
+        {
+            *existing = merge_camera(existing.clone(), incoming.clone());
+        } else {
+            devices.push(normalize_camera_metadata(incoming.clone()));
+        }
+    }
+    store.save_devices(&devices)?;
+    Ok(devices)
+}
+
+pub fn same_camera(existing: &CameraDevice, incoming: &CameraDevice) -> bool {
+    existing.device_id == incoming.device_id
+        || (existing.ip_address.is_some()
+            && existing.ip_address == incoming.ip_address
+            && existing.primary_stream.url == incoming.primary_stream.url)
+        || existing.primary_stream.url == incoming.primary_stream.url
+}
+
+pub fn merge_camera(existing: CameraDevice, incoming: CameraDevice) -> CameraDevice {
+    normalize_camera_metadata(CameraDevice {
+        device_id: existing.device_id,
+        name: if incoming.name.trim().is_empty() {
+            existing.name
+        } else {
+            incoming.name
+        },
+        kind: incoming.kind,
+        status: incoming.status,
+        room: existing.room.or(incoming.room),
+        vendor: incoming.vendor.or(existing.vendor),
+        model: incoming.model.or(existing.model),
+        ip_address: incoming.ip_address.or(existing.ip_address),
+        mac_address: incoming.mac_address.or(existing.mac_address),
+        discovery_source: if incoming.discovery_source.trim().is_empty() {
+            existing.discovery_source
+        } else {
+            incoming.discovery_source
+        },
+        primary_stream: incoming.primary_stream,
+        capabilities: incoming.capabilities,
+        last_seen_at: incoming.last_seen_at.or(existing.last_seen_at),
+    })
+}
+
+pub fn normalize_camera_metadata(mut device: CameraDevice) -> CameraDevice {
+    device.discovery_source = normalize_discovery_source(&device.discovery_source).to_string();
+    if matches!(device.primary_stream.transport, StreamTransport::Unknown) {
+        device.primary_stream.transport = StreamTransport::Rtsp;
+    }
+    device
+}
+
+pub fn normalize_discovery_source(value: &str) -> &str {
+    match value {
+        "rtspprobe" => "rtsp_probe",
+        "mdns" => "mdns",
+        "ssdp" => "ssdp",
+        "onvif" => "onvif",
+        "matter" => "matter",
+        "rtsp_probe" => "rtsp_probe",
+        _ => value,
+    }
+}
+
+pub fn collect_candidate_ips(
+    cidr: &str,
+    devices: &[CameraDevice],
+    rtsp_port: u16,
+) -> Result<Vec<String>, String> {
+    let (network, prefix) = parse_cidr(cidr)?;
+    let mut ordered = Vec::new();
+    let mut seen = HashSet::new();
+
+    for device in devices {
+        if let Some(ip) = &device.ip_address {
+            if ip_in_cidr(ip, network, prefix) && seen.insert(ip.clone()) {
+                ordered.push(ip.clone());
+            }
+        }
+    }
+
+    let hosts = enumerate_hosts(network, prefix)?;
+    if hosts.len() > 256 {
+        return Err(format!(
+            "当前网段 {cidr} 包含 {} 个主机，超出快速扫描上限；请先缩小到 /24 或更小网段",
+            hosts.len()
+        ));
+    }
+
+    for ip in discover_open_rtsp_hosts(&hosts, rtsp_port) {
+        if seen.insert(ip.clone()) {
+            ordered.push(ip);
+        }
+    }
+
+    if ordered.is_empty() {
+        return Err(format!(
+            "在 {cidr} 中没有探测到开放 {rtsp_port} 端口的候选主机；可以先手动添加第一台摄像头"
+        ));
+    }
+
+    Ok(ordered)
+}
+
+pub fn validate_feishu_bot(app_id: &str, app_secret: &str) -> Result<(String, String), String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| format!("failed to build Feishu HTTP client: {error}"))?;
+
+    let token_resp: serde_json::Value = client
+        .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
+        .json(&serde_json::json!({ "app_id": app_id, "app_secret": app_secret }))
+        .send()
+        .map_err(|error| format!("Feishu token request failed: {error}"))?
+        .json()
+        .map_err(|error| format!("Feishu token response parse failed: {error}"))?;
+    if token_resp.get("code").and_then(|value| value.as_i64()) != Some(0) {
+        let msg = token_resp
+            .get("msg")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown error");
+        return Err(format!("Feishu 凭证校验失败: {msg}"));
+    }
+    let token = token_resp
+        .get("tenant_access_token")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Feishu 校验成功但未返回 tenant_access_token".to_string())?;
+
+    let bot_resp: serde_json::Value = client
+        .get("https://open.feishu.cn/open-apis/bot/v3/info")
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .map_err(|error| format!("Feishu bot info request failed: {error}"))?
+        .json()
+        .map_err(|error| format!("Feishu bot info parse failed: {error}"))?;
+    if bot_resp.get("code").and_then(|value| value.as_i64()) != Some(0) {
+        let msg = bot_resp
+            .get("msg")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown error");
+        return Err(format!("Feishu Bot 信息读取失败: {msg}"));
+    }
+
+    let data = bot_resp.get("data").cloned().unwrap_or_default();
+    let app_name = data
+        .get("app_name")
+        .and_then(|value| value.as_str())
+        .or_else(|| data.get("bot_name").and_then(|value| value.as_str()))
+        .unwrap_or("HarborNAS Bot")
+        .to_string();
+    let bot_open_id = data
+        .get("open_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Ok((app_name, bot_open_id))
+}
+
+fn discover_open_rtsp_hosts(hosts: &[String], port: u16) -> Vec<String> {
+    let mut handles = Vec::with_capacity(hosts.len());
+    for ip in hosts {
+        let ip = ip.clone();
+        handles.push(thread::spawn(move || {
+            let ipv4 = ip.parse::<Ipv4Addr>().ok()?;
+            let socket = SocketAddrV4::new(ipv4, port);
+            match TcpStream::connect_timeout(&socket.into(), Duration::from_millis(250)) {
+                Ok(stream) => {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    Some(ip)
+                }
+                Err(_) => None,
+            }
+        }));
+    }
+
+    let mut found = Vec::new();
+    for handle in handles {
+        if let Ok(Some(ip)) = handle.join() {
+            found.push(ip);
+        }
+    }
+    found.sort();
+    found
+}
+
+fn parse_cidr(cidr: &str) -> Result<(Ipv4Addr, u8), String> {
+    let mut parts = cidr.trim().split('/');
+    let network = parts
+        .next()
+        .ok_or_else(|| format!("invalid CIDR: {cidr}"))?
+        .parse::<Ipv4Addr>()
+        .map_err(|error| format!("invalid CIDR network {cidr}: {error}"))?;
+    let prefix = parts
+        .next()
+        .ok_or_else(|| format!("invalid CIDR prefix: {cidr}"))?
+        .parse::<u8>()
+        .map_err(|error| format!("invalid CIDR prefix {cidr}: {error}"))?;
+    if prefix > 32 {
+        return Err(format!("CIDR prefix out of range: {cidr}"));
+    }
+    Ok((network, prefix))
+}
+
+fn ip_in_cidr(ip: &str, network: Ipv4Addr, prefix: u8) -> bool {
+    let parsed = match ip.parse::<Ipv4Addr>() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    (u32::from(parsed) & mask) == (u32::from(network) & mask)
+}
+
+fn enumerate_hosts(network: Ipv4Addr, prefix: u8) -> Result<Vec<String>, String> {
+    let normalized_network = normalize_network(network, prefix);
+    let host_count = if prefix == 32 {
+        1
+    } else if prefix == 31 {
+        2
+    } else {
+        (1u32 << (32 - prefix)) - 2
+    };
+    if host_count == 0 {
+        return Err("CIDR does not contain usable hosts".to_string());
+    }
+
+    let base = u32::from(normalized_network);
+    let start = if prefix >= 31 { base } else { base + 1 };
+    let end = start + host_count;
+    let mut hosts = Vec::with_capacity(host_count as usize);
+    for value in start..end {
+        hosts.push(Ipv4Addr::from(value).to_string());
+    }
+    Ok(hosts)
+}
+
+fn normalize_network(network: Ipv4Addr, prefix: u8) -> Ipv4Addr {
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    Ipv4Addr::from(u32::from(network) & mask)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_mobile_setup_url, humanize_probe_error, looks_like_auth_error, merge_camera,
+        normalize_camera_metadata,
+    };
+    use crate::runtime::registry::{CameraDevice, StreamTransport};
+
+    #[test]
+    fn build_mobile_setup_url_supports_static_and_session_variants() {
+        assert_eq!(
+            build_mobile_setup_url("http://harbornas.local:4174", None),
+            "http://harbornas.local:4174/setup/mobile"
+        );
+        assert_eq!(
+            build_mobile_setup_url("http://harbornas.local:4174/", Some("ABCD-1234")),
+            "http://harbornas.local:4174/setup/mobile?session=ABCD-1234"
+        );
+    }
+
+    #[test]
+    fn auth_error_is_humanized() {
+        assert!(looks_like_auth_error("401 Unauthorized"));
+        assert_eq!(
+            humanize_probe_error("rtsp://demo: 401 Unauthorized"),
+            "RTSP 返回 401，说明摄像头需要密码。"
+        );
+    }
+
+    #[test]
+    fn merge_camera_keeps_stable_identity_and_normalizes_source() {
+        let mut existing = CameraDevice::new("cam-1", "Front Door", "rtsp://1.1.1.1/live");
+        existing.room = Some("客厅".to_string());
+        let mut incoming = CameraDevice::new("cam-2", "Front Door Cam", "rtsp://1.1.1.1/live");
+        incoming.discovery_source = "onvif".to_string();
+        incoming.primary_stream.transport = StreamTransport::Unknown;
+
+        let merged = merge_camera(existing, incoming);
+        assert_eq!(merged.device_id, "cam-1");
+        assert_eq!(merged.room.as_deref(), Some("客厅"));
+        assert_eq!(merged.discovery_source, "onvif");
+        assert_eq!(merged.primary_stream.transport, StreamTransport::Rtsp);
+
+        let normalized = normalize_camera_metadata(merged);
+        assert_eq!(normalized.discovery_source, "onvif");
+    }
+}

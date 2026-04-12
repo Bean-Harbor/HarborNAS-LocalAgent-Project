@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>HarborNAS Agent Hub Admin Console</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="canvas-noise"></div>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-badge">AH</div>
+          <div>
+            <p class="eyebrow">HarborNAS</p>
+            <h1>Agent Hub Admin</h1>
+          </div>
+        </div>
+
+        <nav class="nav-stack">
+          <button class="nav-item active">Hub 总览</button>
+          <button class="nav-item">飞书绑定</button>
+          <button class="nav-item">设备接入</button>
+          <button class="nav-item">默认策略</button>
+          <button class="nav-item">设备库</button>
+          <button class="nav-item">审计与事件</button>
+        </nav>
+
+        <section class="sidebar-card">
+          <p class="sidebar-label">产品主叙事</p>
+          <div class="priority-list">
+            <span class="pill pill-live">IM First</span>
+            <span class="pill">扫码绑定 Hub</span>
+            <span class="pill">飞书控制摄像头</span>
+            <span class="pill">WebUI 做后台配置</span>
+          </div>
+        </section>
+
+        <section class="sidebar-card muted">
+          <p class="sidebar-label">MVP 现在收敛到</p>
+          <div class="priority-list">
+            <span class="pill pill-plan">飞书扫码接入</span>
+            <span class="pill pill-plan">默认扫描摄像头</span>
+            <span class="pill pill-plan">手动添加摄像头</span>
+            <span class="pill pill-plan">抓拍分析并回图</span>
+          </div>
+        </section>
+      </aside>
+
+      <main class="main-stage">
+        <header class="hero">
+          <div class="hero-copy">
+            <p class="eyebrow">Agent Hub Console</p>
+            <h2>主入口在飞书，WebUI 是配置台、绑定台和审计台</h2>
+            <p class="hero-text">
+              用户先用手机扫描设备上的二维码，手机浏览器会打开这台 Agent Hub 的后台配置页。
+              在手机上填入飞书机器人的 app_id 和 app_secret 后，Hub 才正式接通飞书消息。之后就可以直接在飞书里扫描本地摄像头、
+              手动添加摄像头、查看某个房间、抓拍、录像和触发 AI 分析。这个页面负责把默认值、设备、策略和状态收拢起来。
+            </p>
+          </div>
+
+          <div class="hero-actions">
+            <button id="refresh-qr" class="button button-primary">刷新绑定二维码</button>
+            <button id="simulate-bind" class="button button-secondary">打开手机配置页</button>
+          </div>
+        </header>
+
+        <section class="metric-grid">
+          <article class="metric-card">
+            <span class="metric-label">飞书绑定状态</span>
+            <strong id="metric-binding">等待绑定</strong>
+            <span class="metric-note">主入口是飞书，不是 Web 页面按钮</span>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">默认扫描策略</span>
+            <strong id="metric-scan">192.168.3.0/24</strong>
+            <span class="metric-note">扫码完成后可按默认值直接开始扫描</span>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">已接入摄像头</span>
+            <strong id="metric-cameras">3</strong>
+            <span class="metric-note">自动发现后确认接入，也支持手动录入</span>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">最近飞书动作</span>
+            <strong id="metric-command">分析摄像头</strong>
+            <span class="metric-note">图片 + 摘要已可直接回到 IM</span>
+          </article>
+        </section>
+
+        <section class="panel section-panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">01 / Hub Binding</p>
+              <h3>扫码打开手机后台，再把飞书 Bot 接到 Agent Hub</h3>
+            </div>
+            <span class="status-chip">这是用户真正感知到的开始动作</span>
+          </div>
+
+          <div class="bind-grid">
+            <article class="subpanel qr-panel">
+              <div class="subpanel-head">
+                <h4>手机后台入口二维码</h4>
+                <span class="subpanel-note">手机扫一扫，直接打开这台 Hub 的移动配置页</span>
+              </div>
+
+              <div class="qr-frame">
+                <img id="qr-image" alt="HarborNAS mobile setup QR" style="width: 100%; height: 100%; object-fit: contain;" />
+              </div>
+              <div class="qr-token" id="qr-token">http://harbornas.local:4174/setup/mobile</div>
+              <p class="qr-instruction" id="qr-instruction">
+                这张静态二维码适合贴在 Bot 机身上，手机扫码后会打开本机后台配置页
+              </p>
+
+              <div class="status-list">
+                <div class="status-line">
+                  <span class="status-key">当前状态</span>
+                  <strong id="bind-status">等待扫码</strong>
+                </div>
+                <div class="status-line">
+                  <span class="status-key">已连接 Bot</span>
+                  <strong id="bound-user">未配置</strong>
+                </div>
+                <div class="status-line">
+                  <span class="status-key">飞书通道</span>
+                  <strong id="bound-channel">飞书 HarborNAS Bot</strong>
+                </div>
+              </div>
+            </article>
+
+            <article class="subpanel flow-panel">
+              <div class="subpanel-head">
+                <h4>扫码后的真实接入流程</h4>
+                <span class="subpanel-note">二维码只负责打开后台，真正的飞书接入发生在手机端表单</span>
+              </div>
+
+              <ol class="flow-list">
+                <li>用户用手机扫描设备上的二维码，手机浏览器打开这台 Hub 的移动配置页。</li>
+                <li>用户在手机上填入自己创建的飞书机器人的 app_id 和 app_secret。</li>
+                <li>后台即时验证飞书 Open API 与 Bot 信息，保存成功后 Hub 获得飞书消息入口。</li>
+                <li>之后用户回到飞书里，就可以直接发“扫描摄像头”“看看客厅摄像头”等命令。</li>
+                <li>后台页面继续负责策略、设备库和审计，不抢用户主入口。</li>
+              </ol>
+
+              <div class="command-cloud">
+                <span class="command-chip">扫描摄像头</span>
+                <span class="command-chip">添加摄像头 192.168.3.73</span>
+                <span class="command-chip">看看客厅摄像头</span>
+                <span class="command-chip">分析门口摄像头</span>
+                <span class="command-chip">给我拍一张客厅</span>
+              </div>
+
+              <form id="bind-test-form" class="manual-form">
+                <label>
+                  飞书 App ID
+                  <input
+                    id="bind-test-display-name"
+                    name="app_id"
+                    type="text"
+                    placeholder="如：cli_xxxxxxxxxxxxxxxx"
+                    required
+                  />
+                </label>
+                <label>
+                  飞书 App Secret
+                  <input
+                    id="bind-test-open-id"
+                    name="app_secret"
+                    type="password"
+                    placeholder="输入飞书开放平台里对应的 App Secret"
+                  />
+                </label>
+                <button type="submit" class="button button-secondary">保存并验证飞书 Bot</button>
+              </form>
+            </article>
+          </div>
+        </section>
+
+        <section class="panel intake-panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">02 / Device Intake</p>
+              <h3>设备接入台</h3>
+            </div>
+            <span class="status-chip">后台负责默认值与确认，不抢主入口</span>
+          </div>
+
+          <div class="intake-grid">
+            <article class="subpanel">
+              <div class="subpanel-head">
+                <h4>自动扫描候选设备</h4>
+                <span class="subpanel-note">扫码成功后可直接按默认值执行</span>
+              </div>
+
+              <div class="scan-toolbar">
+                <label>
+                  扫描网段
+                  <input id="scan-cidr" type="text" value="192.168.3.0/24" />
+                </label>
+                <label>
+                  发现协议
+                  <select id="scan-protocol">
+                    <option>RTSP Probe</option>
+                    <option>ONVIF + RTSP Fallback</option>
+                  </select>
+                </label>
+              </div>
+
+              <div class="inline-actions">
+                <button id="scan-button" class="button button-primary">执行默认扫描</button>
+                <button id="sync-im-guide" class="button button-secondary">同步到飞书引导</button>
+              </div>
+
+              <ul id="scan-results" class="scan-result-list"></ul>
+            </article>
+
+            <article class="subpanel">
+              <div class="subpanel-head">
+                <h4>手动添加摄像头</h4>
+                <span class="subpanel-note">用户从飞书也能触发同一套参数</span>
+              </div>
+
+              <form id="manual-form" class="manual-form">
+                <label>
+                  摄像头名称
+                  <input name="name" type="text" placeholder="如：Living Room Cam" required />
+                </label>
+                <label>
+                  房间
+                  <input name="room" type="text" placeholder="如：客厅" />
+                </label>
+                <label>
+                  IP 地址
+                  <input name="ip" type="text" placeholder="如：192.168.3.73" required />
+                </label>
+                <label>
+                  RTSP 路径
+                  <input name="path" type="text" value="/ch1/main" />
+                </label>
+                <label>
+                  用户名
+                  <input name="username" type="text" placeholder="admin" />
+                </label>
+                <label>
+                  密码
+                  <input name="password" type="password" placeholder="••••••" />
+                </label>
+                <button type="submit" class="button button-primary">写入设备库</button>
+              </form>
+            </article>
+          </div>
+        </section>
+
+        <section class="panel policy-panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">03 / Default Policies</p>
+              <h3>后台配置的是默认策略，而不是代替飞书操作</h3>
+            </div>
+            <span class="status-chip">用户扫码后可以直接继承这些默认值</span>
+          </div>
+
+          <div class="policy-grid">
+            <article class="stack-card">
+              <h4>扫描默认值</h4>
+              <label>
+                默认网段
+                <input id="policy-cidr" type="text" value="192.168.3.0/24" />
+              </label>
+              <label>
+                首选发现协议
+                <select id="policy-discovery">
+                  <option>RTSP Probe</option>
+                  <option>ONVIF + RTSP Fallback</option>
+                </select>
+              </label>
+              <label>
+                默认 RTSP 用户名
+                <input id="policy-rtsp-username" type="text" value="admin" />
+              </label>
+              <label>
+                默认 RTSP 密码
+                <input id="policy-rtsp-password" type="password" placeholder="用于自动扫描验证" />
+              </label>
+              <label>
+                默认 RTSP 路径候选
+                <input
+                  id="policy-rtsp-paths"
+                  type="text"
+                  value="/ch1/main, /h264/ch1/main/av_stream, /Streaming/Channels/101"
+                />
+              </label>
+            </article>
+
+            <article class="stack-card">
+              <h4>录像与抓拍默认值</h4>
+              <label>
+                默认录像策略
+                <select id="policy-recording">
+                  <option>按事件录制</option>
+                  <option>持续录像</option>
+                  <option>仅手动录像</option>
+                </select>
+              </label>
+              <label>
+                默认截图回传
+                <select id="policy-capture">
+                  <option>图片 + 摘要</option>
+                  <option>仅图片</option>
+                  <option>仅摘要</option>
+                </select>
+              </label>
+            </article>
+
+            <article class="stack-card">
+              <h4>AI 与飞书默认值</h4>
+              <label>
+                默认分析动作
+                <select id="policy-ai">
+                  <option>人体检测 + 中文摘要</option>
+                  <option>仅人体检测</option>
+                </select>
+              </label>
+              <label>
+                默认飞书群组
+                <input id="policy-feishu-group" type="text" value="客厅安全群" />
+              </label>
+            </article>
+          </div>
+
+          <div class="inline-actions">
+            <button id="save-policies" class="button button-primary">保存默认策略</button>
+            <button id="test-im-command" class="button button-secondary">模拟飞书命令流</button>
+          </div>
+        </section>
+
+        <section class="device-grid">
+          <article class="panel library-panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">04 / Device Library</p>
+                <h3>设备库与后台预览</h3>
+              </div>
+              <span class="status-chip">播放只是辅助，不是产品主首页</span>
+            </div>
+
+            <div id="camera-tabs" class="camera-tab-row"></div>
+
+            <div class="player-surface compact">
+              <img id="live-preview-frame" class="live-preview-frame" alt="摄像头近实时预览" />
+              <div class="preview-scrim"></div>
+              <div class="surface-grid"></div>
+              <div class="surface-copy compact-copy">
+                <div class="live-pill">
+                  <span class="live-dot"></span>
+                  <span id="active-live-status">直播已连接</span>
+                </div>
+                <h4 id="active-camera-name">Living Room Cam</h4>
+                <p id="active-camera-meta">客厅 · 192.168.3.73 · RTSP / H.265 Main</p>
+                <p id="active-camera-hint" class="surface-hint">
+                  这里的定位是管理员预览与验证，不是用户主控制入口。真正的日常操作建议继续放在飞书。
+                </p>
+              </div>
+              <div id="overlay-boxes" class="overlay-boxes"></div>
+              <div class="player-overlay">
+                <span id="signal-chip" class="signal-chip">链路稳定</span>
+                <span id="stream-mode" class="signal-chip secondary">按事件录制</span>
+              </div>
+            </div>
+
+            <div class="action-row">
+              <button id="snapshot-button" class="button button-secondary">后台抓拍验证</button>
+              <button id="analyze-button" class="button button-primary">后台触发分析</button>
+              <button id="record-button" class="button button-secondary">切换录像策略</button>
+              <button id="send-to-feishu" class="button button-ghost">把结果发到飞书</button>
+            </div>
+          </article>
+
+          <article class="panel detail-panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">05 / Hub Details</p>
+                <h3>当前设备详情与绑定目标</h3>
+              </div>
+              <span id="device-badge" class="status-chip">在线</span>
+            </div>
+
+            <dl class="detail-list">
+              <div>
+                <dt>设备名称</dt>
+                <dd id="detail-name">Living Room Cam</dd>
+              </div>
+              <div>
+                <dt>房间</dt>
+                <dd id="detail-room">客厅</dd>
+              </div>
+              <div>
+                <dt>发现方式</dt>
+                <dd id="detail-source">rtsp_probe</dd>
+              </div>
+              <div>
+                <dt>主流地址</dt>
+                <dd id="detail-stream">rtsp://admin:***@192.168.3.73:554/ch1/main</dd>
+              </div>
+              <div>
+                <dt>默认飞书去向</dt>
+                <dd id="detail-feishu">客厅安全群 / HarborNAS Bot</dd>
+              </div>
+            </dl>
+
+            <div class="stack-card">
+              <h4>这个后台页应该负责</h4>
+              <ul class="feature-list">
+                <li>绑定状态、默认值、设备接入、推送策略和错误排查。</li>
+                <li>让管理员确认摄像头是否可用，而不是替代飞书做日常操作。</li>
+                <li>提供少量后台验证动作，例如抓拍、分析、发测试消息。</li>
+              </ul>
+            </div>
+
+            <div class="stack-card muted-card">
+              <h4>后续再补</h4>
+              <ul class="feature-list">
+                <li>多租户与账号映射。</li>
+                <li>录像中心与历史检索。</li>
+                <li>多 IM 渠道与权限审计。</li>
+              </ul>
+            </div>
+          </article>
+        </section>
+
+        <section class="bottom-grid">
+          <article class="panel timeline-panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">06 / Audit Feed</p>
+                <h3>绑定、扫描、命令和 AI 的统一事件流</h3>
+              </div>
+              <button id="clear-events" class="button button-ghost">清空演示事件</button>
+            </div>
+            <div id="event-list" class="event-list"></div>
+          </article>
+
+          <article class="panel im-panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">07 / IM Story</p>
+                <h3>对外演示时建议强调什么</h3>
+              </div>
+              <span class="status-chip">宣传重点</span>
+            </div>
+
+            <div class="stack-card">
+              <h4>推荐讲法</h4>
+              <ul class="feature-list">
+                <li>先在飞书扫码，把用户和本地 Agent Hub 绑起来。</li>
+                <li>系统会按默认值自动扫描局域网里的摄像头。</li>
+                <li>用户主要通过飞书完成查看、抓拍、分析和通知。</li>
+                <li>WebUI 只是管理员配置台、设备库和审计台。</li>
+              </ul>
+            </div>
+
+            <div class="stack-card muted-card">
+              <h4>这版页面已经涵盖的能力</h4>
+              <ul class="feature-list">
+                <li>二维码绑定入口</li>
+                <li>飞书命令样例</li>
+                <li>设备发现与手动添加</li>
+                <li>默认策略配置</li>
+                <li>后台预览与事件审计</li>
+              </ul>
+            </div>
+          </article>
+        </section>
+      </main>
+    </div>
+
+    <div id="toast" class="toast" aria-live="polite"></div>
+    <script src="./app.js"></script>
+  </body>
+</html>

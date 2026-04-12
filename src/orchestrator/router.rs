@@ -66,7 +66,9 @@ impl Router {
             status: StepStatus::Failed,
             duration_ms: 0,
             error_code: Some("NO_EXECUTOR_AVAILABLE".to_string()),
-            error_message: Some(last_error.unwrap_or_else(|| "No executor available for this action".to_string())),
+            error_message: Some(
+                last_error.unwrap_or_else(|| "No executor available for this action".to_string()),
+            ),
             audit_ref: String::new(),
             result_payload: serde_json::json!({}),
         }

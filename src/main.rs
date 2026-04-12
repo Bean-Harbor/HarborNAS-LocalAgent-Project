@@ -4,14 +4,20 @@ use std::path::PathBuf;
 use clap::{Parser, ValueEnum};
 use serde_json::json;
 
+use harbornas_local_agent::adapters::onvif::WsDiscoveryOnvifAdapter;
+use harbornas_local_agent::adapters::rtsp::CommandRtspAdapter;
 use harbornas_local_agent::orchestrator::approval::{AutonomyConfig, AutonomyLevel};
+use harbornas_local_agent::orchestrator::executors::device_discovery::DeviceDiscoveryExecutor;
 use harbornas_local_agent::orchestrator::executors::harbor_ops::{
-    MiddlewareExecutor, MiddlewareHttpExecutor, MiddlewareWsExecutor, MidcliExecutor,
+    MidcliExecutor, MiddlewareExecutor, MiddlewareHttpExecutor, MiddlewareWsExecutor,
 };
+use harbornas_local_agent::orchestrator::executors::vision::VisionExecutor;
 use harbornas_local_agent::orchestrator::tool_loop::{
     ToolCall, ToolLoopConfig, ToolLoopEngine, ToolRegistry,
 };
-use harbornas_local_agent::orchestrator::{ApprovalContext, ApprovalManager, Router, Runtime, TaskPlan};
+use harbornas_local_agent::orchestrator::{
+    ApprovalContext, ApprovalManager, Router, Runtime, TaskPlan,
+};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum RunMode {
@@ -26,7 +32,19 @@ enum RunMode {
 #[command(about = "HarborNAS local assistant runtime (Rust)")]
 struct Cli {
     #[arg(long, help = "Path to task plan JSON file")]
-    plan: PathBuf,
+    plan: Option<PathBuf>,
+
+    #[arg(
+        long,
+        help = "Open an RTSP stream directly in a local player, e.g. rtsp://192.168.1.50/live"
+    )]
+    rtsp_open_url: Option<String>,
+
+    #[arg(
+        long,
+        help = "Preferred RTSP player, e.g. ffplay | mpv | vlc | gst-launch-1.0 | open | iina"
+    )]
+    rtsp_player: Option<String>,
 
     #[arg(long, value_enum, default_value_t = RunMode::Plan, help = "Execution mode: plan | loop")]
     mode: RunMode,
@@ -55,7 +73,10 @@ struct Cli {
     #[arg(long, help = "HarborOS API key (Bearer token auth)")]
     harbor_api_key: Option<String>,
 
-    #[arg(long, help = "HarborOS API username (basic auth, used with --harbor-password)")]
+    #[arg(
+        long,
+        help = "HarborOS API username (basic auth, used with --harbor-password)"
+    )]
     harbor_user: Option<String>,
 
     #[arg(long, help = "HarborOS API password (basic auth)")]
@@ -64,7 +85,11 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = AutonomyArg::Supervised, help = "Autonomy level")]
     autonomy: AutonomyArg,
 
-    #[arg(long, default_value_t = 8, help = "Max tool-loop iterations (loop mode)")]
+    #[arg(
+        long,
+        default_value_t = 8,
+        help = "Max tool-loop iterations (loop mode)"
+    )]
     max_iterations: usize,
 }
 
@@ -88,7 +113,20 @@ impl From<AutonomyArg> for AutonomyLevel {
 fn main() {
     let cli = Cli::parse();
 
-    let plan_text = match fs::read_to_string(&cli.plan) {
+    if let Some(stream_url) = &cli.rtsp_open_url {
+        run_rtsp_open_mode(&cli, stream_url);
+        return;
+    }
+
+    let plan_path = match &cli.plan {
+        Some(path) => path,
+        None => {
+            eprintln!("--plan is required unless --rtsp-open-url is provided");
+            std::process::exit(1);
+        }
+    };
+
+    let plan_text = match fs::read_to_string(plan_path) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("failed to read plan file: {e}");
@@ -124,8 +162,32 @@ fn main() {
     }
 }
 
+fn run_rtsp_open_mode(cli: &Cli, stream_url: &str) {
+    let adapter = CommandRtspAdapter::default();
+    let request = harbornas_local_agent::runtime::media::StreamOpenRequest::new(
+        "direct-rtsp-open",
+        stream_url,
+        cli.rtsp_player.clone(),
+    );
+
+    match harbornas_local_agent::adapters::rtsp::RtspProbeAdapter::open_stream(&adapter, &request) {
+        Ok(result) => match serde_json::to_string_pretty(&result) {
+            Ok(out) => println!("{out}"),
+            Err(e) => {
+                eprintln!("failed to serialize RTSP open result: {e}");
+                std::process::exit(1);
+            }
+        },
+        Err(e) => {
+            eprintln!("failed to open RTSP stream: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn run_plan_mode(cli: &Cli, plan: TaskPlan) {
     let mut router = Router::new();
+    let device_registry_path = PathBuf::from(".harbornas/device-registry.json");
 
     // If --harbor-url is provided, use WS executor (user+pass) or HTTP executor (api-key);
     // otherwise fall back to local preview/passthrough executors.
@@ -157,6 +219,28 @@ fn run_plan_mode(cli: &Cli, plan: TaskPlan) {
             cli.midcli_passthrough,
         )));
     }
+
+    let device_executor = match DeviceDiscoveryExecutor::new(
+        Box::new(CommandRtspAdapter::default()),
+        Some(Box::new(WsDiscoveryOnvifAdapter::default())),
+        None,
+        None,
+    )
+    .with_registry_store(
+        harbornas_local_agent::runtime::registry::DeviceRegistryStore::new(device_registry_path),
+    ) {
+        Ok(executor) => executor,
+        Err(e) => {
+            eprintln!("failed to initialize device registry: {e}");
+            std::process::exit(1);
+        }
+    };
+    router.register(Box::new(device_executor));
+    router.register(Box::new(VisionExecutor::new(
+        harbornas_local_agent::runtime::registry::DeviceRegistryStore::new(PathBuf::from(
+            ".harbornas/device-registry.json",
+        )),
+    )));
 
     let approval = ApprovalContext {
         token: cli.approval_token.clone(),
@@ -217,7 +301,9 @@ fn run_loop_mode(cli: &Cli, plan: &TaskPlan) {
                 tool: format!(
                     "{}.{}",
                     steps_snapshot[done_count]["domain"].as_str().unwrap_or("?"),
-                    steps_snapshot[done_count]["operation"].as_str().unwrap_or("?")
+                    steps_snapshot[done_count]["operation"]
+                        .as_str()
+                        .unwrap_or("?")
                 ),
                 args: steps_snapshot[done_count].clone(),
             }

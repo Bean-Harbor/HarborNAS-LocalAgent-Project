@@ -1,11 +1,16 @@
 import json
+import os
 import urllib.request
 import urllib.error
 
 url = 'https://open.feishu.cn/callback/ws/endpoint'
+app_id = os.environ.get('FEISHU_APP_ID', '').strip()
+app_secret = os.environ.get('FEISHU_APP_SECRET', '').strip()
+if not app_id or not app_secret:
+    raise SystemExit('Set FEISHU_APP_ID and FEISHU_APP_SECRET before running this script.')
 payload = json.dumps({
-    'AppID': 'cli_a94bb44b7aba5bcc',
-    'AppSecret': 'd9owtlQMNrhI3OxDNbjX6cYBWBN6881H',
+    'AppID': app_id,
+    'AppSecret': app_secret,
 }).encode('utf-8')
 req = urllib.request.Request(url, data=payload, headers={'Content-Type': 'application/json', 'locale': 'zh'})
 try:

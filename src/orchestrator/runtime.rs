@@ -31,7 +31,8 @@ impl Runtime {
             let audit_ref = self.audit.audit_ref_for(event_id);
 
             if let Err(pv) = enforce(action, self.approval.as_ref()) {
-                self.audit.record_policy_block(event_id, &pv.code, &pv.message);
+                self.audit
+                    .record_policy_block(event_id, &pv.code, &pv.message);
                 task_result.results.push(ExecutionResult {
                     task_id: plan.task_id.clone(),
                     step_id,

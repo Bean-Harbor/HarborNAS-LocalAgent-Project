@@ -4,7 +4,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::scripts::integration::{
-    default_midcli_service_query, IntegrationConfig, MiddlewareClient, MidcliClient,
+    default_midcli_service_query, IntegrationConfig, MidcliClient, MiddlewareClient,
 };
 
 const REQUIRED_FILES: [&str; 7] = [
@@ -55,11 +55,14 @@ pub fn build_checks(root: &Path) -> Vec<CheckResult> {
         });
     }
 
-    let v2_doc = fs::read_to_string(root.join("HarborNAS-LocalAgent-V2-Assistant-Skills-Roadmap.md"))
+    let v2_doc =
+        fs::read_to_string(root.join("HarborNAS-LocalAgent-V2-Assistant-Skills-Roadmap.md"))
+            .unwrap_or_default();
+    let files_doc = fs::read_to_string(root.join("HarborNAS-Files-BatchOps-Contract-v1.md"))
         .unwrap_or_default();
-    let files_doc = fs::read_to_string(root.join("HarborNAS-Files-BatchOps-Contract-v1.md")).unwrap_or_default();
     let planner_doc =
-        fs::read_to_string(root.join("HarborNAS-Planner-TaskDecompose-Contract-v1.md")).unwrap_or_default();
+        fs::read_to_string(root.join("HarborNAS-Planner-TaskDecompose-Contract-v1.md"))
+            .unwrap_or_default();
 
     checks.push(CheckResult {
         name: "route-priority:control-plane-first".to_string(),
@@ -91,7 +94,8 @@ pub fn build_checks(root: &Path) -> Vec<CheckResult> {
 
     checks.push(CheckResult {
         name: "planner-contract:route-priority".to_string(),
-        passed: planner_doc.contains("\"route_priority\": [\"middleware_api\", \"midcli\", \"browser\", \"mcp\"]"),
+        passed: planner_doc
+            .contains("\"route_priority\": [\"middleware_api\", \"midcli\", \"browser\", \"mcp\"]"),
         details: "Planner contract must preserve the approved route priority order.".to_string(),
         skipped: None,
     });
@@ -159,13 +163,20 @@ pub fn build_live_checks(config: &IntegrationConfig) -> Vec<CheckResult> {
     checks
 }
 
-pub fn run_validate(root: &Path, config: &IntegrationConfig, skip_live: bool, require_live: bool) -> ValidateReport {
+pub fn run_validate(
+    root: &Path,
+    config: &IntegrationConfig,
+    skip_live: bool,
+    require_live: bool,
+) -> ValidateReport {
     let mut checks = build_checks(root);
     if !skip_live {
         checks.extend(build_live_checks(config));
     }
 
-    let mut passed = checks.iter().all(|check| check.passed || check.skipped == Some(true));
+    let mut passed = checks
+        .iter()
+        .all(|check| check.passed || check.skipped == Some(true));
     let live_executed = checks.iter().any(|check| {
         (check.name.starts_with("middleware-") || check.name.starts_with("midcli-"))
             && check.skipped != Some(true)
@@ -177,7 +188,8 @@ pub fn run_validate(root: &Path, config: &IntegrationConfig, skip_live: bool, re
             name: "live-probe-required".to_string(),
             passed: false,
             skipped: Some(false),
-            details: "--require-live was set but no live middleware/midcli probe executed.".to_string(),
+            details: "--require-live was set but no live middleware/midcli probe executed."
+                .to_string(),
         });
     }
 

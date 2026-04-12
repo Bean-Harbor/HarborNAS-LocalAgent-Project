@@ -20,7 +20,11 @@ struct Cli {
     #[arg(long, help = "Feishu app_secret")]
     app_secret: String,
 
-    #[arg(long, default_value = "https://open.feishu.cn", help = "Feishu Open API domain")]
+    #[arg(
+        long,
+        default_value = "https://open.feishu.cn",
+        help = "Feishu Open API domain"
+    )]
     domain: String,
 }
 
@@ -71,7 +75,10 @@ fn main() {
 
     let code = resp_body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     if code != 0 {
-        let msg = resp_body.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let msg = resp_body
+            .get("msg")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
         eprintln!("FAIL: Feishu returned error code={code}, msg=\"{msg}\"");
         eprintln!("  Full response: {resp_body}");
         std::process::exit(1);
@@ -81,16 +88,19 @@ fn main() {
         .get("tenant_access_token")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let expire = resp_body.get("expire").and_then(|v| v.as_i64()).unwrap_or(0);
+    let expire = resp_body
+        .get("expire")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
 
-    println!("  OK — token acquired (expires in {expire}s, length={})", token.len());
+    println!(
+        "  OK — token acquired (expires in {expire}s, length={})",
+        token.len()
+    );
 
     // Step 2: Verify token by querying bot info
     println!("[2/3] Querying bot info to verify token ...");
-    let bot_url = format!(
-        "{}/open-apis/bot/v3/info",
-        cli.domain.trim_end_matches('/')
-    );
+    let bot_url = format!("{}/open-apis/bot/v3/info", cli.domain.trim_end_matches('/'));
 
     let bot_resp = match client
         .get(&bot_url)
@@ -132,7 +142,10 @@ fn main() {
         println!("       App Name: {app_name}");
         println!("       Open ID : {open_id}");
     } else {
-        let msg = bot_body.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let msg = bot_body
+            .get("msg")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
         println!("  WARN: bot info returned code={bot_code}, msg=\"{msg}\"");
         println!("  (Token is valid but bot may not be enabled or this app has no bot capability)");
     }
@@ -140,7 +153,14 @@ fn main() {
     // Step 3: Summary
     println!("[3/3] Connectivity summary");
     println!("  tenant_access_token : OK");
-    println!("  bot_info            : {}", if bot_code == 0 { "OK" } else { "DEGRADED (no bot)" });
+    println!(
+        "  bot_info            : {}",
+        if bot_code == 0 {
+            "OK"
+        } else {
+            "DEGRADED (no bot)"
+        }
+    );
     println!();
     println!("=== Feishu connectivity test PASSED ===");
 }

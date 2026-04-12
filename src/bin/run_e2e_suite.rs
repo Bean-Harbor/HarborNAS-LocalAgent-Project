@@ -20,11 +20,15 @@ fn main() {
     let root = std::env::current_dir().expect("failed to resolve current dir");
     let config = IntegrationConfig::from_env();
 
-    let (e2e_payload, latency_payload, audit_payload) = run_e2e(&root, &cli.env, &config, cli.require_live);
+    let (e2e_payload, latency_payload, audit_payload) =
+        run_e2e(&root, &cli.env, &config, cli.require_live);
 
     write_json(&cli.report, &e2e_payload).expect("failed to write e2e report");
-    write_json(&cli.report.with_file_name("latency-summary.json"), &latency_payload)
-        .expect("failed to write latency report");
+    write_json(
+        &cli.report.with_file_name("latency-summary.json"),
+        &latency_payload,
+    )
+    .expect("failed to write latency report");
     write_json(
         &cli.report.with_file_name("audit-coverage-summary.json"),
         &audit_payload,

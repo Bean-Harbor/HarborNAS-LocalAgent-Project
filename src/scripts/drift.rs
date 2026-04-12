@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::scripts::integration::{
     default_midcli_filesystem_command, default_midcli_service_query, discover_source_capabilities,
-    file_operation_risk, service_operation_risk, IntegrationConfig, MiddlewareClient, MidcliClient,
+    file_operation_risk, service_operation_risk, IntegrationConfig, MidcliClient, MiddlewareClient,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,7 +55,10 @@ pub fn live_middleware_capabilities(client: &MiddlewareClient) -> HashMap<String
     map
 }
 
-pub fn live_midcli_capabilities(client: &MidcliClient, config: &IntegrationConfig) -> HashMap<String, bool> {
+pub fn live_midcli_capabilities(
+    client: &MidcliClient,
+    config: &IntegrationConfig,
+) -> HashMap<String, bool> {
     if !client.is_available() {
         return HashMap::new();
     }
@@ -67,7 +70,11 @@ pub fn live_midcli_capabilities(client: &MidcliClient, config: &IntegrationConfi
             format!("service start service={}", config.probe_service),
             true,
         ),
-        ("filesystem.listdir", default_midcli_filesystem_command(config), true),
+        (
+            "filesystem.listdir",
+            default_midcli_filesystem_command(config),
+            true,
+        ),
         (
             "filesystem.copy",
             format!(
@@ -115,9 +122,16 @@ pub fn run_drift_matrix(
 
     let middleware_caps = live_middleware_capabilities(&MiddlewareClient::new(config.clone()));
     let midcli_caps = live_midcli_capabilities(&MidcliClient::new(config.clone()), config);
-    let harbor_source_caps = discover_source_capabilities(harbor_repo_path.as_deref().or(config.harbor_repo_path.as_deref()));
-    let upstream_source_caps =
-        discover_source_capabilities(upstream_repo_path.as_deref().or(config.upstream_repo_path.as_deref()));
+    let harbor_source_caps = discover_source_capabilities(
+        harbor_repo_path
+            .as_deref()
+            .or(config.harbor_repo_path.as_deref()),
+    );
+    let upstream_source_caps = discover_source_capabilities(
+        upstream_repo_path
+            .as_deref()
+            .or(config.upstream_repo_path.as_deref()),
+    );
 
     let service_live_available = middleware_caps.get("service.query") == Some(&true)
         || midcli_caps.get("service.query") == Some(&true);
@@ -263,8 +277,14 @@ mod tests {
         };
 
         let rows = payload.rows;
-        let system = rows.iter().find(|r| r.capability == "system.harbor_ops").unwrap();
-        let files = rows.iter().find(|r| r.capability == "files.batch_ops").unwrap();
+        let system = rows
+            .iter()
+            .find(|r| r.capability == "system.harbor_ops")
+            .unwrap();
+        let files = rows
+            .iter()
+            .find(|r| r.capability == "files.batch_ops")
+            .unwrap();
         assert_eq!(system.status, "degraded");
         assert!(!system.blocking);
         assert_eq!(files.status, "degraded");

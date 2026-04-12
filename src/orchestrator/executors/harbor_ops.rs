@@ -39,7 +39,11 @@ impl Executor for MiddlewareExecutor {
     ) -> Result<ExecutionResult, String> {
         let started = Instant::now();
 
-        if std::env::var("HARBOR_FORCE_MIDDLEWARE_ERROR").ok().as_deref() == Some("1") {
+        if std::env::var("HARBOR_FORCE_MIDDLEWARE_ERROR")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
             return Err("forced middleware failure".to_string());
         }
 
@@ -48,7 +52,8 @@ impl Executor for MiddlewareExecutor {
             .get("service_name")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let (method, call_args) = map_service_operation(&action.operation, service_name, &action.args)?;
+        let (method, call_args) =
+            map_service_operation(&action.operation, service_name, &action.args)?;
 
         Ok(ExecutionResult {
             task_id: task_id.to_string(),
@@ -175,7 +180,11 @@ fn build_midcli_command(
     args: &serde_json::Value,
 ) -> Result<Vec<String>, String> {
     match operation {
-        "status" => Ok(vec!["service".to_string(), service_name.to_string(), "show".to_string()]),
+        "status" => Ok(vec![
+            "service".to_string(),
+            service_name.to_string(),
+            "show".to_string(),
+        ]),
         "start" => Ok(vec![
             "service".to_string(),
             "start".to_string(),
@@ -239,8 +248,8 @@ impl MiddlewareHttpExecutor {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| format!("failed to build HTTP client: {e}"))?;
-        let encoded = base64::engine::general_purpose::STANDARD
-            .encode(format!("{username}:{password}"));
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
         let header_val = HeaderValue::from_str(&format!("Basic {encoded}"))
             .map_err(|e| format!("invalid basic auth header: {e}"))?;
         Ok(Self {
@@ -375,9 +384,7 @@ impl Executor for MiddlewareHttpExecutor {
         };
 
         let status_code = response.status().as_u16();
-        let resp_text = response
-            .text()
-            .unwrap_or_else(|_| String::new());
+        let resp_text = response.text().unwrap_or_else(|_| String::new());
 
         let resp_json: serde_json::Value =
             serde_json::from_str(&resp_text).unwrap_or(json!({"raw": resp_text}));
@@ -436,9 +443,7 @@ impl MiddlewareWsExecutor {
         }
     }
 
-    fn connect_and_auth(
-        &self,
-    ) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, String> {
+    fn connect_and_auth(&self) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, String> {
         let (mut ws, _resp) =
             connect(&self.ws_url).map_err(|e| format!("ws connect failed: {e}"))?;
 
@@ -453,10 +458,8 @@ impl MiddlewareWsExecutor {
         let hs_resp = ws
             .read()
             .map_err(|e| format!("ws handshake recv failed: {e}"))?;
-        let hs_json: serde_json::Value = serde_json::from_str(
-            hs_resp.to_text().unwrap_or(""),
-        )
-        .unwrap_or_default();
+        let hs_json: serde_json::Value =
+            serde_json::from_str(hs_resp.to_text().unwrap_or("")).unwrap_or_default();
         if hs_json.get("msg").and_then(|v| v.as_str()) != Some("connected") {
             return Err(format!("ws handshake unexpected: {hs_json}"));
         }
@@ -474,13 +477,9 @@ impl MiddlewareWsExecutor {
         ))
         .map_err(|e| format!("ws auth send failed: {e}"))?;
 
-        let auth_resp = ws
-            .read()
-            .map_err(|e| format!("ws auth recv failed: {e}"))?;
-        let auth_json: serde_json::Value = serde_json::from_str(
-            auth_resp.to_text().unwrap_or(""),
-        )
-        .unwrap_or_default();
+        let auth_resp = ws.read().map_err(|e| format!("ws auth recv failed: {e}"))?;
+        let auth_json: serde_json::Value =
+            serde_json::from_str(auth_resp.to_text().unwrap_or("")).unwrap_or_default();
         if auth_json.get("msg").and_then(|v| v.as_str()) != Some("result") {
             return Err(format!("ws auth failed: {auth_json}"));
         }
@@ -511,13 +510,9 @@ impl MiddlewareWsExecutor {
         ))
         .map_err(|e| format!("ws call send failed: {e}"))?;
 
-        let resp = ws
-            .read()
-            .map_err(|e| format!("ws call recv failed: {e}"))?;
-        let resp_json: serde_json::Value = serde_json::from_str(
-            resp.to_text().unwrap_or(""),
-        )
-        .unwrap_or_default();
+        let resp = ws.read().map_err(|e| format!("ws call recv failed: {e}"))?;
+        let resp_json: serde_json::Value =
+            serde_json::from_str(resp.to_text().unwrap_or("")).unwrap_or_default();
 
         if resp_json.get("msg").and_then(|v| v.as_str()) != Some("result") {
             return Err(format!("ws method call failed: {resp_json}"));

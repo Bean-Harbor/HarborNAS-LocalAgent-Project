@@ -136,9 +136,21 @@ impl TaskResult {
 
     pub fn summary(&self) -> Value {
         let total_steps = self.results.len();
-        let succeeded = self.results.iter().filter(|r| r.status == StepStatus::Success).count();
-        let failed = self.results.iter().filter(|r| r.status == StepStatus::Failed).count();
-        let blocked = self.results.iter().filter(|r| r.status == StepStatus::Blocked).count();
+        let succeeded = self
+            .results
+            .iter()
+            .filter(|r| r.status == StepStatus::Success)
+            .count();
+        let failed = self
+            .results
+            .iter()
+            .filter(|r| r.status == StepStatus::Failed)
+            .count();
+        let blocked = self
+            .results
+            .iter()
+            .filter(|r| r.status == StepStatus::Blocked)
+            .count();
         serde_json::json!({
             "task_id": self.task_id,
             "total_steps": total_steps,

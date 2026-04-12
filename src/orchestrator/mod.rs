@@ -14,4 +14,6 @@ pub use contracts::{Action, ExecutionResult, RiskLevel, Route, StepStatus, TaskP
 pub use policy::{enforce, ApprovalContext, PolicyViolation};
 pub use router::{allowed_routes, Executor, Router};
 pub use runtime::Runtime;
-pub use tool_loop::{Tool, ToolCall, ToolLoopConfig, ToolLoopEngine, ToolLoopTrace, ToolOutput, ToolRegistry};
+pub use tool_loop::{
+    Tool, ToolCall, ToolLoopConfig, ToolLoopEngine, ToolLoopTrace, ToolOutput, ToolRegistry,
+};
