@@ -21,7 +21,7 @@ const state = {
   },
   defaults: {
     cidr: "192.168.3.0/24",
-    discovery: "RTSP Probe",
+    discovery: "ONVIF + RTSP",
     recording: "按事件录制",
     capture: "图片 + 摘要",
     ai: "人体检测 + 中文摘要",

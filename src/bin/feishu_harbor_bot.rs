@@ -781,6 +781,15 @@ impl FeishuBot {
     fn dispatch_command(&self, text: &str, sender: &FeishuSenderIdentity) -> BotReply {
         let t = normalize_command_text(text);
 
+        if t.contains("自检")
+            || t.contains("检查")
+            || t.contains("诊断")
+            || t.contains("health")
+            || t.contains("status")
+        {
+            return BotReply::Text(self.cmd_self_check(sender));
+        }
+
         if let Some(reply) = self.try_continue_pending_camera_add(text, sender) {
             return BotReply::Text(reply);
         }
@@ -829,6 +838,109 @@ impl FeishuBot {
 
         // Fallback: echo
         BotReply::Text(text.to_string())
+    }
+
+    fn cmd_self_check(&self, sender: &FeishuSenderIdentity) -> String {
+        let public_origin = std::env::var("HARBOR_PUBLIC_ORIGIN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "http://harbornas.local:4174".to_string());
+
+        let mut lines = Vec::new();
+        lines.push("HarborNAS Agent Hub 自检结果：".to_string());
+        lines.push(format!("- Public origin: {public_origin}"));
+        lines.push(format!(
+            "- 静态扫码入口: {}/setup/mobile",
+            public_origin.trim_end_matches('/')
+        ));
+        lines.push(format!(
+            "- 静态二维码 SVG: {}/api/binding/static-qr.svg",
+            public_origin.trim_end_matches('/')
+        ));
+
+        let state = self.hub_service().state_snapshot(Some(&public_origin));
+        match state {
+            Ok(snapshot) => {
+                lines.push(format!(
+                    "- 绑定码: {}",
+                    snapshot.binding.session_code
+                ));
+                lines.push(format!(
+                    "- 飞书 Bot 配置: {}",
+                    if snapshot.feishu_bot.configured {
+                        format!(
+                            "已配置（{}）",
+                            if snapshot.feishu_bot.app_name.trim().is_empty() {
+                                "HarborNAS Bot"
+                            } else {
+                                snapshot.feishu_bot.app_name.as_str()
+                            }
+                        )
+                    } else {
+                        "未配置".to_string()
+                    }
+                ));
+                let device_count = snapshot.devices.len();
+                lines.push(format!("- 设备库: {} 台摄像头", device_count));
+                lines.push(format!(
+                    "- 默认扫描网段: {}",
+                    snapshot.defaults.cidr
+                ));
+                lines.push(format!(
+                    "- 默认发现策略: {}",
+                    snapshot.defaults.discovery
+                ));
+            }
+            Err(error) => {
+                lines.push(format!("- Admin state 读取失败: {error}"));
+            }
+        }
+
+        let ffmpeg_ok = which::which("ffmpeg").is_ok();
+        let ffprobe_ok = which::which("ffprobe").is_ok();
+        lines.push(format!(
+            "- ffmpeg/ffprobe: {}/{}",
+            if ffmpeg_ok { "OK" } else { "MISSING" },
+            if ffprobe_ok { "OK" } else { "MISSING" }
+        ));
+
+        let model_path = std::env::var("HARBOR_YOLO_MODEL").unwrap_or_else(|_| {
+            "/var/lib/harbornas/models/yolov8n.pt".to_string()
+        });
+        lines.push(format!(
+            "- YOLO 模型文件: {}",
+            if PathBuf::from(&model_path).exists() {
+                format!("OK ({model_path})")
+            } else {
+                format!("MISSING ({model_path})")
+            }
+        ));
+
+        let venv_python = self
+            .workspace_root
+            .join(".harbornas/.venv-vision/bin/python");
+        lines.push(format!(
+            "- Vision venv: {}",
+            if venv_python.exists() {
+                format!("OK ({})", venv_python.display())
+            } else {
+                "MISSING (可在 Debian 机器上运行 tools/setup_vision_venv.sh)".to_string()
+            }
+        ));
+
+        let key_hint = sender
+            .chat_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| sender.open_id.as_str());
+        if key_hint.trim().is_empty() {
+            lines.push("- 会话键: 缺失（这会影响“密码/接入”多轮交互）".to_string());
+        } else {
+            lines.push(format!("- 会话键: {key_hint}"));
+        }
+
+        lines.push("你可以继续说：扫描摄像头 / 添加摄像头 192.168.x.x / 接入 1 / 密码 xxxxxx".to_string());
+        lines.join("\n")
     }
 
     fn cmd_bind_feishu_user(&self, text: &str, sender: &FeishuSenderIdentity) -> BotReply {

@@ -93,7 +93,8 @@ impl Default for AdminDefaults {
     fn default() -> Self {
         Self {
             cidr: default_scan_cidr(),
-            discovery: "RTSP Probe".to_string(),
+            // Prefer ONVIF WS-Discovery when available, fall back to RTSP probe for legacy cameras.
+            discovery: "ONVIF + RTSP".to_string(),
             recording: "按事件录制".to_string(),
             capture: "图片 + 摘要".to_string(),
             ai: "人体检测 + 中文摘要".to_string(),
