@@ -83,12 +83,14 @@ impl EzvizCloudPtzConnector {
     pub fn control_ptz(&self, request: &EzvizPtzRequest) -> Result<EzvizPtzResult, String> {
         let access_token = self.resolve_access_token()?;
         if request.direction == EzvizPtzDirection::Stop {
+            let camera_no = request.camera_no.to_string();
             self.post_form(
                 "/api/lapp/device/ptz/stop",
                 &[
                     ("accessToken", access_token.as_str()),
                     ("deviceSerial", request.device_serial.as_str()),
-                    ("cameraNo", &request.camera_no.to_string()),
+                    ("cameraNo", camera_no.as_str()),
+                    ("channelNo", camera_no.as_str()),
                 ],
             )?;
         } else {
@@ -98,12 +100,14 @@ impl EzvizCloudPtzConnector {
                 .ok_or_else(|| "EZVIZ PTZ direction missing command code".to_string())?
                 .to_string();
             let speed = request.speed.clamp(1, 7).to_string();
+            let camera_no = request.camera_no.to_string();
             self.post_form(
                 "/api/lapp/device/ptz/start",
                 &[
                     ("accessToken", access_token.as_str()),
                     ("deviceSerial", request.device_serial.as_str()),
-                    ("cameraNo", &request.camera_no.to_string()),
+                    ("cameraNo", camera_no.as_str()),
+                    ("channelNo", camera_no.as_str()),
                     ("direction", command.as_str()),
                     ("speed", speed.as_str()),
                 ],
@@ -181,4 +185,3 @@ mod tests {
         assert_eq!(EzvizPtzDirection::Stop.command_code(), None);
     }
 }
-
