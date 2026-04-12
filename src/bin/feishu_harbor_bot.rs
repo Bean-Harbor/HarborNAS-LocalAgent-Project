@@ -22,6 +22,7 @@ use harbornas_local_agent::runtime::feishu_session::{
 use harbornas_local_agent::runtime::hub::{
     looks_like_auth_error, CameraConnectRequest, CameraHubService, HubScanResultItem,
 };
+use harbornas_local_agent::runtime::remote_view;
 use harbornas_local_agent::runtime::registry::{CameraDevice, DeviceRegistryStore};
 use prost::Message;
 use reqwest::blocking::multipart::{Form, Part};
@@ -29,9 +30,9 @@ use serde_json::{json, Value};
 use std::fs;
 use std::net::{Ipv4Addr, TcpStream};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::WebSocket;
 use uuid::Uuid;
@@ -109,6 +110,7 @@ struct Cli {
 // HarborOS WebSocket Client
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct HarborOsClient {
     host: String,
     user: String,
@@ -236,6 +238,7 @@ impl HarborOsClient {
 // Feishu Bot
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct FeishuBot {
     domain: String,
     token: String,
@@ -249,6 +252,14 @@ struct CameraAnalysisReply {
     image_path: Option<String>,
 }
 
+struct FileReply {
+    text: String,
+    file_path: String,
+    file_type: String,
+    file_name: String,
+    duration_millis: Option<u64>,
+}
+
 struct CardReply {
     text: String,
     card: Value,
@@ -257,11 +268,14 @@ struct CardReply {
 enum BotReply {
     Text(String),
     CameraAnalysis(CameraAnalysisReply),
+    File(FileReply),
     Card(CardReply),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CameraIntent {
+    RemoteShare,
+    LiveView,
     Snapshot,
     Analyze,
     Record,
@@ -550,6 +564,135 @@ impl FeishuBot {
         Ok(())
     }
 
+    fn send_image_to_chat(&self, chat_id: &str, image_key: &str) -> Result<(), String> {
+        let url = format!(
+            "{}/open-apis/im/v1/messages?receive_id_type=chat_id",
+            self.domain
+        );
+        let body = json!({
+            "receive_id": chat_id,
+            "content": json!({"image_key": image_key}).to_string(),
+            "msg_type": "image",
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .json(&body)
+            .send()
+            .map_err(|e| format!("send image failed: {e}"))?;
+        let data: Value = resp.json().map_err(|e| format!("parse failed: {e}"))?;
+        let code = data.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            return Err(format!(
+                "code={code}, msg={}",
+                data.get("msg").and_then(|v| v.as_str()).unwrap_or("?")
+            ));
+        }
+        Ok(())
+    }
+
+    fn reply_file(&self, message_id: &str, file_key: &str) -> Result<(), String> {
+        let url = format!(
+            "{}/open-apis/im/v1/messages/{}/reply",
+            self.domain, message_id
+        );
+        let body = json!({
+            "content": json!({"file_key": file_key}).to_string(),
+            "msg_type": "file",
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .json(&body)
+            .send()
+            .map_err(|e| format!("file reply failed: {e}"))?;
+        let data: Value = resp.json().map_err(|e| format!("parse failed: {e}"))?;
+        let code = data.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            return Err(format!(
+                "code={code}, msg={}",
+                data.get("msg").and_then(|v| v.as_str()).unwrap_or("?")
+            ));
+        }
+        Ok(())
+    }
+
+    fn send_file_to_chat(&self, chat_id: &str, file_key: &str) -> Result<(), String> {
+        let url = format!(
+            "{}/open-apis/im/v1/messages?receive_id_type=chat_id",
+            self.domain
+        );
+        let body = json!({
+            "receive_id": chat_id,
+            "content": json!({"file_key": file_key}).to_string(),
+            "msg_type": "file",
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .json(&body)
+            .send()
+            .map_err(|e| format!("send file failed: {e}"))?;
+        let data: Value = resp.json().map_err(|e| format!("parse failed: {e}"))?;
+        let code = data.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            return Err(format!(
+                "code={code}, msg={}",
+                data.get("msg").and_then(|v| v.as_str()).unwrap_or("?")
+            ));
+        }
+        Ok(())
+    }
+
+    fn upload_message_file(
+        &self,
+        file_path: &str,
+        file_type: &str,
+        file_name: &str,
+        duration_millis: Option<u64>,
+    ) -> Result<String, String> {
+        let url = format!("{}/open-apis/im/v1/files", self.domain);
+        let bytes =
+            fs::read(file_path).map_err(|e| format!("failed to read file {}: {e}", file_path))?;
+        let file_part = Part::bytes(bytes)
+            .file_name(file_name.to_string())
+            .mime_str("video/mp4")
+            .map_err(|e| format!("failed to build file upload part: {e}"))?;
+        let mut form = Form::new()
+            .text("file_type", file_type.to_string())
+            .text("file_name", file_name.to_string())
+            .part("file", file_part);
+        if file_type != "stream" {
+            if let Some(duration_millis) = duration_millis {
+                form = form.text("duration", duration_millis.to_string());
+            }
+        }
+
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .multipart(form)
+            .send()
+            .map_err(|e| format!("file upload failed: {e}"))?;
+        let data: Value = resp.json().map_err(|e| format!("parse failed: {e}"))?;
+        let code = data.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            return Err(format!(
+                "code={code}, msg={}",
+                data.get("msg").and_then(|v| v.as_str()).unwrap_or("?")
+            ));
+        }
+
+        data.pointer("/data/file_key")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string())
+            .ok_or_else(|| "file upload response missing file_key".to_string())
+    }
+
     fn send_card_to_chat(&self, chat_id: &str, card: &Value) -> Result<(), String> {
         let url = format!(
             "{}/open-apis/im/v1/messages?receive_id_type=chat_id",
@@ -614,9 +757,21 @@ impl FeishuBot {
             .unwrap_or("(unknown)");
         println!("[EVENT] {event_type}");
 
+        let ack_payload = if event_type.contains("card.action.trigger") {
+            let event = payload.get("event").unwrap_or(&payload);
+            let action_value = event
+                .pointer("/action/value")
+                .or_else(|| payload.pointer("/action/value"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            build_card_action_ack_payload(&action_value)
+        } else {
+            json!({"code": 200})
+        };
+
         // ACK
         let mut ack = frame.clone();
-        ack.payload = json!({"code": 200}).to_string().into_bytes();
+        ack.payload = ack_payload.to_string().into_bytes();
         let mut buf = Vec::new();
         if ack.encode(&mut buf).is_ok() {
             let _ = ws.send(tungstenite::Message::Binary(buf.into()));
@@ -625,6 +780,8 @@ impl FeishuBot {
 
         if event_type.contains("im.message.receive") {
             self.handle_message_event(&payload);
+        } else if event_type.contains("card.action.trigger") {
+            self.handle_card_action_event(&payload);
         }
     }
 
@@ -677,6 +834,37 @@ impl FeishuBot {
         self.deliver_reply(message_id, chat_id, reply);
     }
 
+    fn handle_card_action_event(&self, payload: &Value) {
+        let event = payload.get("event").unwrap_or(payload);
+        let action_value = event
+            .pointer("/action/value")
+            .or_else(|| payload.pointer("/action/value"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+
+        let chat_id = string_at_paths(
+            payload,
+            &[
+                "/event/context/open_chat_id",
+                "/event/open_chat_id",
+                "/open_chat_id",
+                "/event/context/chat_id",
+                "/event/chat_id",
+                "/chat_id",
+            ],
+        )
+        .unwrap_or_default();
+        let sender = self.extract_action_sender_identity(payload, event);
+
+        println!("[CARD] action={action_value}");
+
+        let worker = self.clone();
+        thread::spawn(move || {
+            let reply = worker.dispatch_card_action(&action_value, &sender, Some(chat_id.as_str()));
+            worker.deliver_reply("", &chat_id, reply);
+        });
+    }
+
     fn deliver_reply(&self, message_id: &str, chat_id: &str, reply: BotReply) {
         match reply {
             BotReply::Text(text) => {
@@ -719,6 +907,59 @@ impl FeishuBot {
                     }
                 }
                 if !chat_id.is_empty() {
+                    if let Some(image_path) = result.image_path.as_deref() {
+                        match self.upload_message_image(image_path) {
+                            Ok(image_key) => match self.send_image_to_chat(chat_id, &image_key) {
+                                Ok(()) => println!("[REPLY] image OK (send-to-chat)"),
+                                Err(e) => println!("[REPLY] send image failed: {e}"),
+                            },
+                            Err(e) => println!("[REPLY] image upload failed: {e}"),
+                        }
+                    }
+                    match self.send_to_chat(chat_id, &result.text) {
+                        Ok(()) => println!("[REPLY] OK (send-to-chat)"),
+                        Err(e) => println!("[REPLY] send-to-chat failed: {e}"),
+                    }
+                }
+            }
+            BotReply::File(result) => {
+                println!("[REPLY] file -> {}", result.text);
+                let file_key = match self.upload_message_file(
+                    &result.file_path,
+                    &result.file_type,
+                    &result.file_name,
+                    result.duration_millis,
+                ) {
+                    Ok(file_key) => Some(file_key),
+                    Err(e) => {
+                        println!("[REPLY] file upload failed: {e}");
+                        None
+                    }
+                };
+
+                if !message_id.is_empty() {
+                    if let Some(file_key) = file_key.as_deref() {
+                        match self.reply_file(message_id, file_key) {
+                            Ok(()) => println!("[REPLY] file OK"),
+                            Err(e) => println!("[REPLY] file reply failed: {e}"),
+                        }
+                    }
+                    match self.reply_text(message_id, &result.text) {
+                        Ok(()) => {
+                            println!("[REPLY] text OK");
+                            return;
+                        }
+                        Err(e) => println!("[REPLY] reply API failed: {e}"),
+                    }
+                }
+
+                if !chat_id.is_empty() {
+                    if let Some(file_key) = file_key.as_deref() {
+                        match self.send_file_to_chat(chat_id, file_key) {
+                            Ok(()) => println!("[REPLY] file OK (send-to-chat)"),
+                            Err(e) => println!("[REPLY] send file failed: {e}"),
+                        }
+                    }
                     match self.send_to_chat(chat_id, &result.text) {
                         Ok(()) => println!("[REPLY] OK (send-to-chat)"),
                         Err(e) => println!("[REPLY] send-to-chat failed: {e}"),
@@ -804,6 +1045,303 @@ impl FeishuBot {
         }
     }
 
+    fn extract_action_sender_identity(
+        &self,
+        payload: &Value,
+        event: &Value,
+    ) -> FeishuSenderIdentity {
+        let open_id = string_at_paths(
+            payload,
+            &[
+                "/event/operator/open_id",
+                "/operator/open_id",
+                "/event/operator_id/open_id",
+                "/operator_id/open_id",
+                "/open_id",
+            ],
+        )
+        .unwrap_or_default();
+        let user_id = string_at_paths(
+            payload,
+            &[
+                "/event/operator/user_id",
+                "/operator/user_id",
+                "/event/operator_id/user_id",
+                "/operator_id/user_id",
+                "/user_id",
+            ],
+        );
+        let union_id = string_at_paths(
+            payload,
+            &[
+                "/event/operator/union_id",
+                "/operator/union_id",
+                "/event/operator_id/union_id",
+                "/operator_id/union_id",
+            ],
+        );
+        let chat_id = string_at_paths(
+            payload,
+            &[
+                "/event/context/open_chat_id",
+                "/event/open_chat_id",
+                "/open_chat_id",
+                "/event/context/chat_id",
+                "/event/chat_id",
+                "/chat_id",
+            ],
+        );
+        let display_name = string_at_paths(
+            event,
+            &[
+                "/operator/name",
+                "/operator/display_name",
+                "/operator_id/name",
+                "/operator_id/display_name",
+            ],
+        )
+        .unwrap_or_else(|| {
+            if open_id.is_empty() {
+                "飞书用户".to_string()
+            } else {
+                let suffix: String = open_id
+                    .chars()
+                    .rev()
+                    .take(6)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                format!("飞书用户 {suffix}")
+            }
+        });
+
+        FeishuSenderIdentity {
+            open_id,
+            user_id,
+            union_id,
+            display_name,
+            chat_id,
+        }
+    }
+
+    fn dispatch_card_action(
+        &self,
+        action_value: &Value,
+        sender: &FeishuSenderIdentity,
+        chat_id_hint: Option<&str>,
+    ) -> BotReply {
+        let kind = action_value
+            .get("kind")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+
+        match kind {
+            "ptz" => {
+                let device_id = match action_value.get("device_id").and_then(|value| value.as_str())
+                {
+                    Some(value) if !value.trim().is_empty() => value.to_string(),
+                    _ => return BotReply::Text("云台控制失败: 卡片缺少 device_id".to_string()),
+                };
+                let direction = match action_value
+                    .get("direction")
+                    .and_then(|value| value.as_str())
+                    .and_then(parse_ptz_direction_value)
+                {
+                    Some(value) => value,
+                    None => {
+                        return BotReply::Text("云台控制失败: 卡片方向无效".to_string());
+                    }
+                };
+                let mode = match action_value
+                    .get("mode")
+                    .and_then(|value| value.as_str())
+                    .and_then(parse_ptz_mode_value)
+                {
+                    Some(value) => value,
+                    None => {
+                        return BotReply::Text("云台控制失败: 卡片模式无效".to_string());
+                    }
+                };
+                let command = PtzControlCommand { direction, mode };
+                match self.run_camera_ptz(&device_id, command) {
+                    Ok(message) => BotReply::Text(message),
+                    Err(error) => BotReply::Text(format!("云台控制失败: {error}")),
+                }
+            }
+            "snapshot" => {
+                let device_id = match action_value.get("device_id").and_then(|value| value.as_str())
+                {
+                    Some(value) if !value.trim().is_empty() => value.to_string(),
+                    _ => return BotReply::Text("摄像头抓拍失败: 卡片缺少 device_id".to_string()),
+                };
+                match self.run_local_camera_snapshot(&device_id) {
+                    Ok(reply) => BotReply::CameraAnalysis(reply),
+                    Err(error) => BotReply::Text(format!("摄像头抓拍失败: {error}")),
+                }
+            }
+            "live_view" => {
+                let device_id = match action_value.get("device_id").and_then(|value| value.as_str())
+                {
+                    Some(value) if !value.trim().is_empty() => value.to_string(),
+                    _ => return BotReply::Text("打开实时观看失败: 卡片缺少 device_id".to_string()),
+                };
+                let device = match self
+                    .load_registered_cameras()
+                    .and_then(|devices| {
+                        devices
+                            .into_iter()
+                            .find(|device| device.device_id == device_id)
+                            .ok_or_else(|| format!("未找到摄像头设备 {device_id}"))
+                    }) {
+                    Ok(device) => device,
+                    Err(error) => {
+                        return BotReply::Text(format!("打开实时观看失败: {error}"));
+                    }
+                };
+                let display_name = device.room.clone().unwrap_or_else(|| device.name.clone());
+                let live_url = self.camera_live_view_url(&device.device_id);
+                BotReply::Text(format!(
+                    "{} 实时观看入口：\n{}\n建议直接在手机浏览器里打开；如果画面空白，先确认手机和 Agent Hub 在同一个局域网，再点击页面里的“重连画面”。",
+                    display_name, live_url
+                ))
+            }
+            "share_view" => {
+                let device_id = match action_value.get("device_id").and_then(|value| value.as_str())
+                {
+                    Some(value) if !value.trim().is_empty() => value.to_string(),
+                    _ => {
+                        return BotReply::Text("生成外网观看链接失败: 卡片缺少 device_id".to_string())
+                    }
+                };
+                let device = match self
+                    .load_registered_cameras()
+                    .and_then(|devices| {
+                        devices
+                            .into_iter()
+                            .find(|device| device.device_id == device_id)
+                            .ok_or_else(|| format!("未找到摄像头设备 {device_id}"))
+                    }) {
+                    Ok(device) => device,
+                    Err(error) => {
+                        return BotReply::Text(format!("生成外网观看链接失败: {error}"));
+                    }
+                };
+                let display_name = device.room.clone().unwrap_or_else(|| device.name.clone());
+                match self.camera_remote_share_url(&device.device_id) {
+                    Ok((url, ttl_minutes)) => BotReply::Text(format!(
+                        "{} 外网观看链接：\n{}\n有效期：{} 分钟\n这个链接适合发给局域网外的用户直接打开浏览器查看。",
+                        display_name, url, ttl_minutes
+                    )),
+                    Err(error) => BotReply::Text(format!("生成外网观看链接失败: {error}")),
+                }
+            }
+            "record" => {
+                let device_id = match action_value.get("device_id").and_then(|value| value.as_str())
+                {
+                    Some(value) if !value.trim().is_empty() => value.to_string(),
+                    _ => return BotReply::Text("摄像头录像失败: 卡片缺少 device_id".to_string()),
+                };
+                let duration_secs = action_value
+                    .get("seconds")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(8)
+                    .clamp(3, 30) as u32;
+                let target_chat_id = chat_id_hint
+                    .map(|value| value.to_string())
+                    .or_else(|| sender.chat_id.clone())
+                    .filter(|value| !value.trim().is_empty());
+                if let Some(chat_id) = target_chat_id {
+                    let worker = self.clone();
+                    let device_id_for_job = device_id.clone();
+                    thread::spawn(move || {
+                        println!(
+                            "[RECORD] start background recording device={} duration={}s chat_id={}",
+                            device_id_for_job, duration_secs, chat_id
+                        );
+                        let reply = match worker
+                            .run_local_camera_recording(&device_id_for_job, duration_secs)
+                        {
+                            Ok((device_name, path)) => BotReply::File(FileReply {
+                                text: format!(
+                                    "{} 录像完成，已回传视频文件。\n时长：{} 秒",
+                                    device_name, duration_secs
+                                ),
+                                file_path: path,
+                                file_type: "stream".to_string(),
+                                file_name: format!(
+                                    "{}-{}s.mp4",
+                                    device_name.replace(' ', "_"),
+                                    duration_secs
+                                ),
+                                duration_millis: Some(u64::from(duration_secs) * 1000),
+                            }),
+                            Err(error) => BotReply::Text(format!("摄像头录像失败: {error}")),
+                        };
+                        println!("[RECORD] background recording finished, sending result");
+                        worker.deliver_reply("", &chat_id, reply);
+                    });
+                    BotReply::Text(format!(
+                        "已开始录像，预计 {} 秒后回传结果。",
+                        duration_secs
+                    ))
+                } else {
+                    match self.run_local_camera_recording(&device_id, duration_secs) {
+                        Ok((device_name, path)) => BotReply::File(FileReply {
+                            text: format!(
+                                "{} 录像完成，已回传视频文件。\n时长：{} 秒",
+                                device_name, duration_secs
+                            ),
+                            file_path: path,
+                            file_type: "stream".to_string(),
+                            file_name: format!(
+                                "{}-{}s.mp4",
+                                device_name.replace(' ', "_"),
+                                duration_secs
+                            ),
+                            duration_millis: Some(u64::from(duration_secs) * 1000),
+                        }),
+                        Err(error) => BotReply::Text(format!("摄像头录像失败: {error}")),
+                    }
+                }
+            }
+            "panel" => {
+                let device = if let Some(device_id) =
+                    action_value.get("device_id").and_then(|value| value.as_str())
+                {
+                    match self
+                        .load_registered_cameras()
+                        .and_then(|devices| {
+                            devices
+                                .into_iter()
+                                .find(|device| device.device_id == device_id)
+                                .ok_or_else(|| format!("未找到摄像头设备 {device_id}"))
+                        }) {
+                        Ok(device) => device,
+                        Err(error) => {
+                            return BotReply::Text(format!("打开控制面板失败: {error}"));
+                        }
+                    }
+                } else {
+                    match self.resolve_camera_device("控制摄像头") {
+                        Ok(device) => device,
+                        Err(error) => {
+                            return BotReply::Text(format!("打开控制面板失败: {error}"));
+                        }
+                    }
+                };
+                match self.build_camera_control_card(&device) {
+                    Ok(reply) => BotReply::Card(reply),
+                    Err(error) => BotReply::Text(format!("打开控制面板失败: {error}")),
+                }
+            }
+            _ => BotReply::Text(format!(
+                "{} 点击了暂未识别的卡片动作，请重试或直接发送文字命令。",
+                sender.display_name
+            )),
+        }
+    }
+
     fn dispatch_command(&self, text: &str, sender: &FeishuSenderIdentity) -> BotReply {
         let t = normalize_command_text(text);
 
@@ -840,7 +1378,6 @@ impl FeishuBot {
 
         if t.contains("菜单")
             || t.contains("帮助")
-            || t.contains("开始")
             || t.contains("能力")
             || t.contains("能做什么")
         {
@@ -863,15 +1400,25 @@ impl FeishuBot {
             return BotReply::Text(self.cmd_manual_add_camera(text, sender));
         }
 
+        if is_remote_share_command(&t) {
+            return self.cmd_share_camera_live_view(text);
+        }
+
+        if is_live_view_command(&t) {
+            return self.cmd_live_view_camera(text);
+        }
+
         if let Some(command) = parse_ptz_command(text) {
             return BotReply::Text(self.cmd_camera_ptz(text, command));
         }
 
         if let Some(intent) = classify_camera_intent(&t) {
             return match intent {
+                CameraIntent::RemoteShare => self.cmd_share_camera_live_view(text),
+                CameraIntent::LiveView => self.cmd_live_view_camera(text),
                 CameraIntent::Snapshot => self.cmd_snapshot_camera(text),
                 CameraIntent::Analyze => self.cmd_analyze_camera(text),
-                CameraIntent::Record => BotReply::Text(self.cmd_record_camera(text)),
+                CameraIntent::Record => self.cmd_record_camera(text),
             };
         }
 
@@ -884,10 +1431,12 @@ impl FeishuBot {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "http://harbornas.local:4174".to_string());
+        let external_origin = self.external_origin();
 
         let mut lines = Vec::new();
         lines.push("HarborNAS Agent Hub 自检结果：".to_string());
         lines.push(format!("- Public origin: {public_origin}"));
+        lines.push(format!("- External origin: {external_origin}"));
         lines.push(format!(
             "- 静态扫码入口: {}/setup/mobile",
             public_origin.trim_end_matches('/')
@@ -933,6 +1482,12 @@ impl FeishuBot {
             Err(error) => {
                 lines.push(format!("- Admin state 读取失败: {error}"));
             }
+        }
+        if let Ok(admin_state) = self.load_admin_console_state() {
+            lines.push(format!(
+                "- 外网观看链接 TTL: {} 分钟",
+                admin_state.remote_view.share_link_ttl_minutes
+            ));
         }
 
         let ffmpeg_ok = which::which("ffmpeg").is_ok();
@@ -1038,18 +1593,51 @@ impl FeishuBot {
         }
     }
 
-    fn cmd_record_camera(&self, text: &str) -> String {
+    fn cmd_live_view_camera(&self, text: &str) -> BotReply {
+        let device = match self.resolve_camera_device(text) {
+            Ok(device) => device,
+            Err(error) => return BotReply::Text(format!("打开实时观看失败: {error}")),
+        };
+
+        let display_name = device.room.clone().unwrap_or_else(|| device.name.clone());
+        let live_url = self.camera_live_view_url(&device.device_id);
+        BotReply::Text(format!(
+            "{} 实时观看入口：\n{}\n建议在和 HarborNAS Agent Hub 同一局域网的手机浏览器里打开。进入页面后会直接拉起浏览器内实时画面；飞书里仍然可以继续做云台、拍照和录像。",
+            display_name, live_url
+        ))
+    }
+
+    fn cmd_share_camera_live_view(&self, text: &str) -> BotReply {
+        let device = match self.resolve_camera_device(text) {
+            Ok(device) => device,
+            Err(error) => return BotReply::Text(format!("生成外网观看链接失败: {error}")),
+        };
+
+        let display_name = device.room.clone().unwrap_or_else(|| device.name.clone());
+        match self.camera_remote_share_url(&device.device_id) {
+            Ok((url, ttl_minutes)) => BotReply::Text(format!(
+                "{} 外网观看链接：\n{}\n有效期：{} 分钟\n这个链接适合发给局域网外的用户直接在浏览器里看实时画面。到期后会自动失效；如果还要继续看，再让 Bot 重新生成一条。",
+                display_name, url, ttl_minutes
+            )),
+            Err(error) => BotReply::Text(format!("生成外网观看链接失败: {error}")),
+        }
+    }
+
+    fn cmd_record_camera(&self, text: &str) -> BotReply {
         let device_id = match self.resolve_camera_device_id(text) {
             Ok(device_id) => device_id,
-            Err(e) => return format!("摄像头录像失败: {e}"),
+            Err(e) => return BotReply::Text(format!("摄像头录像失败: {e}")),
         };
         let duration_secs = extract_record_duration_secs(text).unwrap_or(8);
         match self.run_local_camera_recording(&device_id, duration_secs) {
-            Ok((device_name, path)) => format!(
-                "{} 录像完成。\n已保存到本地：{}\n时长：{} 秒",
-                device_name, path, duration_secs
-            ),
-            Err(e) => format!("摄像头录像失败: {e}"),
+            Ok((device_name, path)) => BotReply::File(FileReply {
+                text: format!("{} 录像完成，已回传视频文件。\n时长：{} 秒", device_name, duration_secs),
+                file_path: path,
+                file_type: "stream".to_string(),
+                file_name: format!("{}-{}s.mp4", device_name.replace(' ', "_"), duration_secs),
+                duration_millis: Some(u64::from(duration_secs) * 1000),
+            }),
+            Err(e) => BotReply::Text(format!("摄像头录像失败: {e}")),
         }
     }
 
@@ -1189,6 +1777,51 @@ impl FeishuBot {
             .ok_or_else(|| "未找到可分析的摄像头设备 ID".to_string())
     }
 
+    fn public_origin(&self) -> String {
+        std::env::var("HARBOR_PUBLIC_ORIGIN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "http://harbornas.local:4174".to_string())
+    }
+
+    fn external_origin(&self) -> String {
+        std::env::var("HARBOR_EXTERNAL_ORIGIN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| self.public_origin())
+    }
+
+    fn camera_live_view_url(&self, device_id: &str) -> String {
+        format!(
+            "{}/live/cameras/{}",
+            self.public_origin().trim_end_matches('/'),
+            encode_url_path_segment(device_id)
+        )
+    }
+
+    fn camera_remote_share_url(&self, device_id: &str) -> Result<(String, u32), String> {
+        let external_origin = self.external_origin();
+        if !origin_looks_public(&external_origin) {
+            return Err(format!(
+                "当前还没有配置公网入口。请先把 HarborNAS Agent Hub 暴露到公网域名或隧道地址，然后设置 HARBOR_EXTERNAL_ORIGIN，例如 https://cam.example.com 。当前值是：{}",
+                external_origin
+            ));
+        }
+
+        let state = self.load_admin_console_state()?;
+        let issued = remote_view::issue_camera_share_token(
+            &state.remote_view.share_secret,
+            device_id,
+            state.remote_view.share_link_ttl_minutes,
+        )?;
+        let url = format!(
+            "{}/shared/cameras/{}",
+            external_origin.trim_end_matches('/'),
+            encode_url_path_segment(&issued.token)
+        );
+        Ok((url, issued.ttl_minutes))
+    }
+
     fn run_local_camera_snapshot(&self, device_id: &str) -> Result<CameraAnalysisReply, String> {
         let devices = self.load_registered_cameras()?;
         let device = devices
@@ -1229,6 +1862,10 @@ impl FeishuBot {
         device_id: &str,
         duration_secs: u32,
     ) -> Result<(String, String), String> {
+        println!(
+            "[RECORD] run_local_camera_recording device={} duration={}s",
+            device_id, duration_secs
+        );
         let device = self
             .load_registered_cameras()?
             .into_iter()
@@ -1248,21 +1885,60 @@ impl FeishuBot {
             .unwrap_or_default();
         let output_path = output_dir.join(format!("{}-{}.mp4", device.device_id, ts));
 
-        let output = Command::new("ffmpeg")
+        let mut child = Command::new("ffmpeg")
             .args([
                 "-y",
+                "-nostdin",
                 "-rtsp_transport",
                 "tcp",
                 "-i",
                 &device.primary_stream.url,
+                "-map",
+                "0:v:0",
                 "-t",
                 &duration_secs.to_string(),
-                "-c",
+                "-c:v",
                 "copy",
                 output_path.to_string_lossy().as_ref(),
             ])
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| format!("启动录像 ffmpeg 失败: {e}"))?;
+
+        let timeout_deadline =
+            Instant::now() + Duration::from_secs(u64::from(duration_secs).saturating_add(15));
+        let output = loop {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    break child
+                        .wait_with_output()
+                        .map_err(|e| format!("等待录像 ffmpeg 结果失败: {e}"))?;
+                }
+                Ok(None) => {
+                    if Instant::now() >= timeout_deadline {
+                        let _ = child.kill();
+                        let output = child
+                            .wait_with_output()
+                            .map_err(|e| format!("终止录像 ffmpeg 失败: {e}"))?;
+                        let partial_size = fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
+                        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                        let detail = if stderr.is_empty() {
+                            "ffmpeg 超时且未返回错误细节".to_string()
+                        } else {
+                            stderr
+                        };
+                        return Err(format!(
+                            "录像超时，已终止 ffmpeg。当前文件大小 {} bytes。{}",
+                            partial_size, detail
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(200));
+                }
+                Err(e) => return Err(format!("轮询录像 ffmpeg 状态失败: {e}")),
+            }
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -1273,6 +1949,11 @@ impl FeishuBot {
             };
             return Err(format!("录像失败: {detail}"));
         }
+
+        println!(
+            "[RECORD] local recording saved to {}",
+            output_path.to_string_lossy()
+        );
 
         Ok((
             device.room.unwrap_or(device.name),
@@ -1285,6 +1966,7 @@ impl FeishuBot {
         device_id: &str,
         command: PtzControlCommand,
     ) -> Result<String, String> {
+        let started_at = Instant::now();
         let device = self
             .load_registered_cameras()?
             .into_iter()
@@ -1301,18 +1983,28 @@ impl FeishuBot {
         let config = EzvizCloudConfig::from_env().ok_or_else(|| {
             "当前环境缺少 HARBOR_EZVIZ_APP_KEY / HARBOR_EZVIZ_APP_SECRET".to_string()
         })?;
-        let connector = EzvizCloudPtzConnector::new(config)?;
+        let connector = EzvizCloudPtzConnector::new(config.clone())?;
 
         match command.mode {
             PtzControlMode::Continuous => {
                 let direction = map_cloud_ptz_direction(command.direction)
                     .ok_or_else(|| "持续控制命令缺少方向".to_string())?;
+                println!(
+                    "[PTZ] continuous {:?} -> sending start after {} ms",
+                    command.direction,
+                    started_at.elapsed().as_millis()
+                );
                 connector.control_ptz(&EzvizPtzRequest {
                     device_serial,
                     camera_no,
                     direction,
                     speed: 2,
                 })?;
+                println!(
+                    "[PTZ] continuous {:?} start request finished in {} ms",
+                    command.direction,
+                    started_at.elapsed().as_millis()
+                );
                 Ok(format!(
                     "{} 已开始{}。如需停下，请直接回复：`停止`。",
                     device_name,
@@ -1323,23 +2015,48 @@ impl FeishuBot {
                 let direction = map_cloud_ptz_direction(command.direction)
                     .ok_or_else(|| "点动命令缺少方向".to_string())?;
                 let (speed, hold_ms, mode_label) = match command.mode {
-                    PtzControlMode::Coarse => (2, 450_u64, "粗调"),
-                    PtzControlMode::Fine => (1, 180_u64, "精调"),
+                    PtzControlMode::Coarse => (1, 120_u64, "粗调"),
+                    PtzControlMode::Fine => (1, 60_u64, "精调"),
                     PtzControlMode::Continuous => unreachable!(),
                 };
+                println!(
+                    "[PTZ] {:?} {:?} -> sending start after {} ms",
+                    command.mode,
+                    command.direction,
+                    started_at.elapsed().as_millis()
+                );
                 connector.control_ptz(&EzvizPtzRequest {
                     device_serial: device_serial.clone(),
                     camera_no,
                     direction,
                     speed,
                 })?;
-                thread::sleep(Duration::from_millis(hold_ms));
-                connector.control_ptz(&EzvizPtzRequest {
-                    device_serial,
-                    camera_no,
-                    direction: EzvizPtzDirection::Stop,
-                    speed,
-                })?;
+                println!(
+                    "[PTZ] {:?} {:?} start request finished in {} ms",
+                    command.mode,
+                    command.direction,
+                    started_at.elapsed().as_millis()
+                );
+                let stop_config = config.clone();
+                let stop_serial = device_serial;
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(hold_ms));
+                    let connector = match EzvizCloudPtzConnector::new(stop_config) {
+                        Ok(connector) => connector,
+                        Err(error) => {
+                            println!("[PTZ] delayed stop init failed: {error}");
+                            return;
+                        }
+                    };
+                    if let Err(error) = connector.control_ptz(&EzvizPtzRequest {
+                        device_serial: stop_serial,
+                        camera_no,
+                        direction: EzvizPtzDirection::Stop,
+                        speed,
+                    }) {
+                        println!("[PTZ] delayed stop failed: {error}");
+                    }
+                });
                 Ok(format!(
                     "{} 已{}{}。",
                     device_name,
@@ -1512,7 +2229,7 @@ impl FeishuBot {
             "elements": [
                 {
                     "tag": "markdown",
-                    "content": "你已经完成绑定，后续大多数动作都可以直接在飞书里完成。"
+                    "content": "你已经完成绑定，后续大多数动作都可以直接在飞书里完成。实时观看会在浏览器里打开，外网观看会生成临时分享链接；控制、拍照、录像继续留在飞书里。"
                 },
                 {
                     "tag": "markdown",
@@ -1532,7 +2249,7 @@ impl FeishuBot {
                 },
                 {
                     "tag": "markdown",
-                    "content": "**现在可以直接说：**\n- `扫描摄像头`\n- `接入 1`\n- `密码 xxxxxx`\n- `看看客厅摄像头`\n- `分析客厅摄像头`\n- `控制摄像头`\n- `左一点 / 精调左 / 开始左转 / 停止`\n- `拍照`\n- `录像 8秒`"
+                    "content": "**现在可以直接说：**\n- `扫描摄像头`\n- `接入 1`\n- `密码 xxxxxx`\n- `实时观看客厅摄像头`\n- `外网观看客厅摄像头`\n- `看看客厅摄像头`\n- `分析客厅摄像头`\n- `控制摄像头`\n- `左一点 / 精调左 / 开始左转 / 停止`\n- `拍照`\n- `录像 8秒`"
                 },
                 {
                     "tag": "note",
@@ -1551,7 +2268,7 @@ impl FeishuBot {
 
         Ok(CardReply {
             text: format!(
-                "HarborNAS Agent Hub 已连接\n默认网段: {}\n默认截图回传: {}\n默认分析动作: {}\n默认飞书去向: {}\n当前设备库: {} 台\n可以直接说：扫描摄像头 / 接入 1 / 密码 xxxxxx / 看看客厅摄像头 / 分析客厅摄像头 / 控制摄像头 / 左一点 / 精调左 / 开始左转 / 停止 / 拍照 / 录像 8秒",
+                "HarborNAS Agent Hub 已连接\n默认网段: {}\n默认截图回传: {}\n默认分析动作: {}\n默认飞书去向: {}\n当前设备库: {} 台\n可以直接说：扫描摄像头 / 接入 1 / 密码 xxxxxx / 实时观看客厅摄像头 / 外网观看客厅摄像头 / 看看客厅摄像头 / 分析客厅摄像头 / 控制摄像头 / 左一点 / 精调左 / 开始左转 / 停止 / 拍照 / 录像 8秒",
                 defaults.cidr, defaults.capture, defaults.ai, delivery_target, device_count
             ),
             card,
@@ -1560,6 +2277,7 @@ impl FeishuBot {
 
     fn build_camera_control_card(&self, device: &CameraDevice) -> Result<CardReply, String> {
         let display_name = device.room.clone().unwrap_or_else(|| device.name.clone());
+        let device_id = device.device_id.clone();
         let has_cloud = device.ezviz_device_serial.is_some() && device.ezviz_camera_no.is_some();
         let card = json!({
             "config": {
@@ -1580,21 +2298,79 @@ impl FeishuBot {
             "elements": [
                 {
                     "tag": "markdown",
-                    "content": "**粗调**\n- `左一点` `右一点` `上一点` `下一点`\n\n**精调**\n- `精调左` `精调右` `精调上` `精调下`\n\n**持续转动**\n- `开始左转` `开始右转` `开始上转` `开始下转`\n- `停止`"
+                    "content": if has_cloud {
+                        "直接点击下面的按钮即可控制当前摄像头。粗调和精调会自动停下；持续转动需要你再点一次 `停止`。实时观看会回局域网入口，外网分享会回一个带过期时间的链接。"
+                    } else {
+                        "当前卡片可以展示控制位，但这台摄像头还没补齐萤石云控标识，按钮暂时不会生效。"
+                    }
+                },
+                {
+                    "tag": "action",
+                    "actions": [
+                        build_card_button("左一点", "primary", json!({"kind": "ptz", "device_id": device_id.clone(), "mode": "coarse", "direction": "left"})),
+                        build_card_button("右一点", "primary", json!({"kind": "ptz", "device_id": device_id.clone(), "mode": "coarse", "direction": "right"})),
+                        build_card_button("上一点", "default", json!({"kind": "ptz", "device_id": device_id.clone(), "mode": "coarse", "direction": "up"})),
+                        build_card_button("下一点", "default", json!({"kind": "ptz", "device_id": device_id.clone(), "mode": "coarse", "direction": "down"}))
+                    ]
+                },
+                {
+                    "tag": "action",
+                    "actions": [
+                        build_card_button("精调左", "default", json!({"kind": "ptz", "device_id": device_id.clone(), "mode": "fine", "direction": "left"})),
+                        build_card_button("精调右", "default", json!({"kind": "ptz", "device_id": device_id.clone(), "mode": "fine", "direction": "right"})),
+                        build_card_button("精调上", "default", json!({"kind": "ptz", "device_id": device_id.clone(), "mode": "fine", "direction": "up"})),
+                        build_card_button("精调下", "default", json!({"kind": "ptz", "device_id": device_id.clone(), "mode": "fine", "direction": "down"}))
+                    ]
+                },
+                {
+                    "tag": "action",
+                    "actions": [
+                        build_card_button("开始左转", "default", json!({"kind": "ptz", "device_id": device_id.clone(), "mode": "continuous", "direction": "left"})),
+                        build_card_button("开始右转", "default", json!({"kind": "ptz", "device_id": device_id.clone(), "mode": "continuous", "direction": "right"})),
+                        build_card_button("开始上转", "default", json!({"kind": "ptz", "device_id": device_id.clone(), "mode": "continuous", "direction": "up"})),
+                        build_card_button("开始下转", "default", json!({"kind": "ptz", "device_id": device_id.clone(), "mode": "continuous", "direction": "down"}))
+                    ]
+                },
+                {
+                    "tag": "action",
+                    "actions": [
+                        build_card_button("停止", "danger", json!({"kind": "ptz", "device_id": device_id.clone(), "mode": "continuous", "direction": "stop"})),
+                        build_card_button("刷新面板", "default", json!({"kind": "panel", "device_id": device_id.clone()}))
+                    ]
                 },
                 {
                     "tag": "hr"
                 },
                 {
-                    "tag": "markdown",
-                    "content": "**拍照与录像**\n- `拍照`\n- `录像 8秒`\n- `录像 15秒`"
+                    "tag": "action",
+                    "actions": [
+                        build_card_button("实时观看", "primary", json!({"kind": "live_view", "device_id": device_id.clone()})),
+                        build_card_button("外网分享", "default", json!({"kind": "share_view", "device_id": device_id.clone()})),
+                        build_card_button("拍照", "primary", json!({"kind": "snapshot", "device_id": device_id.clone()})),
+                        build_card_button("录像 8 秒", "default", json!({"kind": "record", "device_id": device_id.clone(), "seconds": 8}))
+                    ]
+                },
+                {
+                    "tag": "action",
+                    "actions": [
+                        build_card_button("录像 15 秒", "default", json!({"kind": "record", "device_id": device_id, "seconds": 15}))
+                    ]
+                },
+                {
+                    "tag": "note",
+                    "elements": [
+                        {
+                            "tag": "plain_text",
+                            "content": "如果点动仍然偏大，我们继续把步进时间再缩短；这版已经从 450ms 收紧到了更保守的短按。"
+                        }
+                    ]
                 }
             ]
         });
 
         Ok(CardReply {
             text: format!(
-                "{} 控制面板\n粗调：左一点/右一点/上一点/下一点\n精调：精调左/精调右/精调上/精调下\n持续：开始左转/开始右转/开始上转/开始下转/停止\n媒体：拍照/录像 8秒",
+                "{} 控制面板\n粗调：左一点/右一点/上一点/下一点\n精调：精调左/精调右/精调上/精调下\n持续：开始左转/开始右转/开始上转/开始下转/停止\n媒体：实时观看/外网分享/拍照/录像 8秒",
                 display_name
             ),
             card,
@@ -1613,7 +2389,7 @@ impl FeishuBot {
                 "subtitle".to_string(),
                 json!({
                     "tag": "plain_text",
-                    "content": format!("{user_name} 已完成绑定，可以直接在飞书里查看和分析摄像头")
+                    "content": format!("{user_name} 已完成绑定，可以直接在飞书里查看、分析和控制摄像头")
                 }),
             );
         }
@@ -1633,7 +2409,7 @@ impl FeishuBot {
         }
 
         reply.text = format!(
-            "{} 绑定成功。\n你现在可以直接说：扫描摄像头 / 接入 1 / 密码 xxxxxx / 看看客厅摄像头 / 分析客厅摄像头",
+            "{} 绑定成功。\n你现在可以直接说：扫描摄像头 / 接入 1 / 密码 xxxxxx / 实时观看客厅摄像头 / 外网观看客厅摄像头 / 看看客厅摄像头 / 分析客厅摄像头",
             user_name
         );
         Ok(reply)
@@ -1694,7 +2470,7 @@ impl FeishuBot {
                 )
             } else {
                 format!(
-                    "已按后台默认策略扫描 {}，成功接入 {} 台摄像头，设备库现在共有 {} 台。接下来可以直接说：看看客厅摄像头 / 分析客厅摄像头",
+                    "已按后台默认策略扫描 {}，成功接入 {} 台摄像头，设备库现在共有 {} 台。接下来可以直接说：实时观看客厅摄像头 / 外网观看客厅摄像头 / 看看客厅摄像头 / 分析客厅摄像头",
                     scan.defaults.cidr,
                     connected,
                     scan.devices.len()
@@ -1976,6 +2752,119 @@ fn normalize_command_text(text: &str) -> String {
         .collect()
 }
 
+fn string_at_paths(value: &Value, paths: &[&str]) -> Option<String> {
+    paths.iter().find_map(|path| {
+        value.pointer(path)
+            .and_then(|item| item.as_str())
+            .map(|item| item.to_string())
+            .filter(|item| !item.trim().is_empty())
+    })
+}
+
+fn parse_ptz_direction_value(value: &str) -> Option<PtzControlDirection> {
+    match value {
+        "left" => Some(PtzControlDirection::Left),
+        "right" => Some(PtzControlDirection::Right),
+        "up" => Some(PtzControlDirection::Up),
+        "down" => Some(PtzControlDirection::Down),
+        "stop" => Some(PtzControlDirection::Stop),
+        _ => None,
+    }
+}
+
+fn parse_ptz_mode_value(value: &str) -> Option<PtzControlMode> {
+    match value {
+        "coarse" => Some(PtzControlMode::Coarse),
+        "fine" => Some(PtzControlMode::Fine),
+        "continuous" => Some(PtzControlMode::Continuous),
+        _ => None,
+    }
+}
+
+fn build_card_button(label: &str, button_type: &str, value: Value) -> Value {
+    json!({
+        "tag": "button",
+        "type": button_type,
+        "size": "medium",
+        "text": {
+            "tag": "plain_text",
+            "content": label
+        },
+        "value": value
+    })
+}
+
+fn encode_url_path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(char::from_digit((byte >> 4) as u32, 16).unwrap().to_ascii_uppercase());
+            encoded.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap().to_ascii_uppercase());
+        }
+    }
+    encoded
+}
+
+fn origin_looks_public(origin: &str) -> bool {
+    let Some(after_scheme) = origin.split("://").nth(1) else {
+        return false;
+    };
+    let authority = after_scheme.split('/').next().unwrap_or_default().trim();
+    if authority.is_empty() {
+        return false;
+    }
+
+    let host = authority
+        .trim_start_matches('[')
+        .split(']')
+        .next()
+        .unwrap_or(authority)
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    if host.is_empty() || host == "localhost" || host.ends_with(".local") {
+        return false;
+    }
+
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        return !(ip.is_loopback()
+            || ip.is_private()
+            || ip.is_link_local()
+            || (ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1])));
+    }
+
+    true
+}
+
+fn build_card_action_ack_payload(action_value: &Value) -> Value {
+    let kind = action_value
+        .get("kind")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let content = match kind {
+        "ptz" => "控制指令已发送",
+        "live_view" => "正在生成观看链接",
+        "share_view" => "正在生成外网观看链接",
+        "snapshot" => "正在抓拍，请稍候",
+        "record" => "正在开始录像，请稍候",
+        "panel" => "正在刷新控制面板",
+        _ => "正在处理你的操作",
+    };
+
+    json!({
+        "toast": {
+            "type": "info",
+            "content": content
+        }
+    })
+}
+
 fn is_binding_command(text: &str) -> bool {
     let normalized = normalize_command_text(text);
     normalized.contains("绑定") || normalized.contains("bind")
@@ -2006,6 +2895,36 @@ fn is_manual_add_camera_command(normalized: &str) -> bool {
     .any(|keyword| normalized.contains(keyword))
 }
 
+fn is_live_view_command(normalized: &str) -> bool {
+    [
+        "实时观看",
+        "实时监看",
+        "实时预览",
+        "实时画面",
+        "直播",
+        "打开画面",
+        "打开视频",
+        "liveview",
+        "livestream",
+    ]
+    .iter()
+    .any(|keyword| normalized.contains(keyword))
+}
+
+fn is_remote_share_command(normalized: &str) -> bool {
+    [
+        "外网观看",
+        "远程观看",
+        "分享观看",
+        "分享链接",
+        "外部观看",
+        "shareview",
+        "publicview",
+    ]
+    .iter()
+    .any(|keyword| normalized.contains(keyword))
+}
+
 fn extract_password_reply(text: &str) -> Option<String> {
     let trimmed = text.trim();
     let patterns = ["摄像头密码", "rtsp密码", "密码"];
@@ -2031,6 +2950,14 @@ fn extract_binding_code(text: &str) -> Option<String> {
 }
 
 fn classify_camera_intent(normalized: &str) -> Option<CameraIntent> {
+    if is_remote_share_command(normalized) {
+        return Some(CameraIntent::RemoteShare);
+    }
+
+    if is_live_view_command(normalized) {
+        return Some(CameraIntent::LiveView);
+    }
+
     let wants_analyze = ["分析", "识别", "检测", "看看有没有人", "有人吗"]
         .iter()
         .any(|keyword| normalized.contains(keyword));
@@ -2304,6 +3231,15 @@ fn main() {
     let harbor = HarborOsClient::new(&cli.harbor_host, &cli.harbor_user, &cli.harbor_password);
     let mut bot = FeishuBot::new(&cli.domain, harbor);
 
+    if let Some(config) = EzvizCloudConfig::from_env() {
+        if let Ok(connector) = EzvizCloudPtzConnector::new(config) {
+            match connector.warm_up_access_token() {
+                Ok(()) => println!("[EZVIZ] access token warmed up"),
+                Err(error) => eprintln!("[EZVIZ] warm-up failed: {error}"),
+            }
+        }
+    }
+
     println!("[CHECK] Skipping HarborOS preflight; bot will start immediately.");
     println!();
 
@@ -2421,7 +3357,9 @@ fn resolve_feishu_credentials(cli: &Cli) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_record_duration_secs, parse_ptz_command, PtzControlDirection, PtzControlMode,
+        encode_url_path_segment, extract_record_duration_secs, is_live_view_command,
+        is_remote_share_command, origin_looks_public, parse_ptz_command,
+        parse_ptz_direction_value, parse_ptz_mode_value, PtzControlDirection, PtzControlMode,
     };
 
     #[test]
@@ -2450,6 +3388,46 @@ mod tests {
         assert_eq!(extract_record_duration_secs("录像 2秒"), Some(3));
         assert_eq!(extract_record_duration_secs("录像 15秒"), Some(15));
         assert_eq!(extract_record_duration_secs("录像 60秒"), Some(30));
+    }
+
+    #[test]
+    fn card_action_values_parse_into_ptz_enums() {
+        assert_eq!(parse_ptz_direction_value("left"), Some(PtzControlDirection::Left));
+        assert_eq!(parse_ptz_direction_value("stop"), Some(PtzControlDirection::Stop));
+        assert_eq!(parse_ptz_direction_value("bad"), None);
+
+        assert_eq!(parse_ptz_mode_value("coarse"), Some(PtzControlMode::Coarse));
+        assert_eq!(parse_ptz_mode_value("continuous"), Some(PtzControlMode::Continuous));
+        assert_eq!(parse_ptz_mode_value("bad"), None);
+    }
+
+    #[test]
+    fn live_view_commands_are_detected_before_snapshot_flow() {
+        assert!(is_live_view_command("实时观看客厅摄像头"));
+        assert!(is_live_view_command("liveviewcamera"));
+        assert!(!is_live_view_command("看看客厅摄像头"));
+    }
+
+    #[test]
+    fn remote_share_commands_are_detected() {
+        assert!(is_remote_share_command("外网观看客厅摄像头"));
+        assert!(is_remote_share_command("分享观看门口"));
+        assert!(!is_remote_share_command("实时观看客厅摄像头"));
+    }
+
+    #[test]
+    fn live_view_urls_escape_path_segments() {
+        assert_eq!(
+            encode_url_path_segment("客厅 camera #1"),
+            "%E5%AE%A2%E5%8E%85%20camera%20%231"
+        );
+    }
+
+    #[test]
+    fn public_origin_detection_rejects_private_hosts() {
+        assert!(origin_looks_public("https://cam.example.com"));
+        assert!(!origin_looks_public("http://192.168.3.30:4174"));
+        assert!(!origin_looks_public("http://localhost:4174"));
     }
 }
 

@@ -8,5 +8,6 @@ pub mod feishu_session;
 pub mod hub;
 pub mod media;
 pub mod node_runtime;
+pub mod remote_view;
 pub mod registry;
 pub mod topology;

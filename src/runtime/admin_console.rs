@@ -60,6 +60,23 @@ pub struct FeishuBotConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteViewConfig {
+    #[serde(default = "default_share_secret")]
+    pub share_secret: String,
+    #[serde(default = "default_share_link_ttl_minutes")]
+    pub share_link_ttl_minutes: u32,
+}
+
+impl Default for RemoteViewConfig {
+    fn default() -> Self {
+        Self {
+            share_secret: default_share_secret(),
+            share_link_ttl_minutes: default_share_link_ttl_minutes(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FeishuUserBinding {
     pub open_id: String,
     #[serde(default)]
@@ -115,6 +132,8 @@ pub struct AdminConsoleState {
     pub defaults: AdminDefaults,
     #[serde(default)]
     pub feishu_bot: FeishuBotConfig,
+    #[serde(default)]
+    pub remote_view: RemoteViewConfig,
     #[serde(default)]
     pub feishu_users: Vec<FeishuUserBinding>,
 }
@@ -184,9 +203,7 @@ impl AdminConsoleStore {
 
     pub fn load_or_create_state(&self) -> Result<AdminConsoleState, String> {
         let state = self.load_state()?;
-        if !self.path.exists() {
-            self.save_state(&state)?;
-        }
+        self.save_state(&state)?;
         Ok(state)
     }
 
@@ -290,6 +307,7 @@ impl AdminConsoleStore {
         state.binding = sanitize_binding(state.binding.clone());
         state.defaults = sanitize_defaults(state.defaults.clone());
         state.feishu_bot = sanitize_feishu_bot_config(state.feishu_bot.clone());
+        state.remote_view = sanitize_remote_view_config(state.remote_view.clone());
         Ok(())
     }
 }
@@ -370,8 +388,26 @@ pub fn sanitize_feishu_bot_config(mut config: FeishuBotConfig) -> FeishuBotConfi
     config
 }
 
+pub fn sanitize_remote_view_config(mut config: RemoteViewConfig) -> RemoteViewConfig {
+    if config.share_secret.trim().is_empty() {
+        config.share_secret = default_share_secret();
+    }
+    config.share_link_ttl_minutes = config.share_link_ttl_minutes.clamp(5, 24 * 60);
+    config
+}
+
 pub fn default_rtsp_username() -> String {
     "admin".to_string()
+}
+
+pub fn default_share_secret() -> String {
+    let primary = Uuid::new_v4().simple().to_string();
+    let secondary = Uuid::new_v4().simple().to_string();
+    format!("{primary}{secondary}")
+}
+
+pub fn default_share_link_ttl_minutes() -> u32 {
+    120
 }
 
 pub fn default_scan_cidr() -> String {

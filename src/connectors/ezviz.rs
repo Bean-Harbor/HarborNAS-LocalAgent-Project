@@ -1,4 +1,5 @@
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -71,6 +72,18 @@ pub struct EzvizCloudPtzConnector {
     config: EzvizCloudConfig,
 }
 
+#[derive(Debug, Clone)]
+struct CachedAccessToken {
+    app_key: String,
+    token: String,
+    expires_at_ms: i64,
+}
+
+fn access_token_cache() -> &'static Mutex<Option<CachedAccessToken>> {
+    static CACHE: OnceLock<Mutex<Option<CachedAccessToken>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
 impl EzvizCloudPtzConnector {
     pub fn new(config: EzvizCloudConfig) -> Result<Self, String> {
         let client = Client::builder()
@@ -125,12 +138,31 @@ impl EzvizCloudPtzConnector {
         })
     }
 
+    pub fn warm_up_access_token(&self) -> Result<(), String> {
+        self.resolve_access_token().map(|_| ())
+    }
+
     fn resolve_access_token(&self) -> Result<String, String> {
         if let Some(token) = &self.config.access_token {
             if !token.trim().is_empty() {
                 return Ok(token.clone());
             }
         }
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_millis() as i64)
+            .unwrap_or_default();
+        if let Ok(cache) = access_token_cache().lock() {
+            if let Some(entry) = cache.as_ref() {
+                if entry.app_key == self.config.app_key && entry.expires_at_ms > now_ms + 60_000 {
+                    println!("[EZVIZ] access token cache hit");
+                    return Ok(entry.token.clone());
+                }
+            }
+        }
+
+        println!("[EZVIZ] access token cache miss");
 
         let payload = self.post_form(
             "/api/lapp/token/get",
@@ -140,15 +172,28 @@ impl EzvizCloudPtzConnector {
             ],
         )?;
 
-        payload
+        let access_token = payload
             .pointer("/data/accessToken")
             .and_then(|value| value.as_str())
             .map(|value| value.to_string())
-            .ok_or_else(|| "EZVIZ token response missing data.accessToken".to_string())
+            .ok_or_else(|| "EZVIZ token response missing data.accessToken".to_string())?;
+        let expires_at_ms = payload
+            .pointer("/data/expireTime")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(now_ms + 6 * 24 * 60 * 60 * 1000);
+        if let Ok(mut cache) = access_token_cache().lock() {
+            *cache = Some(CachedAccessToken {
+                app_key: self.config.app_key.clone(),
+                token: access_token.clone(),
+                expires_at_ms,
+            });
+        }
+        Ok(access_token)
     }
 
     fn post_form(&self, path: &str, form: &[(&str, &str)]) -> Result<Value, String> {
         let url = format!("{}{}", self.config.base_url.trim_end_matches('/'), path);
+        let started_at = Instant::now();
         let response = self
             .client
             .post(&url)
@@ -158,6 +203,11 @@ impl EzvizCloudPtzConnector {
         let payload: Value = response
             .json()
             .map_err(|e| format!("EZVIZ response parse failed for {}: {e}", url))?;
+        println!(
+            "[EZVIZ] {} completed in {} ms",
+            path,
+            started_at.elapsed().as_millis()
+        );
 
         let code = payload.get("code").and_then(|value| value.as_str()).unwrap_or("0");
         if code != "200" && code != "0" {
