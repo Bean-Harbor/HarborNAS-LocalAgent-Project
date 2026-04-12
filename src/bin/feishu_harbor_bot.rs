@@ -13,13 +13,16 @@
 
 use base64::Engine as _;
 use clap::Parser;
+use harbornas_local_agent::connectors::ezviz::{
+    EzvizCloudConfig, EzvizCloudPtzConnector, EzvizPtzDirection, EzvizPtzRequest,
+};
 use harbornas_local_agent::runtime::feishu_session::{
     FeishuConversationState, FeishuConversationStore, PendingFeishuAdd, PendingFeishuCandidate,
 };
 use harbornas_local_agent::runtime::hub::{
     looks_like_auth_error, CameraConnectRequest, CameraHubService, HubScanResultItem,
 };
-use harbornas_local_agent::runtime::registry::DeviceRegistryStore;
+use harbornas_local_agent::runtime::registry::{CameraDevice, DeviceRegistryStore};
 use prost::Message;
 use reqwest::blocking::multipart::{Form, Part};
 use serde_json::{json, Value};
@@ -261,6 +264,29 @@ enum BotReply {
 enum CameraIntent {
     Snapshot,
     Analyze,
+    Record,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PtzControlMode {
+    Coarse,
+    Fine,
+    Continuous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PtzControlDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+    Stop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PtzControlCommand {
+    direction: PtzControlDirection,
+    mode: PtzControlMode,
 }
 
 #[derive(Debug, Clone)]
@@ -821,6 +847,14 @@ impl FeishuBot {
             return self.cmd_show_capabilities();
         }
 
+        if t.contains("云台")
+            || t.contains("控制面板")
+            || t.contains("控制摄像头")
+            || t.contains("遥控")
+        {
+            return self.cmd_show_camera_controls(text);
+        }
+
         if is_scan_camera_command(&t) {
             return BotReply::Text(self.cmd_scan_cameras(sender));
         }
@@ -829,10 +863,15 @@ impl FeishuBot {
             return BotReply::Text(self.cmd_manual_add_camera(text, sender));
         }
 
+        if let Some(command) = parse_ptz_command(text) {
+            return BotReply::Text(self.cmd_camera_ptz(text, command));
+        }
+
         if let Some(intent) = classify_camera_intent(&t) {
             return match intent {
                 CameraIntent::Snapshot => self.cmd_snapshot_camera(text),
                 CameraIntent::Analyze => self.cmd_analyze_camera(text),
+                CameraIntent::Record => BotReply::Text(self.cmd_record_camera(text)),
             };
         }
 
@@ -999,6 +1038,43 @@ impl FeishuBot {
         }
     }
 
+    fn cmd_record_camera(&self, text: &str) -> String {
+        let device_id = match self.resolve_camera_device_id(text) {
+            Ok(device_id) => device_id,
+            Err(e) => return format!("摄像头录像失败: {e}"),
+        };
+        let duration_secs = extract_record_duration_secs(text).unwrap_or(8);
+        match self.run_local_camera_recording(&device_id, duration_secs) {
+            Ok((device_name, path)) => format!(
+                "{} 录像完成。\n已保存到本地：{}\n时长：{} 秒",
+                device_name, path, duration_secs
+            ),
+            Err(e) => format!("摄像头录像失败: {e}"),
+        }
+    }
+
+    fn cmd_camera_ptz(&self, text: &str, command: PtzControlCommand) -> String {
+        let device_id = match self.resolve_camera_device_id(text) {
+            Ok(device_id) => device_id,
+            Err(e) => return format!("云台控制失败: {e}"),
+        };
+        match self.run_camera_ptz(&device_id, command) {
+            Ok(message) => message,
+            Err(e) => format!("云台控制失败: {e}"),
+        }
+    }
+
+    fn cmd_show_camera_controls(&self, text: &str) -> BotReply {
+        let device = match self.resolve_camera_device(text) {
+            Ok(device) => device,
+            Err(e) => return BotReply::Text(format!("打开控制面板失败: {e}")),
+        };
+        match self.build_camera_control_card(&device) {
+            Ok(card) => BotReply::Card(card),
+            Err(e) => BotReply::Text(format!("打开控制面板失败: {e}")),
+        }
+    }
+
     fn cmd_service_control(&self, action: &str, service: &str, success_msg: &str) -> String {
         println!("[HARBOR] service.control {action} {service} ...");
         match self.harbor.service_control(action, service) {
@@ -1079,6 +1155,10 @@ impl FeishuBot {
     }
 
     fn resolve_camera_device_id(&self, text: &str) -> Result<String, String> {
+        self.resolve_camera_device(text).map(|device| device.device_id)
+    }
+
+    fn resolve_camera_device(&self, text: &str) -> Result<CameraDevice, String> {
         let devices = self.load_registered_cameras()?;
 
         if devices.is_empty() {
@@ -1087,26 +1167,25 @@ impl FeishuBot {
 
         let normalized = normalize_command_text(text);
         for device in &devices {
-            let device_id = device.device_id.as_str();
             let name = device.name.as_str();
             let room = device.room.as_deref().unwrap_or_default();
 
             if !name.is_empty() && normalized.contains(&name.replace(' ', "").to_lowercase()) {
-                return Ok(device_id.to_string());
+                return Ok(device.clone());
             }
             if !room.is_empty() && normalized.contains(&room.replace(' ', "").to_lowercase()) {
-                return Ok(device_id.to_string());
+                return Ok(device.clone());
             }
             for alias in room_aliases(name, room) {
                 if normalized.contains(alias) {
-                    return Ok(device_id.to_string());
+                    return Ok(device.clone());
                 }
             }
         }
 
         devices
             .first()
-            .map(|device| device.device_id.clone())
+            .cloned()
             .ok_or_else(|| "未找到可分析的摄像头设备 ID".to_string())
     }
 
@@ -1143,6 +1222,132 @@ impl FeishuBot {
             text: format!("{} 当前画面如下\n已为你抓拍 1 张图片。", room),
             image_path: Some(output_path.to_string_lossy().to_string()),
         })
+    }
+
+    fn run_local_camera_recording(
+        &self,
+        device_id: &str,
+        duration_secs: u32,
+    ) -> Result<(String, String), String> {
+        let device = self
+            .load_registered_cameras()?
+            .into_iter()
+            .find(|device| device.device_id == device_id)
+            .ok_or_else(|| format!("未找到摄像头设备 {device_id}"))?;
+
+        if which::which("ffmpeg").is_err() {
+            return Err("当前机器缺少 ffmpeg，无法录制视频".to_string());
+        }
+
+        let output_dir = self.workspace_root.join(".harbornas/tmp/feishu-recordings");
+        fs::create_dir_all(&output_dir)
+            .map_err(|e| format!("无法创建录像目录 {}: {e}", output_dir.display()))?;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        let output_path = output_dir.join(format!("{}-{}.mp4", device.device_id, ts));
+
+        let output = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-rtsp_transport",
+                "tcp",
+                "-i",
+                &device.primary_stream.url,
+                "-t",
+                &duration_secs.to_string(),
+                "-c",
+                "copy",
+                output_path.to_string_lossy().as_ref(),
+            ])
+            .output()
+            .map_err(|e| format!("启动录像 ffmpeg 失败: {e}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let detail = if stderr.is_empty() {
+                "ffmpeg 没有返回错误细节".to_string()
+            } else {
+                stderr
+            };
+            return Err(format!("录像失败: {detail}"));
+        }
+
+        Ok((
+            device.room.unwrap_or(device.name),
+            output_path.to_string_lossy().to_string(),
+        ))
+    }
+
+    fn run_camera_ptz(
+        &self,
+        device_id: &str,
+        command: PtzControlCommand,
+    ) -> Result<String, String> {
+        let device = self
+            .load_registered_cameras()?
+            .into_iter()
+            .find(|device| device.device_id == device_id)
+            .ok_or_else(|| format!("未找到摄像头设备 {device_id}"))?;
+        let device_name = device.room.clone().unwrap_or_else(|| device.name.clone());
+        let device_serial = device
+            .ezviz_device_serial
+            .clone()
+            .ok_or_else(|| "当前摄像头缺少萤石 deviceSerial".to_string())?;
+        let camera_no = device
+            .ezviz_camera_no
+            .ok_or_else(|| "当前摄像头缺少萤石 cameraNo".to_string())?;
+        let config = EzvizCloudConfig::from_env().ok_or_else(|| {
+            "当前环境缺少 HARBOR_EZVIZ_APP_KEY / HARBOR_EZVIZ_APP_SECRET".to_string()
+        })?;
+        let connector = EzvizCloudPtzConnector::new(config)?;
+
+        match command.mode {
+            PtzControlMode::Continuous => {
+                let direction = map_cloud_ptz_direction(command.direction)
+                    .ok_or_else(|| "持续控制命令缺少方向".to_string())?;
+                connector.control_ptz(&EzvizPtzRequest {
+                    device_serial,
+                    camera_no,
+                    direction,
+                    speed: 2,
+                })?;
+                Ok(format!(
+                    "{} 已开始{}。如需停下，请直接回复：`停止`。",
+                    device_name,
+                    direction_label(command.direction)
+                ))
+            }
+            PtzControlMode::Coarse | PtzControlMode::Fine => {
+                let direction = map_cloud_ptz_direction(command.direction)
+                    .ok_or_else(|| "点动命令缺少方向".to_string())?;
+                let (speed, hold_ms, mode_label) = match command.mode {
+                    PtzControlMode::Coarse => (2, 450_u64, "粗调"),
+                    PtzControlMode::Fine => (1, 180_u64, "精调"),
+                    PtzControlMode::Continuous => unreachable!(),
+                };
+                connector.control_ptz(&EzvizPtzRequest {
+                    device_serial: device_serial.clone(),
+                    camera_no,
+                    direction,
+                    speed,
+                })?;
+                thread::sleep(Duration::from_millis(hold_ms));
+                connector.control_ptz(&EzvizPtzRequest {
+                    device_serial,
+                    camera_no,
+                    direction: EzvizPtzDirection::Stop,
+                    speed,
+                })?;
+                Ok(format!(
+                    "{} 已{}{}。",
+                    device_name,
+                    mode_label,
+                    direction_label(command.direction)
+                ))
+            }
+        }
     }
 
     fn run_local_camera_analysis(&self, device_id: &str) -> Result<CameraAnalysisReply, String> {
@@ -1327,7 +1532,7 @@ impl FeishuBot {
                 },
                 {
                     "tag": "markdown",
-                    "content": "**现在可以直接说：**\n- `扫描摄像头`\n- `接入 1`\n- `密码 xxxxxx`\n- `看看客厅摄像头`\n- `分析客厅摄像头`"
+                    "content": "**现在可以直接说：**\n- `扫描摄像头`\n- `接入 1`\n- `密码 xxxxxx`\n- `看看客厅摄像头`\n- `分析客厅摄像头`\n- `控制摄像头`\n- `左一点 / 精调左 / 开始左转 / 停止`\n- `拍照`\n- `录像 8秒`"
                 },
                 {
                     "tag": "note",
@@ -1346,8 +1551,51 @@ impl FeishuBot {
 
         Ok(CardReply {
             text: format!(
-                "HarborNAS Agent Hub 已连接\n默认网段: {}\n默认截图回传: {}\n默认分析动作: {}\n默认飞书去向: {}\n当前设备库: {} 台\n可以直接说：扫描摄像头 / 接入 1 / 密码 xxxxxx / 看看客厅摄像头 / 分析客厅摄像头",
+                "HarborNAS Agent Hub 已连接\n默认网段: {}\n默认截图回传: {}\n默认分析动作: {}\n默认飞书去向: {}\n当前设备库: {} 台\n可以直接说：扫描摄像头 / 接入 1 / 密码 xxxxxx / 看看客厅摄像头 / 分析客厅摄像头 / 控制摄像头 / 左一点 / 精调左 / 开始左转 / 停止 / 拍照 / 录像 8秒",
                 defaults.cidr, defaults.capture, defaults.ai, delivery_target, device_count
+            ),
+            card,
+        })
+    }
+
+    fn build_camera_control_card(&self, device: &CameraDevice) -> Result<CardReply, String> {
+        let display_name = device.room.clone().unwrap_or_else(|| device.name.clone());
+        let has_cloud = device.ezviz_device_serial.is_some() && device.ezviz_camera_no.is_some();
+        let card = json!({
+            "config": {
+                "enable_forward": true,
+                "width_mode": "fill"
+            },
+            "header": {
+                "title": {
+                    "tag": "plain_text",
+                    "content": format!("{} 控制面板", display_name)
+                },
+                "subtitle": {
+                    "tag": "plain_text",
+                    "content": if has_cloud { "已接通萤石云控，可直接在飞书里粗调/精调/持续转动" } else { "当前缺少云控标识，先补齐 deviceSerial/cameraNo" }
+                },
+                "template": "turquoise"
+            },
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": "**粗调**\n- `左一点` `右一点` `上一点` `下一点`\n\n**精调**\n- `精调左` `精调右` `精调上` `精调下`\n\n**持续转动**\n- `开始左转` `开始右转` `开始上转` `开始下转`\n- `停止`"
+                },
+                {
+                    "tag": "hr"
+                },
+                {
+                    "tag": "markdown",
+                    "content": "**拍照与录像**\n- `拍照`\n- `录像 8秒`\n- `录像 15秒`"
+                }
+            ]
+        });
+
+        Ok(CardReply {
+            text: format!(
+                "{} 控制面板\n粗调：左一点/右一点/上一点/下一点\n精调：精调左/精调右/精调上/精调下\n持续：开始左转/开始右转/开始上转/开始下转/停止\n媒体：拍照/录像 8秒",
+                display_name
             ),
             card,
         })
@@ -1790,9 +2038,17 @@ fn classify_camera_intent(normalized: &str) -> Option<CameraIntent> {
         return Some(CameraIntent::Analyze);
     }
 
+    let wants_record = ["录像", "录一段", "录个视频", "录视频", "录制"]
+        .iter()
+        .any(|keyword| normalized.contains(keyword));
+    if wants_record {
+        return Some(CameraIntent::Record);
+    }
+
     let wants_snapshot = [
         "给我拍一张",
         "拍一张",
+        "拍照",
         "抓拍",
         "截图",
         "快照",
@@ -1821,6 +2077,86 @@ fn classify_camera_intent(normalized: &str) -> Option<CameraIntent> {
     }
 
     None
+}
+
+fn parse_ptz_command(text: &str) -> Option<PtzControlCommand> {
+    let normalized = normalize_command_text(text);
+    let direction = if normalized.contains("左") {
+        PtzControlDirection::Left
+    } else if normalized.contains("右") {
+        PtzControlDirection::Right
+    } else if normalized.contains("上") || normalized.contains("抬头") {
+        PtzControlDirection::Up
+    } else if normalized.contains("下") || normalized.contains("低头") {
+        PtzControlDirection::Down
+    } else if normalized.contains("停止") {
+        PtzControlDirection::Stop
+    } else {
+        return None;
+    };
+
+    if direction == PtzControlDirection::Stop {
+        return Some(PtzControlCommand {
+            direction,
+            mode: PtzControlMode::Continuous,
+        });
+    }
+
+    let mode = if normalized.contains("精调") {
+        PtzControlMode::Fine
+    } else if normalized.contains("开始")
+        || normalized.contains("持续")
+        || normalized.contains("一直")
+        || normalized.contains("长按")
+    {
+        PtzControlMode::Continuous
+    } else if normalized.contains("一点")
+        || normalized.contains("轻微")
+        || normalized.contains("稍微")
+        || normalized.contains("挪")
+    {
+        PtzControlMode::Coarse
+    } else if normalized.contains("左转")
+        || normalized.contains("右转")
+        || normalized.contains("上转")
+        || normalized.contains("下转")
+    {
+        PtzControlMode::Continuous
+    } else {
+        return None;
+    };
+
+    Some(PtzControlCommand { direction, mode })
+}
+
+fn extract_record_duration_secs(text: &str) -> Option<u32> {
+    let normalized = text.replace('秒', " ");
+    for token in normalized.split_whitespace() {
+        if let Ok(value) = token.parse::<u32>() {
+            return Some(value.clamp(3, 30));
+        }
+    }
+    None
+}
+
+fn map_cloud_ptz_direction(direction: PtzControlDirection) -> Option<EzvizPtzDirection> {
+    match direction {
+        PtzControlDirection::Left => Some(EzvizPtzDirection::Left),
+        PtzControlDirection::Right => Some(EzvizPtzDirection::Right),
+        PtzControlDirection::Up => Some(EzvizPtzDirection::Up),
+        PtzControlDirection::Down => Some(EzvizPtzDirection::Down),
+        PtzControlDirection::Stop => Some(EzvizPtzDirection::Stop),
+    }
+}
+
+fn direction_label(direction: PtzControlDirection) -> &'static str {
+    match direction {
+        PtzControlDirection::Left => "向左",
+        PtzControlDirection::Right => "向右",
+        PtzControlDirection::Up => "向上",
+        PtzControlDirection::Down => "向下",
+        PtzControlDirection::Stop => "停止",
+    }
 }
 
 fn room_aliases<'a>(name: &'a str, room: &'a str) -> Vec<&'static str> {
@@ -2080,6 +2416,41 @@ fn resolve_feishu_credentials(cli: &Cli) -> Option<(String, String)> {
         .or_else(load_feishu_app_secret_from_admin_state)
         .filter(|value| !value.trim().is_empty())?;
     Some((app_id, app_secret))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        extract_record_duration_secs, parse_ptz_command, PtzControlDirection, PtzControlMode,
+    };
+
+    #[test]
+    fn ptz_command_parses_coarse_and_fine_modes() {
+        let cmd = parse_ptz_command("左一点").expect("coarse");
+        assert_eq!(cmd.direction, PtzControlDirection::Left);
+        assert_eq!(cmd.mode, PtzControlMode::Coarse);
+
+        let cmd = parse_ptz_command("精调右").expect("fine");
+        assert_eq!(cmd.direction, PtzControlDirection::Right);
+        assert_eq!(cmd.mode, PtzControlMode::Fine);
+    }
+
+    #[test]
+    fn ptz_command_parses_continuous_and_stop() {
+        let cmd = parse_ptz_command("开始左转").expect("continuous");
+        assert_eq!(cmd.direction, PtzControlDirection::Left);
+        assert_eq!(cmd.mode, PtzControlMode::Continuous);
+
+        let cmd = parse_ptz_command("停止").expect("stop");
+        assert_eq!(cmd.direction, PtzControlDirection::Stop);
+    }
+
+    #[test]
+    fn record_duration_defaults_are_clamped() {
+        assert_eq!(extract_record_duration_secs("录像 2秒"), Some(3));
+        assert_eq!(extract_record_duration_secs("录像 15秒"), Some(15));
+        assert_eq!(extract_record_duration_secs("录像 60秒"), Some(30));
+    }
 }
 
 fn load_feishu_app_id_from_admin_state() -> Option<String> {
