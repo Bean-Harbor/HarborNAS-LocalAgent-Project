@@ -1863,6 +1863,18 @@ fn sender_key(sender: &FeishuSenderIdentity) -> Option<String> {
         .clone()
         .filter(|value| !value.trim().is_empty())
         .or_else(|| (!sender.open_id.trim().is_empty()).then(|| sender.open_id.clone()))
+        .or_else(|| {
+            sender
+                .user_id
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| {
+            sender
+                .union_id
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+        })
 }
 
 fn looks_like_plain_password(text: &str) -> bool {

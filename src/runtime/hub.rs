@@ -8,8 +8,10 @@ use std::time::Duration;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
+use crate::adapters::mdns::AvahiMdnsAdapter;
 use crate::adapters::onvif::WsDiscoveryOnvifAdapter;
 use crate::adapters::rtsp::{CommandRtspAdapter, RtspProbeAdapter};
+use crate::adapters::ssdp::UdpSsdpAdapter;
 use crate::connectors::storage::StorageTarget;
 use crate::runtime::admin_console::{
     sanitize_defaults, AdminBindingState, AdminConsoleState, AdminConsoleStore, AdminDefaults,
@@ -187,8 +189,14 @@ impl CameraHubService {
         state.defaults = sanitize_defaults(state.defaults);
         self.admin_store.save_state(&state)?;
 
-        if prefers_onvif_discovery(&state.defaults.discovery) {
-            return self.scan_with_onvif(&state, public_origin);
+        let protocols = resolve_discovery_protocols(&state.defaults.discovery);
+        if protocols.iter().any(|p| {
+            matches!(
+                p,
+                DiscoveryProtocol::Onvif | DiscoveryProtocol::Mdns | DiscoveryProtocol::Ssdp
+            )
+        }) {
+            return self.scan_with_discovery_service(&state, public_origin, protocols);
         }
 
         self.scan_with_rtsp_probe(&state, public_origin)
@@ -421,21 +429,22 @@ impl CameraHubService {
         })
     }
 
-    fn scan_with_onvif(
+    fn scan_with_discovery_service(
         &self,
         state: &AdminConsoleState,
         public_origin: Option<&str>,
+        protocols: Vec<DiscoveryProtocol>,
     ) -> Result<HubScanSummary, String> {
         let service = DiscoveryService::new(
             Box::new(CommandRtspAdapter::default()),
             Some(Box::new(WsDiscoveryOnvifAdapter::default())),
-            None,
-            None,
+            Some(Box::new(UdpSsdpAdapter::default())),
+            Some(Box::new(AvahiMdnsAdapter::default())),
         );
         let discovery = service.discover(&DiscoveryRequest {
-            scan_id: "hub-onvif-scan".to_string(),
+            scan_id: "hub-discovery-scan".to_string(),
             network_cidr: state.defaults.cidr.clone(),
-            protocols: vec![DiscoveryProtocol::Onvif, DiscoveryProtocol::RtspProbe],
+            protocols,
             include_rtsp_probe: true,
             rtsp_port: Some(state.defaults.rtsp_port),
             rtsp_username: non_empty_opt(&state.defaults.rtsp_username),
@@ -472,6 +481,14 @@ impl CameraHubService {
                 candidate.rtsp_paths.clone()
             };
 
+            let base = match candidate.protocol {
+                DiscoveryProtocol::Onvif => "ONVIF",
+                DiscoveryProtocol::Mdns => "mDNS",
+                DiscoveryProtocol::Ssdp => "SSDP",
+                DiscoveryProtocol::Matter => "Matter",
+                DiscoveryProtocol::RtspProbe => "RTSP",
+            };
+
             results.push(HubScanResultItem {
                 candidate_id: candidate.candidate_id.clone(),
                 device_id: device.map(|device| device.device_id.clone()),
@@ -486,14 +503,14 @@ impl CameraHubService {
                 ip: candidate.ip_address.clone(),
                 port,
                 protocol: if reachable {
-                    "ONVIF + RTSP / 已验证".to_string()
+                    format!("{base} + RTSP / 已验证")
                 } else if requires_auth {
-                    "ONVIF / 需密码".to_string()
+                    format!("{base} / 需密码")
                 } else {
-                    "ONVIF / 已发现".to_string()
+                    format!("{base} / 已发现")
                 },
                 note: if reachable {
-                    "已通过 ONVIF 发现并完成 RTSP 验证，可直接加入设备库。".to_string()
+                    format!("已通过 {base} 发现并完成 RTSP 验证，可直接加入设备库。")
                 } else if requires_auth {
                     "已发现摄像头，但 RTSP 认证失败。回复“接入 序号”后，再发送“密码 xxxxxx”即可继续。".to_string()
                 } else {
@@ -544,6 +561,22 @@ pub fn enrich_binding_urls(
 
 pub fn prefers_onvif_discovery(value: &str) -> bool {
     value.to_lowercase().contains("onvif")
+}
+
+pub fn resolve_discovery_protocols(discovery: &str) -> Vec<DiscoveryProtocol> {
+    let normalized = discovery.to_lowercase();
+    let mut protocols = Vec::new();
+    if normalized.contains("onvif") {
+        protocols.push(DiscoveryProtocol::Onvif);
+    }
+    if normalized.contains("ssdp") {
+        protocols.push(DiscoveryProtocol::Ssdp);
+    }
+    if normalized.contains("mdns") || normalized.contains("m-dns") || discovery.contains("mDNS") {
+        protocols.push(DiscoveryProtocol::Mdns);
+    }
+    protocols.push(DiscoveryProtocol::RtspProbe);
+    protocols
 }
 
 pub fn non_empty_opt(value: &str) -> Option<String> {
@@ -837,7 +870,7 @@ fn normalize_network(network: Ipv4Addr, prefix: u8) -> Ipv4Addr {
 mod tests {
     use super::{
         build_mobile_setup_url, humanize_probe_error, looks_like_auth_error, merge_camera,
-        normalize_camera_metadata,
+        normalize_camera_metadata, resolve_discovery_protocols,
     };
     use crate::runtime::registry::{CameraDevice, StreamTransport};
 
@@ -878,5 +911,17 @@ mod tests {
 
         let normalized = normalize_camera_metadata(merged);
         assert_eq!(normalized.discovery_source, "onvif");
+    }
+
+    #[test]
+    fn discovery_protocols_include_rtsp_probe_and_detect_keywords() {
+        let protocols = resolve_discovery_protocols("ONVIF + RTSP");
+        assert!(protocols.contains(&crate::runtime::discovery::DiscoveryProtocol::Onvif));
+        assert!(protocols.contains(&crate::runtime::discovery::DiscoveryProtocol::RtspProbe));
+
+        let protocols = resolve_discovery_protocols("mDNS + SSDP");
+        assert!(protocols.contains(&crate::runtime::discovery::DiscoveryProtocol::Mdns));
+        assert!(protocols.contains(&crate::runtime::discovery::DiscoveryProtocol::Ssdp));
+        assert!(protocols.contains(&crate::runtime::discovery::DiscoveryProtocol::RtspProbe));
     }
 }
