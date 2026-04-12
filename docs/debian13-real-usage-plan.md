@@ -36,6 +36,17 @@
 
 - `http://harbornas.local:4174/api/binding/static-qr.svg`
 
+## 模型依赖（YOLO）
+
+仓库不会提交 `yolov8n.pt` 这类权重文件；Debian 安装脚本会默认下载并校验 YOLO 模型到本机：
+
+- 默认路径：`/var/lib/harbornas/models/yolov8n.pt`
+- 默认环境变量：`HARBOR_YOLO_MODEL=/var/lib/harbornas/models/yolov8n.pt`
+
+如需跳过模型下载：
+
+- `sudo INSTALL_YOLO_MODEL=0 ./tools/install_debian13_services.sh`
+
 ## 服务建议
 
 建议至少长期运行两个服务：

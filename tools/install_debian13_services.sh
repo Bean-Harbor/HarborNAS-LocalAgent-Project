@@ -8,6 +8,7 @@ HOSTNAME_VALUE="${HARBOR_HOSTNAME:-harbornas}"
 SERVICE_USER="${SERVICE_USER:-${SUDO_USER:-$(id -un)}}"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-${REPO_ROOT}}"
 ENV_FILE="${HARBOR_ENV_FILE:-/etc/default/harbornas-agent-hub}"
+MODEL_DIR="${MODEL_DIR:-/var/lib/harbornas/models}"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Please run as root: sudo $0"
@@ -15,6 +16,12 @@ if [[ "${EUID}" -ne 0 ]]; then
 fi
 
 "${SCRIPT_DIR}/setup_debian13_local_discovery.sh" "${HOSTNAME_VALUE}"
+chmod 0755 "${WORKSPACE_ROOT}/tools/fetch_yolo_model.sh"
+if [[ "${INSTALL_YOLO_MODEL:-1}" != "0" ]]; then
+  "${WORKSPACE_ROOT}/tools/fetch_yolo_model.sh"
+else
+  echo "Skipping YOLO model download (INSTALL_YOLO_MODEL=0)"
+fi
 
 cat > "${ENV_FILE}" <<EOF
 # HarborNAS Agent Hub runtime environment
@@ -25,6 +32,7 @@ FEISHU_DOMAIN=https://open.feishu.cn
 HARBOR_HOST=192.168.3.172
 HARBOR_USER=harboros_admin
 HARBOR_PASSWORD=123456
+HARBOR_YOLO_MODEL=${MODEL_DIR}/yolov8n.pt
 # FEISHU_APP_ID=
 # FEISHU_APP_SECRET=
 EOF
@@ -70,7 +78,8 @@ EOF
 chmod 0644 "${ENV_FILE}" /etc/systemd/system/agent-hub-admin-api.service /etc/systemd/system/feishu-harbor-bot.service
 chmod 0755 \
   "${WORKSPACE_ROOT}/tools/run_agent_hub_admin_api.sh" \
-  "${WORKSPACE_ROOT}/tools/run_feishu_harbor_bot.sh"
+  "${WORKSPACE_ROOT}/tools/run_feishu_harbor_bot.sh" \
+  "${WORKSPACE_ROOT}/tools/fetch_yolo_model.sh"
 
 systemctl daemon-reload
 systemctl enable --now agent-hub-admin-api.service feishu-harbor-bot.service

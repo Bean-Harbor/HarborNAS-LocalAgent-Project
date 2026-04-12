@@ -45,4 +45,7 @@ echo
 echo "Then install long-running services with:"
 echo "  sudo ./tools/install_debian13_services.sh"
 echo
+echo "To skip YOLO model download during install:"
+echo "  sudo INSTALL_YOLO_MODEL=0 ./tools/install_debian13_services.sh"
+echo
 echo "Use this URL to generate a static QR sticker for the device."

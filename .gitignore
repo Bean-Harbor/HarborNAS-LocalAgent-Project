@@ -7,3 +7,5 @@ target/
 .harborbeacon/
 .harbornas/
 .cache/
+yolov8n.pt
+*.pt
