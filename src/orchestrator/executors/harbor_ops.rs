@@ -27,6 +27,10 @@ impl Executor for MiddlewareExecutor {
         Route::MiddlewareApi
     }
 
+    fn supports(&self, action: &Action) -> bool {
+        action.domain == "service"
+    }
+
     fn is_available(&self) -> bool {
         self.available
     }
@@ -93,6 +97,10 @@ impl MidcliExecutor {
 impl Executor for MidcliExecutor {
     fn route(&self) -> Route {
         Route::Midcli
+    }
+
+    fn supports(&self, action: &Action) -> bool {
+        action.domain == "service"
     }
 
     fn is_available(&self) -> bool {
@@ -270,6 +278,10 @@ impl MiddlewareHttpExecutor {
 impl Executor for MiddlewareHttpExecutor {
     fn route(&self) -> Route {
         Route::MiddlewareApi
+    }
+
+    fn supports(&self, action: &Action) -> bool {
+        action.domain == "service"
     }
 
     fn is_available(&self) -> bool {
@@ -528,6 +540,10 @@ impl MiddlewareWsExecutor {
 impl Executor for MiddlewareWsExecutor {
     fn route(&self) -> Route {
         Route::MiddlewareApi
+    }
+
+    fn supports(&self, action: &Action) -> bool {
+        action.domain == "service"
     }
 
     fn is_available(&self) -> bool {

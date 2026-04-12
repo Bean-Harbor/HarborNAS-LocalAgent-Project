@@ -176,6 +176,10 @@ impl Executor for DeviceDiscoveryExecutor {
         Route::Mcp
     }
 
+    fn supports(&self, action: &Action) -> bool {
+        action.domain == "device"
+    }
+
     fn is_available(&self) -> bool {
         true
     }

@@ -306,6 +306,10 @@ impl Executor for VisionExecutor {
         Route::Mcp
     }
 
+    fn supports(&self, action: &Action) -> bool {
+        action.domain == "vision"
+    }
+
     fn is_available(&self) -> bool {
         true
     }

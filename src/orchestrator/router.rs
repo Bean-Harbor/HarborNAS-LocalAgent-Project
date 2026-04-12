@@ -4,6 +4,9 @@ use crate::orchestrator::contracts::{Action, ExecutionResult, Route, StepStatus,
 
 pub trait Executor {
     fn route(&self) -> Route;
+    fn supports(&self, _action: &Action) -> bool {
+        true
+    }
     fn is_available(&self) -> bool;
     fn execute(
         &self,
@@ -14,7 +17,7 @@ pub trait Executor {
 }
 
 pub struct Router {
-    executors: HashMap<Route, Box<dyn Executor + Send + Sync>>,
+    executors: HashMap<Route, Vec<Box<dyn Executor + Send + Sync>>>,
 }
 
 impl Router {
@@ -25,7 +28,10 @@ impl Router {
     }
 
     pub fn register(&mut self, executor: Box<dyn Executor + Send + Sync>) {
-        self.executors.insert(executor.route(), executor);
+        self.executors
+            .entry(executor.route())
+            .or_default()
+            .push(executor);
     }
 
     pub fn execute(&self, action: &Action, task_id: &str, step_id: &str) -> ExecutionResult {
@@ -34,26 +40,32 @@ impl Router {
         let mut fallback_used = false;
 
         for (idx, route) in routes.iter().enumerate() {
-            let Some(executor) = self.executors.get(route) else {
+            let Some(executors) = self.executors.get(route) else {
                 continue;
             };
-            if !executor.is_available() {
-                continue;
-            }
             if idx > 0 {
                 fallback_used = true;
             }
 
-            match executor.execute(action, task_id, step_id) {
-                Ok(mut result) => {
-                    result.fallback_used = fallback_used;
-                    if result.executor_used.is_empty() {
-                        result.executor_used = route.as_str().to_string();
-                    }
-                    return result;
+            for executor in executors {
+                if !executor.supports(action) {
+                    continue;
                 }
-                Err(err) => {
-                    last_error = Some(err);
+                if !executor.is_available() {
+                    continue;
+                }
+
+                match executor.execute(action, task_id, step_id) {
+                    Ok(mut result) => {
+                        result.fallback_used = fallback_used;
+                        if result.executor_used.is_empty() {
+                            result.executor_used = route.as_str().to_string();
+                        }
+                        return result;
+                    }
+                    Err(err) => {
+                        last_error = Some(err);
+                    }
                 }
             }
         }
@@ -103,6 +115,10 @@ mod tests {
     impl Executor for MockExecutor {
         fn route(&self) -> Route {
             self.route
+        }
+
+        fn supports(&self, _action: &Action) -> bool {
+            true
         }
 
         fn is_available(&self) -> bool {
@@ -175,5 +191,34 @@ mod tests {
         let result = router.execute(&action, "t1", "s1");
         assert_eq!(result.executor_used, "midcli");
         assert!(result.fallback_used);
+    }
+
+    #[test]
+    fn multiple_executors_can_share_same_route() {
+        let mut router = Router::new();
+        router.register(Box::new(MockExecutor {
+            route: Route::Mcp,
+            available: true,
+            fail: true,
+        }));
+        router.register(Box::new(MockExecutor {
+            route: Route::Mcp,
+            available: true,
+            fail: false,
+        }));
+
+        let action = Action {
+            domain: "device".to_string(),
+            operation: "ptz".to_string(),
+            resource: json!({"device_id": "cam-1"}),
+            args: json!({}),
+            risk_level: RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+
+        let result = router.execute(&action, "t1", "s1");
+        assert_eq!(result.executor_used, "mcp");
+        assert_eq!(result.status, StepStatus::Success);
     }
 }
