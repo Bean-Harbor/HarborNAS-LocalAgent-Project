@@ -4,13 +4,17 @@ use std::time::Instant;
 use serde_json::json;
 
 use crate::adapters::mdns::MdnsDiscoveryAdapter;
-use crate::adapters::onvif::OnvifDiscoveryAdapter;
+use crate::adapters::onvif::{
+    default_onvif_device_service_url, OnvifDiscoveryAdapter, OnvifPtzAdapter, OnvifPtzRequest,
+    PtzDirection, SoapOnvifPtzAdapter,
+};
 use crate::adapters::rtsp::RtspProbeAdapter;
 use crate::adapters::ssdp::SsdpDiscoveryAdapter;
 use crate::domains::device::{
     DeviceDiscoverArgs, DeviceDiscoverPayload, DeviceGetArgs, DeviceGetPayload, DeviceListArgs,
-    DeviceListPayload, DeviceOpenStreamArgs, DeviceOpenStreamPayload, DeviceSnapshotArgs,
-    DeviceSnapshotPayload, DeviceUpdateArgs, DeviceUpdatePayload,
+    DeviceListPayload, DeviceOpenStreamArgs, DeviceOpenStreamPayload, DevicePtzArgs,
+    DevicePtzDirection, DevicePtzPayload, DeviceSnapshotArgs, DeviceSnapshotPayload,
+    DeviceUpdateArgs, DeviceUpdatePayload,
 };
 use crate::orchestrator::contracts::{Action, ExecutionResult, Route, StepStatus};
 use crate::orchestrator::router::Executor;
@@ -20,6 +24,7 @@ use crate::runtime::registry::{CameraDevice, DeviceRegistryStore};
 
 pub struct DeviceDiscoveryExecutor {
     service: DiscoveryService,
+    ptz: Box<dyn OnvifPtzAdapter>,
     devices: Arc<Mutex<Vec<CameraDevice>>>,
     registry_store: Option<DeviceRegistryStore>,
 }
@@ -33,6 +38,7 @@ impl DeviceDiscoveryExecutor {
     ) -> Self {
         Self {
             service: DiscoveryService::new(rtsp, onvif, ssdp, mdns),
+            ptz: Box::new(SoapOnvifPtzAdapter::default()),
             devices: Arc::new(Mutex::new(Vec::new())),
             registry_store: None,
         }
@@ -137,6 +143,32 @@ impl DeviceDiscoveryExecutor {
         }
         Ok(normalize_camera_metadata(updated))
     }
+
+    fn ptz_device(&self, args: &DevicePtzArgs) -> Result<DevicePtzPayload, String> {
+        let device = self.find_device(&args.device_id)?;
+        let device_service_url = default_onvif_device_service_url(&device).ok_or_else(|| {
+            format!(
+                "device {} is missing ONVIF device_service url and IP address",
+                device.device_id
+            )
+        })?;
+
+        let result = self.ptz.ptz(&OnvifPtzRequest {
+            device_service_url,
+            username: args.username.clone(),
+            password: args.password.clone(),
+            direction: map_ptz_direction(args.direction.clone()),
+            pan_speed: args.pan_speed,
+            tilt_speed: args.tilt_speed,
+        })?;
+
+        Ok(DevicePtzPayload {
+            device_id: device.device_id,
+            profile_token: result.profile_token,
+            ptz_service_url: result.ptz_service_url,
+            action: result.action,
+        })
+    }
 }
 
 impl Executor for DeviceDiscoveryExecutor {
@@ -208,6 +240,13 @@ impl Executor for DeviceDiscoveryExecutor {
                 serde_json::to_value(DeviceOpenStreamPayload { stream })
                     .map_err(|e| format!("open_stream payload serialize failed: {e}"))?
             }
+            "ptz" => {
+                let args: DevicePtzArgs = serde_json::from_value(merge_resource_and_args(action))
+                    .map_err(|e| format!("invalid ptz args: {e}"))?;
+                let ptz = self.ptz_device(&args)?;
+                serde_json::to_value(ptz)
+                    .map_err(|e| format!("ptz payload serialize failed: {e}"))?
+            }
             other => return Err(format!("unsupported device operation: {other}")),
         };
 
@@ -235,6 +274,16 @@ fn merge_resource_and_args(action: &Action) -> serde_json::Value {
         merged.extend(args.clone());
     }
     json!(merged)
+}
+
+fn map_ptz_direction(direction: DevicePtzDirection) -> PtzDirection {
+    match direction {
+        DevicePtzDirection::Left => PtzDirection::Left,
+        DevicePtzDirection::Right => PtzDirection::Right,
+        DevicePtzDirection::Up => PtzDirection::Up,
+        DevicePtzDirection::Down => PtzDirection::Down,
+        DevicePtzDirection::Stop => PtzDirection::Stop,
+    }
 }
 
 #[cfg(test)]

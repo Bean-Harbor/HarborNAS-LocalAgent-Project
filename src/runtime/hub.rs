@@ -656,6 +656,9 @@ pub fn merge_camera(existing: CameraDevice, incoming: CameraDevice) -> CameraDev
             incoming.discovery_source
         },
         primary_stream: incoming.primary_stream,
+        onvif_device_service_url: incoming
+            .onvif_device_service_url
+            .or(existing.onvif_device_service_url),
         capabilities: incoming.capabilities,
         last_seen_at: incoming.last_seen_at.or(existing.last_seen_at),
     })

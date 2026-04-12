@@ -322,6 +322,11 @@ impl RtspProbeResult {
         device.primary_stream.transport = self.transport;
         device.primary_stream.requires_auth = self.requires_auth;
         device.capabilities = self.capabilities;
+        if matches!(candidate.protocol, DiscoveryProtocol::Onvif) {
+            device.capabilities.ptz = true;
+            device.onvif_device_service_url =
+                Some(format!("http://{}/onvif/device_service", candidate.ip_address));
+        }
         Some(device)
     }
 }

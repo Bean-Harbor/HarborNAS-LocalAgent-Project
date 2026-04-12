@@ -68,6 +68,8 @@ pub struct CameraDevice {
     pub discovery_source: String,
     pub primary_stream: CameraStreamRef,
     #[serde(default)]
+    pub onvif_device_service_url: Option<String>,
+    #[serde(default)]
     pub capabilities: CameraCapabilities,
     #[serde(default)]
     pub last_seen_at: Option<String>,
@@ -95,6 +97,7 @@ impl CameraDevice {
                 url: url.into(),
                 requires_auth: false,
             },
+            onvif_device_service_url: None,
             capabilities: CameraCapabilities::default(),
             last_seen_at: None,
         }

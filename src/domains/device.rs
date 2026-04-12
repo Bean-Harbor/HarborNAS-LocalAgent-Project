@@ -19,6 +19,7 @@ pub const OP_GET: &str = "get";
 pub const OP_UPDATE: &str = "update";
 pub const OP_SNAPSHOT: &str = "snapshot";
 pub const OP_OPEN_STREAM: &str = "open_stream";
+pub const OP_PTZ: &str = "ptz";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceDiscoverArgs {
@@ -110,6 +111,30 @@ impl DeviceOpenStreamArgs {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DevicePtzDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+    Stop,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DevicePtzArgs {
+    pub device_id: String,
+    pub direction: DevicePtzDirection,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default = "default_pan_speed")]
+    pub pan_speed: f32,
+    #[serde(default = "default_tilt_speed")]
+    pub tilt_speed: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceDiscoverPayload {
     pub discovery: DiscoveryBatchResult,
@@ -145,6 +170,14 @@ pub struct DeviceOpenStreamPayload {
     pub stream: StreamOpenResult,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DevicePtzPayload {
+    pub device_id: String,
+    pub profile_token: String,
+    pub ptz_service_url: String,
+    pub action: String,
+}
+
 fn default_discovery_protocols() -> Vec<DiscoveryProtocol> {
     vec![
         DiscoveryProtocol::Onvif,
@@ -158,11 +191,20 @@ fn default_true() -> bool {
     true
 }
 
+fn default_pan_speed() -> f32 {
+    0.4
+}
+
+fn default_tilt_speed() -> f32 {
+    0.4
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        DeviceDiscoverArgs, DeviceOpenStreamArgs, DeviceSnapshotArgs, DeviceUpdateArgs,
-        OP_DISCOVER, OP_OPEN_STREAM, OP_SNAPSHOT, OP_UPDATE,
+        DeviceDiscoverArgs, DeviceOpenStreamArgs, DevicePtzArgs, DevicePtzDirection,
+        DeviceSnapshotArgs, DeviceUpdateArgs, OP_DISCOVER, OP_OPEN_STREAM, OP_PTZ, OP_SNAPSHOT,
+        OP_UPDATE,
     };
     use crate::connectors::storage::StorageTarget;
     use crate::domains::device::DOMAIN;
@@ -249,5 +291,16 @@ mod tests {
         assert_eq!(OP_UPDATE, "update");
         assert_eq!(args.name.as_deref(), Some("Living Room"));
         assert_eq!(args.room.as_deref(), Some("Home"));
+    }
+
+    #[test]
+    fn ptz_args_default_to_medium_speed() {
+        let args: DevicePtzArgs =
+            serde_json::from_str(r#"{"device_id":"cam-1","direction":"left"}"#)
+                .expect("parse ptz args");
+        assert_eq!(OP_PTZ, "ptz");
+        assert_eq!(args.direction, DevicePtzDirection::Left);
+        assert_eq!(args.pan_speed, 0.4);
+        assert_eq!(args.tilt_speed, 0.4);
     }
 }
