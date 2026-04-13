@@ -4,6 +4,7 @@ from orchestrator.executors.harbor_ops import (
     MiddlewareExecutor,
     MidcliExecutor,
     _build_midcli_command,
+    _map_files_operation,
     _map_service_operation,
 )
 
@@ -43,28 +44,41 @@ def test_map_enable():
 # --- _build_midcli_command ---
 
 def test_midcli_status_command():
-    cmd = _build_midcli_command("status", "ssh", {})
+    cmd = _build_midcli_command(Action(domain="service", operation="status", resource={"service_name": "ssh"}))
     assert cmd == "service ssh show"
 
 
 def test_midcli_start_command():
-    cmd = _build_midcli_command("start", "ssh", {})
+    cmd = _build_midcli_command(Action(domain="service", operation="start", resource={"service_name": "ssh"}))
     assert cmd == "service start service=ssh"
 
 
 def test_midcli_stop_command():
-    cmd = _build_midcli_command("stop", "smb", {})
+    cmd = _build_midcli_command(Action(domain="service", operation="stop", resource={"service_name": "smb"}))
     assert cmd == "service stop service=smb"
 
 
 def test_midcli_restart_command():
-    cmd = _build_midcli_command("restart", "ssh", {})
+    cmd = _build_midcli_command(Action(domain="service", operation="restart", resource={"service_name": "ssh"}))
     assert cmd == "service restart service=ssh"
 
 
 def test_midcli_enable_command():
-    cmd = _build_midcli_command("enable", "ssh", {"enable": False})
+    cmd = _build_midcli_command(
+        Action(domain="service", operation="enable", resource={"service_name": "ssh"}, args={"enable": False})
+    )
     assert cmd == "service update id_or_name=ssh enable=false"
+
+
+def test_map_files_copy():
+    method, args = _map_files_operation("copy", {"source": "/tmp/a", "destination": "/tmp/b"}, {})
+    assert method == "filesystem.copy"
+    assert args == ["/tmp/a", "/tmp/b", {"recursive": False, "preserve_attrs": False}]
+
+
+def test_midcli_files_copy_command():
+    cmd = _build_midcli_command(Action(domain="files", operation="copy", resource={"source": "/tmp/a", "destination": "/tmp/b"}))
+    assert cmd == 'filesystem copy src="/tmp/a" dst="/tmp/b"'
 
 
 # --- MiddlewareExecutor ---

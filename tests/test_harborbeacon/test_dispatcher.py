@@ -1,5 +1,7 @@
 """Tests for harborbeacon.dispatcher — Central dispatch chain."""
 import json
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 import pytest
 
 from orchestrator.contracts import Action, ExecutionResult, Route, StepStatus
@@ -11,8 +13,9 @@ from skills.manifest import SkillManifest, HarborApiConfig, HarborCliConfig, Ris
 from skills.registry import Registry
 
 from harborbeacon.autonomy import Autonomy
+from harborbeacon.attachments import AttachmentResolver, ResolvedAttachment
 from harborbeacon.camera_domain import build_camera_domain_manifest
-from harborbeacon.channels import Channel, ChannelConfig, ChannelRegistry, InboundMessage, OutboundMessage
+from harborbeacon.channels import Attachment, AttachmentType, Channel, ChannelConfig, ChannelRegistry, InboundMessage, OutboundMessage
 from harborbeacon.dispatcher import Dispatcher, SessionEntry, SessionStore, _MUTATION_OPS
 from harborbeacon.formatter import ResponseFormatter
 from harborbeacon.intent import IntentParser
@@ -95,6 +98,38 @@ def _build_stack():
         default_autonomy=Autonomy.SUPERVISED,
     )
 
+    return dispatcher, sent_messages
+
+
+def _build_extended_stack(*, attachment_resolver: AttachmentResolver | None = None):
+    reg = Registry()
+    reg.register(_make_manifest())
+    builtins_dir = Path(__file__).resolve().parents[2] / "skills" / "builtins"
+    reg.load_dir(builtins_dir)
+
+    router = Router([FakeExecutor(supported_domains={"service", "files"})])
+    runtime = Runtime(router=router, audit=AuditLog())
+    adapter = McpServerAdapter(reg, runtime, default_autonomy=Autonomy.SUPERVISED)
+    parser = IntentParser()
+    channel_reg = ChannelRegistry()
+
+    sent_messages: list[OutboundMessage] = []
+
+    def fake_sender(msg: OutboundMessage):
+        sent_messages.append(msg)
+
+    channel_reg.register(
+        ChannelConfig(channel=Channel.FEISHU, enabled=True, app_id="test", app_secret="s"),
+        sender=fake_sender,
+    )
+
+    dispatcher = Dispatcher(
+        intent_parser=parser,
+        mcp_adapter=adapter,
+        channel_registry=channel_reg,
+        attachment_resolver=attachment_resolver,
+        default_autonomy=Autonomy.SUPERVISED,
+    )
     return dispatcher, sent_messages
 
 
@@ -303,7 +338,7 @@ class TestApprovalFlow:
 class TestErrorHandling:
     def test_unparseable_intent(self):
         dispatcher, sent = _build_stack()
-        dispatcher.handle(_inbound("今天天气怎么样"))
+        dispatcher.handle(_inbound("随便聊聊"))
         assert len(sent) == 1
         assert "❌" in sent[0].text or "错误" in sent[0].text
 
@@ -314,6 +349,78 @@ class TestErrorHandling:
         # MQTT is not registered in our test stack → RuntimeError in send
         # Dispatcher should catch and log
         dispatcher.handle(msg)  # should not raise
+
+
+class FakeAttachmentResolver(AttachmentResolver):
+    def __init__(self):
+        super().__init__(download_root=Path("."))
+
+    def resolve_message_attachment(self, inbound, config, attachment):
+        return ResolvedAttachment(
+            local_path="/tmp/photo.png",
+            file_name="photo.png",
+            size_bytes=2048,
+        )
+
+
+class TestWeatherAndAttachments:
+    def test_weather_without_city_prompts_for_city(self):
+        dispatcher, sent = _build_extended_stack()
+        dispatcher.handle(_inbound("今天天气怎么样"))
+        assert len(sent) == 1
+        assert "请告诉我要查询的城市" in sent[0].text
+
+    def test_weather_remembers_city(self):
+        dispatcher, sent = _build_extended_stack()
+        geo_response = MagicMock()
+        geo_response.read.return_value = json.dumps({
+            "results": [{"name": "Shanghai", "country": "China", "latitude": 31.23, "longitude": 121.47}],
+        }).encode("utf-8")
+        geo_response.__enter__ = MagicMock(return_value=geo_response)
+        geo_response.__exit__ = MagicMock(return_value=False)
+
+        weather_response = MagicMock()
+        weather_response.read.return_value = json.dumps({
+            "current": {
+                "temperature_2m": 23.5,
+                "wind_speed_10m": 8.1,
+                "weather_code": 1,
+                "time": "2026-04-06T09:00",
+            }
+        }).encode("utf-8")
+        weather_response.__enter__ = MagicMock(return_value=weather_response)
+        weather_response.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.urlopen", side_effect=[geo_response, weather_response, geo_response, weather_response]):
+            dispatcher.handle(_inbound("上海天气怎么样"))
+            assert len(sent) == 1
+            sent.clear()
+            dispatcher.handle(_inbound("今天天气呢"))
+
+        assert len(sent) == 1
+        combined = sent[0].text + json.dumps(sent[0].payload, ensure_ascii=False)
+        assert "Shanghai" in combined or "上海" in combined
+
+    def test_attachment_message_routes_to_photo_upload(self):
+        dispatcher, sent = _build_extended_stack(attachment_resolver=FakeAttachmentResolver())
+        dispatcher.handle(
+            InboundMessage(
+                channel=Channel.FEISHU,
+                sender_id="user1",
+                text="[图片]",
+                message_id="om_1",
+                attachments=[
+                    Attachment(
+                        type=AttachmentType.IMAGE,
+                        content="img_abc",
+                        file_name="camera.png",
+                    )
+                ],
+            )
+        )
+        assert len(sent) == 1
+        combined = sent[0].text + json.dumps(sent[0].payload, ensure_ascii=False)
+        assert "photo.upload_to_nas" in combined or "NAS" in combined
 
 
 class TestCameraDomainFlow:

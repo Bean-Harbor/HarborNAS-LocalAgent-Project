@@ -1,7 +1,8 @@
 """system.harbor_ops executors: middleware API and midcli adapters.
 
 These implement the router.Executor protocol so the Router can
-dispatch service-domain actions through the deterministic route chain.
+dispatch service-domain and files-domain actions through the deterministic
+route chain.
 """
 from __future__ import annotations
 
@@ -36,14 +37,13 @@ class MiddlewareExecutor:
         return self._available and self._call_fn is not None
 
     def supports(self, action: Action) -> bool:
-        return action.domain == "service"
+        return action.domain in {"service", "files"}
 
     def execute(self, action: Action, *, task_id: str, step_id: str) -> ExecutionResult:
         started = time.monotonic()
-        service_name = action.resource.get("service_name", "")
         try:
-            method, args = _map_service_operation(action.operation, service_name, action.args)
-            payload, api_duration = self._call_fn(method, *args)
+            method, args = _map_middleware_action(action)
+            payload, _ = self._call_fn(method, *args)
             duration_ms = int((time.monotonic() - started) * 1000)
             return ExecutionResult(
                 task_id=task_id,
@@ -89,14 +89,13 @@ class MidcliExecutor:
         return self._available and self._run_fn is not None
 
     def supports(self, action: Action) -> bool:
-        return action.domain == "service"
+        return action.domain in {"service", "files"}
 
     def execute(self, action: Action, *, task_id: str, step_id: str) -> ExecutionResult:
         started = time.monotonic()
-        service_name = action.resource.get("service_name", "")
         try:
-            command = _build_midcli_command(action.operation, service_name, action.args)
-            stdout, cli_duration = self._run_fn(command)
+            command = _build_midcli_command(action)
+            stdout, _ = self._run_fn(command)
             duration_ms = int((time.monotonic() - started) * 1000)
             return ExecutionResult(
                 task_id=task_id,
@@ -132,6 +131,17 @@ _MIDDLEWARE_SERVICE_MAP: dict[str, str] = {
 }
 
 
+def _map_middleware_action(action: Action) -> tuple[str, list[Any]]:
+    if action.domain == "service":
+        service_name = action.resource.get("service_name", "")
+        return _map_service_operation(action.operation, service_name, action.args)
+
+    if action.domain == "files":
+        return _map_files_operation(action.operation, action.resource, action.args)
+
+    raise ValueError(f"Unmapped action domain: {action.domain}")
+
+
 def _map_service_operation(
     operation: str, service_name: str, args: dict[str, Any]
 ) -> tuple[str, list[Any]]:
@@ -149,6 +159,23 @@ def _map_service_operation(
     raise ValueError(f"Unmapped service operation: {operation}")
 
 
+def _map_files_operation(
+    operation: str,
+    resource: dict[str, Any],
+    args: dict[str, Any],
+) -> tuple[str, list[Any]]:
+    source = resource.get("source", "")
+    destination = resource.get("destination", "")
+    recursive = bool(args.get("recursive", False))
+
+    if operation == "copy":
+        return "filesystem.copy", [source, destination, {"recursive": recursive, "preserve_attrs": False}]
+    if operation == "move":
+        return "filesystem.move", [[source], destination, {"recursive": recursive}]
+
+    raise ValueError(f"Unmapped files operation: {operation}")
+
+
 _MIDCLI_SERVICE_MAP: dict[str, str] = {
     "status": "service {name} show",
     "start": "service start service={name}",
@@ -158,11 +185,37 @@ _MIDCLI_SERVICE_MAP: dict[str, str] = {
 }
 
 
-def _build_midcli_command(
-    operation: str, service_name: str, args: dict[str, Any]
+def _build_midcli_command(action: Action) -> str:
+    if action.domain == "service":
+        service_name = action.resource.get("service_name", "")
+        template = _MIDCLI_SERVICE_MAP.get(action.operation)
+        if template is None:
+            raise ValueError(f"Unmapped midcli operation: {action.operation}")
+        enable_val = str(action.args.get("enable", True)).lower()
+        return template.format(name=service_name, enable=enable_val)
+
+    if action.domain == "files":
+        return _build_midcli_files_command(action.operation, action.resource, action.args)
+
+    raise ValueError(f"Unmapped action domain: {action.domain}")
+
+
+def _build_midcli_files_command(
+    operation: str,
+    resource: dict[str, Any],
+    args: dict[str, Any],
 ) -> str:
-    template = _MIDCLI_SERVICE_MAP.get(operation)
-    if template is None:
-        raise ValueError(f"Unmapped midcli operation: {operation}")
-    enable_val = str(args.get("enable", True)).lower()
-    return template.format(name=service_name, enable=enable_val)
+    source = json.dumps(resource.get("source", ""))
+    destination = json.dumps(resource.get("destination", ""))
+    recursive = bool(args.get("recursive", False))
+
+    if operation == "copy":
+        command = f"filesystem copy src={source} dst={destination}"
+    elif operation == "move":
+        command = f"filesystem move src={source} dst={destination}"
+    else:
+        raise ValueError(f"Unmapped files operation: {operation}")
+
+    if recursive:
+        command += " recursive=true"
+    return command

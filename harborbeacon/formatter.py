@@ -76,6 +76,86 @@ def _format_payload(payload: Any, *, max_len: int = 500) -> str:
     return text
 
 
+def _format_size(size_bytes: Any) -> str:
+    if not isinstance(size_bytes, (int, float)):
+        return ""
+    size = float(size_bytes)
+    units = ["B", "KB", "MB", "GB"]
+    idx = 0
+    while size >= 1024 and idx < len(units) - 1:
+        size /= 1024
+        idx += 1
+    if idx == 0:
+        return f"{int(size)} {units[idx]}"
+    return f"{size:.1f} {units[idx]}"
+
+
+def _format_operation_summary(payload: Any, operation: str, *, markdown: bool = False) -> str:
+    if not isinstance(payload, dict):
+        return _format_payload(payload)
+
+    if operation == "photo.upload_to_nas":
+        lines = ["照片已上传到 NAS" if not markdown else "照片已上传到 NAS"]
+        if payload.get("target_path"):
+            lines.append(f"目标路径: {payload['target_path']}")
+        if payload.get("file_name"):
+            lines.append(f"文件名: {payload['file_name']}")
+        size_text = _format_size(payload.get("size_bytes"))
+        if size_text:
+            lines.append(f"大小: {size_text}")
+        if payload.get("source_message_id"):
+            lines.append(f"来源消息: {payload['source_message_id']}")
+        return "\n".join(lines)
+
+    if operation == "weather.query":
+        city = payload.get("city", "")
+        summary = payload.get("summary", "")
+        temperature = payload.get("temperature")
+        units = payload.get("units", "metric")
+        observed_at = payload.get("observed_at", "")
+        source = payload.get("source", "")
+        temp_unit = "°F" if units == "imperial" else "°C"
+        lines = []
+        headline = city or "天气查询结果"
+        if summary:
+            headline = f"{headline}: {summary}"
+        lines.append(headline)
+        if temperature is not None:
+            lines.append(f"温度: {temperature}{temp_unit}")
+        if payload.get("wind_speed") is not None:
+            lines.append(f"风速: {payload['wind_speed']}")
+        if observed_at:
+            lines.append(f"更新时间: {observed_at}")
+        if source:
+            lines.append(f"来源: {source}")
+        return "\n".join(lines)
+
+    return _format_payload(payload)
+
+
+def _format_operation_error(result: ExecutionResult, operation: str) -> str:
+    payload = result.result_payload if isinstance(result.result_payload, dict) else {}
+
+    if operation == "photo.upload_to_nas":
+        lines = [payload.get("error_title") or "照片上传失败"]
+        target_text = payload.get("target_path") or payload.get("target_dir")
+        if target_text:
+            lines.append(f"目标位置: {target_text}")
+        if payload.get("file_name"):
+            lines.append(f"文件名: {payload['file_name']}")
+        if payload.get("source_message_id"):
+            lines.append(f"来源消息: {payload['source_message_id']}")
+        if payload.get("error_hint"):
+            lines.append(f"建议: {payload['error_hint']}")
+        return "\n".join(lines)
+
+    return ""
+
+
+def _uses_special_summary(operation: str) -> bool:
+    return operation in {"photo.upload_to_nas", "weather.query"}
+
+
 # ---------------------------------------------------------------------------
 # Plain text
 # ---------------------------------------------------------------------------
@@ -89,10 +169,15 @@ def format_plain(result: ExecutionResult, *, operation: str = "") -> str:
     lines.append(header)
 
     if result.ok and result.result_payload is not None:
-        lines.append(_format_payload(result.result_payload))
+        lines.append(_format_operation_summary(result.result_payload, operation))
 
     if not result.ok and result.error_message:
-        lines.append(f"错误: {result.error_message}")
+        operation_error = _format_operation_error(result, operation)
+        if operation_error:
+            lines.append(operation_error)
+            lines.append(f"详细错误: {result.error_message}")
+        else:
+            lines.append(f"错误: {result.error_message}")
         if result.error_code:
             lines.append(f"错误码: {result.error_code}")
 
@@ -117,10 +202,18 @@ def format_markdown(result: ExecutionResult, *, operation: str = "") -> str:
     lines.append("")
 
     if result.ok and result.result_payload is not None:
-        payload = _format_payload(result.result_payload)
-        lines.append(f"```\n{payload}\n```")
+        if _uses_special_summary(operation):
+            payload = _format_operation_summary(result.result_payload, operation, markdown=True)
+            lines.append(payload)
+        else:
+            payload = _format_payload(result.result_payload)
+            lines.append(f"```\n{payload}\n```")
 
     if not result.ok and result.error_message:
+        operation_error = _format_operation_error(result, operation)
+        if operation_error:
+            lines.append(operation_error)
+            lines.append("")
         lines.append(f"> **错误**: {result.error_message}")
         if result.error_code:
             lines.append(f"> 错误码: `{result.error_code}`")
@@ -154,14 +247,20 @@ def format_feishu_card(result: ExecutionResult, *, operation: str = "") -> dict[
 
     # Payload
     if result.ok and result.result_payload is not None:
-        payload = _format_payload(result.result_payload, max_len=800)
+        payload = _format_operation_summary(result.result_payload, operation, markdown=True)
         elements.append({
             "tag": "div",
-            "text": {"tag": "lark_md", "content": f"```\n{payload}\n```"},
+            "text": {"tag": "lark_md", "content": payload},
         })
 
     # Error
     if not result.ok and result.error_message:
+        operation_error = _format_operation_error(result, operation)
+        if operation_error:
+            elements.append({
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": operation_error},
+            })
         error_text = f"**错误**: {result.error_message}"
         if result.error_code:
             error_text += f"\n错误码: `{result.error_code}`"

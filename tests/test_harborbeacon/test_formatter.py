@@ -97,6 +97,40 @@ class TestPlainFormat:
         text = format_plain(_ok_result(result_payload=None))
         assert "✅" in text
 
+    def test_weather_summary_plain_text(self):
+        text = format_plain(
+            _ok_result(
+                result_payload={
+                    "city": "Shanghai",
+                    "summary": "晴朗",
+                    "temperature": 23.5,
+                    "wind_speed": 8.1,
+                    "observed_at": "2026-04-06T09:00",
+                    "units": "metric",
+                    "source": "open-meteo",
+                }
+            ),
+            operation="weather.query",
+        )
+        assert "Shanghai: 晴朗" in text
+        assert "23.5°C" in text
+
+    def test_photo_upload_error_summary(self):
+        text = format_plain(
+            _failed_result(
+                error_code="VALIDATION_ERROR",
+                error_message="missing target dir",
+                result_payload={
+                    "error_title": "照片上传未完成，尚未配置 NAS 目标目录",
+                    "error_hint": "请设置 HARBOR_IM_UPLOAD_DIR",
+                    "target_dir": "",
+                },
+            ),
+            operation="photo.upload_to_nas",
+        )
+        assert "照片上传未完成" in text
+        assert "HARBOR_IM_UPLOAD_DIR" in text
+
 
 # ---------------------------------------------------------------------------
 # Markdown
@@ -119,6 +153,14 @@ class TestMarkdownFormat:
     def test_includes_duration(self):
         text = format_markdown(_ok_result())
         assert "42ms" in text
+
+    def test_weather_markdown_not_wrapped_as_code_block(self):
+        text = format_markdown(
+            _ok_result(result_payload={"city": "Shanghai", "summary": "晴朗", "temperature": 23.5, "units": "metric"}),
+            operation="weather.query",
+        )
+        assert "Shanghai: 晴朗" in text
+        assert "```" not in text
 
 
 # ---------------------------------------------------------------------------

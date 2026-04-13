@@ -1,0 +1,80 @@
+id: photo.upload_to_nas
+name: Photo Upload To NAS
+version: 1.0.0
+summary: Save a photo or file received from IM into an approved HarborOS NAS inbox.
+owner: harbor-team
+
+capabilities:
+  - photo.upload_to_nas
+
+harbor_api:
+  enabled: false
+
+harbor_cli:
+  enabled: false
+
+executors:
+  cli:
+    enabled: false
+  browser:
+    enabled: false
+  mcp:
+    enabled: false
+
+permissions:
+  - storage.write
+  - im.attachments.read
+
+risk:
+  default_level: MEDIUM
+  requires_confirmation:
+    - HIGH
+    - CRITICAL
+
+input_schema:
+  type: object
+  properties:
+    resource:
+      type: object
+      properties:
+        source_channel:
+          type: string
+        message_id:
+          type: string
+        chat_id:
+          type: string
+        source_message_id:
+          type: string
+        attachment_key:
+          type: string
+        attachment_type:
+          type: string
+        file_name:
+          type: string
+    args:
+      type: object
+      properties:
+        target_album:
+          type: string
+        target_dir:
+          type: string
+        preserve_original_name:
+          type: boolean
+        overwrite:
+          type: boolean
+
+output_schema:
+  type: object
+  properties:
+    ok:
+      type: boolean
+    target_path:
+      type: string
+
+timeouts:
+  plan_ms: 2000
+  exec_ms: 300000
+
+retries:
+  max_attempts: 1
+  backoff_ms: 0

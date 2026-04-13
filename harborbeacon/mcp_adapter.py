@@ -10,11 +10,15 @@ The adapter translates MCP request ↔ Action/ExecutionResult.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
+import os
+import uuid
+from pathlib import Path
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from orchestrator.contracts import Action, ExecutionResult, RiskLevel
+from orchestrator.contracts import Action, ExecutionResult, RiskLevel, StepStatus
 from orchestrator.runtime import Runtime
 from skills.manifest import SkillManifest
 from skills.registry import Registry
@@ -118,7 +122,43 @@ class McpServerAdapter:
                 )
 
         # Resolve the capability → domain + operation
-        action = self._build_action(name, arguments)
+        try:
+            action = self._build_action(name, arguments)
+        except ValueError as exc:
+            if name == "photo.upload_to_nas":
+                resource = arguments.get("resource", {}) if isinstance(arguments, dict) else {}
+                args = arguments.get("args", {}) if isinstance(arguments, dict) else {}
+                result = ExecutionResult(
+                    task_id=uuid.uuid4().hex,
+                    step_id="s1",
+                    executor_used="mcp",
+                    status=StepStatus.FAILED,
+                    error_code="VALIDATION_ERROR",
+                    error_message=str(exc),
+                )
+                photo_action = Action(
+                    domain="files",
+                    operation="copy",
+                    resource=resource,
+                    args=args,
+                    risk_level=RiskLevel.MEDIUM,
+                )
+                result = self._enrich_execution_result(name, photo_action, result)
+                payload = result.to_dict()
+                payload["error"] = result.error_code
+                payload["message"] = result.error_message
+                return McpToolResult(
+                    content=[{"type": "text", "text": json.dumps(payload, default=str)}],
+                    isError=True,
+                )
+            return McpToolResult(
+                content=[{"type": "text", "text": json.dumps({
+                    "error": "VALIDATION_ERROR",
+                    "message": str(exc),
+                })}],
+                isError=True,
+            )
+        manifest = self._resolve_manifest(name)
         if action is None:
             return McpToolResult(
                 content=[{"type": "text", "text": json.dumps({
@@ -127,6 +167,10 @@ class McpServerAdapter:
                 })}],
                 isError=True,
             )
+
+        if manifest and self._supports_local_handler(manifest):
+            result = self._execute_local_handler(manifest, action)
+            return self._result_to_mcp(result)
 
         # Build approval context from HarborBeacon autonomy
         approval = autonomy_to_approval(autonomy, token=token)
@@ -139,6 +183,7 @@ class McpServerAdapter:
         finally:
             self._runtime.approval = prev_approval
 
+        result = self._enrich_execution_result(name, action, result)
         return self._result_to_mcp(result)
 
     # ---- conversion helpers ----
@@ -168,18 +213,15 @@ class McpServerAdapter:
 
     def _build_action(self, name: str, arguments: dict[str, Any]) -> Action | None:
         """Map an MCP tool name + arguments to an Action."""
-        # Check that at least one skill provides this capability
-        skills = self._registry.find_by_capability(name)
-        if not skills:
+        manifest = self._resolve_manifest(name)
+        if manifest is None:
             return None
 
-        manifest = skills[0]  # first match
-
-        domain, operation = name.split(".", 1) if "." in name else (name, name)
         resource = arguments.get("resource", {})
         args = arguments.get("args", {})
         risk_str = arguments.get("risk_level", manifest.risk.default_level)
         dry_run = arguments.get("dry_run", False)
+        domain, operation = self._normalize_tool_action(name, resource, args)
 
         return Action(
             domain=domain,
@@ -188,6 +230,185 @@ class McpServerAdapter:
             args=args,
             risk_level=RiskLevel(risk_str),
             dry_run=bool(dry_run),
+        )
+
+    def _resolve_manifest(self, name: str) -> SkillManifest | None:
+        skills = self._registry.find_by_capability(name)
+        if not skills:
+            return None
+        return skills[0]
+
+    @staticmethod
+    def _normalize_tool_action(
+        name: str,
+        resource: dict[str, Any],
+        args: dict[str, Any],
+    ) -> tuple[str, str]:
+        if name == "photo.upload_to_nas":
+            source_path = resource.get("source_path") or args.get("source_path", "")
+            attachment_key = resource.get("attachment_key") or args.get("source_attachment", "")
+            target_dir = str(args.get("target_dir") or os.environ.get("HARBOR_IM_UPLOAD_DIR", "")).strip()
+            if not target_dir:
+                raise ValueError(
+                    "photo.upload_to_nas requires args.target_dir or environment variable HARBOR_IM_UPLOAD_DIR"
+                )
+            file_name = (
+                resource.get("file_name")
+                or resource.get("local_file_name")
+                or f"{attachment_key or 'upload'}.bin"
+            )
+            normalized_source = source_path or attachment_key or resource.get("source", "")
+            normalized_destination = (
+                f"{target_dir.rstrip('/')}/{file_name}" if target_dir else file_name
+            )
+
+            resource.setdefault("source", normalized_source)
+            resource.setdefault("destination", normalized_destination)
+            args.setdefault("source_channel", resource.get("source_channel", ""))
+            args.setdefault(
+                "source_message_id",
+                resource.get("source_message_id", resource.get("message_id", "")),
+            )
+            args.setdefault("target_dir", target_dir)
+            if source_path:
+                args.setdefault("source_path", source_path)
+
+            return "files", "copy"
+
+        return name.split(".", 1) if "." in name else (name, name)
+
+    @staticmethod
+    def _supports_local_handler(manifest: SkillManifest) -> bool:
+        if not manifest.source_path:
+            return False
+        if manifest.harbor_api.enabled or manifest.harbor_cli.enabled:
+            return False
+        handler_path = Path(manifest.source_path).with_name("handler.py")
+        return handler_path.is_file()
+
+    def _execute_local_handler(self, manifest: SkillManifest, action: Action) -> ExecutionResult:
+        handler_path = Path(manifest.source_path or "").with_name("handler.py")
+        spec = importlib.util.spec_from_file_location(f"{manifest.id}_handler", handler_path)
+        if spec is None or spec.loader is None:
+            return ExecutionResult(
+                task_id=uuid.uuid4().hex,
+                step_id="s1",
+                executor_used="local_handler",
+                status="FAILED",
+                error_code="LOCAL_HANDLER_LOAD_ERROR",
+                error_message=f"Could not load local handler for {manifest.id}",
+            )
+
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        handle = getattr(module, "handle", None)
+        if handle is None:
+            return ExecutionResult(
+                task_id=uuid.uuid4().hex,
+                step_id="s1",
+                executor_used="local_handler",
+                status="FAILED",
+                error_code="LOCAL_HANDLER_MISSING",
+                error_message=f"Local handler missing handle() for {manifest.id}",
+            )
+
+        try:
+            payload = handle(action.operation, **action.resource, **action.args)
+        except Exception as exc:
+            return ExecutionResult(
+                task_id=uuid.uuid4().hex,
+                step_id="s1",
+                executor_used="local_handler",
+                status="FAILED",
+                error_code="LOCAL_HANDLER_ERROR",
+                error_message=str(exc),
+            )
+
+        if isinstance(payload, dict) and payload.get("error"):
+            return ExecutionResult(
+                task_id=uuid.uuid4().hex,
+                step_id="s1",
+                executor_used="local_handler",
+                status="FAILED",
+                error_code="LOCAL_HANDLER_ERROR",
+                error_message=str(payload.get("error")),
+                result_payload=payload,
+            )
+
+        return ExecutionResult(
+            task_id=uuid.uuid4().hex,
+            step_id="s1",
+            executor_used="local_handler",
+            status="SUCCESS",
+            result_payload=payload,
+        )
+
+    @staticmethod
+    def _enrich_execution_result(
+        tool_name: str,
+        action: Action,
+        result: ExecutionResult,
+    ) -> ExecutionResult:
+        if tool_name != "photo.upload_to_nas":
+            return result
+
+        payload = (
+            result.result_payload
+            if isinstance(result.result_payload, dict)
+            else {"result": result.result_payload}
+        )
+        target_dir = action.args.get("target_dir") or os.environ.get("HARBOR_IM_UPLOAD_DIR", "")
+        file_name = action.resource.get("file_name") or action.resource.get("local_file_name") or ""
+        target_path = action.resource.get("destination") or (
+            f"{str(target_dir).rstrip('/')}/{file_name}" if target_dir and file_name else str(target_dir or "")
+        )
+        size_bytes = action.resource.get("size_bytes")
+        source_message_id = action.args.get("source_message_id") or action.resource.get("source_message_id", "")
+        source_channel = action.args.get("source_channel") or action.resource.get("source_channel", "")
+
+        error_category, error_title, error_hint = McpServerAdapter._classify_photo_upload_error(result)
+        result.result_payload = {
+            "operation": "photo.upload_to_nas",
+            "target_path": target_path,
+            "target_dir": target_dir,
+            "file_name": file_name,
+            "size_bytes": size_bytes,
+            "source_channel": source_channel,
+            "source_message_id": source_message_id,
+            "task_id": result.task_id,
+            "trace_id": result.audit_ref,
+            "executor_result": payload,
+        }
+        if not result.ok:
+            result.result_payload["error_category"] = error_category
+            result.result_payload["error_title"] = error_title
+            result.result_payload["error_hint"] = error_hint
+        return result
+
+    @staticmethod
+    def _classify_photo_upload_error(result: ExecutionResult) -> tuple[str, str, str]:
+        if result.error_code == "VALIDATION_ERROR":
+            return (
+                "configuration",
+                "照片上传未完成，尚未配置 NAS 目标目录",
+                "请设置 HARBOR_IM_UPLOAD_DIR，或在调用时传入 args.target_dir",
+            )
+        if result.status == StepStatus.BLOCKED or result.error_code == "APPROVAL_REQUIRED":
+            return (
+                "approval",
+                "照片上传已被拦截，等待确认",
+                "批准该操作后可继续上传照片",
+            )
+        if result.error_code == "NO_EXECUTOR_AVAILABLE":
+            return (
+                "routing",
+                "照片上传未完成，当前没有可用执行链路",
+                "请检查 HarborOS 路由配置，以及中间件或命令执行器是否可用",
+            )
+        return (
+            "execution",
+            "照片上传失败",
+            "请检查目标目录权限、文件执行链路与 HarborOS 运行日志",
         )
 
     @staticmethod

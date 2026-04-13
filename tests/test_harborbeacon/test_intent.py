@@ -130,9 +130,26 @@ class TestRegexParser:
         assert r.arguments["resource"]["device_hint"] == "客厅"
 
     def test_no_match(self):
-        r = parse_intent_regex("今天天气怎么样")
+        r = parse_intent_regex("随便聊聊")
         assert isinstance(r, IntentError)
         assert "No pattern matched" in r.message
+
+    def test_weather_query(self):
+        r = parse_intent_regex("上海今天天气怎么样")
+        assert isinstance(r, IntentResult)
+        assert r.tool == "weather.query"
+        assert r.arguments["resource"]["city"] == "上海"
+
+    def test_weather_query_without_city(self):
+        r = parse_intent_regex("今天天气怎么样")
+        assert isinstance(r, IntentResult)
+        assert r.tool == "weather.query"
+        assert r.arguments["resource"]["city"] == ""
+
+    def test_photo_upload_request(self):
+        r = parse_intent_regex("把这张照片上传到NAS")
+        assert isinstance(r, IntentResult)
+        assert r.tool == "photo.upload_to_nas"
 
     def test_confidence_lower_than_llm(self):
         r = parse_intent_regex("查看 plex 状态")

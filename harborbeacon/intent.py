@@ -169,7 +169,22 @@ _CAMERA_ANALYZE_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"analyze\s+(.+)$", re.I),
 ]
 
+_WEATHER_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"^(?:(?P<city>\S+?)\s*)?(?:今天|今日|现在)?(?:的)?(?:天气|气温)(?:怎么样|如何|咋样|怎样|呢|么|嗎|吗)?$", re.I),
+    re.compile(r"^(?:(?P<city>\S+?)\s*)?(?:天气|气温)(?:预报|如何|怎么样|咋样|怎样|呢|么|嗎|吗)?$", re.I),
+    re.compile(r"^(?:what(?:'s| is) the weather(?: like)?(?: today)?|weather(?: today)?)(?: in (?P<city>[^?.!,]+))?[?.!]*$", re.I),
+]
+
+_PHOTO_UPLOAD_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"^(?:请)?(?:把)?(?:这张|这个)?(?:照片|图片|相片|图|文件).*(?:上传|保存|存到|归档).*(?:nas|NAS|相册|harboros|HarborOS).*$", re.I),
+    re.compile(r"^(?:请)?(?:上传|保存|存到|归档).*(?:这张|这个)?(?:照片|图片|相片|图|文件).*(?:nas|NAS|相册|harboros|HarborOS).*$", re.I),
+    re.compile(r"^(?:upload|save|archive).*(?:photo|image|picture|file).*(?:to).*(?:nas|album|harboros).*$", re.I),
+]
+
 _CIDR_PATTERN = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}/\d{1,2}\b")
+_WEATHER_CITY_STOPWORDS = {
+    "今天", "今日", "现在", "当前", "today", "current", "now",
+}
 
 
 def _parse_camera_intent(text: str) -> IntentResult | None:
@@ -217,6 +232,39 @@ def _parse_camera_intent(text: str) -> IntentResult | None:
     return None
 
 
+def _normalize_weather_city(city: str) -> str:
+    normalized = city.strip().strip("?？!,，。 ")
+    if normalized.lower() in _WEATHER_CITY_STOPWORDS or normalized in _WEATHER_CITY_STOPWORDS:
+        return ""
+    return normalized
+
+
+def _build_weather_result(city: str = "") -> IntentResult:
+    return IntentResult(
+        tool="weather.query",
+        arguments={
+            "resource": {"city": _normalize_weather_city(city), "date": "today"},
+            "args": {"units": "metric", "language": "zh-CN", "include_source": True},
+        },
+        confidence=0.65,
+    )
+
+
+def _build_photo_upload_result() -> IntentResult:
+    return IntentResult(
+        tool="photo.upload_to_nas",
+        arguments={
+            "resource": {},
+            "args": {
+                "target_album": "default",
+                "preserve_original_name": True,
+                "overwrite": False,
+            },
+        },
+        confidence=0.65,
+    )
+
+
 def parse_intent_regex(text: str) -> IntentResult | IntentError:
     """Deterministic regex-based intent parser (zero dependencies)."""
     text = text.strip()
@@ -243,6 +291,16 @@ def parse_intent_regex(text: str) -> IntentResult | IntentError:
                 arguments={"resource": {resource_key: m.group(1).strip()}, "args": {}},
                 confidence=0.6,
             )
+
+    for pattern in _WEATHER_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            city = m.groupdict().get("city", "") if m.groupdict() else ""
+            return _build_weather_result(city or "")
+
+    for pattern in _PHOTO_UPLOAD_PATTERNS:
+        if pattern.search(text):
+            return _build_photo_upload_result()
 
     return IntentError(message="No pattern matched", original_text=text)
 

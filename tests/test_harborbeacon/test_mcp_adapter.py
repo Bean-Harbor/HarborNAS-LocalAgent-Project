@@ -1,5 +1,7 @@
 """Tests for harborbeacon.mcp_adapter — MCP server adapter."""
 import json
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -12,6 +14,8 @@ from skills.registry import Registry
 
 from harborbeacon.autonomy import Autonomy
 from harborbeacon.mcp_adapter import McpServerAdapter, McpToolSchema, McpToolResult
+
+BUILTINS_DIR = Path(__file__).resolve().parents[2] / "skills" / "builtins"
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +147,152 @@ class TestCallTool:
         assert isinstance(result.content, list)
         assert result.content[0]["type"] == "text"
 
+    def test_photo_upload_normalizes_to_files_copy(self):
+        reg = Registry()
+        reg.register(_make_manifest())
+        reg.register(_make_manifest(
+            id="photo.upload_to_nas",
+            name="Photo Upload To NAS",
+            summary="Upload IM photo into NAS",
+            capabilities=["photo.upload_to_nas"],
+            harbor_api=HarborApiConfig(enabled=False),
+            harbor_cli=HarborCliConfig(enabled=False),
+            risk=RiskConfig(default_level="MEDIUM"),
+        ))
+        router = Router([FakeExecutor(Route.MIDDLEWARE_API)])
+        adapter = McpServerAdapter(reg, Runtime(router=router, audit=AuditLog()))
+
+        result = adapter.call_tool(
+            "photo.upload_to_nas",
+            {
+                "resource": {
+                    "attachment_key": "img_abc123",
+                    "file_name": "camera.png",
+                    "source_message_id": "om_photo_1",
+                    "source_path": "/tmp/camera.png",
+                },
+                "args": {
+                    "target_dir": "/mnt/photos/inbox",
+                },
+            },
+            autonomy=Autonomy.FULL,
+            approval_token="tok",
+        )
+
+        payload = json.loads(result.content[0]["text"])
+        assert payload["status"] == "SUCCESS"
+        assert payload["result_payload"]["executor_result"]["op"] == "copy"
+
+    def test_photo_upload_requires_configured_target_dir(self, monkeypatch):
+        monkeypatch.delenv("HARBOR_IM_UPLOAD_DIR", raising=False)
+
+        reg = Registry()
+        reg.register(_make_manifest())
+        reg.register(_make_manifest(
+            id="photo.upload_to_nas",
+            name="Photo Upload To NAS",
+            summary="Upload IM photo into NAS",
+            capabilities=["photo.upload_to_nas"],
+            harbor_api=HarborApiConfig(enabled=False),
+            harbor_cli=HarborCliConfig(enabled=False),
+            risk=RiskConfig(default_level="MEDIUM"),
+        ))
+        router = Router([FakeExecutor(Route.MIDDLEWARE_API)])
+        adapter = McpServerAdapter(reg, Runtime(router=router, audit=AuditLog()))
+
+        result = adapter.call_tool(
+            "photo.upload_to_nas",
+            {
+                "resource": {
+                    "attachment_key": "img_abc123",
+                    "file_name": "camera.png",
+                    "source_path": "/tmp/camera.png",
+                },
+                "args": {},
+            },
+            autonomy=Autonomy.FULL,
+            approval_token="tok",
+        )
+
+        assert result.isError
+        payload = json.loads(result.content[0]["text"])
+        assert payload["error"] == "VALIDATION_ERROR"
+        assert payload["result_payload"]["operation"] == "photo.upload_to_nas"
+        assert payload["result_payload"]["error_category"] == "configuration"
+
+    def test_photo_upload_uses_env_target_dir(self, monkeypatch):
+        monkeypatch.setenv("HARBOR_IM_UPLOAD_DIR", "/mnt/pool/photos/inbox")
+
+        reg = Registry()
+        reg.register(_make_manifest())
+        reg.register(_make_manifest(
+            id="photo.upload_to_nas",
+            name="Photo Upload To NAS",
+            summary="Upload IM photo into NAS",
+            capabilities=["photo.upload_to_nas"],
+            harbor_api=HarborApiConfig(enabled=False),
+            harbor_cli=HarborCliConfig(enabled=False),
+            risk=RiskConfig(default_level="MEDIUM"),
+        ))
+        router = Router([FakeExecutor(Route.MIDDLEWARE_API)])
+        adapter = McpServerAdapter(reg, Runtime(router=router, audit=AuditLog()))
+
+        result = adapter.call_tool(
+            "photo.upload_to_nas",
+            {
+                "resource": {
+                    "attachment_key": "img_abc123",
+                    "file_name": "camera.png",
+                    "source_path": "/tmp/camera.png",
+                },
+                "args": {},
+            },
+            autonomy=Autonomy.FULL,
+            approval_token="tok",
+        )
+
+        payload = json.loads(result.content[0]["text"])
+        assert payload["status"] == "SUCCESS"
+
+    def test_photo_upload_failure_contains_structured_error_metadata(self, monkeypatch):
+        monkeypatch.setenv("HARBOR_IM_UPLOAD_DIR", "/mnt/pool/photos/inbox")
+
+        reg = Registry()
+        reg.register(_make_manifest())
+        reg.register(_make_manifest(
+            id="photo.upload_to_nas",
+            name="Photo Upload To NAS",
+            summary="Upload IM photo into NAS",
+            capabilities=["photo.upload_to_nas"],
+            harbor_api=HarborApiConfig(enabled=False),
+            harbor_cli=HarborCliConfig(enabled=False),
+            risk=RiskConfig(default_level="MEDIUM"),
+        ))
+        runtime = Runtime(router=Router(), audit=AuditLog())
+        adapter = McpServerAdapter(reg, runtime)
+
+        result = adapter.call_tool(
+            "photo.upload_to_nas",
+            {
+                "resource": {
+                    "attachment_key": "img_abc123",
+                    "file_name": "camera.png",
+                    "source_message_id": "om_photo_1",
+                    "source_channel": "feishu",
+                    "source_path": "/tmp/camera.png",
+                },
+                "args": {},
+            },
+            autonomy=Autonomy.FULL,
+            approval_token="tok",
+        )
+
+        assert result.isError
+        payload = json.loads(result.content[0]["text"])
+        assert payload["error_code"] == "NO_EXECUTOR_AVAILABLE"
+        assert payload["result_payload"]["operation"] == "photo.upload_to_nas"
+        assert payload["result_payload"]["error_category"] == "routing"
+
 
 # ---------------------------------------------------------------------------
 # call_tool — ReadOnly guard
@@ -254,3 +404,47 @@ class TestApprovalIsolation:
         original = runtime.approval
         adapter.call_tool("service.status", {"resource": {"service_name": "plex"}})
         assert runtime.approval is original
+
+
+class TestLocalHandlerExecution:
+    def test_weather_query_executes_local_handler(self):
+        reg = Registry()
+        reg.load_dir(BUILTINS_DIR)
+        router = Router([FakeExecutor(Route.MIDDLEWARE_API)])
+        adapter = McpServerAdapter(reg, Runtime(router=router, audit=AuditLog()))
+
+        geo_response = MagicMock()
+        geo_response.read.return_value = json.dumps({
+            "results": [{"name": "Shanghai", "country": "China", "latitude": 31.23, "longitude": 121.47}],
+        }).encode("utf-8")
+        geo_response.__enter__ = MagicMock(return_value=geo_response)
+        geo_response.__exit__ = MagicMock(return_value=False)
+
+        weather_response = MagicMock()
+        weather_response.read.return_value = json.dumps({
+            "current": {
+                "temperature_2m": 23.5,
+                "wind_speed_10m": 8.1,
+                "weather_code": 1,
+                "time": "2026-04-06T09:00",
+            }
+        }).encode("utf-8")
+        weather_response.__enter__ = MagicMock(return_value=weather_response)
+        weather_response.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.urlopen", side_effect=[geo_response, weather_response]):
+            result = adapter.call_tool(
+                "weather.query",
+                {
+                    "resource": {"city": "Shanghai", "date": "today"},
+                    "args": {"units": "metric", "language": "zh-CN", "include_source": True},
+                },
+                autonomy=Autonomy.READ_ONLY,
+            )
+
+        assert not result.isError
+        payload = json.loads(result.content[0]["text"])
+        assert payload["status"] == "SUCCESS"
+        assert payload["executor_used"] == "local_handler"
+        assert payload["result_payload"]["city"] == "Shanghai"
+        assert payload["result_payload"]["source"] == "open-meteo"

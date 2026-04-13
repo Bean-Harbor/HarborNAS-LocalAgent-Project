@@ -1,0 +1,66 @@
+id: weather.query
+name: Weather Query
+version: 1.0.0
+summary: Query current weather for a city and return a concise summary.
+owner: harbor-team
+
+capabilities:
+  - weather.query
+
+harbor_api:
+  enabled: false
+
+harbor_cli:
+  enabled: false
+
+executors:
+  cli:
+    enabled: false
+  browser:
+    enabled: false
+  mcp:
+    enabled: false
+
+permissions:
+  - network.http.read
+
+risk:
+  default_level: LOW
+
+input_schema:
+  type: object
+  properties:
+    resource:
+      type: object
+      properties:
+        city:
+          type: string
+        date:
+          type: string
+    args:
+      type: object
+      properties:
+        units:
+          type: string
+        language:
+          type: string
+        include_source:
+          type: boolean
+
+output_schema:
+  type: object
+  properties:
+    city:
+      type: string
+    temperature:
+      type: number
+    summary:
+      type: string
+
+timeouts:
+  plan_ms: 1000
+  exec_ms: 15000
+
+retries:
+  max_attempts: 1
+  backoff_ms: 0

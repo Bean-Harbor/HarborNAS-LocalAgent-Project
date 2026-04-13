@@ -21,6 +21,7 @@ thinking indicator, and rich-media reply.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 import uuid
@@ -28,9 +29,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from harborbeacon.adapters import ChannelAdapter, get_adapter
+from harborbeacon.attachments import AttachmentResolutionError, AttachmentResolver
 from harborbeacon.autonomy import Autonomy
 from harborbeacon.channels import (
     Attachment,
+    AttachmentType,
     Channel,
     ChannelRegistry,
     ChatType,
@@ -60,6 +63,7 @@ class SessionEntry:
     pending_resume_tool: str | None = None
     pending_resume_token: str | None = None
     pending_missing_fields: list[str] = field(default_factory=list)
+    context: dict[str, Any] = field(default_factory=dict)
     last_active: float = field(default_factory=time.time)
     history: list[dict[str, str]] = field(default_factory=list)
 
@@ -233,6 +237,7 @@ class Dispatcher:
         channel_registry: ChannelRegistry,
         *,
         formatter: ResponseFormatter | None = None,
+        attachment_resolver: AttachmentResolver | None = None,
         session_timeout: int = 600,
         default_autonomy: Autonomy = Autonomy.SUPERVISED,
         thinking_threshold_ms: int = 2500,
@@ -241,6 +246,7 @@ class Dispatcher:
         self._mcp = mcp_adapter
         self._channels = channel_registry
         self._formatter = formatter or ResponseFormatter()
+        self._attachment_resolver = attachment_resolver
         self._sessions = SessionStore(timeout=session_timeout)
         self._default_autonomy = default_autonomy
         self._dedup = MessageDedup(ttl_seconds=session_timeout)
@@ -321,7 +327,9 @@ class Dispatcher:
             self._clear_resume_state(session)
 
         # ------- Parse intent -------
-        result = self._parser.parse(inbound.text)
+        result = self._derive_attachment_intent(inbound)
+        if result is None:
+            result = self._parser.parse(inbound.text)
 
         if isinstance(result, IntentError):
             self._reply(
@@ -333,6 +341,19 @@ class Dispatcher:
             return
 
         assert isinstance(result, IntentResult)
+
+        try:
+            result = self._enrich_intent_from_inbound(inbound, result)
+        except AttachmentResolutionError as exc:
+            self._reply(
+                inbound,
+                self._formatter.format_error(f"附件处理失败: {exc}", fmt=fmt),
+            )
+            return
+
+        result = self._apply_session_context(inbound, session, result, fmt)
+        if result is None:
+            return
 
         # ------- Check if operation needs approval -------
         if self._needs_approval(result):
@@ -347,6 +368,40 @@ class Dispatcher:
 
         # ------- Execute via MCP -------
         self._execute_tool(inbound, result.tool, result.arguments, fmt, session=session)
+
+    @staticmethod
+    def _derive_attachment_intent(inbound: InboundMessage) -> IntentResult | None:
+        if not inbound.attachments:
+            return None
+
+        attachment = next(
+            (
+                item for item in inbound.attachments
+                if item.type in (AttachmentType.IMAGE, AttachmentType.FILE)
+            ),
+            None,
+        )
+        if attachment is None:
+            return None
+
+        normalized_text = inbound.text.strip()
+        if normalized_text and normalized_text not in {"[图片]", "[文件]", "[视频]", "[语音]"}:
+            return None
+
+        return IntentResult(
+            tool="photo.upload_to_nas",
+            arguments={
+                "resource": {
+                    "attachment_key": attachment.content,
+                    "attachment_type": attachment.type.value,
+                    "file_name": attachment.file_name,
+                    "source_channel": inbound.channel.value,
+                    "source_message_id": inbound.message_id,
+                },
+                "args": {},
+            },
+            confidence=0.8,
+        )
 
     def _execute_pending(
         self,
@@ -396,10 +451,13 @@ class Dispatcher:
 
         if mcp_result.isError:
             error_text = ""
+            error_payload = None
             for item in mcp_result.content:
                 error_text += item.get("text", "")
             try:
                 err_data = json.loads(error_text)
+                if isinstance(err_data, dict):
+                    error_payload = err_data.get("result_payload", err_data)
                 error_msg = err_data.get("error_message", err_data.get("message", error_text))
                 error_code = err_data.get("error_code", err_data.get("error", ""))
             except (json.JSONDecodeError, TypeError):
@@ -414,6 +472,7 @@ class Dispatcher:
                 status=StepStatus.FAILED,
                 error_code=error_code,
                 error_message=error_msg,
+                result_payload=error_payload,
             )
         else:
             payload_text = ""
@@ -470,6 +529,111 @@ class Dispatcher:
         else:
             self._reply(inbound, str(formatted))
 
+    def _enrich_intent_from_inbound(
+        self,
+        inbound: InboundMessage,
+        intent: IntentResult,
+    ) -> IntentResult:
+        if intent.tool != "photo.upload_to_nas":
+            return intent
+
+        attachment = next(
+            (
+                item for item in inbound.attachments
+                if item.type in (AttachmentType.IMAGE, AttachmentType.FILE)
+            ),
+            None,
+        )
+        if attachment is None:
+            return intent
+
+        arguments = {
+            "resource": dict(intent.arguments.get("resource", {})),
+            "args": dict(intent.arguments.get("args", {})),
+        }
+        resource = arguments["resource"]
+        args = arguments["args"]
+
+        resource.setdefault("source_channel", inbound.channel.value)
+        resource.setdefault("message_id", inbound.message_id)
+        resource.setdefault("chat_id", inbound.chat_id)
+        resource.setdefault("source_message_id", inbound.message_id)
+        resource.setdefault("attachment_key", attachment.content)
+        resource.setdefault("attachment_type", attachment.type.value)
+        resource.setdefault("file_name", attachment.file_name)
+        args.setdefault("source_attachment", attachment.content)
+
+        if self._attachment_resolver is not None:
+            config = self._channels.get_config(inbound.channel)
+            if config is None:
+                raise AttachmentResolutionError(f"Channel config missing for {inbound.channel.value}")
+            resolved = self._attachment_resolver.resolve_message_attachment(inbound, config, attachment)
+            if resolved is not None:
+                resource.setdefault("source_path", resolved.local_path)
+                resource.setdefault("local_file_name", resolved.file_name)
+                resource.setdefault("size_bytes", resolved.size_bytes)
+                args.setdefault("source_path", resolved.local_path)
+
+        return IntentResult(
+            tool=intent.tool,
+            arguments=arguments,
+            confidence=intent.confidence,
+            raw_llm_response=intent.raw_llm_response,
+        )
+
+    def _apply_session_context(
+        self,
+        inbound: InboundMessage,
+        session: SessionEntry,
+        intent: IntentResult,
+        fmt: OutputFormat,
+    ) -> IntentResult | None:
+        if intent.tool != "weather.query":
+            return intent
+
+        arguments = {
+            "resource": dict(intent.arguments.get("resource", {})),
+            "args": dict(intent.arguments.get("args", {})),
+        }
+        resource = arguments["resource"]
+        city = str(resource.get("city", "")).strip()
+        if city:
+            session.context["weather_city"] = city
+            return IntentResult(
+                tool=intent.tool,
+                arguments=arguments,
+                confidence=intent.confidence,
+                raw_llm_response=intent.raw_llm_response,
+            )
+
+        remembered_city = str(session.context.get("weather_city", "")).strip()
+        if remembered_city:
+            resource["city"] = remembered_city
+            return IntentResult(
+                tool=intent.tool,
+                arguments=arguments,
+                confidence=intent.confidence,
+                raw_llm_response=intent.raw_llm_response,
+            )
+
+        default_city = (
+            os.environ.get("HARBOR_WEATHER_DEFAULT_CITY")
+            or os.environ.get("HARBOR_DEFAULT_CITY")
+            or ""
+        ).strip()
+        if default_city:
+            resource["city"] = default_city
+            session.context["weather_city"] = default_city
+            return IntentResult(
+                tool=intent.tool,
+                arguments=arguments,
+                confidence=intent.confidence,
+                raw_llm_response=intent.raw_llm_response,
+            )
+
+        self._reply(inbound, "请告诉我要查询的城市，例如：上海今天天气怎么样？")
+        return None
+
     def _needs_approval(self, intent: IntentResult) -> bool:
         """Check if a tool call requires user confirmation.
 
@@ -493,9 +657,12 @@ class Dispatcher:
         update_message_id: str = "",
     ) -> None:
         """Send a reply back to the originating channel."""
+        recipient_id = inbound.sender_id
+        if inbound.chat_type == ChatType.GROUP and inbound.chat_id:
+            recipient_id = inbound.chat_id
         outbound = OutboundMessage(
             channel=inbound.channel,
-            recipient_id=inbound.chat_id or inbound.sender_id,
+            recipient_id=recipient_id,
             text=text,
             payload=payload or {},
             attachments=attachments or [],
