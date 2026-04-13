@@ -57,6 +57,9 @@ class SessionEntry:
     pending_tool: str | None = None
     pending_args: dict[str, Any] | None = None
     pending_risk: str | None = None
+    pending_resume_tool: str | None = None
+    pending_resume_token: str | None = None
+    pending_missing_fields: list[str] = field(default_factory=list)
     last_active: float = field(default_factory=time.time)
     history: list[dict[str, str]] = field(default_factory=list)
 
@@ -281,14 +284,15 @@ class Dispatcher:
         session: SessionEntry,
         fmt: OutputFormat,
     ) -> None:
-        text = inbound.text.strip().lower()
+        text = inbound.text.strip()
+        lower_text = text.lower()
 
         # ------- Check for approval response -------
         if session.pending_tool:
-            if text in _CONFIRM_KEYWORDS:
+            if lower_text in _CONFIRM_KEYWORDS:
                 self._execute_pending(inbound, session, fmt)
                 return
-            if text in _CANCEL_KEYWORDS:
+            if lower_text in _CANCEL_KEYWORDS:
                 session.pending_tool = None
                 session.pending_args = None
                 session.pending_risk = None
@@ -298,6 +302,23 @@ class Dispatcher:
             session.pending_tool = None
             session.pending_args = None
             session.pending_risk = None
+
+        if session.pending_resume_tool:
+            if lower_text in _CANCEL_KEYWORDS:
+                self._clear_resume_state(session)
+                self._reply(inbound, "✅ 已取消当前接入流程")
+                return
+            resume_args = _extract_resume_arguments(inbound.text, session)
+            if resume_args is not None:
+                self._execute_tool(
+                    inbound,
+                    session.pending_resume_tool,
+                    {"resource": {}, "args": resume_args},
+                    fmt,
+                    session=session,
+                )
+                return
+            self._clear_resume_state(session)
 
         # ------- Parse intent -------
         result = self._parser.parse(inbound.text)
@@ -325,7 +346,7 @@ class Dispatcher:
             return
 
         # ------- Execute via MCP -------
-        self._execute_tool(inbound, result.tool, result.arguments, fmt)
+        self._execute_tool(inbound, result.tool, result.arguments, fmt, session=session)
 
     def _execute_pending(
         self,
@@ -345,6 +366,7 @@ class Dispatcher:
                 inbound, tool, args, fmt,
                 autonomy=Autonomy.FULL,
                 approval_token="user_confirmed",
+                session=session,
             )
 
     def _execute_tool(
@@ -356,8 +378,10 @@ class Dispatcher:
         *,
         autonomy: Autonomy | None = None,
         approval_token: str | None = None,
+        session: SessionEntry | None = None,
     ) -> None:
         """Call the MCP adapter and send the formatted result."""
+        arguments = self._augment_arguments(arguments, inbound, session)
         mcp_result = self._mcp.call_tool(
             tool,
             arguments,
@@ -420,6 +444,24 @@ class Dispatcher:
                     result_payload=payload,
                 )
 
+        custom_message = None
+        if session is not None and isinstance(exec_result.result_payload, dict):
+            payload = exec_result.result_payload
+            if payload.get("status") == "needs_input":
+                session.pending_resume_tool = tool
+                session.pending_resume_token = str(payload.get("resume_token") or "")
+                session.pending_missing_fields = list(payload.get("missing_fields") or [])
+                prompt = payload.get("prompt") or payload.get("result", {}).get("message") or "需要继续补充信息"
+                self._reply(inbound, str(prompt))
+                return
+
+            self._clear_resume_state(session)
+            custom_message = _format_task_api_message(payload)
+
+        if custom_message:
+            self._reply(inbound, custom_message)
+            return
+
         formatted = self._formatter.format(exec_result, fmt=fmt, operation=tool)
 
         # For feishu card, wrap in payload
@@ -464,6 +506,33 @@ class Dispatcher:
         except RuntimeError as exc:
             logger.warning("Cannot send reply to %s: %s", inbound.channel.value, exc)
 
+    def _augment_arguments(
+        self,
+        arguments: dict[str, Any],
+        inbound: InboundMessage,
+        session: SessionEntry | None,
+    ) -> dict[str, Any]:
+        resource = dict(arguments.get("resource") or {})
+        args = dict(arguments.get("args") or {})
+        args["_source"] = {
+            "channel": inbound.channel.value,
+            "surface": "harborbeacon",
+            "conversation_id": inbound.chat_id or inbound.sender_id,
+            "user_id": inbound.sender_id,
+            "session_id": session.session_id if session else "",
+            "chat_type": inbound.chat_type.value,
+            "raw_text": inbound.text,
+            "trace_id": inbound.message_id or uuid.uuid4().hex,
+            "autonomy_level": self._default_autonomy.value.lower(),
+        }
+        return {"resource": resource, "args": args}
+
+    @staticmethod
+    def _clear_resume_state(session: SessionEntry) -> None:
+        session.pending_resume_tool = None
+        session.pending_resume_token = None
+        session.pending_missing_fields = []
+
     def _send_thinking_placeholder(self, inbound: InboundMessage) -> str:
         """Send a '正在思考…' placeholder message (OpenClaw pattern).
 
@@ -496,3 +565,62 @@ _MUTATION_OPS = frozenset({
     "start", "stop", "restart", "enable", "disable",
     "delete", "move", "archive", "copy",
 })
+
+
+def _extract_password_reply(text: str) -> str | None:
+    trimmed = text.strip()
+    patterns = ("摄像头密码", "rtsp密码", "password", "密码")
+    for pattern in patterns:
+        if trimmed.lower().startswith(pattern.lower()):
+            password = trimmed[len(pattern):].strip().lstrip(":：").strip()
+            if password:
+                return password
+    if 4 <= len(trimmed) <= 64 and not any(ch.isspace() for ch in trimmed):
+        return trimmed
+    return None
+
+
+def _extract_resume_arguments(text: str, session: SessionEntry) -> dict[str, Any] | None:
+    password = _extract_password_reply(text)
+    if password is None or not session.pending_resume_token:
+        return None
+    return {
+        "resume_token": session.pending_resume_token,
+        "password": password,
+    }
+
+
+def _format_task_api_message(payload: dict[str, Any]) -> str | None:
+    if "status" not in payload or "result" not in payload:
+        return None
+
+    result = payload.get("result") or {}
+    if not isinstance(result, dict):
+        result = {}
+
+    lines: list[str] = []
+    message = str(result.get("message") or "").strip()
+    if message:
+        lines.append(message)
+
+    artifacts = result.get("artifacts") or []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        label = artifact.get("label") or artifact.get("kind") or "artifact"
+        target = artifact.get("url") or artifact.get("path")
+        if target:
+            lines.append(f"{label}: {target}")
+
+    next_actions = result.get("next_actions") or []
+    if next_actions:
+        rendered = " / ".join(str(item) for item in next_actions if str(item).strip())
+        if rendered:
+            lines.append(f"你可以继续说：{rendered}")
+
+    if not lines and payload.get("status") == "failed":
+        error = payload.get("error") or payload.get("message")
+        if error:
+            lines.append(str(error))
+
+    return "\n".join(lines).strip() or None

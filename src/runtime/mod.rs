@@ -10,4 +10,6 @@ pub mod media;
 pub mod node_runtime;
 pub mod remote_view;
 pub mod registry;
+pub mod task_api;
+pub mod task_session;
 pub mod topology;

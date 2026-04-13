@@ -154,10 +154,76 @@ _FILE_PATTERNS: list[_ServicePattern] = [
      "files.copy", "source"),
 ]
 
+_CAMERA_SCAN_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"(?:扫描|搜索|发现)\s*(?:一下)?\s*(?:摄像头|相机)(?:候选设备)?", re.I),
+    re.compile(r"scan\s+(?:for\s+)?cameras?$", re.I),
+]
+
+_CAMERA_CONNECT_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"(?:接入|连接)\s*(\d+)\s*(?:号)?(?:摄像头)?$", re.I),
+    re.compile(r"connect\s+(\d+)$", re.I),
+]
+
+_CAMERA_ANALYZE_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"(?:分析|检测)\s*(.+)$", re.I),
+    re.compile(r"analyze\s+(.+)$", re.I),
+]
+
+_CIDR_PATTERN = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}/\d{1,2}\b")
+
+
+def _parse_camera_intent(text: str) -> IntentResult | None:
+    for pattern in _CAMERA_SCAN_PATTERNS:
+        if pattern.search(text):
+            args: dict[str, Any] = {}
+            cidr_match = _CIDR_PATTERN.search(text)
+            if cidr_match:
+                args["cidr"] = cidr_match.group(0)
+            return IntentResult(
+                tool="camera.scan",
+                arguments={"resource": {}, "args": args},
+                confidence=0.75,
+            )
+
+    for pattern in _CAMERA_CONNECT_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            return IntentResult(
+                tool="camera.connect",
+                arguments={
+                    "resource": {"candidate_index": int(m.group(1))},
+                    "args": {},
+                },
+                confidence=0.8,
+            )
+
+    for pattern in _CAMERA_ANALYZE_PATTERNS:
+        m = pattern.search(text)
+        if not m:
+            continue
+        target = m.group(1).strip()
+        target = re.sub(r"(?:摄像头|相机|camera)\s*$", "", target, flags=re.I).strip()
+        if not target:
+            target = "当前摄像头"
+        resource: dict[str, Any] = {"device_hint": target}
+        if re.fullmatch(r"cam[-_a-z0-9]+", target, flags=re.I):
+            resource["device_id"] = target
+        return IntentResult(
+            tool="camera.analyze",
+            arguments={"resource": resource, "args": {}},
+            confidence=0.75,
+        )
+
+    return None
+
 
 def parse_intent_regex(text: str) -> IntentResult | IntentError:
     """Deterministic regex-based intent parser (zero dependencies)."""
     text = text.strip()
+
+    camera_result = _parse_camera_intent(text)
+    if camera_result is not None:
+        return camera_result
 
     for pattern, tool, resource_key in _SERVICE_PATTERNS:
         m = pattern.search(text)

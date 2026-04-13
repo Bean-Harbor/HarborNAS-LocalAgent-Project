@@ -6,10 +6,12 @@ from orchestrator.contracts import Action, ExecutionResult, Route, StepStatus
 from orchestrator.audit import AuditLog
 from orchestrator.router import Router
 from orchestrator.runtime import Runtime
+from skills.executor import TaskApiExecutor
 from skills.manifest import SkillManifest, HarborApiConfig, HarborCliConfig, RiskConfig
 from skills.registry import Registry
 
 from harborbeacon.autonomy import Autonomy
+from harborbeacon.camera_domain import build_camera_domain_manifest
 from harborbeacon.channels import Channel, ChannelConfig, ChannelRegistry, InboundMessage, OutboundMessage
 from harborbeacon.dispatcher import Dispatcher, SessionEntry, SessionStore, _MUTATION_OPS
 from harborbeacon.formatter import ResponseFormatter
@@ -36,9 +38,10 @@ def _make_manifest() -> SkillManifest:
 
 
 class FakeExecutor:
-    def __init__(self, route=Route.MIDDLEWARE_API, payload="ok"):
+    def __init__(self, route=Route.MIDDLEWARE_API, payload="ok", supported_domains=None):
         self._route = route
         self._payload = payload
+        self._supported_domains = set(supported_domains or {"service"})
 
     @property
     def route(self):
@@ -46,6 +49,9 @@ class FakeExecutor:
 
     def is_available(self):
         return True
+
+    def supports(self, action):
+        return action.domain in self._supported_domains
 
     def execute(self, action, *, task_id, step_id):
         return ExecutionResult(
@@ -90,6 +96,81 @@ def _build_stack():
     )
 
     return dispatcher, sent_messages
+
+
+class FakeTaskApi:
+    def __init__(self):
+        self.calls: list[Action] = []
+
+    def execute_action(self, action: Action, task_id: str, step_id: str):
+        self.calls.append(action)
+        if action.operation == "scan":
+            return {
+                "status": "completed",
+                "result": {
+                    "message": "已按后台默认策略扫描 192.168.3.0/24，还剩 1 台待你确认：\n1. Living Room Cam（192.168.3.73，需要密码）\n请直接回复：接入 1。",
+                    "next_actions": ["接入 1"],
+                },
+            }
+        if action.operation == "connect" and action.args.get("resume_token"):
+            return {
+                "status": "completed",
+                "result": {"message": "密码已收到。\n已接入摄像头 192.168.3.73，设备库现在共有 1 台。"},
+            }
+        if action.operation == "connect":
+            return {
+                "status": "needs_input",
+                "missing_fields": ["password"],
+                "prompt": "这台摄像头需要密码，请回复：密码 xxxxxx",
+                "resume_token": "resume-1",
+                "result": {"message": "这台摄像头需要密码，请回复：密码 xxxxxx"},
+            }
+        if action.operation == "analyze":
+            return {
+                "status": "completed",
+                "result": {"message": "客厅摄像头分析完成：当前画面检测到 1 人。"},
+            }
+        return {"status": "failed", "result": {"message": "unsupported action"}}
+
+
+def _build_camera_stack():
+    reg = Registry()
+    reg.register(_make_manifest())
+    camera_manifest = build_camera_domain_manifest()
+    reg.register(camera_manifest)
+
+    fake_task_api = FakeTaskApi()
+    router = Router([
+        FakeExecutor(),
+        TaskApiExecutor(
+            camera_manifest.id,
+            call_fn=fake_task_api.execute_action,
+            supported_capabilities=camera_manifest.capabilities,
+        ),
+    ])
+    runtime = Runtime(router=router, audit=AuditLog())
+    adapter = McpServerAdapter(reg, runtime, default_autonomy=Autonomy.SUPERVISED)
+    parser = IntentParser()
+    channel_reg = ChannelRegistry()
+
+    sent_messages: list[OutboundMessage] = []
+
+    def fake_sender(msg: OutboundMessage):
+        sent_messages.append(msg)
+
+    channel_reg.register(
+        ChannelConfig(channel=Channel.FEISHU, enabled=True, app_id="test", app_secret="s"),
+        sender=fake_sender,
+    )
+
+    dispatcher = Dispatcher(
+        intent_parser=parser,
+        mcp_adapter=adapter,
+        channel_registry=channel_reg,
+        default_autonomy=Autonomy.SUPERVISED,
+    )
+
+    return dispatcher, sent_messages, fake_task_api
 
 
 def _inbound(text: str, channel=Channel.FEISHU, sender="user1") -> InboundMessage:
@@ -233,6 +314,38 @@ class TestErrorHandling:
         # MQTT is not registered in our test stack → RuntimeError in send
         # Dispatcher should catch and log
         dispatcher.handle(msg)  # should not raise
+
+
+class TestCameraDomainFlow:
+    def test_camera_scan_routes_to_task_api(self):
+        dispatcher, sent, fake_task_api = _build_camera_stack()
+        dispatcher.handle(_inbound("扫描摄像头"))
+        assert len(sent) == 1
+        assert "待你确认" in sent[0].text
+        assert fake_task_api.calls[0].domain == "camera"
+        assert fake_task_api.calls[0].operation == "scan"
+        assert fake_task_api.calls[0].args["_source"]["surface"] == "harborbeacon"
+
+    def test_camera_connect_resumes_with_password(self):
+        dispatcher, sent, fake_task_api = _build_camera_stack()
+        dispatcher.handle(_inbound("接入 1"))
+        assert len(sent) == 1
+        assert "需要密码" in sent[0].text
+
+        sent.clear()
+        dispatcher.handle(_inbound("密码 hunter2"))
+        assert len(sent) == 1
+        assert "密码已收到" in sent[0].text
+        assert len(fake_task_api.calls) == 2
+        assert fake_task_api.calls[1].args["resume_token"] == "resume-1"
+        assert fake_task_api.calls[1].args["password"] == "hunter2"
+
+    def test_camera_analyze_uses_device_hint(self):
+        dispatcher, sent, fake_task_api = _build_camera_stack()
+        dispatcher.handle(_inbound("分析客厅摄像头"))
+        assert len(sent) == 1
+        assert "分析完成" in sent[0].text
+        assert fake_task_api.calls[0].resource["device_hint"] == "客厅"
 
 
 # ---------------------------------------------------------------------------

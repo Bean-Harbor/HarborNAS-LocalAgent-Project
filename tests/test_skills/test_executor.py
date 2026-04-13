@@ -9,6 +9,7 @@ from skills.executor import (
     McpExecutor,
     MiddlewareApiExecutor,
     MidcliSkillExecutor,
+    TaskApiExecutor,
     executors_from_manifest,
 )
 from skills.manifest import parse_manifest
@@ -153,6 +154,10 @@ class TestPlaceholderExecutors:
         e = McpExecutor("test.exec", available=True)
         assert e.is_available() is True
 
+    def test_task_api_executor_available_with_call_fn(self):
+        e = TaskApiExecutor("test.exec", call_fn=lambda action, task_id, step_id: {"ok": True})
+        assert e.is_available() is True
+
 
 # ── executors_from_manifest ──────────────────────────────────────────
 
@@ -199,6 +204,15 @@ class TestFactory:
         execs = executors_from_manifest(m, cli_run_fn=self._dummy_run)
         assert len(execs) >= 1
         assert any(isinstance(e, CliExecutor) for e in execs)
+
+    def test_mcp_executor_uses_task_api_when_configured(self):
+        m = _manifest(executors={"mcp": {"enabled": True}})
+        execs = executors_from_manifest(
+            m,
+            task_api_call_fn=lambda action, task_id, step_id: {"status": "completed"},
+        )
+        assert len(execs) == 1
+        assert isinstance(execs[0], TaskApiExecutor)
 
 
 # ── BaseExecutor contract ───────────────────────────────────────────

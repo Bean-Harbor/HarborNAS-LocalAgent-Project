@@ -1,5 +1,9 @@
 # Home Agent Hub Roadmap
 
+> 当前定位说明（2026-04-13）  
+> 本文档是当前正在执行的产品路线，属于 HarborNAS 平台主干下的首个垂直域。  
+> 长期平台骨干仍由 `HarborNAS-LocalAgent-Roadmap.md` 定义；Home Agent Hub 不再作为旁路 demo，而是要通过统一 Task API / Runtime / Audit 入轨平台。
+
 更新时间：2026-04-10
 
 ## 1. 当前产品锚点
@@ -9,6 +13,11 @@
 `局域网自动扫描 -> 识别可用 RTSP 摄像头 -> 抓帧 -> AI 检测 -> 截图推送到 IM`
 
 这条链路将作为 Home Agent Hub 的 MVP。
+
+同时，这条 MVP 链路承担额外职责：
+
+- 作为 HarborNAS 平台首个垂直域的真实落地样板
+- 反向推动 Task API、artifact contract、event contract、补参机制等平台接口收敛
 
 如果这条链路跑通，说明以下核心能力都已经建立：
 

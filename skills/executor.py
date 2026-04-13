@@ -18,9 +18,16 @@ from .manifest import SkillManifest
 class BaseExecutor(ABC):
     """Common base for all skill executors."""
 
-    def __init__(self, skill_id: str, route: Route):
+    def __init__(
+        self,
+        skill_id: str,
+        route: Route,
+        *,
+        supported_capabilities: list[str] | None = None,
+    ):
         self._skill_id = skill_id
         self._route = route
+        self._supported_capabilities = set(supported_capabilities or [])
 
     @property
     def route(self) -> Route:
@@ -29,6 +36,12 @@ class BaseExecutor(ABC):
     @property
     def skill_id(self) -> str:
         return self._skill_id
+
+    def supports(self, action: Action) -> bool:
+        if not self._supported_capabilities:
+            return True
+        capability = f"{action.domain}.{action.operation}"
+        return capability in self._supported_capabilities
 
     @abstractmethod
     def is_available(self) -> bool: ...
@@ -71,8 +84,13 @@ class CliExecutor(BaseExecutor):
         *,
         run_fn: Callable[[str], tuple[str, int]] | None = None,
         command_template: str | None = None,
+        supported_capabilities: list[str] | None = None,
     ):
-        super().__init__(skill_id, Route.BROWSER)  # placeholder route for generic CLI
+        super().__init__(
+            skill_id,
+            Route.BROWSER,
+            supported_capabilities=supported_capabilities,
+        )  # placeholder route for generic CLI
         self._run_fn = run_fn
         self._command_template = command_template
         # Override route to a more appropriate value if needed
@@ -96,8 +114,13 @@ class MiddlewareApiExecutor(BaseExecutor):
         *,
         call_fn: Callable[..., tuple[Any, int]] | None = None,
         allowed_methods: list[str] | None = None,
+        supported_capabilities: list[str] | None = None,
     ):
-        super().__init__(skill_id, Route.MIDDLEWARE_API)
+        super().__init__(
+            skill_id,
+            Route.MIDDLEWARE_API,
+            supported_capabilities=supported_capabilities,
+        )
         self._call_fn = call_fn
         self._allowed_methods = set(allowed_methods or [])
 
@@ -121,8 +144,13 @@ class MidcliSkillExecutor(BaseExecutor):
         *,
         run_fn: Callable[[str], tuple[str, int]] | None = None,
         allowed_subcommands: list[str] | None = None,
+        supported_capabilities: list[str] | None = None,
     ):
-        super().__init__(skill_id, Route.MIDCLI)
+        super().__init__(
+            skill_id,
+            Route.MIDCLI,
+            supported_capabilities=supported_capabilities,
+        )
         self._run_fn = run_fn
         self._allowed_subcommands = set(allowed_subcommands or [])
 
@@ -142,8 +170,18 @@ class MidcliSkillExecutor(BaseExecutor):
 class BrowserExecutor(BaseExecutor):
     """Placeholder executor for browser-based automation."""
 
-    def __init__(self, skill_id: str, *, available: bool = False):
-        super().__init__(skill_id, Route.BROWSER)
+    def __init__(
+        self,
+        skill_id: str,
+        *,
+        available: bool = False,
+        supported_capabilities: list[str] | None = None,
+    ):
+        super().__init__(
+            skill_id,
+            Route.BROWSER,
+            supported_capabilities=supported_capabilities,
+        )
         self._available = available
 
     def is_available(self) -> bool:
@@ -156,8 +194,18 @@ class BrowserExecutor(BaseExecutor):
 class McpExecutor(BaseExecutor):
     """Placeholder executor for MCP-based execution."""
 
-    def __init__(self, skill_id: str, *, available: bool = False):
-        super().__init__(skill_id, Route.MCP)
+    def __init__(
+        self,
+        skill_id: str,
+        *,
+        available: bool = False,
+        supported_capabilities: list[str] | None = None,
+    ):
+        super().__init__(
+            skill_id,
+            Route.MCP,
+            supported_capabilities=supported_capabilities,
+        )
         self._available = available
 
     def is_available(self) -> bool:
@@ -167,11 +215,38 @@ class McpExecutor(BaseExecutor):
         raise NotImplementedError("MCP executor not yet implemented")
 
 
+class TaskApiExecutor(BaseExecutor):
+    """Executes a skill by forwarding the action to the local Task API."""
+
+    def __init__(
+        self,
+        skill_id: str,
+        *,
+        call_fn: Callable[[Action, str, str], Any] | None = None,
+        supported_capabilities: list[str] | None = None,
+    ):
+        super().__init__(
+            skill_id,
+            Route.MCP,
+            supported_capabilities=supported_capabilities,
+        )
+        self._call_fn = call_fn
+
+    def is_available(self) -> bool:
+        return self._call_fn is not None
+
+    def _do_execute(self, action: Action, *, task_id: str, step_id: str) -> Any:
+        if self._call_fn is None:
+            raise RuntimeError("Task API executor is not configured")
+        return self._call_fn(action, task_id, step_id)
+
+
 def executors_from_manifest(
     manifest: SkillManifest,
     *,
     api_call_fn: Callable[..., tuple[Any, int]] | None = None,
     cli_run_fn: Callable[[str], tuple[str, int]] | None = None,
+    task_api_call_fn: Callable[[Action, str, str], Any] | None = None,
 ) -> list[BaseExecutor]:
     """Build executor instances from a skill manifest's config.
 
@@ -186,6 +261,7 @@ def executors_from_manifest(
             manifest.id,
             call_fn=api_call_fn,
             allowed_methods=manifest.harbor_api.allowed_methods,
+            supported_capabilities=manifest.capabilities,
         ))
 
     # Midcli executor
@@ -194,6 +270,7 @@ def executors_from_manifest(
             manifest.id,
             run_fn=cli_run_fn,
             allowed_subcommands=manifest.harbor_cli.allowed_subcommands,
+            supported_capabilities=manifest.capabilities,
         ))
 
     # Generic CLI executor from executors.cli
@@ -203,16 +280,32 @@ def executors_from_manifest(
             manifest.id,
             run_fn=cli_run_fn,
             command_template=cli_cfg.command,
+            supported_capabilities=manifest.capabilities,
         ))
 
     # Browser (placeholder)
     browser_cfg = manifest.executors.get("browser")
     if browser_cfg and browser_cfg.enabled:
-        result.append(BrowserExecutor(manifest.id, available=True))
+        result.append(BrowserExecutor(
+            manifest.id,
+            available=True,
+            supported_capabilities=manifest.capabilities,
+        ))
 
-    # MCP (placeholder)
+    # MCP / Task API
     mcp_cfg = manifest.executors.get("mcp")
     if mcp_cfg and mcp_cfg.enabled:
-        result.append(McpExecutor(manifest.id, available=True))
+        if task_api_call_fn:
+            result.append(TaskApiExecutor(
+                manifest.id,
+                call_fn=task_api_call_fn,
+                supported_capabilities=manifest.capabilities,
+            ))
+        else:
+            result.append(McpExecutor(
+                manifest.id,
+                available=True,
+                supported_capabilities=manifest.capabilities,
+            ))
 
     return result

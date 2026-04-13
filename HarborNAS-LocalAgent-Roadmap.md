@@ -1,5 +1,10 @@
 # HarborNAS Local Agent V2 路线图与任务分配
 
+> 当前定位说明（2026-04-13）  
+> 本文档现在代表 HarborNAS Assistant / Orchestrator 的长期平台主干路线。  
+> 当前正在执行的产品落地线是 `Home Agent Hub MVP`，详见 [docs/home-agent-hub-roadmap.md](docs/home-agent-hub-roadmap.md)。  
+> 后续原则是“平台主干统一 + Home Agent Hub 作为首个垂直域入轨”，而不是两条长期并行主链路。
+
 ## 1. 目标重申（真实北极星）
 
 本项目不是文档工程，而是在 HarborOS 基础上落地:
@@ -7,6 +12,12 @@
 1. 个人助手（多终端自然语言交互）
 2. 多模态 RAG（文本/图像/音频/视频）
 3. 智能编排（规划、路由、执行、审计、回滚）
+
+当前执行策略补充：
+
+- `Local Agent V2` 负责平台骨干
+- `Home Agent Hub` 负责首个垂直域产品闭环
+- Home Agent Hub 已验证出的 artifact / event / long-running task / 补参机制，后续应反哺平台抽象
 
 执行优先级强约束:
 

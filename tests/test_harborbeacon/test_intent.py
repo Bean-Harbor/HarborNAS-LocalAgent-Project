@@ -23,6 +23,9 @@ def _tools() -> list[McpToolSchema]:
         McpToolSchema(name="service.start", description="Start a service"),
         McpToolSchema(name="service.stop", description="Stop a service"),
         McpToolSchema(name="files.search", description="Search files"),
+        McpToolSchema(name="camera.scan", description="Scan cameras"),
+        McpToolSchema(name="camera.connect", description="Connect a discovered camera"),
+        McpToolSchema(name="camera.analyze", description="Analyze a camera"),
     ]
 
 
@@ -108,6 +111,23 @@ class TestRegexParser:
         r = parse_intent_regex("搜索 *.mp4")
         assert isinstance(r, IntentResult)
         assert r.tool == "files.search"
+
+    def test_camera_scan(self):
+        r = parse_intent_regex("扫描摄像头")
+        assert isinstance(r, IntentResult)
+        assert r.tool == "camera.scan"
+
+    def test_camera_connect_candidate(self):
+        r = parse_intent_regex("接入 1")
+        assert isinstance(r, IntentResult)
+        assert r.tool == "camera.connect"
+        assert r.arguments["resource"]["candidate_index"] == 1
+
+    def test_camera_analyze_hint(self):
+        r = parse_intent_regex("分析客厅摄像头")
+        assert isinstance(r, IntentResult)
+        assert r.tool == "camera.analyze"
+        assert r.arguments["resource"]["device_hint"] == "客厅"
 
     def test_no_match(self):
         r = parse_intent_regex("今天天气怎么样")

@@ -17,6 +17,8 @@ class Executor(Protocol):
     @property
     def route(self) -> Route: ...
 
+    def supports(self, action: Action) -> bool: ...
+
     def is_available(self) -> bool: ...
 
     def execute(self, action: Action, *, task_id: str, step_id: str) -> ExecutionResult: ...
@@ -50,7 +52,7 @@ class Router:
         primary = True
         for r in routes:
             ex = self._executors.get(r)
-            if ex and ex.is_available():
+            if ex and getattr(ex, "supports", lambda _action: True)(action) and ex.is_available():
                 return ex, not primary
             primary = False
         return None, False
@@ -64,6 +66,8 @@ class Router:
         for idx, r in enumerate(routes):
             ex = self._executors.get(r)
             if not ex or not ex.is_available():
+                continue
+            if not getattr(ex, "supports", lambda _action: True)(action):
                 continue
             if idx > 0:
                 fallback_used = True

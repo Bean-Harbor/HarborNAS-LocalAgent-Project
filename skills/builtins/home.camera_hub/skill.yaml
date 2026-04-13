@@ -1,0 +1,24 @@
+id: home.camera_hub
+name: Home Agent Hub Camera Domain
+version: 0.1.0
+summary: Scan, connect, and analyze home cameras
+owner: harbor-team
+capabilities:
+  - camera.scan
+  - camera.connect
+  - camera.snapshot
+  - camera.live_view
+  - camera.analyze
+  - camera.ptz
+executors:
+  mcp:
+    enabled: true
+risk:
+  default_level: LOW
+input_schema:
+  type: object
+  properties:
+    resource:
+      type: object
+    args:
+      type: object

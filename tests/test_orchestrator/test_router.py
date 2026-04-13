@@ -6,14 +6,26 @@ from orchestrator.router import Router, allowed_routes
 # --- stub executors ---
 
 class StubExecutor:
-    def __init__(self, route: Route, available: bool = True, fail: bool = False):
+    def __init__(
+        self,
+        route: Route,
+        available: bool = True,
+        fail: bool = False,
+        supported_domains: set[str] | None = None,
+    ):
         self.route = route
         self._available = available
         self._fail = fail
+        self._supported_domains = supported_domains
         self.called = False
 
     def is_available(self) -> bool:
         return self._available
+
+    def supports(self, action: Action) -> bool:
+        if self._supported_domains is None:
+            return True
+        return action.domain in self._supported_domains
 
     def execute(self, action: Action, *, task_id: str, step_id: str) -> ExecutionResult:
         self.called = True
@@ -77,6 +89,16 @@ def test_resolve_returns_none_when_nothing_available():
     a = Action(domain="service", operation="status", resource={"service_name": "ssh"})
     ex, fallback = router.resolve(a)
     assert ex is None
+
+
+def test_resolve_skips_unsupported_executor():
+    mw = StubExecutor(Route.MIDDLEWARE_API, supported_domains={"service"})
+    mcp = StubExecutor(Route.MCP, supported_domains={"camera"})
+    router = Router([mw, mcp])
+    a = Action(domain="camera", operation="scan", resource={})
+    ex, fallback = router.resolve(a)
+    assert ex is mcp
+    assert fallback is True
 
 
 # --- Router.execute tests ---
@@ -145,3 +167,16 @@ def test_register_adds_executor():
     assert result.ok
     assert result.executor_used == "midcli"
     assert result.fallback_used is True  # midcli is not the first in priority
+
+
+def test_execute_skips_unsupported_executor():
+    mw = StubExecutor(Route.MIDDLEWARE_API, supported_domains={"service"})
+    mcp = StubExecutor(Route.MCP, supported_domains={"camera"})
+    router = Router([mw, mcp])
+    a = Action(domain="camera", operation="scan", resource={})
+    result = router.execute(a, task_id="t1", step_id="s1")
+    assert result.ok
+    assert result.executor_used == "mcp"
+    assert result.fallback_used is True
+    assert not mw.called
+    assert mcp.called

@@ -35,6 +35,9 @@ class MiddlewareExecutor:
     def is_available(self) -> bool:
         return self._available and self._call_fn is not None
 
+    def supports(self, action: Action) -> bool:
+        return action.domain == "service"
+
     def execute(self, action: Action, *, task_id: str, step_id: str) -> ExecutionResult:
         started = time.monotonic()
         service_name = action.resource.get("service_name", "")
@@ -84,6 +87,9 @@ class MidcliExecutor:
 
     def is_available(self) -> bool:
         return self._available and self._run_fn is not None
+
+    def supports(self, action: Action) -> bool:
+        return action.domain == "service"
 
     def execute(self, action: Action, *, task_id: str, step_id: str) -> ExecutionResult:
         started = time.monotonic()
