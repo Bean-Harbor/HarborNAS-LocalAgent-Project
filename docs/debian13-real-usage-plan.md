@@ -49,15 +49,17 @@
 
 ## 服务建议
 
-建议至少长期运行两个服务：
+建议至少长期运行三个服务：
 
+- `assistant-task-api`
 - `agent-hub-admin-api`
 - `feishu-harbor-bot`
 
-现在 `feishu-harbor-bot` 可以在凭证尚未配置时先启动，随后持续等待 `.harbornas/admin-console.json` 或环境变量里出现 `app_id` / `app_secret`，不需要人工重启。
+现在 `assistant-task-api` 会常驻在本机 `127.0.0.1:4175`，作为 HarborBeacon -> Home Agent Hub 的本地任务桥接层；`feishu-harbor-bot` 也可以在凭证尚未配置时先启动，随后持续等待 `.harbornas/admin-console.json` 或环境变量里出现 `app_id` / `app_secret`，不需要人工重启。
 
 其中：
 
+- `assistant-task-api` 负责 HarborBeacon 的 camera domain task 请求、补参续执行和会话状态持久化
 - `agent-hub-admin-api` 负责二维码、手机配置页、默认策略和设备库
 - `feishu-harbor-bot` 负责飞书消息收发、扫描摄像头、手动添加、抓拍和分析
 

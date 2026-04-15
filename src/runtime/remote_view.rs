@@ -59,10 +59,7 @@ pub fn issue_camera_share_token(
     })
 }
 
-pub fn verify_camera_share_token(
-    secret: &str,
-    token: &str,
-) -> Result<CameraShareClaims, String> {
+pub fn verify_camera_share_token(secret: &str, token: &str) -> Result<CameraShareClaims, String> {
     if secret.trim().is_empty() {
         return Err("share secret is empty".to_string());
     }

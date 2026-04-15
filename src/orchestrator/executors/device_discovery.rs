@@ -20,13 +20,13 @@ use crate::domains::device::{
 use crate::orchestrator::contracts::{Action, ExecutionResult, Route, StepStatus};
 use crate::orchestrator::router::Executor;
 use crate::runtime::discovery::DiscoveryService;
-use crate::runtime::hub::{merge_camera, normalize_camera_metadata, same_camera};
-use crate::runtime::registry::{CameraDevice, DeviceRegistryStore};
+use crate::runtime::hub::normalize_camera_metadata;
+use crate::runtime::registry::{CameraDevice, DeviceRegistrySnapshot, DeviceRegistryStore};
 
 pub struct DeviceDiscoveryExecutor {
     service: DiscoveryService,
     ptz: Box<dyn OnvifPtzAdapter>,
-    devices: Arc<Mutex<Vec<CameraDevice>>>,
+    devices: Arc<Mutex<DeviceRegistrySnapshot>>,
     registry_store: Option<DeviceRegistryStore>,
 }
 
@@ -40,23 +40,21 @@ impl DeviceDiscoveryExecutor {
         Self {
             service: DiscoveryService::new(rtsp, onvif, ssdp, mdns),
             ptz: Box::new(SoapOnvifPtzAdapter::default()),
-            devices: Arc::new(Mutex::new(Vec::new())),
+            devices: Arc::new(Mutex::new(DeviceRegistrySnapshot::default())),
             registry_store: None,
         }
     }
 
     pub fn with_devices(mut self, devices: Vec<CameraDevice>) -> Self {
-        self.devices = Arc::new(Mutex::new(devices));
+        let devices: Vec<_> = devices.into_iter().map(normalize_camera_metadata).collect();
+        self.devices = Arc::new(Mutex::new(DeviceRegistrySnapshot::from_camera_devices(
+            &devices,
+        )));
         self
     }
 
     pub fn with_registry_store(mut self, store: DeviceRegistryStore) -> Result<Self, String> {
-        let devices = store
-            .load_devices()?
-            .into_iter()
-            .map(normalize_camera_metadata)
-            .collect();
-        self.devices = Arc::new(Mutex::new(devices));
+        self.devices = Arc::new(Mutex::new(store.load_snapshot()?));
         self.registry_store = Some(store);
         Ok(self)
     }
@@ -64,19 +62,26 @@ impl DeviceDiscoveryExecutor {
     fn devices_snapshot(&self) -> Result<Vec<CameraDevice>, String> {
         self.devices
             .lock()
-            .map(|devices| devices.clone())
+            .map(|snapshot| {
+                snapshot
+                    .to_camera_devices()
+                    .into_iter()
+                    .map(normalize_camera_metadata)
+                    .collect()
+            })
             .map_err(|_| "device registry lock poisoned".to_string())
     }
 
     fn find_device(&self, device_id: &str) -> Result<CameraDevice, String> {
-        let devices = self
+        let snapshot = self
             .devices
             .lock()
             .map_err(|_| "device registry lock poisoned".to_string())?;
-        devices
-            .iter()
+        snapshot
+            .to_camera_devices()
+            .into_iter()
             .find(|d| d.device_id == device_id)
-            .cloned()
+            .map(normalize_camera_metadata)
             .ok_or_else(|| format!("device not found: {device_id}"))
     }
 
@@ -84,34 +89,29 @@ impl DeviceDiscoveryExecutor {
         &self,
         discovered: &[CameraDevice],
     ) -> Result<Vec<CameraDevice>, String> {
-        let mut devices = self
+        let mut snapshot = self
             .devices
             .lock()
             .map_err(|_| "device registry lock poisoned".to_string())?;
-
-        for incoming in discovered {
-            if let Some(existing) = devices
-                .iter_mut()
-                .find(|existing| same_camera(existing, incoming))
-            {
-                *existing = merge_camera(existing.clone(), incoming.clone());
-            } else {
-                devices.push(incoming.clone());
-            }
-        }
+        snapshot.upsert_camera_devices_preserving_platform_records(discovered);
 
         if let Some(store) = &self.registry_store {
-            store.save_devices(&devices)?;
+            store.save_snapshot(&snapshot)?;
         }
 
-        Ok(devices.clone())
+        Ok(snapshot
+            .to_camera_devices()
+            .into_iter()
+            .map(normalize_camera_metadata)
+            .collect())
     }
 
     fn update_device(&self, args: &DeviceUpdateArgs) -> Result<CameraDevice, String> {
-        let mut devices = self
+        let mut snapshot = self
             .devices
             .lock()
             .map_err(|_| "device registry lock poisoned".to_string())?;
+        let mut devices = snapshot.to_camera_devices();
         let device = devices
             .iter_mut()
             .find(|d| d.device_id == args.device_id)
@@ -132,17 +132,12 @@ impl DeviceDiscoveryExecutor {
             };
         }
 
-        let updated = device.clone();
+        let updated = normalize_camera_metadata(device.clone());
+        snapshot.upsert_camera_devices_preserving_platform_records(&[updated.clone()]);
         if let Some(store) = &self.registry_store {
-            let normalized: Vec<_> = devices
-                .iter()
-                .cloned()
-                .map(normalize_camera_metadata)
-                .collect();
-            *devices = normalized;
-            store.save_devices(&devices)?;
+            store.save_snapshot(&snapshot)?;
         }
-        Ok(normalize_camera_metadata(updated))
+        Ok(updated)
     }
 
     fn ptz_device(&self, args: &DevicePtzArgs) -> Result<DevicePtzPayload, String> {
@@ -333,6 +328,10 @@ mod tests {
     use crate::adapters::rtsp::RtspProbeAdapter;
     use crate::adapters::ssdp::SsdpDiscoveryAdapter;
     use crate::connectors::storage::StorageTarget;
+    use crate::control_plane::devices::{
+        ConnectivityState, DeviceKind as ControlDeviceKind, DeviceLifecycleState,
+        DeviceRecord as ControlDeviceRecord, DeviceTwin,
+    };
     use crate::orchestrator::contracts::Action;
     use crate::orchestrator::router::Executor;
     use crate::runtime::discovery::{
@@ -342,7 +341,9 @@ mod tests {
     use crate::runtime::media::{
         SnapshotCaptureRequest, SnapshotCaptureResult, StreamOpenRequest, StreamOpenResult,
     };
-    use crate::runtime::registry::{CameraDevice, DeviceRegistryStore, StreamTransport};
+    use crate::runtime::registry::{
+        CameraDevice, DeviceRegistrySnapshot, DeviceRegistryStore, StreamTransport,
+    };
 
     use super::DeviceDiscoveryExecutor;
 
@@ -735,6 +736,85 @@ mod tests {
         let persisted = store.load_devices().expect("load persisted devices");
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].ip_address.as_deref(), Some("192.168.1.50"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn discover_preserves_non_camera_platform_records_when_store_is_configured() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("harbornas-device-executor-platform-{unique}.json"));
+        let store = DeviceRegistryStore::new(&path);
+        store
+            .save_snapshot(&DeviceRegistrySnapshot {
+                devices: vec![ControlDeviceRecord {
+                    device_id: "light-1".to_string(),
+                    workspace_id: "home".to_string(),
+                    kind: ControlDeviceKind::Light,
+                    subtype: None,
+                    display_name: "Hall Light".to_string(),
+                    aliases: vec![],
+                    vendor: None,
+                    model: None,
+                    serial_number: None,
+                    mac_address: None,
+                    primary_room_id: Some("hall".to_string()),
+                    lifecycle_state: DeviceLifecycleState::Registered,
+                    source: "matter".to_string(),
+                    metadata: json!({}),
+                }],
+                device_twins: vec![DeviceTwin {
+                    device_id: "light-1".to_string(),
+                    connectivity_state: ConnectivityState::Online,
+                    reported_state: json!({"power":"on"}),
+                    desired_state: json!({}),
+                    health_state: json!({}),
+                    last_event_id: None,
+                    last_seen_at: None,
+                }],
+                ..DeviceRegistrySnapshot::default()
+            })
+            .expect("persist initial snapshot");
+
+        let executor = DeviceDiscoveryExecutor::new(
+            Box::new(StaticRtspAdapter),
+            Some(Box::new(StaticOnvifAdapter)),
+            Some(Box::new(EmptySsdpAdapter)),
+            Some(Box::new(EmptyMdnsAdapter)),
+        )
+        .with_registry_store(store.clone())
+        .expect("attach registry store");
+
+        let discover_action = Action {
+            domain: "device".to_string(),
+            operation: "discover".to_string(),
+            resource: json!({"scan_id":"scan-1","network_cidr":"192.168.1.0/24"}),
+            args: json!({}),
+            risk_level: crate::orchestrator::contracts::RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+        executor
+            .execute(&discover_action, "t1", "s1")
+            .expect("discover result");
+
+        let snapshot = store.load_snapshot().expect("load persisted snapshot");
+        assert!(
+            snapshot
+                .devices
+                .iter()
+                .any(|device| device.device_id == "light-1"
+                    && device.kind == ControlDeviceKind::Light)
+        );
+        assert!(snapshot
+            .devices
+            .iter()
+            .any(|device| device.device_id == "cam-cand-1"
+                && device.kind == ControlDeviceKind::Camera));
 
         let _ = std::fs::remove_file(&path);
     }

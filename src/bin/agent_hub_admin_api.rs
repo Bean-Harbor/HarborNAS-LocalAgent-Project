@@ -3,6 +3,7 @@ use std::io::{Cursor, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::thread;
 
 use clap::Parser;
 use qrcodegen::{QrCode, QrCodeEcc};
@@ -11,14 +12,14 @@ use serde_json::json;
 use tiny_http::{Header, Method, Request, Response, ResponseBox, Server, StatusCode};
 
 use harbornas_local_agent::runtime::admin_console::{
-    AdminConsoleState, AdminConsoleStore, AdminDefaults, FeishuUserBinding, FeishuBotConfig,
+    AdminConsoleState, AdminConsoleStore, AdminDefaults, FeishuBotConfig, FeishuUserBinding,
 };
 use harbornas_local_agent::runtime::hub::{
     build_mobile_setup_url, CameraConnectRequest, CameraHubService, HubManualAddSummary,
     HubScanRequest, HubScanSummary, HubStateSnapshot,
 };
-use harbornas_local_agent::runtime::remote_view;
 use harbornas_local_agent::runtime::registry::DeviceRegistryStore;
+use harbornas_local_agent::runtime::remote_view;
 
 #[derive(Debug, Parser)]
 #[command(name = "agent-hub-admin-api")]
@@ -145,20 +146,23 @@ impl AdminApi {
             Method::Get if path == "/setup/mobile" => {
                 self.handle_mobile_setup_page(request.url()).boxed()
             }
-            Method::Get if path.starts_with("/shared/cameras/") && path.ends_with("/live.mjpeg") => {
+            Method::Get
+                if path.starts_with("/shared/cameras/") && path.ends_with("/live.mjpeg") =>
+            {
                 self.handle_shared_camera_live_mjpeg(path)
             }
             Method::Get if path.starts_with("/shared/cameras/") => {
                 self.handle_shared_live_view_page(path).boxed()
             }
-            Method::Get if path.starts_with("/live/cameras/") => {
-                self.handle_live_view_page(path, remote_addr, &headers).boxed()
-            }
+            Method::Get if path.starts_with("/live/cameras/") => self
+                .handle_live_view_page(path, remote_addr, &headers)
+                .boxed(),
             Method::Get if path.starts_with("/api/cameras/") && path.ends_with("/live.mjpeg") => {
                 self.handle_camera_live_mjpeg(path, remote_addr, &headers)
             }
             Method::Get if path.starts_with("/api/cameras/") && path.ends_with("/snapshot.jpg") => {
-                self.handle_camera_snapshot(path, remote_addr, &headers).boxed()
+                self.handle_camera_snapshot(path, remote_addr, &headers)
+                    .boxed()
             }
             Method::Post if path == "/api/binding/refresh" => self.handle_refresh_binding().boxed(),
             Method::Post if path == "/api/binding/demo-bind" => self.handle_demo_bind().boxed(),
@@ -536,8 +540,7 @@ impl AdminApi {
                 b"multipart/x-mixed-replace;boundary=ffmpeg".as_slice(),
             )
             .expect("header"),
-            Header::from_bytes(b"X-Accel-Buffering".as_slice(), b"no".as_slice())
-                .expect("header"),
+            Header::from_bytes(b"X-Accel-Buffering".as_slice(), b"no".as_slice()).expect("header"),
         ];
         let mut response = Response::new(StatusCode(200), headers, stream, None, None).boxed();
         add_common_headers(&mut response);
@@ -575,8 +578,7 @@ impl AdminApi {
                 b"multipart/x-mixed-replace;boundary=ffmpeg".as_slice(),
             )
             .expect("header"),
-            Header::from_bytes(b"X-Accel-Buffering".as_slice(), b"no".as_slice())
-                .expect("header"),
+            Header::from_bytes(b"X-Accel-Buffering".as_slice(), b"no".as_slice()).expect("header"),
         ];
         let mut response = Response::new(StatusCode(200), headers, stream, None, None).boxed();
         add_common_headers(&mut response);
@@ -664,7 +666,10 @@ fn main() {
         cli.bind
     );
     for request in server.incoming_requests() {
-        api.handle(request);
+        let api = api.clone();
+        thread::spawn(move || {
+            api.handle(request);
+        });
     }
 }
 
@@ -1315,7 +1320,10 @@ fn ensure_local_admin_access(
     headers: &[Header],
 ) -> Result<(), String> {
     if has_forwarding_headers(headers) {
-        return Err("当前管理后台接口只允许在本机或局域网内直连访问，不能通过公网反向代理转发。".to_string());
+        return Err(
+            "当前管理后台接口只允许在本机或局域网内直连访问，不能通过公网反向代理转发。"
+                .to_string(),
+        );
     }
 
     if remote_addr.is_none() || remote_addr.is_some_and(is_local_socket_addr) {
@@ -1337,7 +1345,10 @@ fn ensure_local_camera_access(
         return Ok(());
     }
 
-    Err("当前摄像头直连预览只允许本机或局域网访问；如果要给外网用户观看，请使用带签名的共享链接。".to_string())
+    Err(
+        "当前摄像头直连预览只允许本机或局域网访问；如果要给外网用户观看，请使用带签名的共享链接。"
+            .to_string(),
+    )
 }
 
 fn is_local_socket_addr(addr: SocketAddr) -> bool {
@@ -1588,10 +1599,11 @@ mod tests {
 
     #[test]
     fn forwarded_headers_block_local_only_routes() {
-        let forwarded = vec![
-            Header::from_bytes(b"X-Forwarded-For".as_slice(), b"198.51.100.10".as_slice())
-                .expect("header"),
-        ];
+        let forwarded =
+            vec![
+                Header::from_bytes(b"X-Forwarded-For".as_slice(), b"198.51.100.10".as_slice())
+                    .expect("header"),
+            ];
         let local = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4567));
         assert!(has_forwarding_headers(&forwarded));
         assert!(ensure_local_admin_access(Some(local), &forwarded).is_err());

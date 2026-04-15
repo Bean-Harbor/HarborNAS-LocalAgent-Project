@@ -10,7 +10,8 @@ use crate::orchestrator::executors::vision::VisionExecutor;
 use crate::orchestrator::router::Executor;
 use crate::runtime::admin_console::AdminConsoleStore;
 use crate::runtime::hub::{
-    looks_like_auth_error, CameraConnectRequest, CameraHubService, HubScanRequest, HubScanResultItem,
+    looks_like_auth_error, CameraConnectRequest, CameraHubService, HubScanRequest,
+    HubScanResultItem,
 };
 use crate::runtime::registry::CameraDevice;
 use crate::runtime::task_session::{
@@ -150,7 +151,9 @@ impl TaskApiService {
             request.intent.domain.trim().to_lowercase(),
             request.intent.action.trim().to_lowercase(),
         ) {
-            (domain, action) if domain == "camera" && action == "scan" => self.handle_camera_scan(&request),
+            (domain, action) if domain == "camera" && action == "scan" => {
+                self.handle_camera_scan(&request)
+            }
             (domain, action) if domain == "camera" && action == "connect" => {
                 self.handle_camera_connect(&request)
             }
@@ -183,7 +186,12 @@ impl TaskApiService {
                     let _ = self.conversation_store.save(&conversation);
                 }
 
-                let message = format_scan_message(&summary.defaults.cidr, &summary.results, &pending_candidates, summary.devices.len());
+                let message = format_scan_message(
+                    &summary.defaults.cidr,
+                    &summary.results,
+                    &pending_candidates,
+                    summary.devices.len(),
+                );
                 let next_actions = if pending_candidates.is_empty() {
                     vec!["分析客厅摄像头".to_string()]
                 } else {
@@ -313,15 +321,16 @@ impl TaskApiService {
                 .unwrap_or_else(|| format!("Camera {ip}")),
             ip: ip.clone(),
             port: first_u16(&[&request.entity_refs, &request.args], &["/port"]).unwrap_or(554),
-            rtsp_paths: first_string_vec(&[&request.entity_refs, &request.args], &["/path_candidates", "/rtsp_paths"]),
+            rtsp_paths: first_string_vec(
+                &[&request.entity_refs, &request.args],
+                &["/path_candidates", "/rtsp_paths"],
+            ),
             requires_auth: false,
             vendor: first_string(&[&request.entity_refs, &request.args], &["/vendor"]),
             model: first_string(&[&request.entity_refs, &request.args], &["/model"]),
         };
-        let connect_request = pending_connect_to_request(
-            &pending,
-            first_string(&[&request.args], &["/password"]),
-        );
+        let connect_request =
+            pending_connect_to_request(&pending, first_string(&[&request.args], &["/password"]));
 
         match self.hub().manual_add(connect_request, None) {
             Ok(summary) => self.completed(
@@ -476,11 +485,9 @@ impl TaskApiService {
         let vision = VisionExecutor::new(self.admin_store.registry_store().clone());
         match vision.execute(&action, &request.task_id, "s1") {
             Ok(result) if result.status == StepStatus::Success => {
-                let summary = string_at_paths(
-                    &result.result_payload,
-                    &["/summary", "/detection_summary"],
-                )
-                .unwrap_or_else(|| "分析完成".to_string());
+                let summary =
+                    string_at_paths(&result.result_payload, &["/summary", "/detection_summary"])
+                        .unwrap_or_else(|| "分析完成".to_string());
                 let artifacts = build_vision_artifacts(&result.result_payload);
                 self.completed(
                     request,
@@ -510,7 +517,9 @@ impl TaskApiService {
             return Err("当前还没有已注册的摄像头，请先完成接入。".to_string());
         }
 
-        if let Some(device_id) = first_string(&[&request.entity_refs, &request.args], &["/device_id"]) {
+        if let Some(device_id) =
+            first_string(&[&request.entity_refs, &request.args], &["/device_id"])
+        {
             if let Some(device) = devices.iter().find(|device| device.device_id == device_id) {
                 return Ok(device.clone());
             }
@@ -520,7 +529,9 @@ impl TaskApiService {
             &[&request.entity_refs, &request.args],
             &["/device_hint", "/room", "/name"],
         )
-        .or_else(|| (!request.intent.raw_text.trim().is_empty()).then(|| request.intent.raw_text.clone()))
+        .or_else(|| {
+            (!request.intent.raw_text.trim().is_empty()).then(|| request.intent.raw_text.clone())
+        })
         .unwrap_or_default();
         let normalized = normalize_command_text(&hint);
 
@@ -831,7 +842,8 @@ fn room_aliases<'a>(name: &'a str, room: &'a str) -> Vec<&'static str> {
 
 fn string_at_paths(value: &Value, paths: &[&str]) -> Option<String> {
     paths.iter().find_map(|path| {
-        value.pointer(path)
+        value
+            .pointer(path)
             .and_then(Value::as_str)
             .map(|item| item.trim().to_string())
             .filter(|item| !item.is_empty())
@@ -849,7 +861,9 @@ fn usize_at_paths(value: &Value, paths: &[&str]) -> Option<usize> {
 }
 
 fn first_string(values: &[&Value], paths: &[&str]) -> Option<String> {
-    values.iter().find_map(|value| string_at_paths(value, paths))
+    values
+        .iter()
+        .find_map(|value| string_at_paths(value, paths))
 }
 
 fn first_u16(values: &[&Value], paths: &[&str]) -> Option<u16> {
@@ -884,7 +898,10 @@ fn first_string_vec(values: &[&Value], paths: &[&str]) -> Vec<String> {
 }
 
 fn first_non_empty<'a>(values: &[&'a str]) -> Option<&'a str> {
-    values.iter().copied().find(|value| !value.trim().is_empty())
+    values
+        .iter()
+        .copied()
+        .find(|value| !value.trim().is_empty())
 }
 
 fn ensure_resume_token() -> String {
@@ -904,8 +921,9 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        conversation_key, format_pending_candidates, normalize_command_text, pending_candidates_from_results,
-        protocol_string, room_aliases, PendingTaskCandidate, TaskIntent, TaskRequest, TaskSource,
+        conversation_key, format_pending_candidates, normalize_command_text,
+        pending_candidates_from_results, protocol_string, room_aliases, PendingTaskCandidate,
+        TaskIntent, TaskRequest, TaskSource,
     };
     use crate::runtime::hub::HubScanResultItem;
 
@@ -933,7 +951,10 @@ mod tests {
     #[test]
     fn protocol_string_joins_protocol_arrays() {
         let args = json!({"protocols":["onvif", "rtsp_probe"]});
-        assert_eq!(protocol_string(&args), Some("onvif + rtsp_probe".to_string()));
+        assert_eq!(
+            protocol_string(&args),
+            Some("onvif + rtsp_probe".to_string())
+        );
     }
 
     #[test]
@@ -995,7 +1016,10 @@ mod tests {
 
     #[test]
     fn normalize_command_text_strips_punctuation() {
-        assert_eq!(normalize_command_text("分析 客厅摄像头！"), "分析客厅摄像头");
+        assert_eq!(
+            normalize_command_text("分析 客厅摄像头！"),
+            "分析客厅摄像头"
+        );
     }
 
     #[test]

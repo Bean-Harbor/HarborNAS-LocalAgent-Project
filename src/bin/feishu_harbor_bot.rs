@@ -22,8 +22,8 @@ use harbornas_local_agent::runtime::feishu_session::{
 use harbornas_local_agent::runtime::hub::{
     looks_like_auth_error, CameraConnectRequest, CameraHubService, HubScanResultItem,
 };
-use harbornas_local_agent::runtime::remote_view;
 use harbornas_local_agent::runtime::registry::{CameraDevice, DeviceRegistryStore};
+use harbornas_local_agent::runtime::remote_view;
 use prost::Message;
 use reqwest::blocking::multipart::{Form, Part};
 use serde_json::{json, Value};
@@ -1138,7 +1138,9 @@ impl FeishuBot {
 
         match kind {
             "ptz" => {
-                let device_id = match action_value.get("device_id").and_then(|value| value.as_str())
+                let device_id = match action_value
+                    .get("device_id")
+                    .and_then(|value| value.as_str())
                 {
                     Some(value) if !value.trim().is_empty() => value.to_string(),
                     _ => return BotReply::Text("云台控制失败: 卡片缺少 device_id".to_string()),
@@ -1170,7 +1172,9 @@ impl FeishuBot {
                 }
             }
             "snapshot" => {
-                let device_id = match action_value.get("device_id").and_then(|value| value.as_str())
+                let device_id = match action_value
+                    .get("device_id")
+                    .and_then(|value| value.as_str())
                 {
                     Some(value) if !value.trim().is_empty() => value.to_string(),
                     _ => return BotReply::Text("摄像头抓拍失败: 卡片缺少 device_id".to_string()),
@@ -1181,19 +1185,19 @@ impl FeishuBot {
                 }
             }
             "live_view" => {
-                let device_id = match action_value.get("device_id").and_then(|value| value.as_str())
+                let device_id = match action_value
+                    .get("device_id")
+                    .and_then(|value| value.as_str())
                 {
                     Some(value) if !value.trim().is_empty() => value.to_string(),
                     _ => return BotReply::Text("打开实时观看失败: 卡片缺少 device_id".to_string()),
                 };
-                let device = match self
-                    .load_registered_cameras()
-                    .and_then(|devices| {
-                        devices
-                            .into_iter()
-                            .find(|device| device.device_id == device_id)
-                            .ok_or_else(|| format!("未找到摄像头设备 {device_id}"))
-                    }) {
+                let device = match self.load_registered_cameras().and_then(|devices| {
+                    devices
+                        .into_iter()
+                        .find(|device| device.device_id == device_id)
+                        .ok_or_else(|| format!("未找到摄像头设备 {device_id}"))
+                }) {
                     Ok(device) => device,
                     Err(error) => {
                         return BotReply::Text(format!("打开实时观看失败: {error}"));
@@ -1207,21 +1211,23 @@ impl FeishuBot {
                 ))
             }
             "share_view" => {
-                let device_id = match action_value.get("device_id").and_then(|value| value.as_str())
+                let device_id = match action_value
+                    .get("device_id")
+                    .and_then(|value| value.as_str())
                 {
                     Some(value) if !value.trim().is_empty() => value.to_string(),
                     _ => {
-                        return BotReply::Text("生成外网观看链接失败: 卡片缺少 device_id".to_string())
+                        return BotReply::Text(
+                            "生成外网观看链接失败: 卡片缺少 device_id".to_string(),
+                        )
                     }
                 };
-                let device = match self
-                    .load_registered_cameras()
-                    .and_then(|devices| {
-                        devices
-                            .into_iter()
-                            .find(|device| device.device_id == device_id)
-                            .ok_or_else(|| format!("未找到摄像头设备 {device_id}"))
-                    }) {
+                let device = match self.load_registered_cameras().and_then(|devices| {
+                    devices
+                        .into_iter()
+                        .find(|device| device.device_id == device_id)
+                        .ok_or_else(|| format!("未找到摄像头设备 {device_id}"))
+                }) {
                     Ok(device) => device,
                     Err(error) => {
                         return BotReply::Text(format!("生成外网观看链接失败: {error}"));
@@ -1237,7 +1243,9 @@ impl FeishuBot {
                 }
             }
             "record" => {
-                let device_id = match action_value.get("device_id").and_then(|value| value.as_str())
+                let device_id = match action_value
+                    .get("device_id")
+                    .and_then(|value| value.as_str())
                 {
                     Some(value) if !value.trim().is_empty() => value.to_string(),
                     _ => return BotReply::Text("摄像头录像失败: 卡片缺少 device_id".to_string()),
@@ -1281,10 +1289,7 @@ impl FeishuBot {
                         println!("[RECORD] background recording finished, sending result");
                         worker.deliver_reply("", &chat_id, reply);
                     });
-                    BotReply::Text(format!(
-                        "已开始录像，预计 {} 秒后回传结果。",
-                        duration_secs
-                    ))
+                    BotReply::Text(format!("已开始录像，预计 {} 秒后回传结果。", duration_secs))
                 } else {
                     match self.run_local_camera_recording(&device_id, duration_secs) {
                         Ok((device_name, path)) => BotReply::File(FileReply {
@@ -1306,17 +1311,16 @@ impl FeishuBot {
                 }
             }
             "panel" => {
-                let device = if let Some(device_id) =
-                    action_value.get("device_id").and_then(|value| value.as_str())
+                let device = if let Some(device_id) = action_value
+                    .get("device_id")
+                    .and_then(|value| value.as_str())
                 {
-                    match self
-                        .load_registered_cameras()
-                        .and_then(|devices| {
-                            devices
-                                .into_iter()
-                                .find(|device| device.device_id == device_id)
-                                .ok_or_else(|| format!("未找到摄像头设备 {device_id}"))
-                        }) {
+                    match self.load_registered_cameras().and_then(|devices| {
+                        devices
+                            .into_iter()
+                            .find(|device| device.device_id == device_id)
+                            .ok_or_else(|| format!("未找到摄像头设备 {device_id}"))
+                    }) {
                         Ok(device) => device,
                         Err(error) => {
                             return BotReply::Text(format!("打开控制面板失败: {error}"));
@@ -1376,10 +1380,7 @@ impl FeishuBot {
             return BotReply::Text(self.cmd_service_query("ssh"));
         }
 
-        if t.contains("菜单")
-            || t.contains("帮助")
-            || t.contains("能力")
-            || t.contains("能做什么")
+        if t.contains("菜单") || t.contains("帮助") || t.contains("能力") || t.contains("能做什么")
         {
             return self.cmd_show_capabilities();
         }
@@ -1449,10 +1450,7 @@ impl FeishuBot {
         let state = self.hub_service().state_snapshot(Some(&public_origin));
         match state {
             Ok(snapshot) => {
-                lines.push(format!(
-                    "- 绑定码: {}",
-                    snapshot.binding.session_code
-                ));
+                lines.push(format!("- 绑定码: {}", snapshot.binding.session_code));
                 lines.push(format!(
                     "- 飞书 Bot 配置: {}",
                     if snapshot.feishu_bot.configured {
@@ -1470,14 +1468,8 @@ impl FeishuBot {
                 ));
                 let device_count = snapshot.devices.len();
                 lines.push(format!("- 设备库: {} 台摄像头", device_count));
-                lines.push(format!(
-                    "- 默认扫描网段: {}",
-                    snapshot.defaults.cidr
-                ));
-                lines.push(format!(
-                    "- 默认发现策略: {}",
-                    snapshot.defaults.discovery
-                ));
+                lines.push(format!("- 默认扫描网段: {}", snapshot.defaults.cidr));
+                lines.push(format!("- 默认发现策略: {}", snapshot.defaults.discovery));
             }
             Err(error) => {
                 lines.push(format!("- Admin state 读取失败: {error}"));
@@ -1498,9 +1490,8 @@ impl FeishuBot {
             if ffprobe_ok { "OK" } else { "MISSING" }
         ));
 
-        let model_path = std::env::var("HARBOR_YOLO_MODEL").unwrap_or_else(|_| {
-            "/var/lib/harbornas/models/yolov8n.pt".to_string()
-        });
+        let model_path = std::env::var("HARBOR_YOLO_MODEL")
+            .unwrap_or_else(|_| "/var/lib/harbornas/models/yolov8n.pt".to_string());
         lines.push(format!(
             "- YOLO 模型文件: {}",
             if PathBuf::from(&model_path).exists() {
@@ -1533,7 +1524,9 @@ impl FeishuBot {
             lines.push(format!("- 会话键: {key_hint}"));
         }
 
-        lines.push("你可以继续说：扫描摄像头 / 添加摄像头 192.168.x.x / 接入 1 / 密码 xxxxxx".to_string());
+        lines.push(
+            "你可以继续说：扫描摄像头 / 添加摄像头 192.168.x.x / 接入 1 / 密码 xxxxxx".to_string(),
+        );
         lines.join("\n")
     }
 
@@ -1631,7 +1624,10 @@ impl FeishuBot {
         let duration_secs = extract_record_duration_secs(text).unwrap_or(8);
         match self.run_local_camera_recording(&device_id, duration_secs) {
             Ok((device_name, path)) => BotReply::File(FileReply {
-                text: format!("{} 录像完成，已回传视频文件。\n时长：{} 秒", device_name, duration_secs),
+                text: format!(
+                    "{} 录像完成，已回传视频文件。\n时长：{} 秒",
+                    device_name, duration_secs
+                ),
                 file_path: path,
                 file_type: "stream".to_string(),
                 file_name: format!("{}-{}s.mp4", device_name.replace(' ', "_"), duration_secs),
@@ -1743,7 +1739,8 @@ impl FeishuBot {
     }
 
     fn resolve_camera_device_id(&self, text: &str) -> Result<String, String> {
-        self.resolve_camera_device(text).map(|device| device.device_id)
+        self.resolve_camera_device(text)
+            .map(|device| device.device_id)
     }
 
     fn resolve_camera_device(&self, text: &str) -> Result<CameraDevice, String> {
@@ -2754,7 +2751,8 @@ fn normalize_command_text(text: &str) -> String {
 
 fn string_at_paths(value: &Value, paths: &[&str]) -> Option<String> {
     paths.iter().find_map(|path| {
-        value.pointer(path)
+        value
+            .pointer(path)
             .and_then(|item| item.as_str())
             .map(|item| item.to_string())
             .filter(|item| !item.trim().is_empty())
@@ -2801,8 +2799,16 @@ fn encode_url_path_segment(value: &str) -> String {
             encoded.push(byte as char);
         } else {
             encoded.push('%');
-            encoded.push(char::from_digit((byte >> 4) as u32, 16).unwrap().to_ascii_uppercase());
-            encoded.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap().to_ascii_uppercase());
+            encoded.push(
+                char::from_digit((byte >> 4) as u32, 16)
+                    .unwrap()
+                    .to_ascii_uppercase(),
+            );
+            encoded.push(
+                char::from_digit((byte & 0x0f) as u32, 16)
+                    .unwrap()
+                    .to_ascii_uppercase(),
+            );
         }
     }
     encoded
@@ -3358,8 +3364,8 @@ fn resolve_feishu_credentials(cli: &Cli) -> Option<(String, String)> {
 mod tests {
     use super::{
         encode_url_path_segment, extract_record_duration_secs, is_live_view_command,
-        is_remote_share_command, origin_looks_public, parse_ptz_command,
-        parse_ptz_direction_value, parse_ptz_mode_value, PtzControlDirection, PtzControlMode,
+        is_remote_share_command, origin_looks_public, parse_ptz_command, parse_ptz_direction_value,
+        parse_ptz_mode_value, PtzControlDirection, PtzControlMode,
     };
 
     #[test]
@@ -3392,12 +3398,21 @@ mod tests {
 
     #[test]
     fn card_action_values_parse_into_ptz_enums() {
-        assert_eq!(parse_ptz_direction_value("left"), Some(PtzControlDirection::Left));
-        assert_eq!(parse_ptz_direction_value("stop"), Some(PtzControlDirection::Stop));
+        assert_eq!(
+            parse_ptz_direction_value("left"),
+            Some(PtzControlDirection::Left)
+        );
+        assert_eq!(
+            parse_ptz_direction_value("stop"),
+            Some(PtzControlDirection::Stop)
+        );
         assert_eq!(parse_ptz_direction_value("bad"), None);
 
         assert_eq!(parse_ptz_mode_value("coarse"), Some(PtzControlMode::Coarse));
-        assert_eq!(parse_ptz_mode_value("continuous"), Some(PtzControlMode::Continuous));
+        assert_eq!(
+            parse_ptz_mode_value("continuous"),
+            Some(PtzControlMode::Continuous)
+        );
         assert_eq!(parse_ptz_mode_value("bad"), None);
     }
 

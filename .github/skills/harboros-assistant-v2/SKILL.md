@@ -25,6 +25,29 @@ description: "Use when implementing HarborNAS personal assistant capabilities, H
 - High-risk operations require confirmation and approval gates.
 - HarborBeacon autonomy levels must align with assistant risk levels.
 
+## Project north star
+
+Treat the project as:
+
+`一个以 IM 为统一入口、以设备协同和媒体数据流为核心、以本地优先与云端补能为原则、通过智能编排、数据脱敏与统一账号凭据治理，统一编排家庭 AIoT 设备与 NAS/HarborOS 的本地优先家庭智能平台。`
+
+This definition is fixed unless the user explicitly redefines the product direction.
+
+## Top-level system frame
+
+Reason about the whole project in four layers only, top to bottom:
+
+1. `IM entry layer`
+   Feishu / Slack / Discord / WeChat / WeCom / Telegram and similar channels.
+2. `HarborBeacon interaction layer`
+   IM access, session management, natural-language understanding, intent parsing, follow-up questions, rich-media replies.
+3. `HarborOS Runtime / Control Plane`
+   Unified task entry, orchestration, automation and device collaboration, device registry, event bus, media pipeline, AI analysis, local account system, credential governance, desensitization, and cloud augmentation.
+4. `Hardware and system layer`
+   NAS, HarborOS services, cameras, and other AIoT devices.
+
+HarborBeacon must not bypass the Runtime / Control Plane to reach cloud providers, credentials, or device backends directly.
+
 ## Required architecture outputs
 
 - `harborbeacon.channels`: IM channel registration, message routing, intent parsing.

@@ -24,7 +24,11 @@ pub struct UdpSsdpAdapter {
 }
 
 impl UdpSsdpAdapter {
-    pub fn new(read_timeout: Duration, announce_window: Duration, search_target: impl Into<String>) -> Self {
+    pub fn new(
+        read_timeout: Duration,
+        announce_window: Duration,
+        search_target: impl Into<String>,
+    ) -> Self {
         Self {
             read_timeout,
             announce_window,
@@ -63,7 +67,12 @@ impl UdpSsdpAdapter {
             }
         }
 
-        Some(ParsedSsdpResponse { usn, server, location, st })
+        Some(ParsedSsdpResponse {
+            usn,
+            server,
+            location,
+            st,
+        })
     }
 }
 
@@ -138,10 +147,7 @@ impl SsdpDiscoveryAdapter for UdpSsdpAdapter {
                 .map(|server| (Some(server.clone()), None))
                 .unwrap_or((None, None));
 
-            let name = parsed
-                .as_ref()
-                .and_then(|value| value.st.as_ref())
-                .cloned();
+            let name = parsed.as_ref().and_then(|value| value.st.as_ref()).cloned();
 
             candidates.push(DiscoveryCandidate {
                 candidate_id,
@@ -188,7 +194,11 @@ fn parse_ipv4_cidr(cidr: &str) -> Result<(Ipv4Addr, u8), String> {
 }
 
 fn ipv4_in_cidr(ip: Ipv4Addr, network: Ipv4Addr, prefix: u8) -> bool {
-    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
     (u32::from(ip) & mask) == (u32::from(network) & mask)
 }
 
@@ -203,6 +213,9 @@ mod tests {
         assert_eq!(parsed.usn.as_deref(), Some("uuid:demo::upnp:rootdevice"));
         assert_eq!(parsed.st.as_deref(), Some("upnp:rootdevice"));
         assert_eq!(parsed.server.as_deref(), Some("demo/1.0 UPnP/1.1"));
-        assert_eq!(parsed.location.as_deref(), Some("http://192.168.1.10:80/desc.xml"));
+        assert_eq!(
+            parsed.location.as_deref(),
+            Some("http://192.168.1.10:80/desc.xml")
+        );
     }
 }

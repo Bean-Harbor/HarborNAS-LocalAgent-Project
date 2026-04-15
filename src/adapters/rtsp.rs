@@ -1,8 +1,10 @@
 //! RTSP media stream adapter boundary.
 
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
-use std::process::Stdio;
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde::Deserialize;
@@ -31,6 +33,10 @@ pub struct CommandRtspAdapter {
 }
 
 impl CommandRtspAdapter {
+    const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(100);
+    const FFPROBE_TIMEOUT: Duration = Duration::from_secs(7);
+    const FFMPEG_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(12);
+
     pub fn new(ffmpeg_bin: impl Into<String>) -> Self {
         Self {
             ffmpeg_bin: ffmpeg_bin.into(),
@@ -84,6 +90,66 @@ impl CommandRtspAdapter {
             "ffprobe is required for RTSP probing but was not found in PATH as '{}'",
             self.ffprobe_bin
         )
+    }
+
+    fn collect_child_output(child: &mut Child, status: ExitStatus) -> Result<Output, String> {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        if let Some(mut pipe) = child.stdout.take() {
+            pipe.read_to_end(&mut stdout)
+                .map_err(|error| format!("failed to read child stdout: {error}"))?;
+        }
+        if let Some(mut pipe) = child.stderr.take() {
+            pipe.read_to_end(&mut stderr)
+                .map_err(|error| format!("failed to read child stderr: {error}"))?;
+        }
+
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
+    fn run_command_with_timeout(
+        &self,
+        command: &mut Command,
+        timeout: Duration,
+        operation: &str,
+    ) -> Result<Output, String> {
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("failed to launch {operation}: {error}"))?;
+        let started_at = Instant::now();
+
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Self::collect_child_output(&mut child, status),
+                Ok(None) if started_at.elapsed() < timeout => {
+                    thread::sleep(Self::COMMAND_POLL_INTERVAL);
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let status = child.wait().map_err(|error| {
+                        format!("failed to stop {operation} after timeout: {error}")
+                    })?;
+                    let output = Self::collect_child_output(&mut child, status)?;
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    let timeout_secs = timeout.as_secs();
+                    if stderr.is_empty() {
+                        return Err(format!("{operation} timed out after {timeout_secs}s"));
+                    }
+                    return Err(format!(
+                        "{operation} timed out after {timeout_secs}s: {stderr}"
+                    ));
+                }
+                Err(error) => return Err(format!("failed while waiting for {operation}: {error}")),
+            }
+        }
     }
 
     fn linux_player_candidates() -> &'static [&'static str] {
@@ -223,22 +289,25 @@ impl CommandRtspAdapter {
             return Err(self.ffprobe_missing_error());
         }
 
-        let output = Command::new(&self.ffprobe_bin)
-            .args([
-                "-v",
-                "error",
-                "-rtsp_transport",
-                "tcp",
-                "-rw_timeout",
-                "5000000",
-                "-show_entries",
-                "stream=codec_name,codec_type",
-                "-of",
-                "json",
-                stream_url,
-            ])
-            .output()
-            .map_err(|e| format!("failed to launch ffprobe for RTSP probe: {e}"))?;
+        let mut command = Command::new(&self.ffprobe_bin);
+        command.args([
+            "-v",
+            "error",
+            "-rtsp_transport",
+            "tcp",
+            "-rw_timeout",
+            "5000000",
+            "-show_entries",
+            "stream=codec_name,codec_type",
+            "-of",
+            "json",
+            stream_url,
+        ]);
+        let output = self.run_command_with_timeout(
+            &mut command,
+            Self::FFPROBE_TIMEOUT,
+            "ffprobe for RTSP probe",
+        )?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -348,22 +417,27 @@ impl RtspProbeAdapter for CommandRtspAdapter {
             SnapshotFormat::Png => "png",
         };
 
-        let output = Command::new(&self.ffmpeg_bin)
-            .args([
-                "-rtsp_transport",
-                "tcp",
-                "-i",
-                &request.stream_url,
-                "-frames:v",
-                "1",
-                "-f",
-                "image2pipe",
-                "-vcodec",
-                codec,
-                "-",
-            ])
-            .output()
-            .map_err(|e| format!("failed to launch ffmpeg for snapshot capture: {e}"))?;
+        let mut command = Command::new(&self.ffmpeg_bin);
+        command.args([
+            "-rtsp_transport",
+            "tcp",
+            "-rw_timeout",
+            "10000000",
+            "-i",
+            &request.stream_url,
+            "-frames:v",
+            "1",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            codec,
+            "-",
+        ]);
+        let output = self.run_command_with_timeout(
+            &mut command,
+            Self::FFMPEG_SNAPSHOT_TIMEOUT,
+            "ffmpeg for snapshot capture",
+        )?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();

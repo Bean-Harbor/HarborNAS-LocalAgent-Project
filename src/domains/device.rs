@@ -2,8 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::connectors::storage::StorageTarget;
 use crate::connectors::ezviz::EzvizPtzDirection;
+use crate::connectors::storage::StorageTarget;
 use crate::runtime::discovery::{
     DiscoveryBatchResult, DiscoveryProtocol, DiscoveryRequest, RtspProbeResult,
 };

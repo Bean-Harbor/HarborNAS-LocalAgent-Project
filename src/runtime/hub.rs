@@ -612,19 +612,8 @@ pub fn upsert_devices(
     store: &DeviceRegistryStore,
     discovered: &[CameraDevice],
 ) -> Result<Vec<CameraDevice>, String> {
-    let mut devices = store.load_devices()?;
-    for incoming in discovered {
-        if let Some(existing) = devices
-            .iter_mut()
-            .find(|existing| same_camera(existing, incoming))
-        {
-            *existing = merge_camera(existing.clone(), incoming.clone());
-        } else {
-            devices.push(normalize_camera_metadata(incoming.clone()));
-        }
-    }
-    store.save_devices(&devices)?;
-    Ok(devices)
+    let snapshot = store.upsert_devices(discovered)?;
+    Ok(snapshot.to_camera_devices())
 }
 
 pub fn same_camera(existing: &CameraDevice, incoming: &CameraDevice) -> bool {
@@ -659,7 +648,9 @@ pub fn merge_camera(existing: CameraDevice, incoming: CameraDevice) -> CameraDev
         onvif_device_service_url: incoming
             .onvif_device_service_url
             .or(existing.onvif_device_service_url),
-        ezviz_device_serial: incoming.ezviz_device_serial.or(existing.ezviz_device_serial),
+        ezviz_device_serial: incoming
+            .ezviz_device_serial
+            .or(existing.ezviz_device_serial),
         ezviz_camera_no: incoming.ezviz_camera_no.or(existing.ezviz_camera_no),
         capabilities: incoming.capabilities,
         last_seen_at: incoming.last_seen_at.or(existing.last_seen_at),

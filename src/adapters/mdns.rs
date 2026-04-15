@@ -25,7 +25,11 @@ pub struct AvahiMdnsAdapter {
 }
 
 impl AvahiMdnsAdapter {
-    pub fn new(browse_bin: impl Into<String>, _timeout: Duration, service_type: impl Into<String>) -> Self {
+    pub fn new(
+        browse_bin: impl Into<String>,
+        _timeout: Duration,
+        service_type: impl Into<String>,
+    ) -> Self {
         Self {
             browse_bin: browse_bin.into(),
             service_type: service_type.into(),
@@ -62,8 +66,8 @@ impl AvahiMdnsAdapter {
 
         // Remaining fields are TXT; best-effort extract a couple of hints.
         let txt = parts.drain(9..).collect::<Vec<_>>().join(";");
-        let vendor = extract_txt_value(&txt, "manufacturer")
-            .or_else(|| extract_txt_value(&txt, "vendor"));
+        let vendor =
+            extract_txt_value(&txt, "manufacturer").or_else(|| extract_txt_value(&txt, "vendor"));
         let model = extract_txt_value(&txt, "model");
 
         Some(ParsedAvahiService {
@@ -175,7 +179,11 @@ fn parse_ipv4_cidr(cidr: &str) -> Result<(Ipv4Addr, u8), String> {
 }
 
 fn ipv4_in_cidr(ip: Ipv4Addr, network: Ipv4Addr, prefix: u8) -> bool {
-    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
     (u32::from(ip) & mask) == (u32::from(network) & mask)
 }
 
