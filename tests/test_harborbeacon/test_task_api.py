@@ -27,6 +27,8 @@ def test_execute_action_builds_task_payload():
                     "user_id": "user-1",
                     "session_id": "sess-1",
                     "raw_text": "分析客厅摄像头",
+                    "approval_token": "tok-1",
+                    "approver_id": "user-1",
                 },
             },
         ),
@@ -36,10 +38,14 @@ def test_execute_action_builds_task_payload():
 
     assert response["status"] == "completed"
     assert captured["url"] == "http://127.0.0.1:4175/api/tasks"
+    assert captured["payload"]["step_id"] == "step-1"
     assert captured["payload"]["intent"]["action"] == "analyze"
     assert captured["payload"]["source"]["conversation_id"] == "chat-1"
     assert captured["payload"]["entity_refs"]["device_hint"] == "客厅"
     assert captured["payload"]["args"]["detect_label"] == "person"
+    assert captured["payload"]["autonomy"]["level"] == "supervised"
+    assert captured["payload"]["args"]["approval"]["token"] == "tok-1"
+    assert captured["payload"]["args"]["approval"]["approver_id"] == "user-1"
     assert "_source" not in captured["payload"]["args"]
 
 

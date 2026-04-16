@@ -20,7 +20,7 @@
 
         <nav class="nav-stack">
           <button class="nav-item active">Hub 总览</button>
-          <button class="nav-item">飞书绑定</button>
+          <button class="nav-item">IM 绑定</button>
           <button class="nav-item">设备接入</button>
           <button class="nav-item">默认策略</button>
           <button class="nav-item">设备库</button>
@@ -32,7 +32,7 @@
           <div class="priority-list">
             <span class="pill pill-live">IM First</span>
             <span class="pill">扫码绑定 Hub</span>
-            <span class="pill">飞书控制摄像头</span>
+            <span class="pill">IM 控制摄像头</span>
             <span class="pill">WebUI 做后台配置</span>
           </div>
         </section>
@@ -40,7 +40,7 @@
         <section class="sidebar-card muted">
           <p class="sidebar-label">MVP 现在收敛到</p>
           <div class="priority-list">
-            <span class="pill pill-plan">飞书扫码接入</span>
+            <span class="pill pill-plan">IM 扫码接入</span>
             <span class="pill pill-plan">默认扫描摄像头</span>
             <span class="pill pill-plan">手动添加摄像头</span>
             <span class="pill pill-plan">抓拍分析并回图</span>
@@ -52,10 +52,10 @@
         <header class="hero">
           <div class="hero-copy">
             <p class="eyebrow">Agent Hub Console</p>
-            <h2>主入口在飞书，WebUI 是配置台、绑定台和审计台</h2>
+            <h2>主入口在统一 IM，WebUI 是配置台、绑定台和审计台</h2>
             <p class="hero-text">
               用户先用手机扫描设备上的二维码，手机浏览器会打开这台 Agent Hub 的后台配置页。
-              在手机上填入飞书机器人的 app_id 和 app_secret 后，Hub 才正式接通飞书消息。之后就可以直接在飞书里扫描本地摄像头、
+              在手机上填入消息桥接 Provider 的 app_id 和 app_secret 后，Hub 才正式接通统一 IM 消息入口。之后就可以直接在 IM 里扫描本地摄像头、
               手动添加摄像头、查看某个房间、抓拍、录像和触发 AI 分析。这个页面负责把默认值、设备、策略和状态收拢起来。
             </p>
           </div>
@@ -68,9 +68,9 @@
 
         <section class="metric-grid">
           <article class="metric-card">
-            <span class="metric-label">飞书绑定状态</span>
+            <span class="metric-label">IM 绑定状态</span>
             <strong id="metric-binding">等待绑定</strong>
-            <span class="metric-note">主入口是飞书，不是 Web 页面按钮</span>
+            <span class="metric-note">主入口是统一 IM，不是 Web 页面按钮</span>
           </article>
           <article class="metric-card">
             <span class="metric-label">默认扫描策略</span>
@@ -83,7 +83,7 @@
             <span class="metric-note">自动发现后确认接入，也支持手动录入</span>
           </article>
           <article class="metric-card">
-            <span class="metric-label">最近飞书动作</span>
+            <span class="metric-label">最近 IM 动作</span>
             <strong id="metric-command">分析摄像头</strong>
             <span class="metric-note">图片 + 摘要已可直接回到 IM</span>
           </article>
@@ -93,7 +93,7 @@
           <div class="panel-header">
             <div>
               <p class="eyebrow">01 / Hub Binding</p>
-              <h3>扫码打开手机后台，再把飞书 Bot 接到 Agent Hub</h3>
+              <h3>扫码打开手机后台，再把消息桥接 Provider 接到 Agent Hub</h3>
             </div>
             <span class="status-chip">这是用户真正感知到的开始动作</span>
           </div>
@@ -123,8 +123,8 @@
                   <strong id="bound-user">未配置</strong>
                 </div>
                 <div class="status-line">
-                  <span class="status-key">飞书通道</span>
-                  <strong id="bound-channel">飞书 HarborNAS Bot</strong>
+                  <span class="status-key">通知通道</span>
+            <strong id="bound-channel">Harbor IM Bridge</strong>
                 </div>
               </div>
             </article>
@@ -132,14 +132,14 @@
             <article class="subpanel flow-panel">
               <div class="subpanel-head">
                 <h4>扫码后的真实接入流程</h4>
-                <span class="subpanel-note">二维码只负责打开后台，真正的飞书接入发生在手机端表单</span>
+                <span class="subpanel-note">二维码只负责打开后台，真正的消息桥接接入发生在手机端表单</span>
               </div>
 
               <ol class="flow-list">
                 <li>用户用手机扫描设备上的二维码，手机浏览器打开这台 Hub 的移动配置页。</li>
-                <li>用户在手机上填入自己创建的飞书机器人的 app_id 和 app_secret。</li>
-                <li>后台即时验证飞书 Open API 与 Bot 信息，保存成功后 Hub 获得飞书消息入口。</li>
-                <li>之后用户回到飞书里，就可以直接发“扫描摄像头”“看看客厅摄像头”等命令。</li>
+                <li>用户在手机上填入自己创建的消息桥接应用的 app_id 和 app_secret。</li>
+                <li>后台即时验证兼容 Open API 与应用信息，保存成功后 Hub 获得统一 IM 消息入口。</li>
+                <li>之后用户回到 IM 里，就可以直接发“扫描摄像头”“看看客厅摄像头”等命令。</li>
                 <li>后台页面继续负责策略、设备库和审计，不抢用户主入口。</li>
               </ol>
 
@@ -153,7 +153,7 @@
 
               <form id="bind-test-form" class="manual-form">
                 <label>
-                  飞书 App ID
+                  Bridge App ID
                   <input
                     id="bind-test-display-name"
                     name="app_id"
@@ -163,15 +163,15 @@
                   />
                 </label>
                 <label>
-                  飞书 App Secret
+                  Bridge App Secret
                   <input
                     id="bind-test-open-id"
                     name="app_secret"
                     type="password"
-                    placeholder="输入飞书开放平台里对应的 App Secret"
+                    placeholder="输入桥接应用开放平台里对应的 App Secret"
                   />
                 </label>
-                <button type="submit" class="button button-secondary">保存并验证飞书 Bot</button>
+                <button type="submit" class="button button-secondary">保存并验证 Bridge Provider</button>
               </form>
             </article>
           </div>
@@ -209,7 +209,7 @@
 
               <div class="inline-actions">
                 <button id="scan-button" class="button button-primary">执行默认扫描</button>
-                <button id="sync-im-guide" class="button button-secondary">同步到飞书引导</button>
+                <button id="sync-im-guide" class="button button-secondary">同步到 IM 引导</button>
               </div>
 
               <ul id="scan-results" class="scan-result-list"></ul>
@@ -218,7 +218,7 @@
             <article class="subpanel">
               <div class="subpanel-head">
                 <h4>手动添加摄像头</h4>
-                <span class="subpanel-note">用户从飞书也能触发同一套参数</span>
+                <span class="subpanel-note">用户从统一 IM 入口也能触发同一套参数</span>
               </div>
 
               <form id="manual-form" class="manual-form">
@@ -256,7 +256,7 @@
           <div class="panel-header">
             <div>
               <p class="eyebrow">03 / Default Policies</p>
-              <h3>后台配置的是默认策略，而不是代替飞书操作</h3>
+              <h3>后台配置的是默认策略，而不是代替 IM 操作</h3>
             </div>
             <span class="status-chip">用户扫码后可以直接继承这些默认值</span>
           </div>
@@ -314,7 +314,7 @@
             </article>
 
             <article class="stack-card">
-              <h4>AI 与飞书默认值</h4>
+              <h4>AI 与通知默认值</h4>
               <label>
                 默认分析动作
                 <select id="policy-ai">
@@ -323,23 +323,35 @@
                 </select>
               </label>
               <label>
-                默认飞书群组
-                <input id="policy-feishu-group" type="text" value="客厅安全群" />
+                默认通知频道
+                <input id="policy-notification-channel" type="text" value="客厅安全群" />
               </label>
             </article>
           </div>
 
           <div class="inline-actions">
             <button id="save-policies" class="button button-primary">保存默认策略</button>
-            <button id="test-im-command" class="button button-secondary">模拟飞书命令流</button>
+            <button id="test-im-command" class="button button-secondary">模拟 IM 命令流</button>
           </div>
+        </section>
+
+        <section class="panel access-panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">04 / Access Control</p>
+              <h3>家庭成员与角色入口</h3>
+            </div>
+            <button id="refresh-access-members" class="button button-secondary">刷新成员列表</button>
+          </div>
+
+          <ul id="access-member-list" class="scan-result-list"></ul>
         </section>
 
         <section class="device-grid">
           <article class="panel library-panel">
             <div class="panel-header">
               <div>
-                <p class="eyebrow">04 / Device Library</p>
+                <p class="eyebrow">05 / Device Library</p>
                 <h3>设备库与后台预览</h3>
               </div>
               <span class="status-chip">播放只是辅助，不是产品主首页</span>
@@ -359,7 +371,7 @@
                 <h4 id="active-camera-name">Living Room Cam</h4>
                 <p id="active-camera-meta">客厅 · 192.168.3.73 · RTSP / H.265 Main</p>
                 <p id="active-camera-hint" class="surface-hint">
-                  这里的定位是管理员预览与验证，不是用户主控制入口。真正的日常操作建议继续放在飞书。
+                  这里的定位是管理员预览与验证，不是用户主控制入口。真正的日常操作建议继续放在统一 IM 入口。
                 </p>
               </div>
               <div id="overlay-boxes" class="overlay-boxes"></div>
@@ -373,14 +385,14 @@
               <button id="snapshot-button" class="button button-secondary">后台抓拍验证</button>
               <button id="analyze-button" class="button button-primary">后台触发分析</button>
               <button id="record-button" class="button button-secondary">切换录像策略</button>
-              <button id="send-to-feishu" class="button button-ghost">把结果发到飞书</button>
+              <button id="share-link-button" class="button button-ghost">生成共享链接</button>
             </div>
           </article>
 
           <article class="panel detail-panel">
             <div class="panel-header">
               <div>
-                <p class="eyebrow">05 / Hub Details</p>
+                <p class="eyebrow">06 / Hub Details</p>
                 <h3>当前设备详情与绑定目标</h3>
               </div>
               <span id="device-badge" class="status-chip">在线</span>
@@ -404,8 +416,8 @@
                 <dd id="detail-stream">rtsp://admin:***@192.168.3.73:554/ch1/main</dd>
               </div>
               <div>
-                <dt>默认飞书去向</dt>
-                <dd id="detail-feishu">客厅安全群 / HarborNAS Bot</dd>
+                <dt>默认通知去向</dt>
+              <dd id="detail-notification">家庭通知频道 / Harbor IM Bridge</dd>
               </div>
             </dl>
 
@@ -413,7 +425,7 @@
               <h4>这个后台页应该负责</h4>
               <ul class="feature-list">
                 <li>绑定状态、默认值、设备接入、推送策略和错误排查。</li>
-                <li>让管理员确认摄像头是否可用，而不是替代飞书做日常操作。</li>
+                <li>让管理员确认摄像头是否可用，而不是替代统一 IM 做日常操作。</li>
                 <li>提供少量后台验证动作，例如抓拍、分析、发测试消息。</li>
               </ul>
             </div>
@@ -429,11 +441,55 @@
           </article>
         </section>
 
+        <section class="panel approval-panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">07 / Approval Queue</p>
+              <h3>待审批的高风险动作</h3>
+            </div>
+            <button id="refresh-approvals" class="button button-secondary">刷新审批队列</button>
+          </div>
+
+          <ul id="approval-list" class="scan-result-list"></ul>
+
+          <article id="task-outcome-card" class="stack-card muted-card task-outcome-card">
+            <div class="subpanel-head">
+              <h4>最近一次审批执行结果</h4>
+              <span id="task-outcome-status" class="status-chip">尚无结果</span>
+            </div>
+
+            <p id="task-outcome-message" class="scan-result-note">
+              批准或拒绝之后，这里会显示任务执行状态、审计引用和通知投递结果。
+            </p>
+
+            <dl class="detail-list compact-detail-list">
+              <div>
+                <dt>执行动作</dt>
+                <dd id="task-outcome-action">等待审批动作</dd>
+              </div>
+              <div>
+                <dt>任务 / 审计</dt>
+                <dd id="task-outcome-audit">尚未生成</dd>
+              </div>
+              <div>
+                <dt>通知投递</dt>
+                <dd id="task-outcome-notification">尚未触发</dd>
+              </div>
+              <div>
+                <dt>结果产物</dt>
+                <dd id="task-outcome-artifacts">尚无产物</dd>
+              </div>
+            </dl>
+
+            <ul id="task-outcome-events" class="feature-list compact-feature-list"></ul>
+          </article>
+        </section>
+
         <section class="bottom-grid">
           <article class="panel timeline-panel">
             <div class="panel-header">
               <div>
-                <p class="eyebrow">06 / Audit Feed</p>
+                <p class="eyebrow">08 / Audit Feed</p>
                 <h3>绑定、扫描、命令和 AI 的统一事件流</h3>
               </div>
               <button id="clear-events" class="button button-ghost">清空演示事件</button>
@@ -444,7 +500,7 @@
           <article class="panel im-panel">
             <div class="panel-header">
               <div>
-                <p class="eyebrow">07 / IM Story</p>
+                <p class="eyebrow">09 / IM Story</p>
                 <h3>对外演示时建议强调什么</h3>
               </div>
               <span class="status-chip">宣传重点</span>
@@ -453,9 +509,9 @@
             <div class="stack-card">
               <h4>推荐讲法</h4>
               <ul class="feature-list">
-                <li>先在飞书扫码，把用户和本地 Agent Hub 绑起来。</li>
+                <li>先在统一 IM 入口扫码，把用户和本地 Agent Hub 绑起来。</li>
                 <li>系统会按默认值自动扫描局域网里的摄像头。</li>
-                <li>用户主要通过飞书完成查看、抓拍、分析和通知。</li>
+                <li>用户主要通过统一 IM 完成查看、抓拍、分析和通知。</li>
                 <li>WebUI 只是管理员配置台、设备库和审计台。</li>
               </ul>
             </div>
@@ -464,7 +520,7 @@
               <h4>这版页面已经涵盖的能力</h4>
               <ul class="feature-list">
                 <li>二维码绑定入口</li>
-                <li>飞书命令样例</li>
+                <li>IM 命令样例</li>
                 <li>设备发现与手动添加</li>
                 <li>默认策略配置</li>
                 <li>后台预览与事件审计</li>

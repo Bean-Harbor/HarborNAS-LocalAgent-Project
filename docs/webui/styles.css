@@ -582,6 +582,93 @@ select:focus {
   gap: 10px;
 }
 
+.approval-panel {
+  overflow: hidden;
+}
+
+.access-panel {
+  overflow: hidden;
+}
+
+.task-outcome-card {
+  margin-top: 18px;
+}
+
+.approval-item {
+  align-items: start;
+}
+
+.member-item {
+  align-items: start;
+}
+
+.member-copy {
+  display: grid;
+  gap: 8px;
+}
+
+.member-pill-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.member-actions {
+  align-items: flex-start;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.member-role-select {
+  min-width: 132px;
+}
+
+.approval-copy {
+  display: grid;
+  gap: 8px;
+}
+
+.approval-pill-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.approval-submeta {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.approval-actions {
+  align-items: flex-start;
+  justify-content: flex-end;
+}
+
+.status-chip.approval-status-pending,
+.status-chip.approval-risk-medium {
+  color: var(--amber);
+  background: var(--amber-soft);
+}
+
+.status-chip.approval-status-approved {
+  color: var(--teal);
+  background: var(--teal-soft);
+}
+
+.status-chip.approval-status-rejected,
+.status-chip.approval-risk-high,
+.status-chip.approval-risk-critical {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.button-danger {
+  color: #fff8f6;
+  background: linear-gradient(135deg, #b94739, #8f3429);
+  box-shadow: 0 14px 26px rgba(185, 71, 57, 0.2);
+}
+
 .library-panel,
 .detail-panel {
   overflow: hidden;
@@ -777,6 +864,10 @@ select:focus {
   line-height: 1.55;
 }
 
+.compact-detail-list div {
+  background: rgba(255, 255, 255, 0.58);
+}
+
 .stack-card {
   display: grid;
   gap: 12px;
@@ -788,6 +879,17 @@ select:focus {
 
 .feature-list li {
   line-height: 1.6;
+}
+
+.compact-feature-list {
+  margin-top: 0;
+}
+
+.compact-feature-list li {
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.52);
+  border: 1px solid rgba(53, 64, 58, 0.06);
 }
 
 .event-list {
@@ -938,6 +1040,14 @@ select:focus {
   .policy-grid,
   .scan-toolbar {
     grid-template-columns: 1fr;
+  }
+
+  .approval-item {
+    grid-template-columns: 1fr;
+  }
+
+  .approval-actions {
+    justify-content: flex-start;
   }
 
   .surface-copy,

@@ -27,6 +27,29 @@ pub fn enforce(action: &Action, approval: Option<&ApprovalContext>) -> Result<()
     Ok(())
 }
 
+pub fn effective_risk_level(action: &Action) -> RiskLevel {
+    match action.risk_level {
+        RiskLevel::Low => default_risk_level(action),
+        other => other,
+    }
+}
+
+pub fn action_requires_approval(action: &Action) -> bool {
+    action.requires_approval
+        || matches!(
+            effective_risk_level(action),
+            RiskLevel::High | RiskLevel::Critical
+        )
+        || default_requires_approval(action)
+}
+
+pub fn apply_governance_defaults(mut action: Action) -> Action {
+    action.risk_level = effective_risk_level(&action);
+    action.normalize();
+    action.requires_approval = action_requires_approval(&action);
+    action
+}
+
 fn check_operation(action: &Action) -> Result<(), PolicyViolation> {
     match action.domain.as_str() {
         "service" => {
@@ -89,16 +112,17 @@ fn check_risk_gate(
     action: &Action,
     approval: Option<&ApprovalContext>,
 ) -> Result<(), PolicyViolation> {
-    if !matches!(action.risk_level, RiskLevel::High | RiskLevel::Critical) {
+    if !action_requires_approval(action) {
         return Ok(());
     }
+    let risk_level = effective_risk_level(action);
 
     let Some(ctx) = approval else {
         return Err(PolicyViolation {
             code: "APPROVAL_REQUIRED".to_string(),
             message: format!(
                 "{}.{} (risk={:?}) requires approval",
-                action.domain, action.operation, action.risk_level
+                action.domain, action.operation, risk_level
             ),
         });
     };
@@ -108,7 +132,7 @@ fn check_risk_gate(
             code: "APPROVAL_REQUIRED".to_string(),
             message: format!(
                 "{}.{} (risk={:?}) requires approval",
-                action.domain, action.operation, action.risk_level
+                action.domain, action.operation, risk_level
             ),
         });
     };
@@ -128,13 +152,54 @@ fn check_risk_gate(
     Ok(())
 }
 
+fn default_requires_approval(action: &Action) -> bool {
+    matches!(
+        (
+            action.domain.trim().to_lowercase().as_str(),
+            action.operation.trim().to_lowercase().as_str(),
+        ),
+        ("camera", "connect")
+    )
+}
+
+fn default_risk_level(action: &Action) -> RiskLevel {
+    match (
+        action.domain.trim().to_lowercase().as_str(),
+        action.operation.trim().to_lowercase().as_str(),
+    ) {
+        ("service", "status") => RiskLevel::Low,
+        ("service", "start") | ("service", "enable") => RiskLevel::Medium,
+        ("service", "stop") | ("service", "restart") => RiskLevel::High,
+        ("files", "search") => RiskLevel::Low,
+        ("files", "copy") => {
+            let overwrite = action
+                .args
+                .get("overwrite")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            if overwrite {
+                RiskLevel::High
+            } else {
+                RiskLevel::Medium
+            }
+        }
+        ("files", "move") => RiskLevel::High,
+        ("files", "archive") => RiskLevel::Medium,
+        ("camera", "connect") => RiskLevel::Medium,
+        _ => RiskLevel::Low,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use crate::orchestrator::contracts::{Action, RiskLevel};
 
-    use super::{enforce, ApprovalContext};
+    use super::{
+        action_requires_approval, apply_governance_defaults, effective_risk_level, enforce,
+        ApprovalContext,
+    };
 
     #[test]
     fn high_risk_requires_approval() {
@@ -157,5 +222,54 @@ mod tests {
             approver_id: Some("admin".to_string()),
         };
         assert!(enforce(&action, Some(&ctx)).is_ok());
+    }
+
+    #[test]
+    fn camera_connect_requires_approval_by_default() {
+        let action = Action {
+            domain: "camera".to_string(),
+            operation: "connect".to_string(),
+            resource: json!({"ip": "192.168.1.10"}),
+            args: json!({}),
+            risk_level: RiskLevel::Medium,
+            requires_approval: false,
+            dry_run: false,
+        };
+
+        assert!(action_requires_approval(&action));
+        let err = enforce(&action, None).unwrap_err();
+        assert_eq!(err.code, "APPROVAL_REQUIRED");
+    }
+
+    #[test]
+    fn service_restart_uses_default_high_risk() {
+        let action = Action {
+            domain: "service".to_string(),
+            operation: "restart".to_string(),
+            resource: json!({"service_name": "ssh"}),
+            args: json!({}),
+            risk_level: RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+
+        assert_eq!(effective_risk_level(&action), RiskLevel::High);
+        assert!(action_requires_approval(&action));
+    }
+
+    #[test]
+    fn governance_defaults_raise_file_move_to_high_risk() {
+        let action = apply_governance_defaults(Action {
+            domain: "files".to_string(),
+            operation: "move".to_string(),
+            resource: json!({"source": "/tmp/a", "target": "/tmp/b"}),
+            args: json!({}),
+            risk_level: RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        });
+
+        assert_eq!(action.risk_level, RiskLevel::High);
+        assert!(action.requires_approval);
     }
 }

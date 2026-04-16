@@ -29,9 +29,10 @@ pub enum DeviceKind {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceStatus {
+    #[default]
     Online,
     Offline,
     Degraded,
@@ -119,6 +120,62 @@ impl CameraDevice {
             ezviz_camera_no: None,
             capabilities: CameraCapabilities::default(),
             last_seen_at: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedCameraTarget {
+    pub device_id: String,
+    #[serde(alias = "name")]
+    pub display_name: String,
+    #[serde(default)]
+    pub status: DeviceStatus,
+    #[serde(default)]
+    #[serde(alias = "room")]
+    pub room_name: Option<String>,
+    #[serde(default)]
+    pub vendor: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub ip_address: Option<String>,
+    #[serde(default)]
+    pub mac_address: Option<String>,
+    #[serde(default)]
+    pub discovery_source: String,
+    pub primary_stream: CameraStreamRef,
+    #[serde(default)]
+    pub onvif_device_service_url: Option<String>,
+    #[serde(default)]
+    pub ezviz_device_serial: Option<String>,
+    #[serde(default)]
+    pub ezviz_camera_no: Option<u32>,
+    #[serde(default)]
+    pub capabilities: CameraCapabilities,
+    #[serde(default)]
+    pub last_seen_at: Option<String>,
+}
+
+impl From<ResolvedCameraTarget> for CameraDevice {
+    fn from(target: ResolvedCameraTarget) -> Self {
+        Self {
+            device_id: target.device_id,
+            name: target.display_name,
+            kind: DeviceKind::Camera,
+            status: target.status,
+            room: target.room_name,
+            vendor: target.vendor,
+            model: target.model,
+            ip_address: target.ip_address,
+            mac_address: target.mac_address,
+            discovery_source: target.discovery_source,
+            primary_stream: target.primary_stream,
+            onvif_device_service_url: target.onvif_device_service_url,
+            ezviz_device_serial: target.ezviz_device_serial,
+            ezviz_camera_no: target.ezviz_camera_no,
+            capabilities: target.capabilities,
+            last_seen_at: target.last_seen_at,
         }
     }
 }
@@ -238,6 +295,26 @@ impl DeviceRegistrySnapshot {
         self.to_camera_devices()
     }
 
+    pub fn camera_target(&self, device_id: &str) -> Option<ResolvedCameraTarget> {
+        self.devices
+            .iter()
+            .find(|device| {
+                device.device_id == device_id
+                    && matches!(
+                        device.kind,
+                        crate::control_plane::devices::DeviceKind::Camera
+                    )
+            })
+            .and_then(|device| self.resolved_camera_target(device))
+    }
+
+    pub fn camera_targets(&self) -> Vec<ResolvedCameraTarget> {
+        self.devices
+            .iter()
+            .filter_map(|device| self.resolved_camera_target(device))
+            .collect()
+    }
+
     pub fn upsert_camera_devices_preserving_platform_records(&mut self, devices: &[CameraDevice]) {
         let normalized_devices: Vec<CameraDevice> = devices
             .iter()
@@ -275,101 +352,101 @@ impl DeviceRegistrySnapshot {
     }
 
     pub fn to_camera_devices(&self) -> Vec<CameraDevice> {
-        self.devices
+        self.camera_targets().into_iter().map(Into::into).collect()
+    }
+
+    fn resolved_camera_target(&self, device: &ControlDeviceRecord) -> Option<ResolvedCameraTarget> {
+        if !matches!(
+            device.kind,
+            crate::control_plane::devices::DeviceKind::Camera
+        ) {
+            return None;
+        }
+
+        let camera_profile = self
+            .camera_profiles
             .iter()
-            .filter_map(|device| {
-                if !matches!(
-                    device.kind,
-                    crate::control_plane::devices::DeviceKind::Camera
-                ) {
-                    return None;
-                }
+            .find(|profile| profile.device_id == device.device_id);
+        let stream_profile = preferred_stream_profile(
+            &self.stream_profiles,
+            &device.device_id,
+            camera_profile.and_then(|profile| profile.default_stream_profile_id.as_deref()),
+        )?;
+        let endpoint = self
+            .device_endpoints
+            .iter()
+            .find(|item| item.endpoint_id == stream_profile.endpoint_id)?;
+        let twin = self
+            .device_twins
+            .iter()
+            .find(|item| item.device_id == device.device_id);
+        let binding_set: Vec<&ProviderBinding> = self
+            .provider_bindings
+            .iter()
+            .filter(|binding| binding.device_id == device.device_id)
+            .collect();
+        let capability_set: Vec<&CapabilityRecord> = self
+            .capabilities
+            .iter()
+            .filter(|capability| capability.device_id == device.device_id)
+            .collect();
+        let discovery_source = if device.source.trim().is_empty() {
+            infer_discovery_source(&binding_set)
+        } else {
+            device.source.clone()
+        };
 
-                let camera_profile = self
-                    .camera_profiles
-                    .iter()
-                    .find(|profile| profile.device_id == device.device_id);
-                let stream_profile = preferred_stream_profile(
-                    &self.stream_profiles,
-                    &device.device_id,
-                    camera_profile.and_then(|profile| profile.default_stream_profile_id.as_deref()),
-                )?;
-                let endpoint = self
-                    .device_endpoints
-                    .iter()
-                    .find(|item| item.endpoint_id == stream_profile.endpoint_id)?;
-                let twin = self
-                    .device_twins
-                    .iter()
-                    .find(|item| item.device_id == device.device_id);
-                let binding_set: Vec<&ProviderBinding> = self
-                    .provider_bindings
-                    .iter()
-                    .filter(|binding| binding.device_id == device.device_id)
-                    .collect();
-                let capability_set: Vec<&CapabilityRecord> = self
-                    .capabilities
-                    .iter()
-                    .filter(|capability| capability.device_id == device.device_id)
-                    .collect();
-
-                let mut camera = CameraDevice::new(
-                    device.device_id.clone(),
-                    device.display_name.clone(),
-                    stream_url_from_endpoint(endpoint),
-                );
-                camera.kind = control_device_kind_to_legacy(device.kind);
-                camera.status = twin
-                    .map(|item| connectivity_to_legacy_status(item.connectivity_state))
-                    .unwrap_or(DeviceStatus::Unknown);
-                camera.room = device.primary_room_id.clone();
-                camera.vendor = device.vendor.clone();
-                camera.model = device.model.clone();
-                camera.mac_address = device.mac_address.clone();
-                camera.discovery_source = device.source.clone();
-                camera.primary_stream.transport =
-                    control_stream_transport_to_legacy(stream_profile.transport);
-                camera.primary_stream.requires_auth = endpoint.requires_auth;
-                camera.ip_address = self
-                    .device_endpoints
-                    .iter()
-                    .find(|item| {
-                        item.device_id == device.device_id
-                            && matches!(item.endpoint_kind, DeviceEndpointKind::Ipv4)
-                    })
-                    .map(|item| item.host.clone());
-                camera.last_seen_at = twin.and_then(|item| item.last_seen_at.clone());
-                camera.capabilities = camera_capabilities_from_records(&capability_set);
-                camera.onvif_device_service_url = binding_set
-                    .iter()
-                    .find(|binding| binding.provider_key == "onvif")
-                    .and_then(|binding| {
-                        binding
-                            .metadata
-                            .get("device_service_url")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    });
-                camera.ezviz_device_serial = binding_set
-                    .iter()
-                    .find(|binding| binding.provider_key == "ezviz")
-                    .and_then(|binding| binding.remote_device_id.clone());
-                camera.ezviz_camera_no = binding_set
-                    .iter()
-                    .find(|binding| binding.provider_key == "ezviz")
-                    .and_then(|binding| {
-                        binding
-                            .metadata
-                            .get("camera_no")
-                            .and_then(Value::as_u64)
-                            .map(|value| value as u32)
-                    });
-                if camera.discovery_source.trim().is_empty() {
-                    camera.discovery_source = infer_discovery_source(&binding_set);
-                }
-                Some(camera)
-            })
-            .collect()
+        Some(ResolvedCameraTarget {
+            device_id: device.device_id.clone(),
+            display_name: device.display_name.clone(),
+            status: twin
+                .map(|item| connectivity_to_legacy_status(item.connectivity_state))
+                .unwrap_or(DeviceStatus::Unknown),
+            room_name: device.primary_room_id.clone(),
+            vendor: device.vendor.clone(),
+            model: device.model.clone(),
+            ip_address: self
+                .device_endpoints
+                .iter()
+                .find(|item| {
+                    item.device_id == device.device_id
+                        && matches!(item.endpoint_kind, DeviceEndpointKind::Ipv4)
+                })
+                .map(|item| item.host.clone()),
+            mac_address: device.mac_address.clone(),
+            discovery_source,
+            primary_stream: CameraStreamRef {
+                transport: control_stream_transport_to_legacy(stream_profile.transport),
+                url: stream_url_from_endpoint(endpoint),
+                requires_auth: endpoint.requires_auth,
+            },
+            onvif_device_service_url: binding_set
+                .iter()
+                .find(|binding| binding.provider_key == "onvif")
+                .and_then(|binding| {
+                    binding
+                        .metadata
+                        .get("device_service_url")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                }),
+            ezviz_device_serial: binding_set
+                .iter()
+                .find(|binding| binding.provider_key == "ezviz")
+                .and_then(|binding| binding.remote_device_id.clone()),
+            ezviz_camera_no: binding_set
+                .iter()
+                .find(|binding| binding.provider_key == "ezviz")
+                .and_then(|binding| {
+                    binding
+                        .metadata
+                        .get("camera_no")
+                        .and_then(Value::as_u64)
+                        .map(|value| value as u32)
+                }),
+            capabilities: camera_capabilities_from_records(&capability_set),
+            last_seen_at: twin.and_then(|item| item.last_seen_at.clone()),
+        })
     }
 
     fn find_matching_camera_device_id(&self, incoming: &CameraDevice) -> Option<String> {
@@ -668,6 +745,16 @@ impl DeviceRegistryStore {
         Ok(self.load_snapshot()?.into_camera_devices())
     }
 
+    pub fn load_camera_targets(&self) -> Result<Vec<ResolvedCameraTarget>, String> {
+        Ok(self.load_snapshot()?.camera_targets())
+    }
+
+    pub fn resolve_camera_target(&self, device_id: &str) -> Result<ResolvedCameraTarget, String> {
+        self.load_snapshot()?
+            .camera_target(device_id)
+            .ok_or_else(|| format!("device not found in registry: {device_id}"))
+    }
+
     pub fn save_devices(&self, devices: &[CameraDevice]) -> Result<(), String> {
         let mut snapshot = self.load_snapshot()?;
         if snapshot.schema_version == 0 {
@@ -755,19 +842,6 @@ fn legacy_device_kind_to_control(kind: DeviceKind) -> crate::control_plane::devi
         DeviceKind::Lock => crate::control_plane::devices::DeviceKind::Lock,
         DeviceKind::Gateway => crate::control_plane::devices::DeviceKind::Gateway,
         DeviceKind::Unknown => crate::control_plane::devices::DeviceKind::Unknown,
-    }
-}
-
-fn control_device_kind_to_legacy(kind: crate::control_plane::devices::DeviceKind) -> DeviceKind {
-    match kind {
-        crate::control_plane::devices::DeviceKind::Camera => DeviceKind::Camera,
-        crate::control_plane::devices::DeviceKind::Light => DeviceKind::Light,
-        crate::control_plane::devices::DeviceKind::Sensor => DeviceKind::Sensor,
-        crate::control_plane::devices::DeviceKind::Lock => DeviceKind::Lock,
-        crate::control_plane::devices::DeviceKind::Gateway => DeviceKind::Gateway,
-        crate::control_plane::devices::DeviceKind::Nas
-        | crate::control_plane::devices::DeviceKind::Service
-        | crate::control_plane::devices::DeviceKind::Unknown => DeviceKind::Unknown,
     }
 }
 
@@ -1096,7 +1170,8 @@ mod tests {
     };
 
     use super::{
-        CameraDevice, DeviceKind, DeviceRegistrySnapshot, DeviceRegistryStore, StreamTransport,
+        CameraDevice, DeviceKind, DeviceRegistrySnapshot, DeviceRegistryStore,
+        ResolvedCameraTarget, StreamTransport,
     };
 
     #[test]
@@ -1146,6 +1221,41 @@ mod tests {
         let round_tripped = snapshot.to_camera_devices();
 
         assert_eq!(round_tripped, vec![device]);
+    }
+
+    #[test]
+    fn snapshot_resolves_camera_target_from_platform_records() {
+        let mut device = CameraDevice::new("cam-1", "Front Door", "rtsp://192.168.1.10/live");
+        device.status = super::DeviceStatus::Online;
+        device.room = Some("entrance".to_string());
+        device.ip_address = Some("192.168.1.10".to_string());
+        device.discovery_source = "onvif".to_string();
+        device.capabilities.stream = true;
+        device.capabilities.snapshot = true;
+
+        let snapshot = DeviceRegistrySnapshot::from_camera_devices(std::slice::from_ref(&device));
+        let target = snapshot.camera_target("cam-1").expect("camera target");
+
+        assert_eq!(
+            target,
+            ResolvedCameraTarget {
+                device_id: "cam-1".to_string(),
+                display_name: "Front Door".to_string(),
+                status: super::DeviceStatus::Online,
+                room_name: Some("entrance".to_string()),
+                vendor: None,
+                model: None,
+                ip_address: Some("192.168.1.10".to_string()),
+                mac_address: None,
+                discovery_source: "onvif".to_string(),
+                primary_stream: device.primary_stream.clone(),
+                onvif_device_service_url: None,
+                ezviz_device_serial: None,
+                ezviz_camera_no: None,
+                capabilities: device.capabilities.clone(),
+                last_seen_at: None,
+            }
+        );
     }
 
     #[test]

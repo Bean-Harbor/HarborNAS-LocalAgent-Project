@@ -1,21 +1,42 @@
 //! Minimal Assistant Task API service for HarborBeacon integration.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::connectors::notifications::{
+    NotificationAttachment, NotificationAttachmentKind, NotificationBridgeConfig,
+    NotificationChannel, NotificationDeliveryService, NotificationPayloadFormat,
+    NotificationRecipient, NotificationRecipientIdType, NotificationRequest,
+};
+use crate::control_plane::approvals::{ApprovalStatus, ApprovalTicket};
+use crate::control_plane::events::{EventRecord, EventSeverity, EventSourceKind};
+use crate::control_plane::tasks::{
+    ArtifactKind, ArtifactRecord, ConversationSession, ExecutionRoute, TaskRun, TaskRunStatus,
+    TaskStepRun, TaskStepRunStatus,
+};
 use crate::domains::vision::OP_ANALYZE_CAMERA;
+use crate::orchestrator::approval::{ApprovalManager, AutonomyConfig, AutonomyLevel};
 use crate::orchestrator::contracts::{Action, RiskLevel, StepStatus};
 use crate::orchestrator::executors::vision::VisionExecutor;
+use crate::orchestrator::policy::{
+    action_requires_approval, apply_governance_defaults, effective_risk_level, enforce,
+    ApprovalContext,
+};
 use crate::orchestrator::router::Executor;
-use crate::runtime::admin_console::AdminConsoleStore;
+use crate::runtime::admin_console::{AdminConsoleState, AdminConsoleStore, IdentityBindingRecord};
 use crate::runtime::hub::{
     looks_like_auth_error, CameraConnectRequest, CameraHubService, HubScanRequest,
     HubScanResultItem,
 };
-use crate::runtime::registry::CameraDevice;
+use crate::runtime::media::SnapshotCaptureResult;
+use crate::runtime::registry::ResolvedCameraTarget;
+use crate::runtime::remote_view;
 use crate::runtime::task_session::{
-    PendingTaskCandidate, PendingTaskConnect, TaskConversationState, TaskConversationStore,
+    session_state_value_from_conversation, PendingTaskCandidate, PendingTaskConnect,
+    TaskConversationState, TaskConversationStore,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -42,10 +63,18 @@ pub struct TaskIntent {
     pub raw_text: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskAutonomy {
-    #[serde(default)]
+    #[serde(default = "default_task_autonomy_level")]
     pub level: String,
+}
+
+impl Default for TaskAutonomy {
+    fn default() -> Self {
+        Self {
+            level: default_task_autonomy_level(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -54,6 +83,8 @@ pub struct TaskRequest {
     pub task_id: String,
     #[serde(default)]
     pub trace_id: String,
+    #[serde(default)]
+    pub step_id: String,
     #[serde(default)]
     pub source: TaskSource,
     #[serde(default)]
@@ -66,7 +97,7 @@ pub struct TaskRequest {
     pub autonomy: TaskAutonomy,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Completed,
@@ -121,10 +152,39 @@ pub struct TaskResponse {
     pub resume_token: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TaskApprovalSummary {
+    pub approval_ticket: ApprovalTicket,
+    pub source_channel: String,
+    pub surface: String,
+    pub conversation_id: String,
+    pub user_id: String,
+    pub session_id: String,
+    pub domain: String,
+    pub action: String,
+    pub intent_text: String,
+    pub autonomy_level: String,
+    pub risk_level: RiskLevel,
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskApiService {
     admin_store: AdminConsoleStore,
     conversation_store: TaskConversationStore,
+}
+
+#[derive(Debug, Clone)]
+struct TaskRuntimeTracking {
+    session_id: String,
+    step_id: String,
+    started_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct NotificationDeliveryOutcome {
+    event_type: &'static str,
+    severity: EventSeverity,
+    payload: Value,
 }
 
 impl TaskApiService {
@@ -139,6 +199,88 @@ impl TaskApiService {
         &self.conversation_store
     }
 
+    pub fn pending_approvals(&self) -> Result<Vec<TaskApprovalSummary>, String> {
+        self.conversation_store
+            .pending_approvals()?
+            .into_iter()
+            .map(|approval| self.load_approval_summary(&approval))
+            .collect()
+    }
+
+    pub fn approve_pending_approval(
+        &self,
+        approval_id: &str,
+        approver_user_id: Option<String>,
+    ) -> Result<(TaskApprovalSummary, TaskResponse), String> {
+        let (approval, task_run, session) = self.load_approval_context(approval_id)?;
+        if approval.status != ApprovalStatus::Pending {
+            return Err(format!("approval is not pending: {}", approval.approval_id));
+        }
+
+        let request = self.build_approval_resume_request(
+            &approval,
+            &task_run,
+            session.as_ref(),
+            approver_user_id.clone(),
+        );
+        let response = self.handle_task(request);
+
+        let updated_approval = self
+            .conversation_store
+            .load_approval(approval_id)?
+            .unwrap_or(approval.clone());
+        self.record_approval_decision_event(
+            &updated_approval,
+            &task_run,
+            session.as_ref(),
+            "task.approval_approved",
+            EventSeverity::Info,
+            approver_user_id,
+        )?;
+        Ok((self.load_approval_summary(&updated_approval)?, response))
+    }
+
+    pub fn reject_pending_approval(
+        &self,
+        approval_id: &str,
+        approver_user_id: Option<String>,
+    ) -> Result<TaskApprovalSummary, String> {
+        let (approval, mut task_run, session) = self.load_approval_context(approval_id)?;
+        if approval.status != ApprovalStatus::Pending {
+            return Err(format!("approval is not pending: {}", approval.approval_id));
+        }
+
+        let decided_at = Some(current_timestamp());
+        let updated_approval = self
+            .conversation_store
+            .update_approval_status(
+                approval_id,
+                ApprovalStatus::Rejected,
+                approver_user_id.clone(),
+                decided_at.clone(),
+            )?
+            .ok_or_else(|| format!("approval not found: {approval_id}"))?;
+
+        task_run.status = TaskRunStatus::Failed;
+        task_run.completed_at = decided_at;
+        self.conversation_store.save_task_run(&task_run)?;
+
+        if let Some(mut session) = session.clone() {
+            session.resume_token = None;
+            self.conversation_store.save_session(&session)?;
+        }
+
+        self.record_approval_decision_event(
+            &updated_approval,
+            &task_run,
+            session.as_ref(),
+            "task.approval_rejected",
+            EventSeverity::Warning,
+            approver_user_id,
+        )?;
+        Ok(self.load_approval_summary(&updated_approval)?)
+    }
+
     pub fn handle_task(&self, mut request: TaskRequest) -> TaskResponse {
         if request.task_id.trim().is_empty() {
             request.task_id = new_task_id();
@@ -146,8 +288,9 @@ impl TaskApiService {
         if request.trace_id.trim().is_empty() {
             request.trace_id = request.task_id.clone();
         }
+        let tracking = self.begin_task_tracking(&request);
 
-        match (
+        let mut response = match (
             request.intent.domain.trim().to_lowercase(),
             request.intent.action.trim().to_lowercase(),
         ) {
@@ -156,6 +299,12 @@ impl TaskApiService {
             }
             (domain, action) if domain == "camera" && action == "connect" => {
                 self.handle_camera_connect(&request)
+            }
+            (domain, action) if domain == "camera" && action == "snapshot" => {
+                self.handle_camera_snapshot(&request)
+            }
+            (domain, action) if domain == "camera" && action == "share_link" => {
+                self.handle_camera_share_link(&request)
             }
             (domain, action) if domain == "camera" && action == "analyze" => {
                 self.handle_camera_analyze(&request)
@@ -166,7 +315,10 @@ impl TaskApiService {
                 RiskLevel::Low,
                 format!("unsupported task action: {domain}.{action}"),
             ),
-        }
+        };
+        self.append_task_lifecycle_event(&request, &tracking, &mut response);
+        let _ = self.finish_task_tracking(&request, &response, &tracking);
+        response
     }
 
     fn handle_camera_scan(&self, request: &TaskRequest) -> TaskResponse {
@@ -175,16 +327,32 @@ impl TaskApiService {
             cidr: string_at_paths(&request.args, &["/cidr"]),
             protocol: protocol_string(&request.args),
         };
+        let action = apply_governance_defaults(Action {
+            domain: "camera".to_string(),
+            operation: "scan".to_string(),
+            resource: json!({
+                "workspace_id": workspace_id_for_request(request),
+            }),
+            args: json!({
+                "cidr": scan_request.cidr.clone(),
+                "protocol": scan_request.protocol.clone(),
+            }),
+            risk_level: RiskLevel::Low,
+            requires_approval: request_requires_approval(request),
+            dry_run: false,
+        });
+        if let Err(response) = self.ensure_action_allowed(request, &action, "camera_hub_service") {
+            return response;
+        }
 
         match hub.scan(scan_request, None) {
             Ok(summary) => {
                 let pending_candidates = pending_candidates_from_results(&summary.results);
-                if let Some(mut conversation) = self.load_conversation(request) {
-                    conversation.pending_candidates = pending_candidates.clone();
-                    conversation.pending_connect = None;
-                    conversation.last_scan_cidr = summary.defaults.cidr.clone();
-                    let _ = self.conversation_store.save(&conversation);
-                }
+                let mut conversation = self.load_or_create_conversation(request);
+                conversation.pending_candidates = pending_candidates.clone();
+                conversation.pending_connect = None;
+                conversation.last_scan_cidr = summary.defaults.cidr.clone();
+                let _ = self.save_conversation(request, &conversation);
 
                 let message = format_scan_message(
                     &summary.defaults.cidr,
@@ -219,6 +387,24 @@ impl TaskApiService {
     }
 
     fn handle_camera_connect(&self, request: &TaskRequest) -> TaskResponse {
+        let action = apply_governance_defaults(Action {
+            domain: "camera".to_string(),
+            operation: "connect".to_string(),
+            resource: json!({
+                "candidate_index": usize_at_paths(&request.entity_refs, &["/candidate_index"])
+                    .or_else(|| usize_at_paths(&request.args, &["/candidate_index"])),
+                "ip": first_string(&[&request.entity_refs, &request.args], &["/ip"]),
+                "resume_token": string_at_paths(&request.args, &["/resume_token"]),
+            }),
+            args: request.args.clone(),
+            risk_level: RiskLevel::Low,
+            requires_approval: request_requires_approval(request),
+            dry_run: false,
+        });
+        if let Err(response) = self.ensure_action_allowed(request, &action, "camera_hub_service") {
+            return response;
+        }
+
         if let Some(resume_token) = string_at_paths(&request.args, &["/resume_token"]) {
             return self.resume_camera_connect(request, &resume_token);
         }
@@ -234,14 +420,15 @@ impl TaskApiService {
     }
 
     fn connect_camera_candidate(&self, request: &TaskRequest, index: usize) -> TaskResponse {
-        let Some(mut conversation) = self.load_conversation(request) else {
+        let mut conversation = self.load_or_create_conversation(request);
+        if conversation.pending_candidates.is_empty() {
             return self.failed(
                 request,
                 "camera_hub_service",
                 RiskLevel::Medium,
                 "当前没有可继续的候选设备列表，请先发送“扫描摄像头”。".to_string(),
             );
-        };
+        }
 
         if index == 0 || index > conversation.pending_candidates.len() {
             return self.failed(
@@ -260,7 +447,7 @@ impl TaskApiService {
                 conversation
                     .pending_candidates
                     .retain(|item| item.candidate_id != candidate.candidate_id);
-                let _ = self.conversation_store.save(&conversation);
+                let _ = self.save_conversation(request, &conversation);
                 self.completed(
                     request,
                     "camera_hub_service",
@@ -285,13 +472,14 @@ impl TaskApiService {
                     resume_token: resume_token.clone(),
                     name: candidate.name.clone(),
                     ip: candidate.ip.clone(),
+                    room: candidate.room.clone(),
                     port: candidate.port,
                     rtsp_paths: candidate.rtsp_paths.clone(),
                     requires_auth: true,
                     vendor: candidate.vendor.clone(),
                     model: candidate.model.clone(),
                 });
-                let _ = self.conversation_store.save(&conversation);
+                let _ = self.save_conversation(request, &conversation);
                 self.needs_input(
                     request,
                     "camera_hub_service",
@@ -320,6 +508,7 @@ impl TaskApiService {
             name: first_string(&[&request.entity_refs, &request.args], &["/name"])
                 .unwrap_or_else(|| format!("Camera {ip}")),
             ip: ip.clone(),
+            room: first_string(&[&request.entity_refs, &request.args], &["/room"]),
             port: first_u16(&[&request.entity_refs, &request.args], &["/port"]).unwrap_or(554),
             rtsp_paths: first_string_vec(
                 &[&request.entity_refs, &request.args],
@@ -350,21 +539,12 @@ impl TaskApiService {
                 vec!["分析客厅摄像头".to_string()],
             ),
             Err(error) if looks_like_auth_error(&error) => {
-                let Some(mut conversation) = self.load_conversation(request) else {
-                    return self.needs_input(
-                        request,
-                        "camera_hub_service",
-                        RiskLevel::Medium,
-                        "这台摄像头需要密码，请回复：密码 xxxxxx".to_string(),
-                        vec!["password".to_string()],
-                        ensure_resume_token(),
-                    );
-                };
+                let mut conversation = self.load_or_create_conversation(request);
                 let resume_token = ensure_resume_token();
                 let mut pending_with_token = pending.clone();
                 pending_with_token.resume_token = resume_token.clone();
                 conversation.pending_connect = Some(pending_with_token);
-                let _ = self.conversation_store.save(&conversation);
+                let _ = self.save_conversation(request, &conversation);
                 self.needs_input(
                     request,
                     "camera_hub_service",
@@ -387,14 +567,15 @@ impl TaskApiService {
                 "缺少 password，无法继续接入流程。".to_string(),
             );
         };
-        let Some(mut conversation) = self.load_conversation(request) else {
+        let mut conversation = self.load_or_create_conversation(request);
+        if conversation.pending_connect.is_none() {
             return self.failed(
                 request,
                 "camera_hub_service",
                 RiskLevel::Medium,
                 "接入流程已过期，请重新发送“扫描摄像头”。".to_string(),
             );
-        };
+        }
         let Some(pending) = conversation.pending_connect.clone() else {
             return self.failed(
                 request,
@@ -421,7 +602,7 @@ impl TaskApiService {
                 conversation
                     .pending_candidates
                     .retain(|candidate| candidate.ip != pending.ip);
-                let _ = self.conversation_store.save(&conversation);
+                let _ = self.save_conversation(request, &conversation);
                 self.completed(
                     request,
                     "camera_hub_service",
@@ -452,8 +633,8 @@ impl TaskApiService {
     }
 
     fn handle_camera_analyze(&self, request: &TaskRequest) -> TaskResponse {
-        let device = match self.resolve_camera_device(request) {
-            Ok(device) => device,
+        let target = match self.resolve_camera_target(request) {
+            Ok(target) => target,
             Err(error) => {
                 return self.failed(request, "vision_executor", RiskLevel::Low, error);
             }
@@ -468,34 +649,78 @@ impl TaskApiService {
             .unwrap_or(0.25);
         let prompt = first_string(&[&request.args], &["/prompt"]);
 
-        let action = Action {
+        let action = apply_governance_defaults(Action {
             domain: "vision".to_string(),
             operation: OP_ANALYZE_CAMERA.to_string(),
-            resource: json!({ "device_id": device.device_id }),
+            resource: json!({ "device_id": target.device_id }),
             args: json!({
                 "detect_label": detect_label,
                 "min_confidence": min_confidence,
                 "prompt": prompt,
             }),
             risk_level: RiskLevel::Low,
-            requires_approval: false,
+            requires_approval: request_requires_approval(request),
             dry_run: false,
-        };
+        });
+        if let Err(response) = self.ensure_action_allowed(request, &action, "vision_executor") {
+            return response;
+        }
 
         let vision = VisionExecutor::new(self.admin_store.registry_store().clone());
-        match vision.execute(&action, &request.task_id, "s1") {
+        match vision.execute(&action, &request.task_id, &step_id_for_request(request)) {
             Ok(result) if result.status == StepStatus::Success => {
                 let summary =
                     string_at_paths(&result.result_payload, &["/summary", "/detection_summary"])
                         .unwrap_or_else(|| "分析完成".to_string());
                 let artifacts = build_vision_artifacts(&result.result_payload);
-                self.completed(
+                let mut payload = result.result_payload;
+                let notification_request =
+                    self.build_notification_request(request, &target, &payload, &artifacts);
+                let mut events = Vec::new();
+                if let Some(notification_request) = notification_request {
+                    let encoded =
+                        serde_json::to_value(&notification_request).unwrap_or(Value::Null);
+                    if let Some(object) = payload.as_object_mut() {
+                        object.insert("notification_request".to_string(), encoded.clone());
+                    }
+                    events.push(self.serialize_event_record(&build_task_event_record(
+                        request,
+                        &step_id_for_request(request),
+                        "task.notification_requested",
+                        EventSeverity::Info,
+                        json!({
+                            "executor_used": "vision_executor",
+                            "notification": encoded,
+                        }),
+                    )));
+                    let delivery_outcome =
+                        self.deliver_notification_request(request, &notification_request);
+                    if let Some(object) = payload.as_object_mut() {
+                        object.insert(
+                            "notification_delivery".to_string(),
+                            delivery_outcome.payload.clone(),
+                        );
+                    }
+                    events.push(self.serialize_event_record(&build_task_event_record(
+                        request,
+                        &step_id_for_request(request),
+                        delivery_outcome.event_type,
+                        delivery_outcome.severity,
+                        json!({
+                            "executor_used": "vision_executor",
+                            "notification_request": notification_request,
+                            "delivery": delivery_outcome.payload,
+                        }),
+                    )));
+                }
+                self.completed_with_context(
                     request,
                     "vision_executor",
                     RiskLevel::Low,
-                    format!("{} 分析完成：{}", device.name, summary),
-                    result.result_payload,
+                    format!("{} 分析完成：{}", target.display_name, summary),
+                    payload,
                     artifacts,
+                    events,
                     Vec::new(),
                 )
             }
@@ -511,17 +736,116 @@ impl TaskApiService {
         }
     }
 
-    fn resolve_camera_device(&self, request: &TaskRequest) -> Result<CameraDevice, String> {
-        let devices = self.hub().load_registered_cameras()?;
-        if devices.is_empty() {
+    fn handle_camera_snapshot(&self, request: &TaskRequest) -> TaskResponse {
+        let target = match self.resolve_camera_target(request) {
+            Ok(target) => target,
+            Err(error) => {
+                return self.failed(request, "camera_hub_service", RiskLevel::Low, error);
+            }
+        };
+
+        let action = apply_governance_defaults(Action {
+            domain: "camera".to_string(),
+            operation: "snapshot".to_string(),
+            resource: json!({ "device_id": target.device_id.clone() }),
+            args: json!({ "device_id": target.device_id.clone() }),
+            risk_level: RiskLevel::Low,
+            requires_approval: request_requires_approval(request),
+            dry_run: false,
+        });
+        if let Err(response) = self.ensure_action_allowed(request, &action, "camera_hub_service") {
+            return response;
+        }
+
+        match self.hub().capture_camera_snapshot_result(&target.device_id) {
+            Ok(snapshot) => self.completed(
+                request,
+                "camera_hub_service",
+                RiskLevel::Low,
+                format!("已抓拍 {} 当前画面。", target.display_name),
+                build_snapshot_payload(&target, &snapshot),
+                vec![build_snapshot_artifact(&snapshot)],
+                vec![format!("分析 {}", target.display_name)],
+            ),
+            Err(error) => self.failed(request, "camera_hub_service", RiskLevel::Low, error),
+        }
+    }
+
+    fn handle_camera_share_link(&self, request: &TaskRequest) -> TaskResponse {
+        let target = match self.resolve_camera_target(request) {
+            Ok(target) => target,
+            Err(error) => {
+                return self.failed(request, "camera_hub_service", RiskLevel::Medium, error);
+            }
+        };
+
+        let action = apply_governance_defaults(Action {
+            domain: "camera".to_string(),
+            operation: "share_link".to_string(),
+            resource: json!({ "device_id": target.device_id.clone() }),
+            args: json!({ "device_id": target.device_id.clone() }),
+            risk_level: RiskLevel::Medium,
+            requires_approval: request_requires_approval(request),
+            dry_run: false,
+        });
+        if let Err(response) = self.ensure_action_allowed(request, &action, "camera_hub_service") {
+            return response;
+        }
+
+        let admin_state = match self.admin_store.load_or_create_state() {
+            Ok(state) => state,
+            Err(error) => {
+                return self.failed(request, "camera_hub_service", RiskLevel::Medium, error);
+            }
+        };
+        let issued = match remote_view::issue_camera_share_token(
+            &admin_state.remote_view.share_secret,
+            &target.device_id,
+            admin_state.remote_view.share_link_ttl_minutes,
+        ) {
+            Ok(issued) => issued,
+            Err(error) => {
+                return self.failed(request, "camera_hub_service", RiskLevel::Medium, error);
+            }
+        };
+
+        let share_link = build_share_link_payload(&target, &issued);
+        let event = self.serialize_event_record(&build_task_event_record(
+            request,
+            &step_id_for_request(request),
+            "task.share_link_issued",
+            EventSeverity::Info,
+            share_link.clone(),
+        ));
+        self.completed_with_context(
+            request,
+            "camera_hub_service",
+            RiskLevel::Medium,
+            format!(
+                "已为 {} 生成 {} 分钟共享观看链接。",
+                target.display_name, issued.ttl_minutes
+            ),
+            json!({
+                "camera_target": target,
+                "share_link": share_link,
+            }),
+            vec![build_share_link_artifact(&share_link)],
+            vec![event],
+            vec!["打开共享观看页".to_string()],
+        )
+    }
+
+    fn resolve_camera_target(&self, request: &TaskRequest) -> Result<ResolvedCameraTarget, String> {
+        let targets = self.admin_store.registry_store().load_camera_targets()?;
+        if targets.is_empty() {
             return Err("当前还没有已注册的摄像头，请先完成接入。".to_string());
         }
 
         if let Some(device_id) =
             first_string(&[&request.entity_refs, &request.args], &["/device_id"])
         {
-            if let Some(device) = devices.iter().find(|device| device.device_id == device_id) {
-                return Ok(device.clone());
+            if let Some(target) = targets.iter().find(|target| target.device_id == device_id) {
+                return Ok(target.clone());
             }
         }
 
@@ -535,23 +859,23 @@ impl TaskApiService {
         .unwrap_or_default();
         let normalized = normalize_command_text(&hint);
 
-        for device in &devices {
-            let name = device.name.as_str();
-            let room = device.room.as_deref().unwrap_or_default();
+        for target in &targets {
+            let name = target.display_name.as_str();
+            let room = target.room_name.as_deref().unwrap_or_default();
             if !name.is_empty() && normalized.contains(&name.replace(' ', "").to_lowercase()) {
-                return Ok(device.clone());
+                return Ok(target.clone());
             }
             if !room.is_empty() && normalized.contains(&room.replace(' ', "").to_lowercase()) {
-                return Ok(device.clone());
+                return Ok(target.clone());
             }
             for alias in room_aliases(name, room) {
                 if normalized.contains(alias) {
-                    return Ok(device.clone());
+                    return Ok(target.clone());
                 }
             }
         }
 
-        devices
+        targets
             .first()
             .cloned()
             .ok_or_else(|| "未找到可分析的摄像头设备。".to_string())
@@ -567,6 +891,29 @@ impl TaskApiService {
         artifacts: Vec<TaskArtifact>,
         next_actions: Vec<String>,
     ) -> TaskResponse {
+        self.completed_with_context(
+            request,
+            executor_used,
+            risk_level,
+            message,
+            data,
+            artifacts,
+            Vec::new(),
+            next_actions,
+        )
+    }
+
+    fn completed_with_context(
+        &self,
+        request: &TaskRequest,
+        executor_used: &str,
+        risk_level: RiskLevel,
+        message: String,
+        data: Value,
+        artifacts: Vec<TaskArtifact>,
+        events: Vec<Value>,
+        next_actions: Vec<String>,
+    ) -> TaskResponse {
         TaskResponse {
             task_id: request.task_id.clone(),
             trace_id: request.trace_id.clone(),
@@ -577,7 +924,7 @@ impl TaskApiService {
                 message,
                 data,
                 artifacts,
-                events: Vec::new(),
+                events,
                 next_actions,
             },
             audit_ref: new_audit_ref(),
@@ -596,6 +943,31 @@ impl TaskApiService {
         missing_fields: Vec<String>,
         resume_token: String,
     ) -> TaskResponse {
+        self.needs_input_with_context(
+            request,
+            executor_used,
+            risk_level,
+            prompt,
+            missing_fields,
+            resume_token,
+            Value::Null,
+            Vec::new(),
+            vec!["密码 xxxxxx".to_string()],
+        )
+    }
+
+    fn needs_input_with_context(
+        &self,
+        request: &TaskRequest,
+        executor_used: &str,
+        risk_level: RiskLevel,
+        prompt: String,
+        missing_fields: Vec<String>,
+        resume_token: String,
+        data: Value,
+        events: Vec<Value>,
+        next_actions: Vec<String>,
+    ) -> TaskResponse {
         TaskResponse {
             task_id: request.task_id.clone(),
             trace_id: request.trace_id.clone(),
@@ -604,10 +976,10 @@ impl TaskApiService {
             risk_level,
             result: TaskResultEnvelope {
                 message: prompt.clone(),
-                data: Value::Null,
+                data,
                 artifacts: Vec::new(),
-                events: Vec::new(),
-                next_actions: vec!["密码 xxxxxx".to_string()],
+                events,
+                next_actions,
             },
             audit_ref: new_audit_ref(),
             missing_fields,
@@ -623,6 +995,25 @@ impl TaskApiService {
         risk_level: RiskLevel,
         message: String,
     ) -> TaskResponse {
+        self.failed_with_context(
+            request,
+            executor_used,
+            risk_level,
+            message,
+            Value::Null,
+            Vec::new(),
+        )
+    }
+
+    fn failed_with_context(
+        &self,
+        request: &TaskRequest,
+        executor_used: &str,
+        risk_level: RiskLevel,
+        message: String,
+        data: Value,
+        events: Vec<Value>,
+    ) -> TaskResponse {
         TaskResponse {
             task_id: request.task_id.clone(),
             trace_id: request.trace_id.clone(),
@@ -631,9 +1022,9 @@ impl TaskApiService {
             risk_level,
             result: TaskResultEnvelope {
                 message,
-                data: Value::Null,
+                data,
                 artifacts: Vec::new(),
-                events: Vec::new(),
+                events,
                 next_actions: Vec::new(),
             },
             audit_ref: new_audit_ref(),
@@ -643,13 +1034,715 @@ impl TaskApiService {
         }
     }
 
+    fn ensure_action_allowed(
+        &self,
+        request: &TaskRequest,
+        action: &Action,
+        executor_used: &str,
+    ) -> Result<(), TaskResponse> {
+        let autonomy_level = effective_autonomy_level(request);
+        let approval_manager = approval_manager_for_level(autonomy_level);
+        if !approval_manager.risk_allowed(effective_risk_level(action)) {
+            let event = self.serialize_event_record(&build_task_event_record(
+                request,
+                &step_id_for_request(request),
+                "task.autonomy_blocked",
+                EventSeverity::Warning,
+                json!({
+                    "executor_used": executor_used,
+                    "autonomy_level": autonomy_level_label(autonomy_level),
+                    "policy_ref": format!("{}.{}", action.domain, action.operation),
+                    "risk_level": serde_json::to_value(effective_risk_level(action)).unwrap_or(Value::Null),
+                }),
+            ));
+            return Err(self.failed_with_context(
+                request,
+                executor_used,
+                effective_risk_level(action),
+                format!(
+                    "当前任务处于 {} 模式，无法执行需要写入或变更的操作。",
+                    autonomy_level_label(autonomy_level)
+                ),
+                json!({
+                    "error": "AUTONOMY_BLOCKED",
+                    "autonomy_level": autonomy_level_label(autonomy_level),
+                    "policy_ref": format!("{}.{}", action.domain, action.operation),
+                }),
+                vec![event],
+            ));
+        }
+
+        let approval_tickets = self
+            .conversation_store
+            .approvals_for_task(&request.task_id)
+            .unwrap_or_default();
+        let pending_approval = approval_tickets
+            .iter()
+            .find(|approval| approval.status == ApprovalStatus::Pending)
+            .cloned();
+        let approval_context = approval_context_for_request(request, pending_approval.as_ref());
+        let approval_context_ref = approval_context.as_ref();
+
+        if let Err(violation) = enforce(action, approval_context_ref) {
+            let approval_id = pending_approval
+                .as_ref()
+                .map(|approval| approval.approval_id.clone())
+                .unwrap_or_else(new_approval_id);
+            let ticket = ApprovalTicket {
+                approval_id: approval_id.clone(),
+                task_id: request.task_id.clone(),
+                policy_ref: format!("{}.{}", action.domain, action.operation),
+                requester_user_id: request.source.user_id.clone(),
+                approver_user_id: None,
+                status: ApprovalStatus::Pending,
+                reason: violation.message.clone(),
+                requested_at: Some(current_timestamp()),
+                decided_at: None,
+            };
+            let _ = self.conversation_store.save_approval(&ticket);
+            let policy_ref = format!("{}.{}", action.domain, action.operation);
+            let event = self.serialize_event_record(&build_task_event_record(
+                request,
+                &step_id_for_request(request),
+                "task.approval_required",
+                EventSeverity::Warning,
+                json!({
+                    "executor_used": executor_used,
+                    "policy_violation": {
+                        "code": violation.code.clone(),
+                        "message": violation.message.clone(),
+                    },
+                    "approval_ticket": ticket.clone(),
+                }),
+            ));
+            return Err(self.needs_input_with_context(
+                request,
+                executor_used,
+                action.risk_level,
+                "这个操作需要审批，请带 approval_token 重新提交。".to_string(),
+                vec!["approval_token".to_string()],
+                approval_id.clone(),
+                json!({
+                    "approval_ticket": ticket,
+                    "policy_ref": policy_ref,
+                }),
+                vec![event],
+                vec![format!("approval_token {approval_id}")],
+            ));
+        }
+
+        if (action_requires_approval(action) || pending_approval.is_some())
+            && request_approval_token(request).is_some()
+        {
+            let _ = self.conversation_store.resolve_pending_approvals(
+                &request.task_id,
+                request_approver_id(request),
+                Some(current_timestamp()),
+            );
+        }
+
+        Ok(())
+    }
+
+    fn append_task_lifecycle_event(
+        &self,
+        request: &TaskRequest,
+        tracking: &TaskRuntimeTracking,
+        response: &mut TaskResponse,
+    ) {
+        let (event_type, severity) = match response.status {
+            TaskStatus::Completed => ("task.completed", EventSeverity::Info),
+            TaskStatus::NeedsInput => ("task.needs_input", EventSeverity::Warning),
+            TaskStatus::Failed => ("task.failed", EventSeverity::Error),
+        };
+        response
+            .result
+            .events
+            .push(self.serialize_event_record(&build_task_event_record(
+                request,
+                &tracking.step_id,
+                event_type,
+                severity,
+                json!({
+                    "executor_used": response.executor_used.clone(),
+                    "risk_level": serde_json::to_value(response.risk_level).unwrap_or(Value::Null),
+                    "message": response.result.message.clone(),
+                    "missing_fields": response.missing_fields.clone(),
+                    "resume_token": response.resume_token.clone(),
+                    "audit_ref": response.audit_ref.clone(),
+                }),
+            )));
+    }
+
+    fn build_notification_request(
+        &self,
+        request: &TaskRequest,
+        target: &ResolvedCameraTarget,
+        payload: &Value,
+        artifacts: &[TaskArtifact],
+    ) -> Option<NotificationRequest> {
+        let admin_state = self.admin_store.load_state().ok()?;
+        let destination = first_string(
+            &[&request.args],
+            &["/notification/destination", "/notification_channel"],
+        )
+        .unwrap_or_else(|| admin_state.defaults.notification_channel.clone());
+        if destination.trim().is_empty() {
+            return None;
+        }
+
+        let channel = notification_channel_from_value(
+            payload
+                .pointer("/notification_channel")
+                .and_then(Value::as_str)
+                .unwrap_or("im_bridge"),
+        )?;
+        let payload_format = notification_payload_format_from_value(
+            payload
+                .pointer("/notification_format")
+                .and_then(Value::as_str)
+                .unwrap_or("plain_text"),
+        );
+        let title = format!("{} AI 分析", target.display_name);
+        let body = string_at_paths(payload, &["/summary", "/detection_summary"])
+            .unwrap_or_else(|| format!("{} 分析完成", target.display_name));
+
+        Some(NotificationRequest {
+            channel,
+            destination,
+            title,
+            body,
+            payload_format,
+            structured_payload: payload
+                .pointer("/notification_card")
+                .cloned()
+                .unwrap_or(Value::Null),
+            attachments: artifacts
+                .iter()
+                .filter_map(task_artifact_to_notification_attachment)
+                .collect(),
+            correlation_id: Some(request.trace_id.clone()),
+        })
+    }
+
+    fn deliver_notification_request(
+        &self,
+        request: &TaskRequest,
+        notification_request: &NotificationRequest,
+    ) -> NotificationDeliveryOutcome {
+        let service = match NotificationDeliveryService::new() {
+            Ok(service) => service,
+            Err(error) => {
+                return NotificationDeliveryOutcome {
+                    event_type: "task.notification_failed",
+                    severity: EventSeverity::Error,
+                    payload: json!({
+                        "status": "failed",
+                        "error": error,
+                    }),
+                };
+            }
+        };
+        let admin_state = match self.admin_store.load_state() {
+            Ok(state) => state,
+            Err(error) => {
+                return NotificationDeliveryOutcome {
+                    event_type: "task.notification_failed",
+                    severity: EventSeverity::Error,
+                    payload: json!({
+                        "status": "failed",
+                        "error": error,
+                    }),
+                };
+            }
+        };
+
+        let bridge_provider = bridge_provider_config_from_state(&admin_state);
+        let recipient = resolve_notification_recipient(
+            notification_request,
+            &admin_state,
+            request.source.user_id.as_str(),
+        );
+        match service.deliver(
+            notification_request,
+            bridge_provider.as_ref(),
+            recipient.as_ref(),
+        ) {
+            Ok(record) => NotificationDeliveryOutcome {
+                event_type: "task.notification_delivered",
+                severity: EventSeverity::Info,
+                payload: serde_json::to_value(record).unwrap_or(Value::Null),
+            },
+            Err(error) => NotificationDeliveryOutcome {
+                event_type: "task.notification_failed",
+                severity: EventSeverity::Warning,
+                payload: json!({
+                    "status": "failed",
+                    "channel": notification_request.channel,
+                    "destination": notification_request.destination,
+                    "recipient": recipient,
+                    "error": error,
+                }),
+            },
+        }
+    }
+
+    fn serialize_event_record(&self, event: &EventRecord) -> Value {
+        serde_json::to_value(event).unwrap_or(Value::Null)
+    }
+
+    fn begin_task_tracking(&self, request: &TaskRequest) -> TaskRuntimeTracking {
+        let started_at = current_timestamp();
+        let tracking = TaskRuntimeTracking {
+            session_id: session_id_for_request(request),
+            step_id: step_id_for_request(request),
+            started_at: started_at.clone(),
+        };
+        let session = self.build_session_record(request, &tracking, None);
+        let _ = self.conversation_store.save_session(&session);
+
+        let mut task_run = self
+            .conversation_store
+            .load_task_run(&request.task_id)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| TaskRun {
+                task_id: request.task_id.clone(),
+                workspace_id: workspace_id_for_request(request),
+                session_id: tracking.session_id.clone(),
+                source_channel: request.source.channel.clone(),
+                domain: request.intent.domain.clone(),
+                action: request.intent.action.clone(),
+                intent_text: request.intent.raw_text.clone(),
+                entity_refs: request.entity_refs.clone(),
+                args: request.args.clone(),
+                autonomy_level: effective_autonomy_level_for_task_run(request),
+                status: TaskRunStatus::Queued,
+                risk_level: expected_risk_level(request),
+                requires_approval: effective_requires_approval(request),
+                started_at: Some(started_at.clone()),
+                completed_at: None,
+                metadata: Value::Null,
+            });
+        task_run.workspace_id = workspace_id_for_request(request);
+        task_run.session_id = tracking.session_id.clone();
+        task_run.source_channel = request.source.channel.clone();
+        task_run.domain = request.intent.domain.clone();
+        task_run.action = request.intent.action.clone();
+        task_run.intent_text = request.intent.raw_text.clone();
+        task_run.entity_refs = request.entity_refs.clone();
+        task_run.args = request.args.clone();
+        task_run.autonomy_level = effective_autonomy_level_for_task_run(request);
+        task_run.status = TaskRunStatus::Running;
+        task_run.risk_level = expected_risk_level(request);
+        task_run.requires_approval = effective_requires_approval(request);
+        if task_run.started_at.is_none() {
+            task_run.started_at = Some(started_at.clone());
+        }
+        task_run.completed_at = None;
+        task_run.metadata = build_task_run_metadata(request, &tracking.step_id);
+        let _ = self.conversation_store.save_task_run(&task_run);
+
+        let mut task_step = self
+            .conversation_store
+            .load_task_step(&tracking.step_id)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| TaskStepRun {
+                step_id: tracking.step_id.clone(),
+                task_id: request.task_id.clone(),
+                domain: request.intent.domain.clone(),
+                operation: request.intent.action.clone(),
+                route: ExecutionRoute::Local,
+                executor_used: "task_api_dispatch".to_string(),
+                status: TaskStepRunStatus::Pending,
+                input_payload: Value::Null,
+                output_payload: Value::Null,
+                error_code: None,
+                error_message: None,
+                audit_ref: None,
+                started_at: Some(started_at.clone()),
+                ended_at: None,
+            });
+        task_step.task_id = request.task_id.clone();
+        task_step.domain = request.intent.domain.clone();
+        task_step.operation = request.intent.action.clone();
+        task_step.route = ExecutionRoute::Local;
+        task_step.executor_used = "task_api_dispatch".to_string();
+        task_step.status = TaskStepRunStatus::Executing;
+        task_step.input_payload = build_step_input_payload(request);
+        task_step.output_payload = Value::Null;
+        task_step.error_code = None;
+        task_step.error_message = None;
+        task_step.audit_ref = None;
+        if task_step.started_at.is_none() {
+            task_step.started_at = Some(started_at);
+        }
+        task_step.ended_at = None;
+        let _ = self.conversation_store.save_task_step(&task_step);
+
+        tracking
+    }
+
+    fn finish_task_tracking(
+        &self,
+        request: &TaskRequest,
+        response: &TaskResponse,
+        tracking: &TaskRuntimeTracking,
+    ) -> Result<(), String> {
+        let finished_at = current_timestamp();
+        let mut task_run = self
+            .conversation_store
+            .load_task_run(&request.task_id)?
+            .unwrap_or_else(|| TaskRun {
+                task_id: request.task_id.clone(),
+                workspace_id: workspace_id_for_request(request),
+                session_id: tracking.session_id.clone(),
+                source_channel: request.source.channel.clone(),
+                domain: request.intent.domain.clone(),
+                action: request.intent.action.clone(),
+                intent_text: request.intent.raw_text.clone(),
+                entity_refs: request.entity_refs.clone(),
+                args: request.args.clone(),
+                autonomy_level: effective_autonomy_level_for_task_run(request),
+                status: TaskRunStatus::Queued,
+                risk_level: response.risk_level,
+                requires_approval: effective_requires_approval(request),
+                started_at: Some(tracking.started_at.clone()),
+                completed_at: None,
+                metadata: build_task_run_metadata(request, &tracking.step_id),
+            });
+        task_run.workspace_id = workspace_id_for_request(request);
+        task_run.session_id = tracking.session_id.clone();
+        task_run.source_channel = request.source.channel.clone();
+        task_run.domain = request.intent.domain.clone();
+        task_run.action = request.intent.action.clone();
+        task_run.intent_text = request.intent.raw_text.clone();
+        task_run.entity_refs = request.entity_refs.clone();
+        task_run.args = request.args.clone();
+        task_run.autonomy_level = effective_autonomy_level_for_task_run(request);
+        task_run.status = task_run_status_from_response(response.status);
+        task_run.risk_level = response.risk_level;
+        task_run.requires_approval = effective_requires_approval(request);
+        if task_run.started_at.is_none() {
+            task_run.started_at = Some(tracking.started_at.clone());
+        }
+        task_run.completed_at = task_run_completed_at(response.status, &finished_at);
+        task_run.metadata = build_task_run_metadata(request, &tracking.step_id);
+        self.conversation_store.save_task_run(&task_run)?;
+
+        let (step_domain, step_operation) = step_identity(request, response);
+        let mut task_step = self
+            .conversation_store
+            .load_task_step(&tracking.step_id)?
+            .unwrap_or_else(|| TaskStepRun {
+                step_id: tracking.step_id.clone(),
+                task_id: request.task_id.clone(),
+                domain: step_domain.clone(),
+                operation: step_operation.clone(),
+                route: ExecutionRoute::Local,
+                executor_used: response.executor_used.clone(),
+                status: TaskStepRunStatus::Pending,
+                input_payload: build_step_input_payload(request),
+                output_payload: Value::Null,
+                error_code: None,
+                error_message: None,
+                audit_ref: Some(response.audit_ref.clone()),
+                started_at: Some(tracking.started_at.clone()),
+                ended_at: None,
+            });
+        task_step.task_id = request.task_id.clone();
+        task_step.domain = step_domain;
+        task_step.operation = step_operation;
+        task_step.route = ExecutionRoute::Local;
+        task_step.executor_used = response.executor_used.clone();
+        task_step.status = task_step_status_from_response(response.status);
+        task_step.input_payload = build_step_input_payload(request);
+        task_step.output_payload = build_step_output_payload(response);
+        task_step.error_code = match response.status {
+            TaskStatus::Failed => Some(format!("{}_failed", response.executor_used)),
+            _ => None,
+        };
+        task_step.error_message = match response.status {
+            TaskStatus::Failed => Some(response.result.message.clone()),
+            _ => None,
+        };
+        task_step.audit_ref = Some(response.audit_ref.clone());
+        if task_step.started_at.is_none() {
+            task_step.started_at = Some(tracking.started_at.clone());
+        }
+        task_step.ended_at = Some(finished_at.clone());
+        self.conversation_store.save_task_step(&task_step)?;
+
+        let artifact_records =
+            build_artifact_records(request, &tracking.step_id, &response.result.artifacts);
+        self.conversation_store.replace_artifacts_for_step(
+            &request.task_id,
+            Some(&tracking.step_id),
+            &artifact_records,
+        )?;
+        let event_records =
+            build_event_records(request, &tracking.step_id, &response.result.events);
+        self.conversation_store.replace_events_for_step(
+            &request.task_id,
+            Some(&tracking.step_id),
+            &event_records,
+        )?;
+
+        let session = self.build_session_record(request, tracking, response.resume_token.clone());
+        self.conversation_store.save_session(&session)?;
+        Ok(())
+    }
+
+    fn build_session_record(
+        &self,
+        request: &TaskRequest,
+        tracking: &TaskRuntimeTracking,
+        resume_token: Option<String>,
+    ) -> ConversationSession {
+        let mut session = self
+            .conversation_store
+            .load_session(&tracking.session_id)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| ConversationSession {
+                session_id: tracking.session_id.clone(),
+                workspace_id: workspace_id_for_request(request),
+                channel: request.source.channel.clone(),
+                surface: request.source.surface.clone(),
+                conversation_id: request.source.conversation_id.clone(),
+                user_id: request.source.user_id.clone(),
+                state: Value::Null,
+                resume_token: None,
+                expires_at: None,
+            });
+        session.workspace_id = workspace_id_for_request(request);
+        session.channel = request.source.channel.clone();
+        session.surface = request.source.surface.clone();
+        session.conversation_id = request.source.conversation_id.clone();
+        session.user_id = request.source.user_id.clone();
+        session.state = self
+            .load_conversation(request)
+            .and_then(|conversation| {
+                session_state_value_from_conversation(&conversation, Some(&session)).ok()
+            })
+            .unwrap_or(Value::Null);
+        session.resume_token = resume_token;
+        session.expires_at = None;
+        session
+    }
+
     fn hub(&self) -> CameraHubService {
         CameraHubService::new(self.admin_store.clone())
     }
 
     fn load_conversation(&self, request: &TaskRequest) -> Option<TaskConversationState> {
-        let key = conversation_key(request)?;
-        self.conversation_store.load(&key).ok()
+        let session_id = session_id_for_request(request);
+        let key = conversation_key(request).unwrap_or_else(|| session_id.clone());
+        self.conversation_store
+            .load_for_session(&session_id, Some(&key))
+            .ok()
+            .flatten()
+    }
+
+    fn load_or_create_conversation(&self, request: &TaskRequest) -> TaskConversationState {
+        let session_id = session_id_for_request(request);
+        let key = conversation_key(request).unwrap_or(session_id);
+        self.load_conversation(request)
+            .unwrap_or(TaskConversationState {
+                key,
+                ..Default::default()
+            })
+    }
+
+    fn save_conversation(
+        &self,
+        request: &TaskRequest,
+        conversation: &TaskConversationState,
+    ) -> Result<(), String> {
+        let session_id = session_id_for_request(request);
+        let session = self
+            .conversation_store
+            .load_session(&session_id)?
+            .unwrap_or_else(|| ConversationSession {
+                session_id,
+                workspace_id: workspace_id_for_request(request),
+                channel: request.source.channel.clone(),
+                surface: request.source.surface.clone(),
+                conversation_id: request.source.conversation_id.clone(),
+                user_id: request.source.user_id.clone(),
+                state: Value::Null,
+                resume_token: None,
+                expires_at: None,
+            });
+        self.conversation_store
+            .save_for_session(&session, conversation)
+    }
+
+    fn load_approval_context(
+        &self,
+        approval_id: &str,
+    ) -> Result<(ApprovalTicket, TaskRun, Option<ConversationSession>), String> {
+        let approval = self
+            .conversation_store
+            .load_approval(approval_id)?
+            .ok_or_else(|| format!("approval not found: {approval_id}"))?;
+        let task_run = self
+            .conversation_store
+            .load_task_run(&approval.task_id)?
+            .ok_or_else(|| format!("task run not found for approval: {}", approval.task_id))?;
+        let session = if task_run.session_id.trim().is_empty() {
+            None
+        } else {
+            self.conversation_store.load_session(&task_run.session_id)?
+        };
+        Ok((approval, task_run, session))
+    }
+
+    fn load_approval_summary(
+        &self,
+        approval: &ApprovalTicket,
+    ) -> Result<TaskApprovalSummary, String> {
+        let task_run = self
+            .conversation_store
+            .load_task_run(&approval.task_id)?
+            .ok_or_else(|| format!("task run not found for approval: {}", approval.task_id))?;
+        let session = if task_run.session_id.trim().is_empty() {
+            None
+        } else {
+            self.conversation_store.load_session(&task_run.session_id)?
+        };
+        Ok(build_approval_summary(
+            approval,
+            &task_run,
+            session.as_ref(),
+        ))
+    }
+
+    fn build_approval_resume_request(
+        &self,
+        approval: &ApprovalTicket,
+        task_run: &TaskRun,
+        session: Option<&ConversationSession>,
+        approver_user_id: Option<String>,
+    ) -> TaskRequest {
+        let mut args = task_run.args.clone();
+        inject_approval_args(
+            &mut args,
+            &approval.approval_id,
+            approver_user_id.as_deref(),
+        );
+        let trace_id = task_run
+            .metadata
+            .pointer("/trace_id")
+            .and_then(Value::as_str)
+            .map(|value| value.to_string())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| task_run.task_id.clone());
+        let surface = session
+            .map(|session| session.surface.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                task_run
+                    .metadata
+                    .pointer("/surface")
+                    .and_then(Value::as_str)
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            })
+            .unwrap_or_else(|| "task_api".to_string());
+
+        TaskRequest {
+            task_id: task_run.task_id.clone(),
+            trace_id,
+            step_id: approval_resume_step_id(&approval.approval_id),
+            source: TaskSource {
+                channel: task_run.source_channel.clone(),
+                surface,
+                conversation_id: session
+                    .map(|session| session.conversation_id.clone())
+                    .unwrap_or_default(),
+                user_id: session
+                    .map(|session| session.user_id.clone())
+                    .unwrap_or_else(|| approval.requester_user_id.clone()),
+                session_id: task_run.session_id.clone(),
+            },
+            intent: TaskIntent {
+                domain: task_run.domain.clone(),
+                action: task_run.action.clone(),
+                raw_text: task_run.intent_text.clone(),
+            },
+            entity_refs: task_run.entity_refs.clone(),
+            args,
+            autonomy: TaskAutonomy {
+                level: normalize_task_autonomy_level(&task_run.autonomy_level),
+            },
+        }
+    }
+
+    fn record_approval_decision_event(
+        &self,
+        approval: &ApprovalTicket,
+        task_run: &TaskRun,
+        session: Option<&ConversationSession>,
+        event_type: &str,
+        severity: EventSeverity,
+        approver_user_id: Option<String>,
+    ) -> Result<(), String> {
+        let request = TaskRequest {
+            task_id: task_run.task_id.clone(),
+            trace_id: task_run
+                .metadata
+                .pointer("/trace_id")
+                .and_then(Value::as_str)
+                .unwrap_or(task_run.task_id.as_str())
+                .to_string(),
+            step_id: approval_event_step_id(&approval.approval_id),
+            source: TaskSource {
+                channel: task_run.source_channel.clone(),
+                surface: session
+                    .map(|session| session.surface.clone())
+                    .unwrap_or_else(|| {
+                        task_run
+                            .metadata
+                            .pointer("/surface")
+                            .and_then(Value::as_str)
+                            .unwrap_or("task_api")
+                            .to_string()
+                    }),
+                conversation_id: session
+                    .map(|session| session.conversation_id.clone())
+                    .unwrap_or_default(),
+                user_id: session
+                    .map(|session| session.user_id.clone())
+                    .unwrap_or_else(|| approval.requester_user_id.clone()),
+                session_id: task_run.session_id.clone(),
+            },
+            intent: TaskIntent {
+                domain: task_run.domain.clone(),
+                action: task_run.action.clone(),
+                raw_text: task_run.intent_text.clone(),
+            },
+            entity_refs: task_run.entity_refs.clone(),
+            args: task_run.args.clone(),
+            autonomy: TaskAutonomy {
+                level: normalize_task_autonomy_level(&task_run.autonomy_level),
+            },
+        };
+        let step_id = approval_event_step_id(&approval.approval_id);
+        let event = build_task_event_record(
+            &request,
+            &step_id,
+            event_type,
+            severity,
+            json!({
+                "approval_ticket": approval,
+                "approver_user_id": approver_user_id,
+                "policy_ref": approval.policy_ref.clone(),
+            }),
+        );
+        self.conversation_store
+            .replace_events_for_step(&task_run.task_id, Some(&step_id), &[event])
     }
 }
 
@@ -661,6 +1754,7 @@ fn pending_candidates_from_results(results: &[HubScanResultItem]) -> Vec<Pending
             candidate_id: item.candidate_id.clone(),
             name: item.name.clone(),
             ip: item.ip.clone(),
+            room: (!item.room.trim().is_empty()).then(|| item.room.clone()),
             port: item.port,
             rtsp_paths: item.rtsp_paths.clone(),
             requires_auth: item.requires_auth,
@@ -676,7 +1770,7 @@ fn candidate_to_connect_request(
 ) -> CameraConnectRequest {
     CameraConnectRequest {
         name: candidate.name.clone(),
-        room: None,
+        room: candidate.room.clone(),
         ip: candidate.ip.clone(),
         path_candidates: candidate.rtsp_paths.clone(),
         username: None,
@@ -694,7 +1788,7 @@ fn pending_connect_to_request(
 ) -> CameraConnectRequest {
     CameraConnectRequest {
         name: pending.name.clone(),
-        room: None,
+        room: pending.room.clone(),
         ip: pending.ip.clone(),
         path_candidates: pending.rtsp_paths.clone(),
         username: None,
@@ -790,6 +1884,419 @@ fn build_vision_artifacts(payload: &Value) -> Vec<TaskArtifact> {
     artifacts
 }
 
+fn build_snapshot_payload(
+    target: &ResolvedCameraTarget,
+    snapshot: &SnapshotCaptureResult,
+) -> Value {
+    json!({
+        "camera_target": target,
+        "snapshot": {
+            "mime_type": snapshot.mime_type,
+            "byte_size": snapshot.byte_size,
+            "captured_at_epoch_ms": snapshot.captured_at_epoch_ms,
+            "storage": snapshot.storage,
+        }
+    })
+}
+
+fn build_snapshot_artifact(snapshot: &SnapshotCaptureResult) -> TaskArtifact {
+    TaskArtifact {
+        kind: "image".to_string(),
+        label: "抓拍图片".to_string(),
+        mime_type: snapshot.mime_type.clone(),
+        path: Some(snapshot.storage.relative_path.clone()),
+        url: None,
+        metadata: json!({
+            "storage_target": snapshot.storage.target,
+            "captured_at_epoch_ms": snapshot.captured_at_epoch_ms,
+            "byte_size": snapshot.byte_size,
+        }),
+    }
+}
+
+fn build_share_link_payload(
+    target: &ResolvedCameraTarget,
+    issued: &remote_view::IssuedCameraShareToken,
+) -> Value {
+    let encoded_token = url_encode_path_segment(&issued.token);
+    let relative_url = format!("/shared/cameras/{encoded_token}");
+    let stream_url = format!("{relative_url}/live.mjpeg");
+    json!({
+        "device_id": target.device_id,
+        "display_name": target.display_name,
+        "url": relative_url,
+        "stream_url": stream_url,
+        "expires_at_unix_secs": issued.expires_at_unix_secs,
+        "ttl_minutes": issued.ttl_minutes,
+    })
+}
+
+fn build_share_link_artifact(share_link: &Value) -> TaskArtifact {
+    TaskArtifact {
+        kind: "link".to_string(),
+        label: "共享观看链接".to_string(),
+        mime_type: "text/uri-list".to_string(),
+        path: None,
+        url: share_link
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        metadata: json!({
+            "stream_url": share_link.get("stream_url").cloned().unwrap_or(Value::Null),
+            "expires_at_unix_secs": share_link
+                .get("expires_at_unix_secs")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "ttl_minutes": share_link.get("ttl_minutes").cloned().unwrap_or(Value::Null),
+        }),
+    }
+}
+
+fn build_task_run_metadata(request: &TaskRequest, step_id: &str) -> Value {
+    json!({
+        "trace_id": request.trace_id.clone(),
+        "step_id": step_id,
+        "surface": request.source.surface.clone(),
+    })
+}
+
+fn build_approval_summary(
+    approval: &ApprovalTicket,
+    task_run: &TaskRun,
+    session: Option<&ConversationSession>,
+) -> TaskApprovalSummary {
+    TaskApprovalSummary {
+        approval_ticket: approval.clone(),
+        source_channel: task_run.source_channel.clone(),
+        surface: session
+            .map(|session| session.surface.clone())
+            .unwrap_or_else(|| {
+                task_run
+                    .metadata
+                    .pointer("/surface")
+                    .and_then(Value::as_str)
+                    .unwrap_or("task_api")
+                    .to_string()
+            }),
+        conversation_id: session
+            .map(|session| session.conversation_id.clone())
+            .unwrap_or_default(),
+        user_id: session
+            .map(|session| session.user_id.clone())
+            .unwrap_or_else(|| approval.requester_user_id.clone()),
+        session_id: task_run.session_id.clone(),
+        domain: task_run.domain.clone(),
+        action: task_run.action.clone(),
+        intent_text: task_run.intent_text.clone(),
+        autonomy_level: normalize_task_autonomy_level(&task_run.autonomy_level),
+        risk_level: task_run.risk_level,
+    }
+}
+
+fn inject_approval_args(args: &mut Value, approval_id: &str, approver_user_id: Option<&str>) {
+    if !args.is_object() {
+        *args = json!({});
+    }
+    if let Some(object) = args.as_object_mut() {
+        let approval_entry = object
+            .entry("approval".to_string())
+            .or_insert_with(|| json!({}));
+        if !approval_entry.is_object() {
+            *approval_entry = json!({});
+        }
+        if let Some(approval_object) = approval_entry.as_object_mut() {
+            approval_object.insert("token".to_string(), Value::String(approval_id.to_string()));
+            if let Some(approver_user_id) = approver_user_id {
+                approval_object.insert(
+                    "approver_id".to_string(),
+                    Value::String(approver_user_id.to_string()),
+                );
+            }
+        }
+    }
+}
+
+fn approval_resume_step_id(approval_id: &str) -> String {
+    format!("approval:{approval_id}:resume")
+}
+
+fn approval_event_step_id(approval_id: &str) -> String {
+    format!("approval:{approval_id}:event")
+}
+
+fn normalize_task_autonomy_level(level: &str) -> String {
+    match level.trim().to_lowercase().as_str() {
+        "" => default_task_autonomy_level(),
+        "readonly" | "read_only" | "read-only" => "readonly".to_string(),
+        "full" => "full".to_string(),
+        _ => "supervised".to_string(),
+    }
+}
+
+fn build_step_input_payload(request: &TaskRequest) -> Value {
+    json!({
+        "trace_id": request.trace_id.clone(),
+        "source": request.source.clone(),
+        "intent": request.intent.clone(),
+        "entity_refs": request.entity_refs.clone(),
+        "args": request.args.clone(),
+    })
+}
+
+fn build_step_output_payload(response: &TaskResponse) -> Value {
+    json!({
+        "message": response.result.message.clone(),
+        "data": response.result.data.clone(),
+        "events": response.result.events.clone(),
+        "next_actions": response.result.next_actions.clone(),
+        "missing_fields": response.missing_fields.clone(),
+        "prompt": response.prompt.clone(),
+        "resume_token": response.resume_token.clone(),
+    })
+}
+
+fn build_artifact_records(
+    request: &TaskRequest,
+    step_id: &str,
+    artifacts: &[TaskArtifact],
+) -> Vec<ArtifactRecord> {
+    artifacts
+        .iter()
+        .enumerate()
+        .map(|(index, artifact)| ArtifactRecord {
+            artifact_id: format!("{}:{}:artifact-{}", request.task_id, step_id, index + 1),
+            task_id: request.task_id.clone(),
+            step_id: Some(step_id.to_string()),
+            artifact_kind: artifact_kind_from_name(&artifact.kind),
+            label: artifact.label.clone(),
+            mime_type: artifact.mime_type.clone(),
+            media_asset_id: None,
+            path: artifact.path.clone(),
+            url: artifact.url.clone(),
+            metadata: artifact.metadata.clone(),
+        })
+        .collect()
+}
+
+fn build_event_records(request: &TaskRequest, step_id: &str, events: &[Value]) -> Vec<EventRecord> {
+    events
+        .iter()
+        .filter_map(|event| serde_json::from_value::<EventRecord>(event.clone()).ok())
+        .map(|mut event| {
+            if event.workspace_id.trim().is_empty() {
+                event.workspace_id = workspace_id_for_request(request);
+            }
+            if event.source_id.trim().is_empty() {
+                event.source_id = request.task_id.clone();
+            }
+            if event.correlation_id.is_none() && !request.trace_id.trim().is_empty() {
+                event.correlation_id = Some(request.trace_id.clone());
+            }
+            if event.causation_id.is_none() {
+                event.causation_id = Some(step_id.to_string());
+            }
+            if event.occurred_at.is_none() {
+                event.occurred_at = Some(current_timestamp());
+            }
+            if event.ingested_at.is_none() {
+                event.ingested_at = event.occurred_at.clone();
+            }
+            event
+        })
+        .collect()
+}
+
+fn build_task_event_record(
+    request: &TaskRequest,
+    step_id: &str,
+    event_type: &str,
+    severity: EventSeverity,
+    payload: Value,
+) -> EventRecord {
+    let occurred_at = current_timestamp();
+    EventRecord {
+        event_id: new_event_id(),
+        workspace_id: workspace_id_for_request(request),
+        source_kind: EventSourceKind::Task,
+        source_id: request.task_id.clone(),
+        event_type: event_type.to_string(),
+        severity,
+        payload,
+        correlation_id: (!request.trace_id.trim().is_empty()).then(|| request.trace_id.clone()),
+        causation_id: Some(step_id.to_string()),
+        occurred_at: Some(occurred_at.clone()),
+        ingested_at: Some(occurred_at),
+    }
+}
+
+fn artifact_kind_from_name(kind: &str) -> ArtifactKind {
+    match kind.trim().to_lowercase().as_str() {
+        "image" => ArtifactKind::Image,
+        "video" => ArtifactKind::Video,
+        "link" => ArtifactKind::Link,
+        "card" => ArtifactKind::Card,
+        "json" => ArtifactKind::Json,
+        _ => ArtifactKind::Text,
+    }
+}
+
+fn session_id_for_request(request: &TaskRequest) -> String {
+    first_non_empty(&[
+        request.source.session_id.as_str(),
+        request.source.conversation_id.as_str(),
+        request.source.user_id.as_str(),
+    ])
+    .map(|value| value.to_string())
+    .unwrap_or_else(|| format!("task-{}", request.task_id))
+}
+
+fn step_id_for_request(request: &TaskRequest) -> String {
+    first_non_empty(&[request.step_id.as_str()])
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| format!("{}:s1", request.task_id))
+}
+
+fn workspace_id_for_request(request: &TaskRequest) -> String {
+    first_string(&[&request.entity_refs, &request.args], &["/workspace_id"])
+        .unwrap_or_else(|| "home-1".to_string())
+}
+
+fn url_encode_path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(&mut encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+fn default_task_autonomy_level() -> String {
+    "supervised".to_string()
+}
+
+fn expected_risk_level(request: &TaskRequest) -> RiskLevel {
+    effective_risk_level(&Action {
+        domain: request.intent.domain.trim().to_lowercase(),
+        operation: request.intent.action.trim().to_lowercase(),
+        resource: Value::Null,
+        args: request.args.clone(),
+        risk_level: RiskLevel::Low,
+        requires_approval: request_requires_approval(request),
+        dry_run: false,
+    })
+}
+
+fn effective_autonomy_level(request: &TaskRequest) -> AutonomyLevel {
+    let normalized = request.autonomy.level.trim().to_lowercase();
+    match normalized.as_str() {
+        "" | "supervised" => AutonomyLevel::Supervised,
+        "readonly" | "read_only" | "read-only" => AutonomyLevel::ReadOnly,
+        "full" => AutonomyLevel::Full,
+        _ => AutonomyLevel::Supervised,
+    }
+}
+
+fn effective_autonomy_level_for_task_run(request: &TaskRequest) -> String {
+    autonomy_level_label(effective_autonomy_level(request)).to_string()
+}
+
+fn autonomy_level_label(level: AutonomyLevel) -> &'static str {
+    match level {
+        AutonomyLevel::ReadOnly => "readonly",
+        AutonomyLevel::Supervised => "supervised",
+        AutonomyLevel::Full => "full",
+    }
+}
+
+fn approval_manager_for_level(level: AutonomyLevel) -> ApprovalManager {
+    ApprovalManager::for_non_interactive(&AutonomyConfig {
+        level,
+        ..AutonomyConfig::default()
+    })
+}
+
+fn effective_requires_approval(request: &TaskRequest) -> bool {
+    let action = apply_governance_defaults(Action {
+        domain: request.intent.domain.trim().to_lowercase(),
+        operation: request.intent.action.trim().to_lowercase(),
+        resource: Value::Null,
+        args: request.args.clone(),
+        risk_level: RiskLevel::Low,
+        requires_approval: request_requires_approval(request),
+        dry_run: false,
+    });
+    action.requires_approval
+}
+
+fn request_requires_approval(request: &TaskRequest) -> bool {
+    bool_at_paths(&request.args, &["/approval/required", "/requires_approval"]).unwrap_or(false)
+}
+
+fn request_approval_token(request: &TaskRequest) -> Option<String> {
+    first_string(
+        &[&request.args, &request.entity_refs],
+        &["/approval/token", "/approval_token"],
+    )
+}
+
+fn request_approver_id(request: &TaskRequest) -> Option<String> {
+    first_string(
+        &[&request.args, &request.entity_refs],
+        &["/approval/approver_id", "/approver_id"],
+    )
+}
+
+fn approval_context_for_request(
+    request: &TaskRequest,
+    pending_approval: Option<&ApprovalTicket>,
+) -> Option<ApprovalContext> {
+    let token = request_approval_token(request);
+    let required_token = pending_approval.map(|approval| approval.approval_id.clone());
+    let approver_id = request_approver_id(request);
+    if token.is_none() && required_token.is_none() && approver_id.is_none() {
+        return None;
+    }
+    Some(ApprovalContext {
+        token,
+        required_token,
+        approver_id,
+    })
+}
+
+fn task_run_status_from_response(status: TaskStatus) -> TaskRunStatus {
+    match status {
+        TaskStatus::Completed => TaskRunStatus::Completed,
+        TaskStatus::NeedsInput => TaskRunStatus::NeedsInput,
+        TaskStatus::Failed => TaskRunStatus::Failed,
+    }
+}
+
+fn task_step_status_from_response(status: TaskStatus) -> TaskStepRunStatus {
+    match status {
+        TaskStatus::Completed => TaskStepRunStatus::Success,
+        TaskStatus::NeedsInput => TaskStepRunStatus::Blocked,
+        TaskStatus::Failed => TaskStepRunStatus::Failed,
+    }
+}
+
+fn task_run_completed_at(status: TaskStatus, finished_at: &str) -> Option<String> {
+    match status {
+        TaskStatus::Completed | TaskStatus::Failed => Some(finished_at.to_string()),
+        TaskStatus::NeedsInput => None,
+    }
+}
+
+fn step_identity(request: &TaskRequest, response: &TaskResponse) -> (String, String) {
+    if response.executor_used == "vision_executor" {
+        return ("vision".to_string(), OP_ANALYZE_CAMERA.to_string());
+    }
+    (request.intent.domain.clone(), request.intent.action.clone())
+}
+
 fn protocol_string(args: &Value) -> Option<String> {
     if let Some(value) = string_at_paths(args, &["/protocol"]) {
         return Some(value);
@@ -860,6 +2367,20 @@ fn usize_at_paths(value: &Value, paths: &[&str]) -> Option<usize> {
     })
 }
 
+fn bool_at_paths(value: &Value, paths: &[&str]) -> Option<bool> {
+    paths.iter().find_map(|path| {
+        let item = value.pointer(path)?;
+        if let Some(flag) = item.as_bool() {
+            return Some(flag);
+        }
+        match item.as_str()?.trim().to_lowercase().as_str() {
+            "true" | "1" | "yes" => Some(true),
+            "false" | "0" | "no" => Some(false),
+            _ => None,
+        }
+    })
+}
+
 fn first_string(values: &[&Value], paths: &[&str]) -> Option<String> {
     values
         .iter()
@@ -904,6 +2425,204 @@ fn first_non_empty<'a>(values: &[&'a str]) -> Option<&'a str> {
         .find(|value| !value.trim().is_empty())
 }
 
+fn notification_channel_from_value(value: &str) -> Option<NotificationChannel> {
+    match value.trim().to_lowercase().as_str() {
+        "im_bridge" | "feishu" => Some(NotificationChannel::ImBridge),
+        "wecom" => Some(NotificationChannel::Wecom),
+        "telegram" => Some(NotificationChannel::Telegram),
+        "webhook" => Some(NotificationChannel::Webhook),
+        "local_ui" => Some(NotificationChannel::LocalUi),
+        _ => None,
+    }
+}
+
+fn notification_payload_format_from_value(value: &str) -> NotificationPayloadFormat {
+    match value.trim().to_lowercase().as_str() {
+        "markdown" => NotificationPayloadFormat::Markdown,
+        "lark_card" | "card" => NotificationPayloadFormat::LarkCard,
+        "json" => NotificationPayloadFormat::Json,
+        _ => NotificationPayloadFormat::PlainText,
+    }
+}
+
+fn task_artifact_to_notification_attachment(
+    artifact: &TaskArtifact,
+) -> Option<NotificationAttachment> {
+    let kind = match artifact.kind.trim().to_lowercase().as_str() {
+        "image" => NotificationAttachmentKind::Image,
+        "video" => NotificationAttachmentKind::Video,
+        "link" => NotificationAttachmentKind::Link,
+        "json" | "card" | "text" => NotificationAttachmentKind::Json,
+        _ => return None,
+    };
+    Some(NotificationAttachment {
+        kind,
+        label: artifact.label.clone(),
+        mime_type: artifact.mime_type.clone(),
+        path: artifact.path.clone(),
+        url: artifact.url.clone(),
+        metadata: artifact.metadata.clone(),
+    })
+}
+
+fn bridge_provider_config_from_state(
+    state: &AdminConsoleState,
+) -> Option<NotificationBridgeConfig> {
+    if state.bridge_provider.app_id.trim().is_empty()
+        || state.bridge_provider.app_secret.trim().is_empty()
+    {
+        return None;
+    }
+    Some(NotificationBridgeConfig {
+        app_id: state.bridge_provider.app_id.clone(),
+        app_secret: state.bridge_provider.app_secret.clone(),
+        bot_open_id: state.bridge_provider.bot_open_id.clone(),
+    })
+}
+
+fn resolve_notification_recipient(
+    request: &NotificationRequest,
+    state: &AdminConsoleState,
+    requester_user_id: &str,
+) -> Option<NotificationRecipient> {
+    if request.destination.trim().is_empty() {
+        return None;
+    }
+
+    if request.channel == NotificationChannel::LocalUi {
+        return Some(NotificationRecipient {
+            receive_id_type: NotificationRecipientIdType::ChatId,
+            receive_id: request.destination.clone(),
+            label: request.destination.clone(),
+        });
+    }
+
+    if let Some(recipient) =
+        recipient_from_literal_destination(&request.destination, &state.identity_bindings)
+    {
+        return Some(recipient);
+    }
+
+    if let Some(recipient) =
+        recipient_from_binding_match(&request.destination, &state.identity_bindings)
+    {
+        return Some(recipient);
+    }
+
+    if !requester_user_id.trim().is_empty() {
+        if let Some(binding) = state.identity_bindings.iter().find(|binding| {
+            binding
+                .user_id
+                .as_deref()
+                .map(|value| value == requester_user_id)
+                .unwrap_or(false)
+        }) {
+            if let Some(recipient) = recipient_from_binding(binding) {
+                return Some(recipient);
+            }
+        }
+    }
+
+    let chat_bindings = state
+        .identity_bindings
+        .iter()
+        .filter_map(recipient_from_binding)
+        .collect::<Vec<_>>();
+    if chat_bindings.len() == 1 {
+        return chat_bindings.into_iter().next();
+    }
+
+    None
+}
+
+fn recipient_from_literal_destination(
+    destination: &str,
+    bindings: &[IdentityBindingRecord],
+) -> Option<NotificationRecipient> {
+    if destination.starts_with("oc_") {
+        return Some(NotificationRecipient {
+            receive_id_type: NotificationRecipientIdType::ChatId,
+            receive_id: destination.to_string(),
+            label: destination.to_string(),
+        });
+    }
+    if destination.starts_with("ou_") {
+        let label = bindings
+            .iter()
+            .find(|binding| binding.open_id == destination)
+            .map(|binding| binding.display_name.clone())
+            .unwrap_or_else(|| destination.to_string());
+        return Some(NotificationRecipient {
+            receive_id_type: NotificationRecipientIdType::OpenId,
+            receive_id: destination.to_string(),
+            label,
+        });
+    }
+    None
+}
+
+fn recipient_from_binding_match(
+    destination: &str,
+    bindings: &[IdentityBindingRecord],
+) -> Option<NotificationRecipient> {
+    let normalized = destination.trim();
+    bindings
+        .iter()
+        .find(|binding| {
+            binding.display_name == normalized
+                || binding.open_id == normalized
+                || binding
+                    .chat_id
+                    .as_deref()
+                    .map(|value| value == normalized)
+                    .unwrap_or(false)
+                || binding
+                    .user_id
+                    .as_deref()
+                    .map(|value| value == normalized)
+                    .unwrap_or(false)
+        })
+        .and_then(recipient_from_binding)
+}
+
+fn recipient_from_binding(binding: &IdentityBindingRecord) -> Option<NotificationRecipient> {
+    if let Some(chat_id) = binding
+        .chat_id
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Some(NotificationRecipient {
+            receive_id_type: NotificationRecipientIdType::ChatId,
+            receive_id: chat_id.clone(),
+            label: binding.display_name.clone(),
+        });
+    }
+    if !binding.open_id.trim().is_empty() {
+        return Some(NotificationRecipient {
+            receive_id_type: NotificationRecipientIdType::OpenId,
+            receive_id: binding.open_id.clone(),
+            label: binding.display_name.clone(),
+        });
+    }
+    None
+}
+
+fn current_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string()
+}
+
+fn new_event_id() -> String {
+    Uuid::new_v4().as_simple().to_string()
+}
+
+fn new_approval_id() -> String {
+    Uuid::new_v4().as_simple().to_string()
+}
+
 fn ensure_resume_token() -> String {
     Uuid::new_v4().as_simple().to_string()
 }
@@ -918,20 +2637,49 @@ fn new_audit_ref() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use serde_json::{json, Value};
 
     use super::{
-        conversation_key, format_pending_candidates, normalize_command_text,
-        pending_candidates_from_results, protocol_string, room_aliases, PendingTaskCandidate,
-        TaskIntent, TaskRequest, TaskSource,
+        artifact_kind_from_name, build_artifact_records, conversation_key,
+        effective_autonomy_level, effective_autonomy_level_for_task_run,
+        effective_requires_approval, format_pending_candidates, normalize_command_text,
+        pending_candidates_from_results, protocol_string, resolve_notification_recipient,
+        room_aliases, PendingTaskCandidate, TaskApiService, TaskArtifact, TaskIntent, TaskRequest,
+        TaskSource, TaskStatus,
+    };
+    use crate::connectors::notifications::{
+        NotificationChannel, NotificationPayloadFormat, NotificationRecipientIdType,
+        NotificationRequest,
+    };
+    use crate::control_plane::approvals::ApprovalStatus;
+    use crate::control_plane::tasks::{ArtifactKind, TaskRunStatus, TaskStepRunStatus};
+    use crate::runtime::admin_console::{
+        AdminConsoleState, AdminConsoleStore, BridgeProviderConfig, IdentityBindingRecord,
     };
     use crate::runtime::hub::HubScanResultItem;
+    use crate::runtime::registry::{
+        CameraCapabilities, CameraDevice, CameraStreamRef, DeviceRegistryStore, DeviceStatus,
+        ResolvedCameraTarget, StreamTransport,
+    };
+    use crate::runtime::task_session::TaskConversationStore;
+
+    fn unique_path(prefix: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{unique}.json"))
+    }
 
     #[test]
     fn conversation_key_prefers_conversation_id() {
         let request = TaskRequest {
             task_id: "task-1".to_string(),
             trace_id: "trace-1".to_string(),
+            step_id: "step-1".to_string(),
             source: TaskSource {
                 channel: "feishu".to_string(),
                 surface: "harborbeacon".to_string(),
@@ -1004,6 +2752,7 @@ mod tests {
             candidate_id: "cand-1".to_string(),
             name: "Living Room Cam".to_string(),
             ip: "192.168.1.20".to_string(),
+            room: Some("living room".to_string()),
             port: 554,
             rtsp_paths: vec!["/live".to_string()],
             requires_auth: true,
@@ -1012,6 +2761,26 @@ mod tests {
         }]);
 
         assert!(rendered.contains("需要密码"));
+    }
+
+    #[test]
+    fn connect_request_preserves_room_hint() {
+        let request = super::candidate_to_connect_request(
+            &PendingTaskCandidate {
+                candidate_id: "cand-1".to_string(),
+                name: "Living Room Cam".to_string(),
+                ip: "192.168.1.20".to_string(),
+                room: Some("Living Room".to_string()),
+                port: 554,
+                rtsp_paths: vec!["/live".to_string()],
+                requires_auth: false,
+                vendor: None,
+                model: None,
+            },
+            None,
+        );
+
+        assert_eq!(request.room.as_deref(), Some("Living Room"));
     }
 
     #[test]
@@ -1026,5 +2795,863 @@ mod tests {
     fn room_aliases_cover_living_room() {
         let aliases = room_aliases("Living Room Cam", "living room");
         assert!(aliases.contains(&"客厅"));
+    }
+
+    #[test]
+    fn build_artifact_records_maps_image_kind() {
+        let request = TaskRequest {
+            task_id: "task-1".to_string(),
+            trace_id: "trace-1".to_string(),
+            step_id: "step-1".to_string(),
+            source: TaskSource::default(),
+            intent: TaskIntent::default(),
+            entity_refs: Value::Null,
+            args: Value::Null,
+            autonomy: Default::default(),
+        };
+        let artifacts = build_artifact_records(
+            &request,
+            "step-1",
+            &[super::TaskArtifact {
+                kind: "image".to_string(),
+                label: "抓拍图片".to_string(),
+                mime_type: "image/jpeg".to_string(),
+                path: Some("snap.jpg".to_string()),
+                url: None,
+                metadata: Value::Null,
+            }],
+        );
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].artifact_kind, ArtifactKind::Image);
+        assert_eq!(artifact_kind_from_name("json"), ArtifactKind::Json);
+    }
+
+    #[test]
+    fn build_notification_request_uses_generic_contract() {
+        let admin_path = unique_path("harbornas-admin-state");
+        let registry_path = unique_path("harbornas-device-registry");
+        let conversation_path = unique_path("harbornas-task-runtime");
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        let conversation_store = TaskConversationStore::new(conversation_path);
+        let service = TaskApiService::new(admin_store, conversation_store);
+        let request = TaskRequest {
+            task_id: "task-vision".to_string(),
+            trace_id: "trace-vision".to_string(),
+            step_id: "step-vision".to_string(),
+            source: TaskSource {
+                channel: "im_bridge".to_string(),
+                surface: "harborbeacon".to_string(),
+                conversation_id: "chat-1".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-1".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "camera".to_string(),
+                action: "analyze".to_string(),
+                raw_text: "分析门口摄像头".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: Value::Null,
+            autonomy: Default::default(),
+        };
+        let target = ResolvedCameraTarget {
+            device_id: "cam-1".to_string(),
+            display_name: "Front Door".to_string(),
+            status: DeviceStatus::Online,
+            room_name: Some("Entry".to_string()),
+            vendor: None,
+            model: None,
+            ip_address: Some("192.168.1.10".to_string()),
+            mac_address: None,
+            discovery_source: "onvif".to_string(),
+            primary_stream: CameraStreamRef {
+                transport: StreamTransport::Rtsp,
+                url: "rtsp://192.168.1.10/live".to_string(),
+                requires_auth: false,
+            },
+            onvif_device_service_url: None,
+            ezviz_device_serial: None,
+            ezviz_camera_no: None,
+            capabilities: CameraCapabilities {
+                snapshot: true,
+                stream: true,
+                ptz: false,
+                audio: false,
+            },
+            last_seen_at: None,
+        };
+        let notification = service
+            .build_notification_request(
+                &request,
+                &target,
+                &json!({
+                    "summary": "检测到门口有人活动",
+                    "notification_channel": "im_bridge",
+                    "notification_format": "lark_card",
+                    "notification_card": {
+                        "header": {"title": {"content": "Front Door AI 分析"}}
+                    }
+                }),
+                &[TaskArtifact {
+                    kind: "image".to_string(),
+                    label: "抓拍图片".to_string(),
+                    mime_type: "image/jpeg".to_string(),
+                    path: Some("snap.jpg".to_string()),
+                    url: None,
+                    metadata: Value::Null,
+                }],
+            )
+            .expect("notification request");
+
+        assert_eq!(notification.channel, NotificationChannel::ImBridge);
+        assert_eq!(
+            notification.payload_format,
+            NotificationPayloadFormat::LarkCard
+        );
+        assert_eq!(notification.destination, "家庭通知频道");
+        assert_eq!(notification.attachments.len(), 1);
+        assert_eq!(notification.title, "Front Door AI 分析");
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn handle_camera_share_link_returns_link_artifact() {
+        let admin_path = unique_path("harbornas-admin-state");
+        let registry_path = unique_path("harbornas-device-registry");
+        let conversation_path = unique_path("harbornas-task-runtime");
+        let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store.clone());
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let service = TaskApiService::new(admin_store, conversation_store);
+
+        let mut device = CameraDevice::new("cam-share", "Front Door", "rtsp://192.168.1.10/live");
+        device.status = DeviceStatus::Online;
+        device.room = Some("Entry".to_string());
+        device.discovery_source = "manual_entry".to_string();
+        device.capabilities.snapshot = true;
+        device.capabilities.stream = true;
+        registry_store
+            .save_devices(&[device])
+            .expect("save registry device");
+
+        let response = service.handle_task(TaskRequest {
+            task_id: "task-share".to_string(),
+            trace_id: "trace-share".to_string(),
+            step_id: "step-share".to_string(),
+            source: TaskSource {
+                channel: "admin_api".to_string(),
+                surface: "agent_hub_admin_api".to_string(),
+                conversation_id: "admin-console".to_string(),
+                user_id: "local-admin".to_string(),
+                session_id: "admin-console".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "camera".to_string(),
+                action: "share_link".to_string(),
+                raw_text: "生成共享观看链接".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "device_id": "cam-share",
+            }),
+            autonomy: Default::default(),
+        });
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(
+            response.risk_level,
+            crate::orchestrator::contracts::RiskLevel::Medium
+        );
+        assert_eq!(response.result.artifacts.len(), 1);
+        assert_eq!(response.result.artifacts[0].kind, "link");
+        assert!(response.result.artifacts[0]
+            .url
+            .as_deref()
+            .expect("share url")
+            .starts_with("/shared/cameras/"));
+        assert_eq!(response.result.data["share_link"]["ttl_minutes"], 120);
+        assert_eq!(
+            response.result.events[0]["event_type"],
+            "task.share_link_issued"
+        );
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn resolve_notification_recipient_prefers_bound_chat_id() {
+        let state = AdminConsoleState {
+            bridge_provider: BridgeProviderConfig {
+                configured: true,
+                app_id: "cli_xxx".to_string(),
+                app_secret: "secret".to_string(),
+                app_name: "Harbor Bridge".to_string(),
+                bot_open_id: "ou_bot".to_string(),
+                status: "已连接".to_string(),
+            },
+            identity_bindings: vec![IdentityBindingRecord {
+                open_id: "ou_demo".to_string(),
+                user_id: Some("user-1".to_string()),
+                union_id: None,
+                display_name: "家庭通知频道".to_string(),
+                chat_id: Some("oc_demo".to_string()),
+            }],
+            ..Default::default()
+        };
+        let request = NotificationRequest {
+            channel: NotificationChannel::ImBridge,
+            destination: "家庭通知频道".to_string(),
+            title: "AI 分析".to_string(),
+            body: "检测到人员活动".to_string(),
+            payload_format: NotificationPayloadFormat::PlainText,
+            structured_payload: Value::Null,
+            attachments: Vec::new(),
+            correlation_id: Some("trace-1".to_string()),
+        };
+
+        let recipient =
+            resolve_notification_recipient(&request, &state, "user-1").expect("recipient");
+
+        assert_eq!(
+            recipient.receive_id_type,
+            NotificationRecipientIdType::ChatId
+        );
+        assert_eq!(recipient.receive_id, "oc_demo");
+    }
+
+    #[test]
+    fn deliver_notification_request_reports_failure_without_bridge_config() {
+        let admin_path = unique_path("harbornas-admin-state");
+        let registry_path = unique_path("harbornas-device-registry");
+        let conversation_path = unique_path("harbornas-task-runtime");
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        let conversation_store = TaskConversationStore::new(conversation_path);
+        let service = TaskApiService::new(admin_store, conversation_store);
+        let request = TaskRequest {
+            task_id: "task-notify".to_string(),
+            trace_id: "trace-notify".to_string(),
+            step_id: "step-notify".to_string(),
+            source: TaskSource {
+                channel: "im_bridge".to_string(),
+                surface: "harborbeacon".to_string(),
+                conversation_id: "chat-1".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-1".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "camera".to_string(),
+                action: "analyze".to_string(),
+                raw_text: "分析门口摄像头".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: Value::Null,
+            autonomy: Default::default(),
+        };
+        let outcome = service.deliver_notification_request(
+            &request,
+            &NotificationRequest {
+                channel: NotificationChannel::ImBridge,
+                destination: "家庭通知频道".to_string(),
+                title: "AI 分析".to_string(),
+                body: "检测到人员活动".to_string(),
+                payload_format: NotificationPayloadFormat::PlainText,
+                structured_payload: Value::Null,
+                attachments: Vec::new(),
+                correlation_id: Some("trace-notify".to_string()),
+            },
+        );
+
+        assert_eq!(outcome.event_type, "task.notification_failed");
+        assert_eq!(outcome.payload["status"], "failed");
+        assert!(outcome.payload["error"].is_string());
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn effective_requires_approval_defaults_camera_connect_only() {
+        let connect_request = TaskRequest {
+            task_id: "task-connect".to_string(),
+            trace_id: "trace-connect".to_string(),
+            step_id: "step-connect".to_string(),
+            source: TaskSource {
+                channel: "im_bridge".to_string(),
+                surface: "harborbeacon".to_string(),
+                conversation_id: "chat-1".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-1".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "camera".to_string(),
+                action: "connect".to_string(),
+                raw_text: "接入摄像头".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: Value::Null,
+            autonomy: Default::default(),
+        };
+        let scan_request = TaskRequest {
+            task_id: "task-scan".to_string(),
+            trace_id: "trace-scan".to_string(),
+            step_id: "step-scan".to_string(),
+            source: connect_request.source.clone(),
+            intent: TaskIntent {
+                domain: "camera".to_string(),
+                action: "scan".to_string(),
+                raw_text: "扫描摄像头".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: Value::Null,
+            autonomy: Default::default(),
+        };
+
+        assert!(effective_requires_approval(&connect_request));
+        assert!(!effective_requires_approval(&scan_request));
+    }
+
+    #[test]
+    fn effective_autonomy_defaults_to_supervised_and_normalizes_aliases() {
+        let default_request = TaskRequest {
+            task_id: "task-autonomy-default".to_string(),
+            trace_id: "trace-autonomy-default".to_string(),
+            step_id: "step-autonomy-default".to_string(),
+            source: TaskSource::default(),
+            intent: TaskIntent {
+                domain: "camera".to_string(),
+                action: "scan".to_string(),
+                raw_text: "扫描摄像头".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: Value::Null,
+            autonomy: Default::default(),
+        };
+        let readonly_request = TaskRequest {
+            task_id: "task-autonomy-readonly".to_string(),
+            trace_id: "trace-autonomy-readonly".to_string(),
+            step_id: "step-autonomy-readonly".to_string(),
+            source: TaskSource::default(),
+            intent: TaskIntent {
+                domain: "camera".to_string(),
+                action: "connect".to_string(),
+                raw_text: "接入摄像头".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: Value::Null,
+            autonomy: super::TaskAutonomy {
+                level: "ReadOnly".to_string(),
+            },
+        };
+
+        assert_eq!(
+            format!("{:?}", effective_autonomy_level(&default_request)),
+            "Supervised"
+        );
+        assert_eq!(
+            effective_autonomy_level_for_task_run(&default_request),
+            "supervised"
+        );
+        assert_eq!(
+            format!("{:?}", effective_autonomy_level(&readonly_request)),
+            "ReadOnly"
+        );
+        assert_eq!(
+            effective_autonomy_level_for_task_run(&readonly_request),
+            "readonly"
+        );
+    }
+
+    #[test]
+    fn handle_camera_connect_blocks_by_default_until_approved() {
+        let admin_path = unique_path("harbornas-admin-state");
+        let registry_path = unique_path("harbornas-device-registry");
+        let conversation_path = unique_path("harbornas-task-runtime");
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let service = TaskApiService::new(admin_store, conversation_store.clone());
+        let request = TaskRequest {
+            task_id: "task-connect-approval".to_string(),
+            trace_id: "trace-connect-approval".to_string(),
+            step_id: "step-connect-approval".to_string(),
+            source: TaskSource {
+                channel: "im_bridge".to_string(),
+                surface: "harborbeacon".to_string(),
+                conversation_id: "chat-1".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-1".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "camera".to_string(),
+                action: "connect".to_string(),
+                raw_text: "接入摄像头".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: Value::Null,
+            autonomy: Default::default(),
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::NeedsInput);
+        assert_eq!(response.missing_fields, vec!["approval_token".to_string()]);
+        assert_eq!(
+            response.result.data["approval_ticket"]["policy_ref"],
+            "camera.connect"
+        );
+
+        let task_run = conversation_store
+            .load_task_run("task-connect-approval")
+            .expect("load task run")
+            .expect("task run");
+        assert_eq!(task_run.status, TaskRunStatus::NeedsInput);
+        assert!(task_run.requires_approval);
+
+        let approvals = conversation_store
+            .approvals_for_task("task-connect-approval")
+            .expect("load approvals");
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].policy_ref, "camera.connect");
+        assert_eq!(approvals[0].status, ApprovalStatus::Pending);
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn handle_camera_connect_fails_under_readonly_autonomy_before_approval() {
+        let admin_path = unique_path("harbornas-admin-state");
+        let registry_path = unique_path("harbornas-device-registry");
+        let conversation_path = unique_path("harbornas-task-runtime");
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let service = TaskApiService::new(admin_store, conversation_store.clone());
+        let request = TaskRequest {
+            task_id: "task-connect-readonly".to_string(),
+            trace_id: "trace-connect-readonly".to_string(),
+            step_id: "step-connect-readonly".to_string(),
+            source: TaskSource {
+                channel: "im_bridge".to_string(),
+                surface: "harborbeacon".to_string(),
+                conversation_id: "chat-1".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-1".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "camera".to_string(),
+                action: "connect".to_string(),
+                raw_text: "接入摄像头".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: Value::Null,
+            autonomy: super::TaskAutonomy {
+                level: "ReadOnly".to_string(),
+            },
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Failed);
+        assert_eq!(response.result.data["error"], "AUTONOMY_BLOCKED");
+        assert_eq!(response.result.data["autonomy_level"], "readonly");
+
+        let task_run = conversation_store
+            .load_task_run("task-connect-readonly")
+            .expect("load task run")
+            .expect("task run");
+        assert_eq!(task_run.status, TaskRunStatus::Failed);
+        assert_eq!(task_run.autonomy_level, "readonly");
+
+        let approvals = conversation_store
+            .approvals_for_task("task-connect-readonly")
+            .expect("load approvals");
+        assert!(approvals.is_empty());
+
+        let events = conversation_store
+            .events_for_task("task-connect-readonly")
+            .expect("load events");
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "task.autonomy_blocked"));
+        assert!(events.iter().any(|event| event.event_type == "task.failed"));
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn handle_camera_connect_with_full_autonomy_and_token_skips_approval_prompt() {
+        let admin_path = unique_path("harbornas-admin-state");
+        let registry_path = unique_path("harbornas-device-registry");
+        let conversation_path = unique_path("harbornas-task-runtime");
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let service = TaskApiService::new(admin_store, conversation_store.clone());
+        let request = TaskRequest {
+            task_id: "task-connect-full".to_string(),
+            trace_id: "trace-connect-full".to_string(),
+            step_id: "step-connect-full".to_string(),
+            source: TaskSource {
+                channel: "im_bridge".to_string(),
+                surface: "harborbeacon".to_string(),
+                conversation_id: "chat-1".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-1".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "camera".to_string(),
+                action: "connect".to_string(),
+                raw_text: "接入摄像头".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "approval": {
+                    "token": "approved-token",
+                    "approver_id": "user-1"
+                }
+            }),
+            autonomy: super::TaskAutonomy {
+                level: "full".to_string(),
+            },
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Failed);
+        assert_ne!(response.missing_fields, vec!["approval_token".to_string()]);
+        assert!(
+            response.result.message.contains("缺少摄像头 IP 地址"),
+            "unexpected response: {}",
+            response.result.message
+        );
+
+        let task_run = conversation_store
+            .load_task_run("task-connect-full")
+            .expect("load task run")
+            .expect("task run");
+        assert_eq!(task_run.status, TaskRunStatus::Failed);
+        assert_eq!(task_run.autonomy_level, "full");
+        assert!(task_run.requires_approval);
+
+        let approvals = conversation_store
+            .approvals_for_task("task-connect-full")
+            .expect("load approvals");
+        assert!(approvals.is_empty());
+
+        let events = conversation_store
+            .events_for_task("task-connect-full")
+            .expect("load events");
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "task.approval_required"));
+        assert!(events.iter().any(|event| event.event_type == "task.failed"));
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn approve_pending_approval_replays_task_request() {
+        let admin_path = unique_path("harbornas-admin-state");
+        let registry_path = unique_path("harbornas-device-registry");
+        let conversation_path = unique_path("harbornas-task-runtime");
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let service = TaskApiService::new(admin_store, conversation_store.clone());
+        let request = TaskRequest {
+            task_id: "task-approve-replay".to_string(),
+            trace_id: "trace-approve-replay".to_string(),
+            step_id: "step-approve-replay".to_string(),
+            source: TaskSource {
+                channel: "im_bridge".to_string(),
+                surface: "harborbeacon".to_string(),
+                conversation_id: "chat-1".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-1".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "camera".to_string(),
+                action: "connect".to_string(),
+                raw_text: "接入摄像头".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: Value::Null,
+            autonomy: Default::default(),
+        };
+
+        let initial = service.handle_task(request);
+        let approval_id = initial.result.data["approval_ticket"]["approval_id"]
+            .as_str()
+            .expect("approval id")
+            .to_string();
+        let pending = service.pending_approvals().expect("pending approvals");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].approval_ticket.approval_id, approval_id);
+
+        let (approval, resumed) = service
+            .approve_pending_approval(&approval_id, Some("approver-1".to_string()))
+            .expect("approve");
+
+        assert_eq!(approval.approval_ticket.status, ApprovalStatus::Approved);
+        assert_eq!(
+            approval.approval_ticket.approver_user_id.as_deref(),
+            Some("approver-1")
+        );
+        assert_eq!(resumed.status, TaskStatus::Failed);
+        assert!(resumed.result.message.contains("缺少摄像头 IP 地址"));
+
+        let approvals = conversation_store
+            .approvals_for_task("task-approve-replay")
+            .expect("load approvals");
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].status, ApprovalStatus::Approved);
+
+        let events = conversation_store
+            .events_for_task("task-approve-replay")
+            .expect("load events");
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "task.approval_approved"));
+        assert!(events.iter().any(|event| event.event_type == "task.failed"));
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn reject_pending_approval_closes_task() {
+        let admin_path = unique_path("harbornas-admin-state");
+        let registry_path = unique_path("harbornas-device-registry");
+        let conversation_path = unique_path("harbornas-task-reject");
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let service = TaskApiService::new(admin_store, conversation_store.clone());
+        let request = TaskRequest {
+            task_id: "task-reject-approval".to_string(),
+            trace_id: "trace-reject-approval".to_string(),
+            step_id: "step-reject-approval".to_string(),
+            source: TaskSource {
+                channel: "im_bridge".to_string(),
+                surface: "harborbeacon".to_string(),
+                conversation_id: "chat-1".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-1".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "camera".to_string(),
+                action: "connect".to_string(),
+                raw_text: "接入摄像头".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: Value::Null,
+            autonomy: Default::default(),
+        };
+
+        let initial = service.handle_task(request);
+        let approval_id = initial.result.data["approval_ticket"]["approval_id"]
+            .as_str()
+            .expect("approval id")
+            .to_string();
+
+        let approval = service
+            .reject_pending_approval(&approval_id, Some("approver-2".to_string()))
+            .expect("reject");
+
+        assert_eq!(approval.approval_ticket.status, ApprovalStatus::Rejected);
+        assert_eq!(
+            approval.approval_ticket.approver_user_id.as_deref(),
+            Some("approver-2")
+        );
+
+        let task_run = conversation_store
+            .load_task_run("task-reject-approval")
+            .expect("load task run")
+            .expect("task run");
+        assert_eq!(task_run.status, TaskRunStatus::Failed);
+        assert!(task_run.completed_at.is_some());
+
+        let session = conversation_store
+            .load_session("sess-1")
+            .expect("load session")
+            .expect("session");
+        assert!(session.resume_token.is_none());
+
+        let events = conversation_store
+            .events_for_task("task-reject-approval")
+            .expect("load events");
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "task.approval_rejected"));
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn handle_task_blocks_when_approval_required_without_token() {
+        let admin_path = unique_path("harbornas-admin-state");
+        let registry_path = unique_path("harbornas-device-registry");
+        let conversation_path = unique_path("harbornas-task-runtime");
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let service = TaskApiService::new(admin_store, conversation_store.clone());
+        let request = TaskRequest {
+            task_id: "task-approval".to_string(),
+            trace_id: "trace-approval".to_string(),
+            step_id: "step-approval".to_string(),
+            source: TaskSource {
+                channel: "im_bridge".to_string(),
+                surface: "harborbeacon".to_string(),
+                conversation_id: "chat-1".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-1".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "camera".to_string(),
+                action: "scan".to_string(),
+                raw_text: "扫描摄像头".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "approval": {
+                    "required": true
+                }
+            }),
+            autonomy: Default::default(),
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::NeedsInput);
+        assert_eq!(response.missing_fields, vec!["approval_token".to_string()]);
+        assert_eq!(
+            response.result.data["approval_ticket"]["task_id"],
+            "task-approval"
+        );
+
+        let task_run = conversation_store
+            .load_task_run("task-approval")
+            .expect("load task run")
+            .expect("task run");
+        assert_eq!(task_run.status, TaskRunStatus::NeedsInput);
+        assert!(task_run.requires_approval);
+
+        let approvals = conversation_store
+            .approvals_for_task("task-approval")
+            .expect("load approvals");
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].status, ApprovalStatus::Pending);
+
+        let events = conversation_store
+            .events_for_task("task-approval")
+            .expect("load events");
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "task.approval_required"));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "task.needs_input"));
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn handle_task_persists_runtime_records_for_failures() {
+        let admin_path = unique_path("harbornas-admin-state");
+        let registry_path = unique_path("harbornas-device-registry");
+        let conversation_path = unique_path("harbornas-task-runtime");
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let service = TaskApiService::new(admin_store, conversation_store.clone());
+        let request = TaskRequest {
+            task_id: "task-unsupported".to_string(),
+            trace_id: "trace-unsupported".to_string(),
+            step_id: "step-unsupported".to_string(),
+            source: TaskSource {
+                channel: "feishu".to_string(),
+                surface: "harborbeacon".to_string(),
+                conversation_id: "chat-1".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-1".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "system".to_string(),
+                action: "ping".to_string(),
+                raw_text: "测试一下".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: Value::Null,
+            autonomy: Default::default(),
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Failed);
+        let task_run = conversation_store
+            .load_task_run("task-unsupported")
+            .expect("load task run")
+            .expect("task run");
+        assert_eq!(task_run.status, TaskRunStatus::Failed);
+        assert_eq!(task_run.session_id, "sess-1");
+        assert_eq!(task_run.autonomy_level, "supervised");
+
+        let task_step = conversation_store
+            .load_task_step("step-unsupported")
+            .expect("load task step")
+            .expect("task step");
+        assert_eq!(task_step.status, TaskStepRunStatus::Failed);
+        assert_eq!(task_step.executor_used, "task_api");
+
+        let session = conversation_store
+            .load_session("sess-1")
+            .expect("load session")
+            .expect("session");
+        assert_eq!(session.channel, "feishu");
+        let events = conversation_store
+            .events_for_task("task-unsupported")
+            .expect("load events");
+        assert!(events.iter().any(|event| event.event_type == "task.failed"));
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
     }
 }

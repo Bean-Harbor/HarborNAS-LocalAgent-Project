@@ -8,18 +8,28 @@ use std::thread;
 use clap::Parser;
 use qrcodegen::{QrCode, QrCodeEcc};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, ResponseBox, Server, StatusCode};
 
+use harbornas_local_agent::control_plane::users::{MembershipStatus, RoleKind};
+use harbornas_local_agent::runtime::access_control::{
+    authorize_access, AccessAction, AccessIdentityHints, AccessPrincipal,
+};
 use harbornas_local_agent::runtime::admin_console::{
-    AdminConsoleState, AdminConsoleStore, AdminDefaults, FeishuBotConfig, FeishuUserBinding,
+    AdminConsoleState, AdminConsoleStore, AdminDefaults, BridgeProviderConfig,
+    IdentityBindingRecord,
 };
 use harbornas_local_agent::runtime::hub::{
-    build_mobile_setup_url, CameraConnectRequest, CameraHubService, HubManualAddSummary,
-    HubScanRequest, HubScanSummary, HubStateSnapshot,
+    build_mobile_setup_url, CameraHubService, HubManualAddSummary, HubScanRequest, HubScanSummary,
+    HubStateSnapshot,
 };
-use harbornas_local_agent::runtime::registry::DeviceRegistryStore;
+use harbornas_local_agent::runtime::registry::{CameraDevice, DeviceRegistryStore};
 use harbornas_local_agent::runtime::remote_view;
+use harbornas_local_agent::runtime::task_api::{
+    TaskApiService, TaskApprovalSummary, TaskIntent, TaskRequest, TaskResponse, TaskSource,
+    TaskStatus,
+};
+use harbornas_local_agent::runtime::task_session::TaskConversationStore;
 
 #[derive(Debug, Parser)]
 #[command(name = "agent-hub-admin-api")]
@@ -44,6 +54,13 @@ struct Cli {
 
     #[arg(
         long,
+        default_value = ".harbornas/task-api-conversations.json",
+        help = "Task API conversation state file"
+    )]
+    conversations: PathBuf,
+
+    #[arg(
+        long,
         default_value = "http://harbornas.local:4174",
         help = "Public origin used in QR setup URL"
     )]
@@ -53,6 +70,7 @@ struct Cli {
 #[derive(Debug, Clone)]
 struct AdminApi {
     admin_store: AdminConsoleStore,
+    task_service: TaskApiService,
     public_origin: String,
 }
 
@@ -89,7 +107,8 @@ struct DefaultsRequest {
     recording: String,
     capture: String,
     ai: String,
-    feishu_group: String,
+    #[serde(alias = "feishu_group")]
+    notification_channel: String,
     #[serde(default)]
     rtsp_username: String,
     #[serde(default)]
@@ -101,9 +120,47 @@ struct DefaultsRequest {
 }
 
 #[derive(Debug, Deserialize)]
-struct FeishuConfigRequest {
+struct BridgeConfigRequest {
     app_id: String,
     app_secret: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ApprovalDecisionRequest {
+    #[serde(default)]
+    approver_user_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MembershipRoleUpdateRequest {
+    role_kind: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CameraTaskResponse {
+    task_response: TaskResponse,
+}
+
+#[derive(Debug, Serialize)]
+struct ApprovalDecisionResponse {
+    approval: TaskApprovalSummary,
+    #[serde(default)]
+    task_response: Option<TaskResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct AccessMemberSummary {
+    user_id: String,
+    display_name: String,
+    role_kind: String,
+    membership_status: String,
+    source: String,
+    #[serde(default)]
+    open_id: Option<String>,
+    #[serde(default)]
+    chat_id: Option<String>,
+    can_edit: bool,
+    is_owner: bool,
 }
 
 type StateResponse = HubStateSnapshot;
@@ -112,9 +169,14 @@ type ScanResponse = HubScanSummary;
 type ManualAddResponse = HubManualAddSummary;
 
 impl AdminApi {
-    fn new(admin_store: AdminConsoleStore, public_origin: String) -> Self {
+    fn new(
+        admin_store: AdminConsoleStore,
+        task_service: TaskApiService,
+        public_origin: String,
+    ) -> Self {
         Self {
             admin_store,
+            task_service,
             public_origin,
         }
     }
@@ -123,13 +185,46 @@ impl AdminApi {
         CameraHubService::new(self.admin_store.clone())
     }
 
+    fn authorize_admin_action(
+        &self,
+        hints: &AccessIdentityHints,
+        action: AccessAction,
+    ) -> Result<AccessPrincipal, String> {
+        let state = self.admin_store.load_or_create_state()?;
+        let workspace_id = state
+            .platform
+            .workspaces
+            .first()
+            .map(|workspace| workspace.workspace_id.clone())
+            .unwrap_or_else(|| "home-1".to_string());
+        authorize_access(
+            &state,
+            hints,
+            action,
+            &format!("workspace:{workspace_id}"),
+            true,
+        )
+    }
+
+    fn authorize_camera_action(
+        &self,
+        hints: &AccessIdentityHints,
+        device_id: &str,
+        action: AccessAction,
+    ) -> Result<AccessPrincipal, String> {
+        let state = self.admin_store.load_or_create_state()?;
+        authorize_access(&state, hints, action, &format!("camera:{device_id}"), true)
+    }
+
     fn handle(&self, mut request: Request) {
         let method = request.method().clone();
-        let path = request.url().split('?').next().unwrap_or("/");
+        let raw_url = request.url().to_string();
+        let path = raw_url.split('?').next().unwrap_or("/").to_string();
         let remote_addr = request.remote_addr().copied();
         let headers = request.headers().to_vec();
+        let identity_hints = request_identity_hints(&raw_url, &headers);
 
-        if is_admin_surface_path(path) {
+        if is_admin_surface_path(path.as_str()) {
             if let Err(error) = ensure_local_admin_access(remote_addr, &headers) {
                 let _ = request.respond(error_json(StatusCode(403), &error).boxed());
                 return;
@@ -138,47 +233,88 @@ impl AdminApi {
 
         let response = match method {
             Method::Get if path == "/healthz" => ok_json(&json!({"status":"ok"})).boxed(),
-            Method::Get if path == "/api/state" => self.handle_state().boxed(),
-            Method::Get if path == "/api/binding/qr.svg" => self.handle_binding_qr_svg().boxed(),
+            Method::Get if path == "/api/state" => self.handle_state(&identity_hints).boxed(),
+            Method::Get if path == "/api/access/members" => {
+                self.handle_access_members(&identity_hints).boxed()
+            }
+            Method::Get if path == "/api/tasks/approvals" => {
+                self.handle_pending_approvals(&identity_hints).boxed()
+            }
+            Method::Get if path == "/api/binding/qr.svg" => {
+                self.handle_binding_qr_svg(&identity_hints).boxed()
+            }
             Method::Get if path == "/api/binding/static-qr.svg" => {
-                self.handle_static_binding_qr_svg().boxed()
+                self.handle_static_binding_qr_svg(&identity_hints).boxed()
             }
-            Method::Get if path == "/setup/mobile" => {
-                self.handle_mobile_setup_page(request.url()).boxed()
-            }
+            Method::Get if path == "/setup/mobile" => self
+                .handle_mobile_setup_page(&raw_url, &identity_hints)
+                .boxed(),
             Method::Get
                 if path.starts_with("/shared/cameras/") && path.ends_with("/live.mjpeg") =>
             {
-                self.handle_shared_camera_live_mjpeg(path)
+                self.handle_shared_camera_live_mjpeg(&path)
             }
             Method::Get if path.starts_with("/shared/cameras/") => {
-                self.handle_shared_live_view_page(path).boxed()
+                self.handle_shared_live_view_page(&path).boxed()
             }
             Method::Get if path.starts_with("/live/cameras/") => self
-                .handle_live_view_page(path, remote_addr, &headers)
+                .handle_live_view_page(&raw_url, &path, remote_addr, &headers, &identity_hints)
                 .boxed(),
             Method::Get if path.starts_with("/api/cameras/") && path.ends_with("/live.mjpeg") => {
-                self.handle_camera_live_mjpeg(path, remote_addr, &headers)
+                self.handle_camera_live_mjpeg(&path, remote_addr, &headers, &identity_hints)
             }
             Method::Get if path.starts_with("/api/cameras/") && path.ends_with("/snapshot.jpg") => {
-                self.handle_camera_snapshot(path, remote_addr, &headers)
+                self.handle_camera_snapshot(&path, remote_addr, &headers, &identity_hints)
                     .boxed()
             }
-            Method::Post if path == "/api/binding/refresh" => self.handle_refresh_binding().boxed(),
-            Method::Post if path == "/api/binding/demo-bind" => self.handle_demo_bind().boxed(),
+            Method::Post if path == "/api/binding/refresh" => {
+                self.handle_refresh_binding(&identity_hints).boxed()
+            }
+            Method::Post if path == "/api/binding/demo-bind" => {
+                self.handle_demo_bind(&identity_hints).boxed()
+            }
             Method::Post if path == "/api/binding/test-bind" => {
-                self.handle_test_bind(&mut request).boxed()
+                self.handle_test_bind(&mut request, &identity_hints).boxed()
             }
-            Method::Post if path == "/api/feishu/configure" => {
-                self.handle_configure_feishu(&mut request).boxed()
+            Method::Post if path == "/api/bridge/configure" => self
+                .handle_configure_bridge(&mut request, &identity_hints)
+                .boxed(),
+            Method::Post
+                if path.starts_with("/api/tasks/approvals/") && path.ends_with("/approve") =>
+            {
+                self.handle_approve_approval(path.as_str(), &mut request, &identity_hints)
+                    .boxed()
             }
-            Method::Post if path == "/api/discovery/scan" => self.handle_scan(&mut request).boxed(),
-            Method::Post if path == "/api/devices/manual" => {
-                self.handle_manual_add(&mut request).boxed()
+            Method::Post if path.starts_with("/api/access/members/") && path.ends_with("/role") => {
+                self.handle_update_member_role(path.as_str(), &mut request, &identity_hints)
+                    .boxed()
             }
-            Method::Post if path == "/api/defaults" => {
-                self.handle_save_defaults(&mut request).boxed()
+            Method::Post
+                if path.starts_with("/api/tasks/approvals/") && path.ends_with("/reject") =>
+            {
+                self.handle_reject_approval(path.as_str(), &mut request, &identity_hints)
+                    .boxed()
             }
+            Method::Post if path == "/api/discovery/scan" => {
+                self.handle_scan(&mut request, &identity_hints).boxed()
+            }
+            Method::Post if path == "/api/devices/manual" => self
+                .handle_manual_add(&mut request, &identity_hints)
+                .boxed(),
+            Method::Post if path.starts_with("/api/cameras/") && path.ends_with("/share-link") => {
+                self.handle_camera_share_link(&path, &identity_hints)
+                    .boxed()
+            }
+            Method::Post if path.starts_with("/api/cameras/") && path.ends_with("/snapshot") => {
+                self.handle_camera_task_snapshot(&path, &identity_hints)
+                    .boxed()
+            }
+            Method::Post if path.starts_with("/api/cameras/") && path.ends_with("/analyze") => {
+                self.handle_camera_analyze(&path, &identity_hints).boxed()
+            }
+            Method::Post if path == "/api/defaults" => self
+                .handle_save_defaults(&mut request, &identity_hints)
+                .boxed(),
             Method::Options => no_content().boxed(),
             _ => error_json(StatusCode(404), "route not found").boxed(),
         };
@@ -186,14 +322,155 @@ impl AdminApi {
         let _ = request.respond(response);
     }
 
-    fn handle_state(&self) -> Response<std::io::Cursor<Vec<u8>>> {
+    fn handle_state(&self, hints: &AccessIdentityHints) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
         match self.current_state() {
             Ok(payload) => ok_json(&redact_state_snapshot(payload)),
             Err(error) => error_json(StatusCode(500), &error),
         }
     }
 
-    fn handle_binding_qr_svg(&self) -> Response<std::io::Cursor<Vec<u8>>> {
+    fn handle_access_members(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+
+        let state = match self.admin_store.load_or_create_state() {
+            Ok(state) => state,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+
+        ok_json(&build_access_member_summaries(&state))
+    }
+
+    fn handle_pending_approvals(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::ApprovalReview) {
+            return error_json(StatusCode(403), &error);
+        }
+        match self.task_service.pending_approvals() {
+            Ok(payload) => ok_json(&payload),
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_approve_approval(
+        &self,
+        path: &str,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = match self.authorize_admin_action(hints, AccessAction::ApprovalReview) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
+        let approval_id = match parse_approval_decision_path(path, "approve") {
+            Some(approval_id) => approval_id,
+            None => return error_json(StatusCode(400), "invalid approval approve path"),
+        };
+        let body: ApprovalDecisionRequest = match read_json_body_or_default(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let approver_user_id = body
+            .approver_user_id
+            .filter(|user_id| user_id == &principal.user_id)
+            .or_else(|| Some(principal.user_id.clone()));
+
+        match self
+            .task_service
+            .approve_pending_approval(&approval_id, approver_user_id)
+        {
+            Ok((approval, task_response)) => ok_json(&ApprovalDecisionResponse {
+                approval,
+                task_response: Some(task_response),
+            }),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_reject_approval(
+        &self,
+        path: &str,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = match self.authorize_admin_action(hints, AccessAction::ApprovalReview) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
+        let approval_id = match parse_approval_decision_path(path, "reject") {
+            Some(approval_id) => approval_id,
+            None => return error_json(StatusCode(400), "invalid approval reject path"),
+        };
+        let body: ApprovalDecisionRequest = match read_json_body_or_default(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let approver_user_id = body
+            .approver_user_id
+            .filter(|user_id| user_id == &principal.user_id)
+            .or_else(|| Some(principal.user_id.clone()));
+
+        match self
+            .task_service
+            .reject_pending_approval(&approval_id, approver_user_id)
+        {
+            Ok(approval) => ok_json(&ApprovalDecisionResponse {
+                approval,
+                task_response: None,
+            }),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_update_member_role(
+        &self,
+        path: &str,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+
+        let user_id = match parse_member_role_update_path(path) {
+            Some(user_id) => user_id,
+            None => return error_json(StatusCode(400), "invalid member role path"),
+        };
+        let body: MembershipRoleUpdateRequest = match read_json_body(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let role_kind = match parse_role_kind(&body.role_kind) {
+            Ok(role_kind) => role_kind,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+
+        match self
+            .admin_store
+            .set_member_role(&user_id, role_kind)
+            .map(|state| build_access_member_summaries(&state))
+        {
+            Ok(payload) => ok_json(&payload),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_binding_qr_svg(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
         let state = match self.current_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
@@ -218,7 +495,13 @@ impl AdminApi {
         response
     }
 
-    fn handle_static_binding_qr_svg(&self) -> Response<std::io::Cursor<Vec<u8>>> {
+    fn handle_static_binding_qr_svg(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
         let state = match self.current_state() {
             Ok(state) => state,
             Err(error) => return error_json(StatusCode(500), &error),
@@ -243,7 +526,14 @@ impl AdminApi {
         response
     }
 
-    fn handle_mobile_setup_page(&self, url: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    fn handle_mobile_setup_page(
+        &self,
+        url: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
         let state = match self.admin_store.load_or_create_state() {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(500), &error),
@@ -270,9 +560,11 @@ impl AdminApi {
 
     fn handle_live_view_page(
         &self,
+        url: &str,
         path: &str,
         remote_addr: Option<SocketAddr>,
         headers: &[Header],
+        hints: &AccessIdentityHints,
     ) -> Response<Cursor<Vec<u8>>> {
         if let Err(error) = ensure_local_camera_access(remote_addr, headers) {
             return error_json(StatusCode(403), &error);
@@ -291,7 +583,13 @@ impl AdminApi {
             Err(error) => return error_json(StatusCode(422), &error),
         };
 
-        let body = render_live_view_page(&self.public_origin, &device);
+        if let Err(error) =
+            self.authorize_camera_action(hints, &device_id, AccessAction::CameraView)
+        {
+            return error_json(StatusCode(403), &error);
+        }
+
+        let body = render_live_view_page(&self.public_origin, &device, &identity_query_suffix(url));
         let mut response = Response::from_string(body).with_status_code(StatusCode(200));
         add_common_headers(&mut response);
         response.add_header(
@@ -334,7 +632,13 @@ impl AdminApi {
         response
     }
 
-    fn handle_refresh_binding(&self) -> Response<std::io::Cursor<Vec<u8>>> {
+    fn handle_refresh_binding(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
         match self
             .admin_store
             .refresh_binding_qr()
@@ -345,10 +649,13 @@ impl AdminApi {
         }
     }
 
-    fn handle_demo_bind(&self) -> Response<std::io::Cursor<Vec<u8>>> {
+    fn handle_demo_bind(&self, hints: &AccessIdentityHints) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
         match self
             .admin_store
-            .mark_demo_bound("Bean / 飞书管理员")
+            .mark_demo_bound("Bean / 本地管理员")
             .and_then(|_| self.current_state())
         {
             Ok(payload) => ok_json(&payload),
@@ -356,7 +663,14 @@ impl AdminApi {
         }
     }
 
-    fn handle_test_bind(&self, request: &mut Request) -> Response<std::io::Cursor<Vec<u8>>> {
+    fn handle_test_bind(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
         let body: BindingTestRequest = match read_json_body(request) {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
@@ -387,7 +701,7 @@ impl AdminApi {
             .map(|value| value.to_string())
             .unwrap_or_else(|| slugify_identity(display_name));
 
-        let user = FeishuUserBinding {
+        let user = IdentityBindingRecord {
             open_id,
             user_id: body
                 .user_id
@@ -406,7 +720,7 @@ impl AdminApi {
 
         match self
             .admin_store
-            .bind_feishu_user(&binding_code, user)
+            .bind_identity_user(&binding_code, user)
             .and_then(|_| self.current_state())
         {
             Ok(payload) => ok_json(&payload),
@@ -414,13 +728,20 @@ impl AdminApi {
         }
     }
 
-    fn handle_configure_feishu(&self, request: &mut Request) -> Response<std::io::Cursor<Vec<u8>>> {
-        let body: FeishuConfigRequest = match read_json_body(request) {
+    fn handle_configure_bridge(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        let body: BridgeConfigRequest = match read_json_body(request) {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
         };
 
-        match self.hub().configure_feishu_bot(
+        match self.hub().configure_bridge_provider(
             &body.app_id,
             &body.app_secret,
             Some(&self.public_origin),
@@ -430,31 +751,54 @@ impl AdminApi {
         }
     }
 
-    fn handle_scan(&self, request: &mut Request) -> Response<std::io::Cursor<Vec<u8>>> {
+    fn handle_scan(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
         let body: ScanRequest = match read_json_body(request) {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
         };
 
-        match self.scan(body) {
+        match self.scan(&principal, body) {
             Ok(payload) => ok_json(&payload),
             Err(error) => error_json(StatusCode(422), &error),
         }
     }
 
-    fn handle_manual_add(&self, request: &mut Request) -> Response<std::io::Cursor<Vec<u8>>> {
+    fn handle_manual_add(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            Ok(principal) => principal,
+            Err(error) => return error_json(StatusCode(403), &error),
+        };
         let body: ManualAddRequest = match read_json_body(request) {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
         };
 
-        match self.manual_add(body) {
+        match self.manual_add(&principal, body) {
             Ok(payload) => ok_json(&payload),
             Err(error) => error_json(StatusCode(422), &error),
         }
     }
 
-    fn handle_save_defaults(&self, request: &mut Request) -> Response<std::io::Cursor<Vec<u8>>> {
+    fn handle_save_defaults(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
         let body: DefaultsRequest = match read_json_body(request) {
             Ok(payload) => payload,
             Err(error) => return error_json(StatusCode(400), &error),
@@ -466,7 +810,7 @@ impl AdminApi {
             recording: body.recording,
             capture: body.capture,
             ai: body.ai,
-            feishu_group: body.feishu_group,
+            notification_channel: body.notification_channel,
             rtsp_username: body.rtsp_username,
             rtsp_password: body.rtsp_password,
             rtsp_port: body.rtsp_port.unwrap_or(554),
@@ -482,11 +826,72 @@ impl AdminApi {
         }
     }
 
+    fn handle_camera_analyze(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let device_id = match parse_camera_analyze_path(path) {
+            Some(device_id) => device_id,
+            None => return error_json(StatusCode(400), "invalid camera analyze path"),
+        };
+        let principal =
+            match self.authorize_camera_action(hints, &device_id, AccessAction::CameraOperate) {
+                Ok(principal) => principal,
+                Err(error) => return error_json(StatusCode(403), &error),
+            };
+
+        ok_json(&CameraTaskResponse {
+            task_response: self.analyze_camera(&principal, &device_id),
+        })
+    }
+
+    fn handle_camera_task_snapshot(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let device_id = match parse_camera_task_snapshot_path(path) {
+            Some(device_id) => device_id,
+            None => return error_json(StatusCode(400), "invalid camera snapshot task path"),
+        };
+        let principal =
+            match self.authorize_camera_action(hints, &device_id, AccessAction::CameraOperate) {
+                Ok(principal) => principal,
+                Err(error) => return error_json(StatusCode(403), &error),
+            };
+
+        ok_json(&CameraTaskResponse {
+            task_response: self.snapshot_camera(&principal, &device_id),
+        })
+    }
+
+    fn handle_camera_share_link(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let device_id = match parse_camera_share_link_path(path) {
+            Some(device_id) => device_id,
+            None => return error_json(StatusCode(400), "invalid camera share-link path"),
+        };
+        let principal =
+            match self.authorize_camera_action(hints, &device_id, AccessAction::CameraOperate) {
+                Ok(principal) => principal,
+                Err(error) => return error_json(StatusCode(403), &error),
+            };
+
+        ok_json(&CameraTaskResponse {
+            task_response: self.share_camera_link(&principal, &device_id),
+        })
+    }
+
     fn handle_camera_snapshot(
         &self,
         path: &str,
         remote_addr: Option<SocketAddr>,
         headers: &[Header],
+        hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
         if let Err(error) = ensure_local_camera_access(remote_addr, headers) {
             return error_json(StatusCode(403), &error);
@@ -496,6 +901,11 @@ impl AdminApi {
             Some(device_id) => device_id,
             None => return error_json(StatusCode(400), "invalid camera snapshot path"),
         };
+        if let Err(error) =
+            self.authorize_camera_action(hints, &device_id, AccessAction::CameraView)
+        {
+            return error_json(StatusCode(403), &error);
+        }
 
         match self.capture_camera_snapshot(&device_id) {
             Ok(bytes) => image_response(StatusCode(200), bytes, "image/jpeg"),
@@ -509,6 +919,7 @@ impl AdminApi {
         path: &str,
         remote_addr: Option<SocketAddr>,
         headers: &[Header],
+        hints: &AccessIdentityHints,
     ) -> ResponseBox {
         if let Err(error) = ensure_local_camera_access(remote_addr, headers) {
             return error_json(StatusCode(403), &error).boxed();
@@ -518,6 +929,11 @@ impl AdminApi {
             Some(device_id) => device_id,
             None => return error_json(StatusCode(400), "invalid live stream path").boxed(),
         };
+        if let Err(error) =
+            self.authorize_camera_action(hints, &device_id, AccessAction::CameraView)
+        {
+            return error_json(StatusCode(403), &error).boxed();
+        }
 
         let device = match self.load_camera_device(&device_id) {
             Ok(device) => device,
@@ -589,11 +1005,50 @@ impl AdminApi {
         self.hub().state_snapshot(Some(&self.public_origin))
     }
 
-    fn scan(&self, request: ScanRequest) -> Result<ScanResponse, String> {
-        self.hub().scan(request, Some(&self.public_origin))
+    fn scan(
+        &self,
+        principal: &AccessPrincipal,
+        request: ScanRequest,
+    ) -> Result<ScanResponse, String> {
+        let response = self
+            .task_service
+            .handle_task(self.build_camera_task_request(
+                principal,
+                "scan",
+                "扫描摄像头",
+                json!({
+                    "cidr": request.cidr,
+                    "protocol": request.protocol,
+                }),
+            ));
+        if response.status != TaskStatus::Completed {
+            return Err(task_error_message(&response));
+        }
+
+        let state = self.current_state()?;
+        let results = parse_scan_results(&response.result.data)?;
+        let scanned_hosts = response
+            .result
+            .data
+            .pointer("/summary/scanned_hosts")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or_default();
+
+        Ok(HubScanSummary {
+            binding: state.binding,
+            defaults: state.defaults,
+            devices: state.devices,
+            results,
+            scanned_hosts,
+        })
     }
 
-    fn manual_add(&self, request: ManualAddRequest) -> Result<ManualAddResponse, String> {
+    fn manual_add(
+        &self,
+        principal: &AccessPrincipal,
+        request: ManualAddRequest,
+    ) -> Result<ManualAddResponse, String> {
         let path_candidates = request
             .path
             .as_deref()
@@ -609,21 +1064,72 @@ impl AdminApi {
             .map(|value| vec![value])
             .unwrap_or_default();
 
-        self.hub().manual_add(
-            CameraConnectRequest {
-                name: request.name,
-                room: request.room,
-                ip: request.ip,
-                path_candidates,
-                username: request.username,
-                password: request.password,
-                port: request.port,
-                discovery_source: "manual_entry".to_string(),
-                vendor: None,
-                model: None,
-            },
-            Some(&self.public_origin),
-        )
+        let response = self
+            .task_service
+            .handle_task(self.build_camera_task_request(
+                principal,
+                "connect",
+                "手动接入摄像头",
+                json!({
+                    "name": request.name,
+                    "room": request.room,
+                    "ip": request.ip,
+                    "path_candidates": path_candidates,
+                    "username": request.username,
+                    "password": request.password,
+                    "port": request.port,
+                    "discovery_source": "admin_console_manual_add",
+                }),
+            ));
+        if response.status != TaskStatus::Completed {
+            return Err(task_error_message(&response));
+        }
+
+        let state = self.current_state()?;
+        let device = parse_connected_device(&response.result.data)?;
+        Ok(HubManualAddSummary {
+            binding: state.binding,
+            defaults: state.defaults,
+            device,
+            devices: state.devices,
+            note: response.result.message,
+        })
+    }
+
+    fn analyze_camera(&self, principal: &AccessPrincipal, device_id: &str) -> TaskResponse {
+        self.task_service
+            .handle_task(self.build_camera_task_request(
+                principal,
+                "analyze",
+                "分析摄像头画面",
+                json!({
+                    "device_id": device_id,
+                }),
+            ))
+    }
+
+    fn snapshot_camera(&self, principal: &AccessPrincipal, device_id: &str) -> TaskResponse {
+        self.task_service
+            .handle_task(self.build_camera_task_request(
+                principal,
+                "snapshot",
+                "抓拍摄像头画面",
+                json!({
+                    "device_id": device_id,
+                }),
+            ))
+    }
+
+    fn share_camera_link(&self, principal: &AccessPrincipal, device_id: &str) -> TaskResponse {
+        self.task_service
+            .handle_task(self.build_camera_task_request(
+                principal,
+                "share_link",
+                "生成共享观看链接",
+                json!({
+                    "device_id": device_id,
+                }),
+            ))
     }
 
     fn capture_camera_snapshot(&self, device_id: &str) -> Result<Vec<u8>, String> {
@@ -648,13 +1154,44 @@ impl AdminApi {
         let state = self.admin_store.load_or_create_state()?;
         remote_view::verify_camera_share_token(&state.remote_view.share_secret, token)
     }
+
+    fn build_camera_task_request(
+        &self,
+        principal: &AccessPrincipal,
+        action: &str,
+        raw_text: &str,
+        args: Value,
+    ) -> TaskRequest {
+        TaskRequest {
+            task_id: String::new(),
+            trace_id: String::new(),
+            step_id: String::new(),
+            source: TaskSource {
+                channel: "admin_api".to_string(),
+                surface: "agent_hub_admin_api".to_string(),
+                conversation_id: format!("admin-console:{}", principal.user_id),
+                user_id: principal.user_id.clone(),
+                session_id: format!("admin-console:{}", principal.user_id),
+            },
+            intent: TaskIntent {
+                domain: "camera".to_string(),
+                action: action.to_string(),
+                raw_text: raw_text.to_string(),
+            },
+            entity_refs: Value::Null,
+            args,
+            autonomy: Default::default(),
+        }
+    }
 }
 
 fn main() {
     let cli = Cli::parse();
     let registry_store = DeviceRegistryStore::new(cli.device_registry);
     let admin_store = AdminConsoleStore::new(cli.admin_state, registry_store);
-    let api = AdminApi::new(admin_store, cli.public_origin);
+    let conversation_store = TaskConversationStore::new(cli.conversations);
+    let task_service = TaskApiService::new(admin_store.clone(), conversation_store);
+    let api = AdminApi::new(admin_store, task_service, cli.public_origin);
 
     let server = Server::http(&cli.bind).unwrap_or_else(|error| {
         eprintln!("failed to start admin api on {}: {}", cli.bind, error);
@@ -684,17 +1221,168 @@ fn parse_query_param(url: &str, key: &str) -> Option<String> {
     None
 }
 
+fn request_identity_hints(url: &str, headers: &[Header]) -> AccessIdentityHints {
+    AccessIdentityHints {
+        user_id: header_value(headers, "X-Harbor-User-Id")
+            .or_else(|| parse_query_param(url, "user_id"))
+            .and_then(percent_decode_optional_query_value),
+        open_id: header_value(headers, "X-Harbor-Open-Id")
+            .or_else(|| parse_query_param(url, "open_id"))
+            .and_then(percent_decode_optional_query_value),
+    }
+}
+
+fn header_value(headers: &[Header], name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|header| header.field.as_str().to_string().eq_ignore_ascii_case(name))
+        .map(|header| header.value.as_str().trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn percent_decode_optional_query_value(value: String) -> Option<String> {
+    percent_decode_path_segment(&value).ok().or(Some(value))
+}
+
+fn identity_query_suffix(url: &str) -> String {
+    let mut pairs = Vec::new();
+    if let Some(open_id) = parse_query_param(url, "open_id").filter(|value| !value.is_empty()) {
+        pairs.push(format!("open_id={open_id}"));
+    }
+    if let Some(user_id) = parse_query_param(url, "user_id").filter(|value| !value.is_empty()) {
+        pairs.push(format!("user_id={user_id}"));
+    }
+    if pairs.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", pairs.join("&"))
+    }
+}
+
+fn parse_approval_decision_path(path: &str, action: &str) -> Option<String> {
+    let prefix = "/api/tasks/approvals/";
+    let suffix = format!("/{action}");
+    let approval_id = path.strip_prefix(prefix)?.strip_suffix(&suffix)?.trim();
+    if approval_id.is_empty() {
+        return None;
+    }
+    percent_decode_path_segment(approval_id).ok()
+}
+
+fn parse_member_role_update_path(path: &str) -> Option<String> {
+    let trimmed = path.strip_prefix("/api/access/members/")?;
+    let user_id = trimmed.strip_suffix("/role")?.trim();
+    if user_id.is_empty() {
+        None
+    } else {
+        percent_decode_path_segment(user_id).ok()
+    }
+}
+
+fn parse_role_kind(value: &str) -> Result<RoleKind, String> {
+    match value.trim().to_lowercase().replace('-', "_").as_str() {
+        "admin" => Ok(RoleKind::Admin),
+        "operator" => Ok(RoleKind::Operator),
+        "member" => Ok(RoleKind::Member),
+        "viewer" => Ok(RoleKind::Viewer),
+        "guest" => Ok(RoleKind::Guest),
+        "owner" => Err("当前入口不支持直接设置 owner 角色".to_string()),
+        _ => Err(format!("unknown role_kind: {}", value.trim())),
+    }
+}
+
+fn build_access_member_summaries(state: &AdminConsoleState) -> Vec<AccessMemberSummary> {
+    let workspace = state
+        .platform
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == "home-1")
+        .or_else(|| state.platform.workspaces.first());
+    let owner_user_id = workspace
+        .map(|workspace| workspace.owner_user_id.as_str())
+        .unwrap_or("local-owner");
+
+    let mut members: Vec<AccessMemberSummary> = state
+        .platform
+        .memberships
+        .iter()
+        .filter(|membership| membership.workspace_id == "home-1")
+        .map(|membership| {
+            let user = state
+                .platform
+                .users
+                .iter()
+                .find(|user| user.user_id == membership.user_id);
+            let identity_binding = state
+                .platform
+                .identity_bindings
+                .iter()
+                .find(|binding| binding.user_id == membership.user_id);
+
+            AccessMemberSummary {
+                user_id: membership.user_id.clone(),
+                display_name: user
+                    .map(|user| user.display_name.clone())
+                    .or_else(|| {
+                        identity_binding
+                            .and_then(|binding| binding.profile_snapshot.get("display_name"))
+                            .and_then(Value::as_str)
+                            .map(|value| value.to_string())
+                    })
+                    .unwrap_or_else(|| membership.user_id.clone()),
+                role_kind: role_kind_value(membership.role_kind).to_string(),
+                membership_status: membership_status_value(membership.status).to_string(),
+                source: identity_binding
+                    .map(|binding| binding.provider_key.clone())
+                    .unwrap_or_else(|| "local_console".to_string()),
+                open_id: identity_binding.map(|binding| binding.external_user_id.clone()),
+                chat_id: identity_binding.and_then(|binding| binding.external_chat_id.clone()),
+                can_edit: membership.user_id != owner_user_id,
+                is_owner: membership.user_id == owner_user_id
+                    || membership.role_kind == RoleKind::Owner,
+            }
+        })
+        .collect();
+
+    members.sort_by(|left, right| {
+        right
+            .is_owner
+            .cmp(&left.is_owner)
+            .then_with(|| left.display_name.cmp(&right.display_name))
+    });
+    members
+}
+
+fn role_kind_value(role_kind: RoleKind) -> &'static str {
+    match role_kind {
+        RoleKind::Owner => "owner",
+        RoleKind::Admin => "admin",
+        RoleKind::Operator => "operator",
+        RoleKind::Member => "member",
+        RoleKind::Viewer => "viewer",
+        RoleKind::Guest => "guest",
+    }
+}
+
+fn membership_status_value(status: MembershipStatus) -> &'static str {
+    match status {
+        MembershipStatus::Active => "active",
+        MembershipStatus::Pending => "pending",
+        MembershipStatus::Revoked => "revoked",
+    }
+}
+
 fn render_mobile_setup_page(
     state: &AdminConsoleState,
     setup_url: &str,
     static_setup_url: &str,
     session_code: &str,
 ) -> String {
-    let app_id = html_escape(&state.feishu_bot.app_id);
-    let bot_name = if state.feishu_bot.app_name.trim().is_empty() {
+    let app_id = html_escape(&state.bridge_provider.app_id);
+    let bot_name = if state.bridge_provider.app_name.trim().is_empty() {
         "尚未配置".to_string()
     } else {
-        html_escape(&state.feishu_bot.app_name)
+        html_escape(&state.bridge_provider.app_name)
     };
     let status = html_escape(&state.binding.metric);
     let session_code = html_escape(session_code);
@@ -706,7 +1394,7 @@ fn render_mobile_setup_page(
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>HarborNAS 飞书 Bot 配置</title>
+  <title>HarborNAS IM Bridge 配置</title>
   <style>
     body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #f4efe7; color: #1e1b18; margin: 0; }}
     .wrap {{ max-width: 560px; margin: 0 auto; padding: 24px 18px 40px; }}
@@ -727,21 +1415,21 @@ fn render_mobile_setup_page(
   <div class="wrap">
     <div class="card">
       <div class="meta">HarborNAS Agent Hub · 手机配置页</div>
-      <h1>绑定飞书 Bot</h1>
-      <p>在这台手机上填入你刚创建的飞书机器人的 <code>app_id</code> 和 <code>app_secret</code>。保存成功后，这台 Agent Hub 就能正式接通飞书消息。</p>
+      <h1>配置消息桥接 Provider</h1>
+      <p>在这台手机上填入外部消息桥接应用的 <code>app_id</code> 和 <code>app_secret</code>。保存成功后，这台 Agent Hub 就能记录统一的 bridge/provider 凭据。</p>
       <div class="status">
         <div><strong>当前状态：</strong><span id="status-text">{status}</span></div>
         <div><strong>当前会话：</strong>{session_code}</div>
-        <div><strong>已连接 Bot：</strong><span id="bot-name">{bot_name}</span></div>
+        <div><strong>已连接 Provider：</strong><span id="bot-name">{bot_name}</span></div>
       </div>
       <p class="hint">当前打开的是本地配置入口：<code>{setup_url}</code></p>
       <label for="app-id">App ID</label>
       <input id="app-id" value="{app_id}" autocomplete="off" />
       <label for="app-secret">App Secret</label>
       <input id="app-secret" type="password" value="" autocomplete="off" placeholder="为安全起见，这里不会回显已保存的 secret" />
-      <button id="submit-btn">保存并验证飞书连接</button>
-      <p class="hint">保存时会立即调用飞书 Open API 校验凭证，并读取 Bot 信息。成功后桌面端后台会同步显示“Bot 已连接”。你也可以把这台机器上贴的静态二维码固定为 <code>{static_setup_url}</code>。</p>
-      <p class="hint">如果当前已经配过 Bot，但你没有要更换凭证，请不要把空白的 secret 直接提交；这里不会显示历史 secret，是为了避免硬件二维码泄露后被他人看到现有密钥。</p>
+      <button id="submit-btn">保存并验证 Bridge 连接</button>
+      <p class="hint">保存时会立即校验兼容桥接凭证，并读取应用信息。当前实现仍按飞书 Open API 做兼容验证。成功后桌面端后台会同步显示“Bridge 已连接”。你也可以把这台机器上贴的静态二维码固定为 <code>{static_setup_url}</code>。</p>
+      <p class="hint">如果当前已经配过 bridge provider，但你没有要更换凭证，请不要把空白的 secret 直接提交；这里不会显示历史 secret，是为了避免硬件二维码泄露后被他人看到现有密钥。</p>
       <p id="result" class="hint"></p>
     </div>
   </div>
@@ -749,9 +1437,9 @@ fn render_mobile_setup_page(
     document.getElementById('submit-btn').addEventListener('click', async () => {{
       const result = document.getElementById('result');
       result.className = 'hint';
-      result.textContent = '正在验证飞书凭证...';
+      result.textContent = '正在验证 bridge 凭证...';
       try {{
-        const response = await fetch('/api/feishu/configure', {{
+        const response = await fetch('/api/bridge/configure', {{
           method: 'POST',
           headers: {{ 'Content-Type': 'application/json' }},
           body: JSON.stringify({{
@@ -763,10 +1451,10 @@ fn render_mobile_setup_page(
         if (!response.ok) {{
           throw new Error(payload.error || '保存失败');
         }}
-        document.getElementById('status-text').textContent = payload.binding.metric || 'Bot 已连接';
-        document.getElementById('bot-name').textContent = payload.feishu_bot?.app_name || '已连接';
+        document.getElementById('status-text').textContent = payload.binding.metric || 'Bridge 已连接';
+        document.getElementById('bot-name').textContent = payload.bridge_provider?.app_name || '已连接';
         result.className = 'hint ok';
-        result.textContent = '飞书 Bot 已验证成功，现在可以回到飞书里直接和 Bot 对话了。';
+        result.textContent = 'Bridge provider 已验证成功，后台已经记录了统一 provider 凭据。';
       }} catch (error) {{
         result.className = 'hint err';
         result.textContent = error.message;
@@ -781,6 +1469,7 @@ fn render_mobile_setup_page(
 fn render_live_view_page(
     public_origin: &str,
     device: &harbornas_local_agent::runtime::registry::CameraDevice,
+    identity_query: &str,
 ) -> String {
     let device_label = device.room.as_deref().unwrap_or(device.name.as_str());
     let device_label = html_escape(device_label);
@@ -788,8 +1477,8 @@ fn render_live_view_page(
     let ip_address = html_escape(device.ip_address.as_deref().unwrap_or("未知 IP"));
     let device_id = url_encode_path_segment(&device.device_id);
     let origin = public_origin.trim_end_matches('/');
-    let live_stream_url = format!("{origin}/api/cameras/{device_id}/live.mjpeg");
-    let snapshot_url = format!("{origin}/api/cameras/{device_id}/snapshot.jpg");
+    let live_stream_url = format!("{origin}/api/cameras/{device_id}/live.mjpeg{identity_query}");
+    let snapshot_url = format!("{origin}/api/cameras/{device_id}/snapshot.jpg{identity_query}");
 
     format!(
         r#"<!DOCTYPE html>
@@ -955,13 +1644,14 @@ fn render_live_view_page(
 
       <div class="hint">
         如果画面没有出来，先确认手机和 HarborNAS Agent Hub 在同一个局域网，再点击“重连画面”。
-        这个页面只负责看实时视频；拍照、录像、云台控制仍然建议继续在飞书里完成。
+        这个页面只负责看实时视频；拍照、录像、云台控制仍然建议继续在统一 IM 入口里完成。
       </div>
     </div>
   </div>
 
   <script>
     const streamUrl = {live_stream_url:?};
+    const reloadSeparator = streamUrl.includes('?') ? '&' : '?';
     const streamEl = document.getElementById('stream');
     const statusEl = document.getElementById('status');
     const statusTextEl = document.getElementById('status-text');
@@ -974,7 +1664,7 @@ fn render_live_view_page(
 
     function reloadStream() {{
       setStatus(false, '正在重连画面…');
-      streamEl.src = `${{streamUrl}}?ts=${{Date.now()}}`;
+      streamEl.src = `${{streamUrl}}${{reloadSeparator}}ts=${{Date.now()}}`;
     }}
 
     streamEl.addEventListener('load', () => {{
@@ -1243,6 +1933,21 @@ fn read_json_body<T: for<'de> Deserialize<'de>>(request: &mut Request) -> Result
     serde_json::from_str(&body).map_err(|e| format!("invalid JSON body: {e}"))
 }
 
+fn read_json_body_or_default<T>(request: &mut Request) -> Result<T, String>
+where
+    T: for<'de> Deserialize<'de> + Default,
+{
+    let mut body = String::new();
+    request
+        .as_reader()
+        .read_to_string(&mut body)
+        .map_err(|e| format!("failed to read request body: {e}"))?;
+    if body.trim().is_empty() {
+        return Ok(T::default());
+    }
+    serde_json::from_str(&body).map_err(|e| format!("invalid JSON body: {e}"))
+}
+
 fn ok_json(payload: &impl Serialize) -> Response<std::io::Cursor<Vec<u8>>> {
     json_response(StatusCode(200), payload)
 }
@@ -1303,15 +2008,22 @@ fn add_common_headers<R: Read>(response: &mut Response<R>) {
 
 fn is_admin_surface_path(path: &str) -> bool {
     path == "/api/state"
+        || path == "/api/access/members"
         || path == "/api/binding/qr.svg"
         || path == "/api/binding/static-qr.svg"
         || path == "/setup/mobile"
         || path == "/api/binding/refresh"
         || path == "/api/binding/demo-bind"
         || path == "/api/binding/test-bind"
-        || path == "/api/feishu/configure"
+        || path == "/api/bridge/configure"
+        || (path.starts_with("/api/access/members/") && path.ends_with("/role"))
+        || path == "/api/tasks/approvals"
+        || path.starts_with("/api/tasks/approvals/")
         || path == "/api/discovery/scan"
         || path == "/api/devices/manual"
+        || (path.starts_with("/api/cameras/") && path.ends_with("/share-link"))
+        || (path.starts_with("/api/cameras/") && path.ends_with("/snapshot"))
+        || (path.starts_with("/api/cameras/") && path.ends_with("/analyze"))
         || path == "/api/defaults"
 }
 
@@ -1377,13 +2089,41 @@ fn has_forwarding_headers(headers: &[Header]) -> bool {
 
 fn redact_state_snapshot(mut state: StateResponse) -> StateResponse {
     state.defaults.rtsp_password.clear();
-    state.feishu_bot = redact_feishu_bot_config(state.feishu_bot);
+    state.bridge_provider = redact_bridge_provider_config(state.bridge_provider);
     state
 }
 
-fn redact_feishu_bot_config(mut config: FeishuBotConfig) -> FeishuBotConfig {
+fn redact_bridge_provider_config(mut config: BridgeProviderConfig) -> BridgeProviderConfig {
     config.app_secret.clear();
     config
+}
+
+fn task_error_message(response: &TaskResponse) -> String {
+    response
+        .prompt
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| response.result.message.clone())
+}
+
+fn parse_scan_results(
+    data: &Value,
+) -> Result<Vec<harbornas_local_agent::runtime::hub::HubScanResultItem>, String> {
+    let value = data
+        .pointer("/candidates")
+        .cloned()
+        .unwrap_or_else(|| Value::Array(Vec::new()));
+    serde_json::from_value(value)
+        .map_err(|error| format!("failed to parse camera scan results from task response: {error}"))
+}
+
+fn parse_connected_device(data: &Value) -> Result<CameraDevice, String> {
+    let value = data
+        .pointer("/device")
+        .cloned()
+        .ok_or_else(|| "task response missing connected device payload".to_string())?;
+    serde_json::from_value(value)
+        .map_err(|error| format!("failed to parse connected camera from task response: {error}"))
 }
 
 fn parse_camera_snapshot_path(path: &str) -> Option<String> {
@@ -1399,6 +2139,36 @@ fn parse_camera_snapshot_path(path: &str) -> Option<String> {
 fn parse_camera_live_stream_path(path: &str) -> Option<String> {
     let trimmed = path.strip_prefix("/api/cameras/")?;
     let device_id = trimmed.strip_suffix("/live.mjpeg")?;
+    if device_id.is_empty() {
+        None
+    } else {
+        percent_decode_path_segment(device_id).ok()
+    }
+}
+
+fn parse_camera_analyze_path(path: &str) -> Option<String> {
+    let trimmed = path.strip_prefix("/api/cameras/")?;
+    let device_id = trimmed.strip_suffix("/analyze")?;
+    if device_id.is_empty() {
+        None
+    } else {
+        percent_decode_path_segment(device_id).ok()
+    }
+}
+
+fn parse_camera_task_snapshot_path(path: &str) -> Option<String> {
+    let trimmed = path.strip_prefix("/api/cameras/")?;
+    let device_id = trimmed.strip_suffix("/snapshot")?;
+    if device_id.is_empty() {
+        None
+    } else {
+        percent_decode_path_segment(device_id).ok()
+    }
+}
+
+fn parse_camera_share_link_path(path: &str) -> Option<String> {
+    let trimmed = path.strip_prefix("/api/cameras/")?;
+    let device_id = trimmed.strip_suffix("/share-link")?;
     if device_id.is_empty() {
         None
     } else {
@@ -1545,9 +2315,12 @@ impl Drop for FfmpegMjpegStream {
 mod tests {
     use super::{
         ensure_local_admin_access, ensure_local_camera_access, has_forwarding_headers,
-        parse_camera_live_page_path, parse_camera_live_stream_path, parse_camera_snapshot_path,
-        parse_shared_camera_live_page_path, parse_shared_camera_live_stream_path,
-        percent_decode_path_segment, redact_feishu_bot_config, url_encode_path_segment,
+        identity_query_suffix, is_admin_surface_path, parse_approval_decision_path,
+        parse_camera_analyze_path, parse_camera_live_page_path, parse_camera_live_stream_path,
+        parse_camera_share_link_path, parse_camera_snapshot_path, parse_camera_task_snapshot_path,
+        parse_member_role_update_path, parse_shared_camera_live_page_path,
+        parse_shared_camera_live_stream_path, percent_decode_path_segment,
+        redact_bridge_provider_config, request_identity_hints, url_encode_path_segment,
     };
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use tiny_http::Header;
@@ -1557,6 +2330,18 @@ mod tests {
         let encoded = "camera%201%2Fleft";
         assert_eq!(
             parse_camera_snapshot_path(&format!("/api/cameras/{encoded}/snapshot.jpg")),
+            Some("camera 1/left".to_string())
+        );
+        assert_eq!(
+            parse_camera_task_snapshot_path(&format!("/api/cameras/{encoded}/snapshot")),
+            Some("camera 1/left".to_string())
+        );
+        assert_eq!(
+            parse_camera_share_link_path(&format!("/api/cameras/{encoded}/share-link")),
+            Some("camera 1/left".to_string())
+        );
+        assert_eq!(
+            parse_camera_analyze_path(&format!("/api/cameras/{encoded}/analyze")),
             Some("camera 1/left".to_string())
         );
         assert_eq!(
@@ -1611,9 +2396,9 @@ mod tests {
     }
 
     #[test]
-    fn feishu_bot_config_redacts_secret() {
-        let redacted = redact_feishu_bot_config(
-            harbornas_local_agent::runtime::admin_console::FeishuBotConfig {
+    fn bridge_provider_config_redacts_secret() {
+        let redacted = redact_bridge_provider_config(
+            harbornas_local_agent::runtime::admin_console::BridgeProviderConfig {
                 configured: true,
                 app_id: "cli_xxx".to_string(),
                 app_secret: "super-secret".to_string(),
@@ -1623,5 +2408,75 @@ mod tests {
             },
         );
         assert_eq!(redacted.app_secret, "");
+    }
+
+    #[test]
+    fn approval_decision_paths_decode_ids() {
+        let encoded = "approval%2F1";
+        assert_eq!(
+            parse_approval_decision_path(
+                &format!("/api/tasks/approvals/{encoded}/approve"),
+                "approve"
+            ),
+            Some("approval/1".to_string())
+        );
+        assert_eq!(
+            parse_approval_decision_path(
+                &format!("/api/tasks/approvals/{encoded}/reject"),
+                "reject"
+            ),
+            Some("approval/1".to_string())
+        );
+    }
+
+    #[test]
+    fn approval_routes_are_admin_surface_paths() {
+        assert!(is_admin_surface_path("/api/tasks/approvals"));
+        assert!(is_admin_surface_path("/api/access/members"));
+        assert!(is_admin_surface_path("/api/access/members/user-1/role"));
+        assert!(is_admin_surface_path(
+            "/api/tasks/approvals/approval-1/approve"
+        ));
+        assert!(is_admin_surface_path(
+            "/api/tasks/approvals/approval-1/reject"
+        ));
+        assert!(is_admin_surface_path("/api/cameras/camera-1/share-link"));
+        assert!(is_admin_surface_path("/api/cameras/camera-1/snapshot"));
+        assert!(is_admin_surface_path("/api/cameras/camera-1/analyze"));
+    }
+
+    #[test]
+    fn member_role_paths_decode_ids() {
+        let encoded = "user%2F1";
+        assert_eq!(
+            parse_member_role_update_path(&format!("/api/access/members/{encoded}/role")),
+            Some("user/1".to_string())
+        );
+    }
+
+    #[test]
+    fn request_identity_hints_prefer_headers_then_query() {
+        let headers = vec![
+            Header::from_bytes(b"X-Harbor-Open-Id".as_slice(), b"ou_header".as_slice())
+                .expect("header"),
+            Header::from_bytes(b"X-Harbor-User-Id".as_slice(), b"user-header".as_slice())
+                .expect("header"),
+        ];
+
+        let hints = request_identity_hints(
+            "/live/cameras/cam-1?open_id=ou_query&user_id=user-query",
+            &headers,
+        );
+        assert_eq!(hints.open_id.as_deref(), Some("ou_header"));
+        assert_eq!(hints.user_id.as_deref(), Some("user-header"));
+    }
+
+    #[test]
+    fn identity_query_suffix_keeps_open_id_and_user_id() {
+        assert_eq!(
+            identity_query_suffix("/live/cameras/cam-1?open_id=ou_demo&user_id=u_demo"),
+            "?open_id=ou_demo&user_id=u_demo"
+        );
+        assert!(identity_query_suffix("/live/cameras/cam-1").is_empty());
     }
 }
