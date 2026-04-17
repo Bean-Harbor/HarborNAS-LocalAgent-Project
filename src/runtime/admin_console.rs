@@ -220,7 +220,7 @@ impl AdminConsoleStore {
         Ok(state)
     }
 
-    pub fn save_state(&self, state: &AdminConsoleState) -> Result<(), String> {
+    fn save_state(&self, state: &AdminConsoleState) -> Result<(), String> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|e| {
                 format!(
@@ -246,6 +246,28 @@ impl AdminConsoleStore {
         })
     }
 
+    fn save_platform_primary_state(
+        &self,
+        mut platform_state: AdminConsoleState,
+    ) -> Result<AdminConsoleState, String> {
+        hydrate_legacy_views_from_platform(&mut platform_state);
+        sanitize_legacy_admin_fields(&mut platform_state);
+        platform_state.platform = sync_platform_from_legacy(&platform_state);
+        self.save_state(&platform_state)?;
+        Ok(platform_state)
+    }
+
+    fn save_projected_state(
+        &self,
+        mut projected_state: AdminConsoleState,
+    ) -> Result<AdminConsoleState, String> {
+        sanitize_legacy_admin_fields(&mut projected_state);
+        projected_state.platform = sync_platform_from_legacy(&projected_state);
+        hydrate_legacy_views_from_platform(&mut projected_state);
+        self.save_state(&projected_state)?;
+        Ok(projected_state)
+    }
+
     pub fn load_or_create_state(&self) -> Result<AdminConsoleState, String> {
         let state = self.load_state()?;
         self.save_state(&state)?;
@@ -255,8 +277,7 @@ impl AdminConsoleStore {
     pub fn refresh_binding_qr(&self) -> Result<AdminConsoleState, String> {
         let mut state = self.load_or_create_state()?;
         state.binding = AdminBindingState::default();
-        self.save_state(&state)?;
-        Ok(state)
+        self.save_projected_state(state)
     }
 
     pub fn mark_demo_bound(&self, user_name: &str) -> Result<AdminConsoleState, String> {
@@ -264,8 +285,7 @@ impl AdminConsoleStore {
         state.binding.status = "已绑定".to_string();
         state.binding.metric = "已绑定".to_string();
         state.binding.bound_user = Some(user_name.to_string());
-        self.save_state(&state)?;
-        Ok(state)
+        self.save_projected_state(state)
     }
 
     pub fn bind_identity_user(
@@ -283,22 +303,49 @@ impl AdminConsoleStore {
             ));
         }
 
+        let user = sanitize_identity_binding_record(user)?;
+        let workspace = state
+            .platform
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == DEFAULT_WORKSPACE_ID)
+            .or_else(|| state.platform.workspaces.first())
+            .cloned()
+            .ok_or_else(|| "当前没有可编辑的 workspace".to_string())?;
+        let projected_user_id = projected_user_id_for_binding(&user);
+
         state.binding.status = "已绑定".to_string();
         state.binding.metric = "已绑定".to_string();
         state.binding.bound_user = Some(user.display_name.clone());
 
-        if let Some(existing) = state
-            .identity_bindings
-            .iter_mut()
-            .find(|existing| existing.open_id == user.open_id)
-        {
-            *existing = user;
-        } else {
-            state.identity_bindings.push(user);
+        upsert_user(
+            &mut state.platform.users,
+            build_user_account_projection(&user, &workspace.workspace_id),
+        );
+        upsert_identity_binding(
+            &mut state.platform.identity_bindings,
+            build_identity_binding_projection(&user),
+        );
+
+        if projected_user_id != workspace.owner_user_id {
+            if let Some(existing) = state.platform.memberships.iter_mut().find(|membership| {
+                membership.workspace_id == workspace.workspace_id
+                    && membership.user_id == projected_user_id
+            }) {
+                existing.status = MembershipStatus::Active;
+            } else {
+                state
+                    .platform
+                    .memberships
+                    .push(build_membership_projection(&workspace, &user));
+            }
         }
 
-        self.save_state(&state)?;
-        Ok(state)
+        if let Some(workspace) = preferred_workspace_mut(&mut state.platform) {
+            set_workspace_binding_projection(workspace, &state.binding);
+        }
+
+        self.save_platform_primary_state(state)
     }
 
     pub fn set_member_role(
@@ -347,15 +394,30 @@ impl AdminConsoleStore {
             });
         }
 
-        self.save_state(&state)?;
-        Ok(state)
+        self.save_platform_primary_state(state)
     }
 
     pub fn save_defaults(&self, defaults: AdminDefaults) -> Result<AdminConsoleState, String> {
         let mut state = self.load_or_create_state()?;
         state.defaults = sanitize_defaults(defaults);
-        self.save_state(&state)?;
-        Ok(state)
+        self.save_projected_state(state)
+    }
+
+    pub fn save_remote_view_config(
+        &self,
+        config: RemoteViewConfig,
+    ) -> Result<AdminConsoleState, String> {
+        let mut state = self.load_or_create_state()?;
+        state.remote_view = sanitize_remote_view_config(config);
+        if let Some(workspace) = preferred_workspace_mut(&mut state.platform) {
+            set_workspace_remote_view_projection(workspace, &state.remote_view);
+        }
+        self.save_platform_primary_state(state)
+    }
+
+    pub fn load_remote_view_config(&self) -> Result<RemoteViewConfig, String> {
+        let state = self.load_or_create_state()?;
+        Ok(resolved_remote_view_config(&state))
     }
 
     pub fn save_bridge_provider_config(
@@ -371,8 +433,32 @@ impl AdminConsoleStore {
                 state.binding.bound_user = Some(state.bridge_provider.app_name.clone());
             }
         }
-        self.save_state(&state)?;
-        Ok(state)
+
+        state
+            .platform
+            .provider_accounts
+            .retain(|provider| provider.provider_account_id != BRIDGE_PROVIDER_ACCOUNT_ID);
+        if let Some(provider) = build_bridge_provider_account(
+            &state.bridge_provider,
+            &state.defaults.notification_channel,
+            state.platform.identity_bindings.len(),
+        ) {
+            upsert_provider_account(&mut state.platform.provider_accounts, provider);
+        }
+
+        state
+            .platform
+            .credentials
+            .retain(|credential| credential.credential_id != BRIDGE_APP_SECRET_CREDENTIAL_ID);
+        if let Some(credential) = build_bridge_secret_credential(&state.bridge_provider) {
+            upsert_credential(&mut state.platform.credentials, credential);
+        }
+
+        if let Some(workspace) = preferred_workspace_mut(&mut state.platform) {
+            set_workspace_binding_projection(workspace, &state.binding);
+        }
+
+        self.save_platform_primary_state(state)
     }
 
     pub fn registry_store(&self) -> &DeviceRegistryStore {
@@ -522,7 +608,8 @@ fn apply_workspace_projection_to_legacy(state: &mut AdminConsoleState) {
         .workspaces
         .iter()
         .find(|workspace| workspace.workspace_id == DEFAULT_WORKSPACE_ID)
-        .or_else(|| state.platform.workspaces.first());
+        .or_else(|| state.platform.workspaces.first())
+        .cloned();
     let Some(workspace) = workspace else {
         return;
     };
@@ -555,14 +642,7 @@ fn apply_workspace_projection_to_legacy(state: &mut AdminConsoleState) {
         }
     }
 
-    if let Some(remote_view) = workspace.settings.get("remote_view") {
-        if let Some(ttl) = remote_view
-            .get("share_link_ttl_minutes")
-            .and_then(Value::as_u64)
-        {
-            state.remote_view.share_link_ttl_minutes = ttl as u32;
-        }
-    }
+    state.remote_view = resolved_remote_view_config(state);
 }
 
 fn apply_provider_projections_to_legacy(state: &mut AdminConsoleState) {
@@ -730,6 +810,19 @@ fn legacy_identity_bindings_from_platform(
     bindings
 }
 
+pub fn resolved_identity_binding_records(state: &AdminConsoleState) -> Vec<IdentityBindingRecord> {
+    if !state.platform.identity_bindings.is_empty() {
+        return legacy_identity_bindings_from_platform(&state.platform);
+    }
+
+    state
+        .identity_bindings
+        .iter()
+        .cloned()
+        .filter_map(|binding| sanitize_identity_binding_record(binding).ok())
+        .collect()
+}
+
 fn sync_platform_from_legacy(state: &AdminConsoleState) -> AdminPlatformState {
     let mut platform = state.platform.clone();
     let workspace = build_workspace_projection(state);
@@ -795,6 +888,95 @@ fn upsert_user(users: &mut Vec<UserAccount>, user: UserAccount) {
     }
 }
 
+fn upsert_provider_account(providers: &mut Vec<ProviderAccount>, provider: ProviderAccount) {
+    if let Some(existing) = providers
+        .iter_mut()
+        .find(|existing| existing.provider_account_id == provider.provider_account_id)
+    {
+        *existing = provider;
+    } else {
+        providers.push(provider);
+    }
+}
+
+fn upsert_credential(credentials: &mut Vec<CredentialRecord>, credential: CredentialRecord) {
+    if let Some(existing) = credentials
+        .iter_mut()
+        .find(|existing| existing.credential_id == credential.credential_id)
+    {
+        *existing = credential;
+    } else {
+        credentials.push(credential);
+    }
+}
+
+fn preferred_workspace_mut(platform: &mut AdminPlatformState) -> Option<&mut Workspace> {
+    let index = platform
+        .workspaces
+        .iter()
+        .position(|workspace| workspace.workspace_id == DEFAULT_WORKSPACE_ID)
+        .or_else(|| (!platform.workspaces.is_empty()).then_some(0))?;
+    platform.workspaces.get_mut(index)
+}
+
+fn set_workspace_binding_projection(workspace: &mut Workspace, binding: &AdminBindingState) {
+    if !workspace.settings.is_object() {
+        workspace.settings = json!({});
+    }
+    let Some(settings) = workspace.settings.as_object_mut() else {
+        return;
+    };
+    settings.insert(
+        "binding".to_string(),
+        json!({
+            "channel": binding.channel.clone(),
+            "status": binding.status.clone(),
+            "metric": binding.metric.clone(),
+            "bound_user": binding.bound_user.clone(),
+        }),
+    );
+}
+
+fn set_workspace_remote_view_projection(workspace: &mut Workspace, remote_view: &RemoteViewConfig) {
+    if !workspace.settings.is_object() {
+        workspace.settings = json!({});
+    }
+    let Some(settings) = workspace.settings.as_object_mut() else {
+        return;
+    };
+    settings.insert(
+        "remote_view".to_string(),
+        json!({
+            "share_link_ttl_minutes": remote_view.share_link_ttl_minutes,
+            "share_secret": remote_view.share_secret.clone(),
+            "share_secret_configured": !remote_view.share_secret.trim().is_empty(),
+        }),
+    );
+}
+
+pub fn resolved_remote_view_config(state: &AdminConsoleState) -> RemoteViewConfig {
+    let mut config = sanitize_remote_view_config(state.remote_view.clone());
+    let workspace = state
+        .platform
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == DEFAULT_WORKSPACE_ID)
+        .or_else(|| state.platform.workspaces.first());
+
+    if let Some(remote_view) = workspace.and_then(|workspace| workspace.settings.get("remote_view"))
+    {
+        assign_string(&mut config.share_secret, remote_view.get("share_secret"));
+        if let Some(ttl) = remote_view
+            .get("share_link_ttl_minutes")
+            .and_then(Value::as_u64)
+        {
+            config.share_link_ttl_minutes = ttl as u32;
+        }
+    }
+
+    sanitize_remote_view_config(config)
+}
+
 fn ensure_platform_user_exists(
     state: &mut AdminConsoleState,
     workspace_id: &str,
@@ -809,8 +991,8 @@ fn ensure_platform_user_exists(
         return Ok(());
     }
 
-    if let Some(binding) = state
-        .identity_bindings
+    let bindings = resolved_identity_binding_records(state);
+    if let Some(binding) = bindings
         .iter()
         .find(|binding| binding.user_id.as_deref() == Some(user_id))
     {
@@ -889,6 +1071,32 @@ fn upsert_permission_binding(
     }
 }
 
+fn sanitize_identity_binding_record(
+    mut binding: IdentityBindingRecord,
+) -> Result<IdentityBindingRecord, String> {
+    binding.open_id = binding.open_id.trim().to_string();
+    if binding.open_id.is_empty() {
+        return Err("open_id 不能为空".to_string());
+    }
+    binding.display_name = binding.display_name.trim().to_string();
+    if binding.display_name.is_empty() {
+        binding.display_name = binding.open_id.clone();
+    }
+    binding.user_id = binding
+        .user_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    binding.union_id = binding
+        .union_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    binding.chat_id = binding
+        .chat_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    Ok(binding)
+}
+
 fn assign_string(target: &mut String, value: Option<&Value>) {
     if let Some(value) = value
         .and_then(Value::as_str)
@@ -947,7 +1155,7 @@ pub fn build_platform_state(state: &AdminConsoleState) -> AdminPlatformState {
 }
 
 fn build_workspace_projection(state: &AdminConsoleState) -> Workspace {
-    Workspace {
+    let mut workspace = Workspace {
         workspace_id: DEFAULT_WORKSPACE_ID.to_string(),
         workspace_type: WorkspaceType::Home,
         display_name: "Harbor Home".to_string(),
@@ -972,15 +1180,14 @@ fn build_workspace_projection(state: &AdminConsoleState) -> Workspace {
                 "rtsp_paths": state.defaults.rtsp_paths.clone(),
                 "rtsp_username": state.defaults.rtsp_username.clone(),
             },
-            "remote_view": {
-                "share_link_ttl_minutes": state.remote_view.share_link_ttl_minutes,
-                "share_secret_configured": !state.remote_view.share_secret.trim().is_empty(),
-            },
         }),
-    }
+    };
+    set_workspace_remote_view_projection(&mut workspace, &state.remote_view);
+    workspace
 }
 
 fn build_provider_accounts(state: &AdminConsoleState) -> Vec<ProviderAccount> {
+    let bindings = resolved_identity_binding_records(state);
     let mut providers = vec![ProviderAccount {
         provider_account_id: LOCAL_RTSP_PROVIDER_ACCOUNT_ID.to_string(),
         workspace_id: DEFAULT_WORKSPACE_ID.to_string(),
@@ -1003,37 +1210,54 @@ fn build_provider_accounts(state: &AdminConsoleState) -> Vec<ProviderAccount> {
         }),
     }];
 
-    if state.bridge_provider.configured || !state.bridge_provider.app_id.trim().is_empty() {
-        providers.push(ProviderAccount {
-            provider_account_id: BRIDGE_PROVIDER_ACCOUNT_ID.to_string(),
-            workspace_id: DEFAULT_WORKSPACE_ID.to_string(),
-            provider_key: "im_bridge".to_string(),
-            provider_kind: ProviderKind::Bridge,
-            display_name: "Harbor IM Bridge".to_string(),
-            owner_scope: ProviderOwnerScope::Workspace,
-            owner_user_id: None,
-            status: if state.bridge_provider.configured {
-                ProviderAccountStatus::Active
-            } else {
-                ProviderAccountStatus::NeedsReauth
-            },
-            capabilities: json!({
-                "bot_open_id": state.bridge_provider.bot_open_id.clone(),
-                "channel": state.defaults.notification_channel.clone(),
-                "bound_users": state.identity_bindings.len(),
-            }),
-            metadata: json!({
-                "app_id": state.bridge_provider.app_id.clone(),
-                "app_name": state.bridge_provider.app_name.clone(),
-                "status": state.bridge_provider.status.clone(),
-            }),
-        });
+    if let Some(provider) = build_bridge_provider_account(
+        &state.bridge_provider,
+        &state.defaults.notification_channel,
+        bindings.len(),
+    ) {
+        providers.push(provider);
     }
 
     providers
 }
 
+fn build_bridge_provider_account(
+    config: &BridgeProviderConfig,
+    notification_channel: &str,
+    bound_users: usize,
+) -> Option<ProviderAccount> {
+    if !config.configured && config.app_id.trim().is_empty() {
+        return None;
+    }
+
+    Some(ProviderAccount {
+        provider_account_id: BRIDGE_PROVIDER_ACCOUNT_ID.to_string(),
+        workspace_id: DEFAULT_WORKSPACE_ID.to_string(),
+        provider_key: "im_bridge".to_string(),
+        provider_kind: ProviderKind::Bridge,
+        display_name: "Harbor IM Bridge".to_string(),
+        owner_scope: ProviderOwnerScope::Workspace,
+        owner_user_id: None,
+        status: if config.configured {
+            ProviderAccountStatus::Active
+        } else {
+            ProviderAccountStatus::NeedsReauth
+        },
+        capabilities: json!({
+            "bot_open_id": config.bot_open_id.clone(),
+            "channel": notification_channel,
+            "bound_users": bound_users,
+        }),
+        metadata: json!({
+            "app_id": config.app_id.clone(),
+            "app_name": config.app_name.clone(),
+            "status": config.status.clone(),
+        }),
+    })
+}
+
 fn build_user_accounts(state: &AdminConsoleState, workspace: &Workspace) -> Vec<UserAccount> {
+    let bindings = resolved_identity_binding_records(state);
     let mut users = vec![UserAccount {
         user_id: workspace.owner_user_id.clone(),
         display_name: "本地管理员".to_string(),
@@ -1047,29 +1271,40 @@ fn build_user_accounts(state: &AdminConsoleState, workspace: &Workspace) -> Vec<
         }),
     }];
 
-    for binding in &state.identity_bindings {
+    for binding in &bindings {
         let user_id = projected_user_id_for_binding(binding);
         if users.iter().any(|user| user.user_id == user_id) {
             continue;
         }
-        users.push(UserAccount {
-            user_id,
-            display_name: binding.display_name.clone(),
-            email: None,
-            phone: None,
-            status: UserStatus::Active,
-            default_workspace_id: Some(workspace.workspace_id.clone()),
-            preferences: json!({
-                "auth_source": "im_bridge",
-                "open_id": binding.open_id.clone(),
-            }),
-        });
+        users.push(build_user_account_projection(
+            binding,
+            &workspace.workspace_id,
+        ));
     }
 
     users
 }
 
+fn build_user_account_projection(
+    binding: &IdentityBindingRecord,
+    workspace_id: &str,
+) -> UserAccount {
+    UserAccount {
+        user_id: projected_user_id_for_binding(binding),
+        display_name: binding.display_name.clone(),
+        email: None,
+        phone: None,
+        status: UserStatus::Active,
+        default_workspace_id: Some(workspace_id.to_string()),
+        preferences: json!({
+            "auth_source": "im_bridge",
+            "open_id": binding.open_id.clone(),
+        }),
+    }
+}
+
 fn build_memberships(state: &AdminConsoleState, workspace: &Workspace) -> Vec<Membership> {
+    let bindings = resolved_identity_binding_records(state);
     let mut memberships = vec![Membership {
         membership_id: format!("membership-{}", workspace.owner_user_id),
         workspace_id: workspace.workspace_id.clone(),
@@ -1080,7 +1315,7 @@ fn build_memberships(state: &AdminConsoleState, workspace: &Workspace) -> Vec<Me
         granted_at: None,
     }];
 
-    for binding in &state.identity_bindings {
+    for binding in &bindings {
         let user_id = projected_user_id_for_binding(binding);
         if user_id == workspace.owner_user_id
             || memberships
@@ -1089,38 +1324,49 @@ fn build_memberships(state: &AdminConsoleState, workspace: &Workspace) -> Vec<Me
         {
             continue;
         }
-        memberships.push(Membership {
-            membership_id: format!("membership-{user_id}"),
-            workspace_id: workspace.workspace_id.clone(),
-            user_id,
-            role_kind: RoleKind::Viewer,
-            status: MembershipStatus::Active,
-            granted_by_user_id: Some(workspace.owner_user_id.clone()),
-            granted_at: None,
-        });
+        memberships.push(build_membership_projection(workspace, binding));
     }
 
     memberships
 }
 
+fn build_membership_projection(
+    workspace: &Workspace,
+    binding: &IdentityBindingRecord,
+) -> Membership {
+    let user_id = projected_user_id_for_binding(binding);
+    Membership {
+        membership_id: format!("membership-{user_id}"),
+        workspace_id: workspace.workspace_id.clone(),
+        user_id,
+        role_kind: RoleKind::Viewer,
+        status: MembershipStatus::Active,
+        granted_by_user_id: Some(workspace.owner_user_id.clone()),
+        granted_at: None,
+    }
+}
+
 fn build_identity_binding_projections(state: &AdminConsoleState) -> Vec<IdentityBinding> {
-    state
-        .identity_bindings
+    resolved_identity_binding_records(state)
         .iter()
-        .map(|binding| IdentityBinding {
-            identity_id: format!("identity-{}", binding.open_id),
-            user_id: projected_user_id_for_binding(binding),
-            auth_source: AuthSource::ImChannel,
-            provider_key: "im_bridge".to_string(),
-            external_user_id: binding.open_id.clone(),
-            external_union_id: binding.union_id.clone(),
-            external_chat_id: binding.chat_id.clone(),
-            profile_snapshot: json!({
-                "display_name": binding.display_name.clone(),
-            }),
-            last_seen_at: None,
-        })
+        .map(build_identity_binding_projection)
         .collect()
+}
+
+fn build_identity_binding_projection(binding: &IdentityBindingRecord) -> IdentityBinding {
+    IdentityBinding {
+        identity_id: format!("identity-{}", binding.open_id),
+        user_id: projected_user_id_for_binding(binding),
+        auth_source: AuthSource::ImChannel,
+        provider_key: "im_bridge".to_string(),
+        external_user_id: binding.open_id.clone(),
+        external_union_id: binding.union_id.clone(),
+        external_chat_id: binding.chat_id.clone(),
+        profile_snapshot: json!({
+            "display_name": binding.display_name.clone(),
+        }),
+        last_seen_at: None,
+    }
 }
 
 fn build_permission_bindings(workspace: &Workspace) -> Vec<PermissionBinding> {
@@ -1217,24 +1463,32 @@ fn build_credentials(state: &AdminConsoleState) -> Vec<CredentialRecord> {
             }),
         });
     }
-    if !state.bridge_provider.app_secret.trim().is_empty() {
-        credentials.push(CredentialRecord {
-            credential_id: BRIDGE_APP_SECRET_CREDENTIAL_ID.to_string(),
-            provider_account_id: BRIDGE_PROVIDER_ACCOUNT_ID.to_string(),
-            credential_kind: CredentialKind::ApiKey,
-            vault_key: "admin_console.bridge_provider.app_secret".to_string(),
-            scope: json!({
-                "app_id": state.bridge_provider.app_id.clone(),
-            }),
-            expires_at: None,
-            rotation_state: CredentialRotationState::Valid,
-            last_verified_at: None,
-            metadata: json!({
-                "configured": state.bridge_provider.configured,
-            }),
-        });
+    if let Some(credential) = build_bridge_secret_credential(&state.bridge_provider) {
+        credentials.push(credential);
     }
     credentials
+}
+
+fn build_bridge_secret_credential(config: &BridgeProviderConfig) -> Option<CredentialRecord> {
+    if config.app_secret.trim().is_empty() {
+        return None;
+    }
+
+    Some(CredentialRecord {
+        credential_id: BRIDGE_APP_SECRET_CREDENTIAL_ID.to_string(),
+        provider_account_id: BRIDGE_PROVIDER_ACCOUNT_ID.to_string(),
+        credential_kind: CredentialKind::ApiKey,
+        vault_key: "admin_console.bridge_provider.app_secret".to_string(),
+        scope: json!({
+            "app_id": config.app_id.clone(),
+        }),
+        expires_at: None,
+        rotation_state: CredentialRotationState::Valid,
+        last_verified_at: None,
+        metadata: json!({
+            "configured": config.configured,
+        }),
+    })
 }
 
 fn build_recording_policy(state: &AdminConsoleState) -> RecordingPolicy {
@@ -1447,6 +1701,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::control_plane::auth::{AuthSource, IdentityBinding};
+    use crate::control_plane::media::RecordingTriggerMode;
     use crate::control_plane::users::{
         Membership, MembershipStatus, RoleKind, UserAccount, UserStatus,
     };
@@ -1455,8 +1710,11 @@ mod tests {
 
     use super::{
         build_platform_state, dedupe_rtsp_paths, derive_rtsp_hints, normalize_binding_code,
-        normalize_loaded_admin_state, parse_rtsp_auth, parse_rtsp_path, AdminConsoleStore,
-        BridgeProviderConfig, IdentityBindingRecord,
+        normalize_loaded_admin_state, parse_rtsp_auth, parse_rtsp_path,
+        resolved_identity_binding_records, resolved_remote_view_config, AdminConsoleStore,
+        AdminDefaults, BridgeProviderConfig, IdentityBindingRecord, RemoteViewConfig,
+        BRIDGE_APP_SECRET_CREDENTIAL_ID, BRIDGE_PROVIDER_ACCOUNT_ID, LOCAL_RTSP_CREDENTIAL_ID,
+        LOCAL_RTSP_PROVIDER_ACCOUNT_ID,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -1577,6 +1835,103 @@ mod tests {
         assert_eq!(updated.binding.bound_user.as_deref(), Some("Bean"));
         assert_eq!(updated.identity_bindings.len(), 1);
         assert_eq!(updated.identity_bindings[0].open_id, "ou_demo");
+        assert_eq!(updated.platform.users.len(), 2);
+        assert_eq!(updated.platform.memberships.len(), 2);
+        assert_eq!(updated.platform.identity_bindings.len(), 1);
+        assert_eq!(
+            updated.platform.identity_bindings[0].external_user_id,
+            "ou_demo"
+        );
+
+        let _ = std::fs::remove_file(admin_path);
+        let _ = std::fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn save_defaults_returns_updated_platform_projection() {
+        let registry_path = temp_path("registry-defaults");
+        let admin_path = temp_path("admin-defaults");
+        let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
+        let store = AdminConsoleStore::new(admin_path.clone(), registry);
+
+        let updated = store
+            .save_defaults(AdminDefaults {
+                cidr: "10.42.0.0/24".to_string(),
+                discovery: "ONVIF".to_string(),
+                recording: "持续录制".to_string(),
+                capture: "仅图片".to_string(),
+                ai: "快速摘要".to_string(),
+                notification_channel: "平台频道".to_string(),
+                rtsp_username: "platform-user".to_string(),
+                rtsp_password: "secret-rtsp".to_string(),
+                rtsp_port: 8554,
+                rtsp_paths: vec!["/alt/main".to_string()],
+            })
+            .expect("save defaults");
+
+        assert_eq!(updated.platform.workspaces.len(), 1);
+        assert_eq!(
+            updated.platform.workspaces[0].settings["defaults"]["cidr"],
+            json!("10.42.0.0/24")
+        );
+        assert!(updated.platform.provider_accounts.iter().any(|provider| {
+            provider.provider_account_id == LOCAL_RTSP_PROVIDER_ACCOUNT_ID
+                && provider.capabilities["rtsp_port"] == json!(8554)
+        }));
+        assert!(updated.platform.credentials.iter().any(|credential| {
+            credential.credential_id == LOCAL_RTSP_CREDENTIAL_ID
+                && credential.vault_key == "admin_console.defaults.rtsp_password"
+        }));
+        assert_eq!(
+            updated.platform.recording_policies[0].trigger_mode,
+            RecordingTriggerMode::Continuous
+        );
+
+        let reloaded = store.load_or_create_state().expect("reload");
+        assert_eq!(reloaded.defaults.cidr, "10.42.0.0/24");
+        assert_eq!(reloaded.defaults.rtsp_port, 8554);
+
+        let _ = std::fs::remove_file(admin_path);
+        let _ = std::fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn save_remote_view_config_returns_updated_platform_projection() {
+        let registry_path = temp_path("registry-remote-view");
+        let admin_path = temp_path("admin-remote-view");
+        let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
+        let store = AdminConsoleStore::new(admin_path.clone(), registry);
+
+        let updated = store
+            .save_remote_view_config(RemoteViewConfig {
+                share_secret: "platform-share-secret".to_string(),
+                share_link_ttl_minutes: 45,
+            })
+            .expect("save remote view");
+
+        assert_eq!(updated.remote_view.share_secret, "platform-share-secret");
+        assert_eq!(updated.remote_view.share_link_ttl_minutes, 45);
+        assert_eq!(
+            updated.platform.workspaces[0].settings["remote_view"]["share_secret"],
+            json!("platform-share-secret")
+        );
+        assert_eq!(
+            updated.platform.workspaces[0].settings["remote_view"]["share_link_ttl_minutes"],
+            json!(45)
+        );
+
+        let reloaded = store.load_or_create_state().expect("reload");
+        assert_eq!(reloaded.remote_view.share_secret, "platform-share-secret");
+        assert_eq!(reloaded.remote_view.share_link_ttl_minutes, 45);
+        assert_eq!(
+            store
+                .load_remote_view_config()
+                .expect("resolved remote view"),
+            RemoteViewConfig {
+                share_secret: "platform-share-secret".to_string(),
+                share_link_ttl_minutes: 45,
+            }
+        );
 
         let _ = std::fs::remove_file(admin_path);
         let _ = std::fs::remove_file(registry_path);
@@ -1621,6 +1976,43 @@ mod tests {
     }
 
     #[test]
+    fn save_bridge_provider_config_returns_updated_platform_projection() {
+        let registry_path = temp_path("registry-bridge");
+        let admin_path = temp_path("admin-bridge");
+        let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
+        let store = AdminConsoleStore::new(admin_path.clone(), registry);
+
+        let updated = store
+            .save_bridge_provider_config(BridgeProviderConfig {
+                configured: true,
+                app_id: "cli_a1".to_string(),
+                app_secret: "secret".to_string(),
+                app_name: "HarborNAS".to_string(),
+                bot_open_id: "ou_bot".to_string(),
+                status: "已连接".to_string(),
+            })
+            .expect("save bridge provider");
+
+        assert_eq!(updated.binding.metric, "Bridge 已连接");
+        assert_eq!(updated.binding.bound_user.as_deref(), Some("HarborNAS"));
+        assert!(updated.platform.provider_accounts.iter().any(|provider| {
+            provider.provider_account_id == BRIDGE_PROVIDER_ACCOUNT_ID
+                && provider.metadata["app_id"] == json!("cli_a1")
+        }));
+        assert!(updated.platform.credentials.iter().any(|credential| {
+            credential.credential_id == BRIDGE_APP_SECRET_CREDENTIAL_ID
+                && credential.vault_key == "admin_console.bridge_provider.app_secret"
+        }));
+
+        let reloaded = store.load_or_create_state().expect("reload");
+        assert_eq!(reloaded.bridge_provider.app_id, "cli_a1");
+        assert_eq!(reloaded.bridge_provider.app_name, "HarborNAS");
+
+        let _ = std::fs::remove_file(admin_path);
+        let _ = std::fs::remove_file(registry_path);
+    }
+
+    #[test]
     fn platform_projection_adds_bridge_provider_and_secret_metadata() {
         let mut state = super::AdminConsoleState::default();
         state.bridge_provider = BridgeProviderConfig {
@@ -1655,9 +2047,51 @@ mod tests {
     }
 
     #[test]
+    fn resolved_identity_binding_records_prefers_platform_projection() {
+        let mut state = super::AdminConsoleState::default();
+        state.identity_bindings.push(IdentityBindingRecord {
+            open_id: "ou_legacy".to_string(),
+            user_id: Some("legacy-user".to_string()),
+            union_id: None,
+            display_name: "Legacy".to_string(),
+            chat_id: Some("oc_legacy".to_string()),
+        });
+        state.platform.users.push(UserAccount {
+            user_id: "viewer-1".to_string(),
+            display_name: "Viewer".to_string(),
+            email: None,
+            phone: None,
+            status: UserStatus::Active,
+            default_workspace_id: Some("home-1".to_string()),
+            preferences: json!({}),
+        });
+        state.platform.identity_bindings.push(IdentityBinding {
+            identity_id: "identity-ou_viewer".to_string(),
+            user_id: "viewer-1".to_string(),
+            auth_source: AuthSource::ImChannel,
+            provider_key: "im_bridge".to_string(),
+            external_user_id: "ou_viewer".to_string(),
+            external_union_id: None,
+            external_chat_id: Some("oc_viewer".to_string()),
+            profile_snapshot: json!({
+                "display_name": "Viewer",
+            }),
+            last_seen_at: None,
+        });
+
+        let bindings = resolved_identity_binding_records(&state);
+
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].open_id, "ou_viewer");
+        assert_eq!(bindings[0].display_name, "Viewer");
+        assert_eq!(bindings[0].chat_id.as_deref(), Some("oc_viewer"));
+    }
+
+    #[test]
     fn loaded_state_prefers_platform_projection_and_preserves_custom_memberships() {
         let mut state = super::AdminConsoleState::default();
         state.platform = build_platform_state(&state);
+        state.remote_view.share_secret = "legacy-share-secret".to_string();
         state.platform.workspaces[0].settings = json!({
             "binding": {
                 "channel": "Platform Bridge",
@@ -1677,6 +2111,7 @@ mod tests {
             },
             "remote_view": {
                 "share_link_ttl_minutes": 45,
+                "share_secret": "platform-share-secret",
                 "share_secret_configured": true,
             }
         });
@@ -1725,11 +2160,37 @@ mod tests {
         assert_eq!(state.defaults.rtsp_port, 8554);
         assert_eq!(state.defaults.recording, "持续录制");
         assert_eq!(state.remote_view.share_link_ttl_minutes, 45);
+        assert_eq!(state.remote_view.share_secret, "platform-share-secret");
         assert_eq!(state.identity_bindings.len(), 1);
         assert_eq!(state.identity_bindings[0].open_id, "ou_viewer");
         assert_eq!(state.identity_bindings[0].display_name, "Viewer");
         assert!(state.platform.memberships.iter().any(|membership| {
             membership.user_id == "viewer-1" && membership.role_kind == RoleKind::Admin
         }));
+    }
+
+    #[test]
+    fn resolved_remote_view_config_prefers_workspace_projection() {
+        let mut state = super::AdminConsoleState::default();
+        state.remote_view = RemoteViewConfig {
+            share_secret: "legacy-share-secret".to_string(),
+            share_link_ttl_minutes: 120,
+        };
+        state.platform = build_platform_state(&state);
+        state.platform.workspaces[0].settings["remote_view"] = json!({
+            "share_secret": "platform-share-secret",
+            "share_link_ttl_minutes": 30,
+            "share_secret_configured": true,
+        });
+
+        let resolved = resolved_remote_view_config(&state);
+
+        assert_eq!(
+            resolved,
+            RemoteViewConfig {
+                share_secret: "platform-share-secret".to_string(),
+                share_link_ttl_minutes: 30,
+            }
+        );
     }
 }

@@ -1,9 +1,13 @@
 //! Minimal Assistant Task API service for HarborBeacon integration.
 
+use std::fs;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::connectors::notifications::{
@@ -11,8 +15,13 @@ use crate::connectors::notifications::{
     NotificationChannel, NotificationDeliveryService, NotificationPayloadFormat,
     NotificationRecipient, NotificationRecipientIdType, NotificationRequest,
 };
+use crate::connectors::storage::StorageTarget;
 use crate::control_plane::approvals::{ApprovalStatus, ApprovalTicket};
 use crate::control_plane::events::{EventRecord, EventSeverity, EventSourceKind};
+use crate::control_plane::media::{
+    MediaAsset, MediaAssetKind, MediaDeliveryMode, MediaSession, MediaSessionKind,
+    MediaSessionStatus, ShareAccessScope, ShareLink, StorageTargetKind,
+};
 use crate::control_plane::tasks::{
     ArtifactKind, ArtifactRecord, ConversationSession, ExecutionRoute, TaskRun, TaskRunStatus,
     TaskStepRun, TaskStepRunStatus,
@@ -26,7 +35,9 @@ use crate::orchestrator::policy::{
     ApprovalContext,
 };
 use crate::orchestrator::router::Executor;
-use crate::runtime::admin_console::{AdminConsoleState, AdminConsoleStore, IdentityBindingRecord};
+use crate::runtime::admin_console::{
+    resolved_identity_binding_records, AdminConsoleState, AdminConsoleStore, IdentityBindingRecord,
+};
 use crate::runtime::hub::{
     looks_like_auth_error, CameraConnectRequest, CameraHubService, HubScanRequest,
     HubScanResultItem,
@@ -112,6 +123,8 @@ pub struct TaskArtifact {
     pub label: String,
     #[serde(default)]
     pub mime_type: String,
+    #[serde(default)]
+    pub media_asset_id: Option<String>,
     #[serde(default)]
     pub path: Option<String>,
     #[serde(default)]
@@ -349,8 +362,8 @@ impl TaskApiService {
             Ok(summary) => {
                 let pending_candidates = pending_candidates_from_results(&summary.results);
                 let mut conversation = self.load_or_create_conversation(request);
-                conversation.pending_candidates = pending_candidates.clone();
-                conversation.pending_connect = None;
+                conversation.set_camera_pending_candidates(pending_candidates.clone());
+                conversation.set_camera_pending_connect(None);
                 conversation.last_scan_cidr = summary.defaults.cidr.clone();
                 let _ = self.save_conversation(request, &conversation);
 
@@ -421,7 +434,8 @@ impl TaskApiService {
 
     fn connect_camera_candidate(&self, request: &TaskRequest, index: usize) -> TaskResponse {
         let mut conversation = self.load_or_create_conversation(request);
-        if conversation.pending_candidates.is_empty() {
+        let pending_candidates = conversation.camera_pending_candidates();
+        if pending_candidates.is_empty() {
             return self.failed(
                 request,
                 "camera_hub_service",
@@ -430,7 +444,7 @@ impl TaskApiService {
             );
         }
 
-        if index == 0 || index > conversation.pending_candidates.len() {
+        if index == 0 || index > pending_candidates.len() {
             return self.failed(
                 request,
                 "camera_hub_service",
@@ -439,14 +453,14 @@ impl TaskApiService {
             );
         }
 
-        let candidate = conversation.pending_candidates[index - 1].clone();
+        let candidate = pending_candidates[index - 1].clone();
         let connect_request = candidate_to_connect_request(&candidate, None);
         match self.hub().manual_add(connect_request, None) {
             Ok(summary) => {
-                conversation.pending_connect = None;
-                conversation
-                    .pending_candidates
-                    .retain(|item| item.candidate_id != candidate.candidate_id);
+                conversation.set_camera_pending_connect(None);
+                conversation.retain_camera_pending_candidates(|item| {
+                    item.candidate_id != candidate.candidate_id
+                });
                 let _ = self.save_conversation(request, &conversation);
                 self.completed(
                     request,
@@ -468,7 +482,7 @@ impl TaskApiService {
             }
             Err(error) if looks_like_auth_error(&error) => {
                 let resume_token = ensure_resume_token();
-                conversation.pending_connect = Some(PendingTaskConnect {
+                conversation.set_camera_pending_connect(Some(PendingTaskConnect {
                     resume_token: resume_token.clone(),
                     name: candidate.name.clone(),
                     ip: candidate.ip.clone(),
@@ -478,7 +492,7 @@ impl TaskApiService {
                     requires_auth: true,
                     vendor: candidate.vendor.clone(),
                     model: candidate.model.clone(),
-                });
+                }));
                 let _ = self.save_conversation(request, &conversation);
                 self.needs_input(
                     request,
@@ -543,7 +557,7 @@ impl TaskApiService {
                 let resume_token = ensure_resume_token();
                 let mut pending_with_token = pending.clone();
                 pending_with_token.resume_token = resume_token.clone();
-                conversation.pending_connect = Some(pending_with_token);
+                conversation.set_camera_pending_connect(Some(pending_with_token));
                 let _ = self.save_conversation(request, &conversation);
                 self.needs_input(
                     request,
@@ -568,15 +582,7 @@ impl TaskApiService {
             );
         };
         let mut conversation = self.load_or_create_conversation(request);
-        if conversation.pending_connect.is_none() {
-            return self.failed(
-                request,
-                "camera_hub_service",
-                RiskLevel::Medium,
-                "接入流程已过期，请重新发送“扫描摄像头”。".to_string(),
-            );
-        }
-        let Some(pending) = conversation.pending_connect.clone() else {
+        let Some(pending) = conversation.camera_pending_connect() else {
             return self.failed(
                 request,
                 "camera_hub_service",
@@ -598,10 +604,9 @@ impl TaskApiService {
             .manual_add(pending_connect_to_request(&pending, Some(password)), None)
         {
             Ok(summary) => {
-                conversation.pending_connect = None;
+                conversation.set_camera_pending_connect(None);
                 conversation
-                    .pending_candidates
-                    .retain(|candidate| candidate.ip != pending.ip);
+                    .retain_camera_pending_candidates(|candidate| candidate.ip != pending.ip);
                 let _ = self.save_conversation(request, &conversation);
                 self.completed(
                     request,
@@ -672,8 +677,17 @@ impl TaskApiService {
                 let summary =
                     string_at_paths(&result.result_payload, &["/summary", "/detection_summary"])
                         .unwrap_or_else(|| "分析完成".to_string());
-                let artifacts = build_vision_artifacts(&result.result_payload);
                 let mut payload = result.result_payload;
+                if let Err(error) = self.persist_vision_media_assets(request, &target, &mut payload)
+                {
+                    return self.failed(
+                        request,
+                        "vision_executor",
+                        RiskLevel::Low,
+                        format!("分析已完成，但保存媒体记录失败: {error}"),
+                    );
+                }
+                let artifacts = build_vision_artifacts(&payload);
                 let notification_request =
                     self.build_notification_request(request, &target, &payload, &artifacts);
                 let mut events = Vec::new();
@@ -758,15 +772,27 @@ impl TaskApiService {
         }
 
         match self.hub().capture_camera_snapshot_result(&target.device_id) {
-            Ok(snapshot) => self.completed(
-                request,
-                "camera_hub_service",
-                RiskLevel::Low,
-                format!("已抓拍 {} 当前画面。", target.display_name),
-                build_snapshot_payload(&target, &snapshot),
-                vec![build_snapshot_artifact(&snapshot)],
-                vec![format!("分析 {}", target.display_name)],
-            ),
+            Ok(snapshot) => {
+                let media_asset = build_snapshot_media_asset(request, &target, &snapshot);
+                if let Err(error) = self.conversation_store.save_media_asset(&media_asset) {
+                    return self.failed(
+                        request,
+                        "camera_hub_service",
+                        RiskLevel::Low,
+                        format!("抓拍已完成，但保存媒体记录失败: {error}"),
+                    );
+                }
+
+                self.completed(
+                    request,
+                    "camera_hub_service",
+                    RiskLevel::Low,
+                    format!("已抓拍 {} 当前画面。", target.display_name),
+                    build_snapshot_payload(&target, &snapshot, &media_asset),
+                    vec![build_snapshot_artifact(&snapshot, &media_asset)],
+                    vec![format!("分析 {}", target.display_name)],
+                )
+            }
             Err(error) => self.failed(request, "camera_hub_service", RiskLevel::Low, error),
         }
     }
@@ -792,16 +818,16 @@ impl TaskApiService {
             return response;
         }
 
-        let admin_state = match self.admin_store.load_or_create_state() {
-            Ok(state) => state,
+        let remote_view_config = match self.admin_store.load_remote_view_config() {
+            Ok(config) => config,
             Err(error) => {
                 return self.failed(request, "camera_hub_service", RiskLevel::Medium, error);
             }
         };
         let issued = match remote_view::issue_camera_share_token(
-            &admin_state.remote_view.share_secret,
+            &remote_view_config.share_secret,
             &target.device_id,
-            admin_state.remote_view.share_link_ttl_minutes,
+            remote_view_config.share_link_ttl_minutes,
         ) {
             Ok(issued) => issued,
             Err(error) => {
@@ -809,7 +835,20 @@ impl TaskApiService {
             }
         };
 
-        let share_link = build_share_link_payload(&target, &issued);
+        let share_link_id = new_share_link_id();
+        let media_session_id = new_media_session_id();
+        let media_session =
+            build_share_media_session(request, &target, &media_session_id, &share_link_id);
+        let share_link_record = build_share_link_record(&issued, &media_session_id, &share_link_id);
+        if let Err(error) = self
+            .conversation_store
+            .save_share_link_bundle(&media_session, &share_link_record)
+        {
+            return self.failed(request, "camera_hub_service", RiskLevel::Medium, error);
+        }
+
+        let share_link =
+            build_share_link_payload(&target, &issued, &media_session, &share_link_record);
         let event = self.serialize_event_record(&build_task_event_record(
             request,
             &step_id_for_request(request),
@@ -1289,6 +1328,101 @@ impl TaskApiService {
 
     fn serialize_event_record(&self, event: &EventRecord) -> Value {
         serde_json::to_value(event).unwrap_or(Value::Null)
+    }
+
+    fn persist_vision_media_assets(
+        &self,
+        request: &TaskRequest,
+        target: &ResolvedCameraTarget,
+        payload: &mut Value,
+    ) -> Result<(), String> {
+        let snapshot_image_path = string_at_paths(payload, &["/snapshot/image_path"]);
+        let annotated_image_path = string_at_paths(payload, &["/snapshot/annotated_image_path"]);
+        if snapshot_image_path.is_none() && annotated_image_path.is_none() {
+            return Ok(());
+        }
+
+        let snapshot_mime_type =
+            string_at_paths(payload, &["/snapshot/mime_type"]).unwrap_or_else(|| {
+                snapshot_image_path
+                    .as_deref()
+                    .and_then(mime_type_from_path)
+                    .unwrap_or_else(|| "image/jpeg".to_string())
+            });
+        let captured_at = u64_at_paths(payload, &["/snapshot/captured_at_epoch_ms"])
+            .map(|value| value.to_string())
+            .unwrap_or_else(current_timestamp_millis);
+        let source_storage = payload
+            .pointer("/snapshot/source_storage")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let snapshot_byte_size = u64_at_paths(payload, &["/snapshot/byte_size"]);
+        let detection_summary = string_at_paths(payload, &["/detection_summary"]);
+        let summary = string_at_paths(payload, &["/summary"]);
+        let summary_source = string_at_paths(payload, &["/summary_source"]);
+
+        let snapshot_media_asset_id = if let Some(path) = snapshot_image_path.as_deref() {
+            let media_asset = build_vision_image_media_asset(
+                request,
+                target,
+                path,
+                snapshot_mime_type.as_str(),
+                MediaAssetKind::Snapshot,
+                None,
+                "analysis_snapshot",
+                &captured_at,
+                snapshot_byte_size,
+                source_storage.clone(),
+                detection_summary.as_deref(),
+                summary.as_deref(),
+                summary_source.as_deref(),
+            );
+            let asset_id = media_asset.asset_id.clone();
+            self.conversation_store.save_media_asset(&media_asset)?;
+            Some(asset_id)
+        } else {
+            None
+        };
+
+        let annotated_media_asset_id = if let Some(path) = annotated_image_path.as_deref() {
+            let media_asset = build_vision_image_media_asset(
+                request,
+                target,
+                path,
+                snapshot_mime_type.as_str(),
+                MediaAssetKind::Derived,
+                snapshot_media_asset_id.clone(),
+                "analysis_annotation",
+                &captured_at,
+                None,
+                source_storage.clone(),
+                detection_summary.as_deref(),
+                summary.as_deref(),
+                summary_source.as_deref(),
+            );
+            let asset_id = media_asset.asset_id.clone();
+            self.conversation_store.save_media_asset(&media_asset)?;
+            Some(asset_id)
+        } else {
+            None
+        };
+
+        if let Some(snapshot_object) = payload
+            .pointer_mut("/snapshot")
+            .and_then(Value::as_object_mut)
+        {
+            if let Some(asset_id) = snapshot_media_asset_id {
+                snapshot_object.insert("media_asset_id".to_string(), Value::String(asset_id));
+            }
+            if let Some(asset_id) = annotated_media_asset_id {
+                snapshot_object.insert(
+                    "annotated_media_asset_id".to_string(),
+                    Value::String(asset_id),
+                );
+            }
+        }
+
+        Ok(())
     }
 
     fn begin_task_tracking(&self, request: &TaskRequest) -> TaskRuntimeTracking {
@@ -1861,24 +1995,38 @@ fn format_pending_candidates(candidates: &[PendingTaskCandidate]) -> String {
 
 fn build_vision_artifacts(payload: &Value) -> Vec<TaskArtifact> {
     let mut artifacts = Vec::new();
+    let snapshot_mime_type = string_at_paths(payload, &["/snapshot/mime_type"])
+        .unwrap_or_else(|| "image/jpeg".to_string());
+    let snapshot_media_asset_id =
+        string_at_paths(payload, &["/snapshot/media_asset_id", "/snapshot/asset_id"]);
+    let annotated_media_asset_id =
+        string_at_paths(payload, &["/snapshot/annotated_media_asset_id"]);
     if let Some(path) = string_at_paths(payload, &["/snapshot/image_path"]) {
         artifacts.push(TaskArtifact {
             kind: "image".to_string(),
             label: "抓拍图片".to_string(),
-            mime_type: "image/jpeg".to_string(),
+            mime_type: snapshot_mime_type.clone(),
+            media_asset_id: snapshot_media_asset_id.clone(),
             path: Some(path),
             url: None,
-            metadata: Value::Null,
+            metadata: json!({
+                "media_asset_id": snapshot_media_asset_id,
+                "artifact_role": "analysis_snapshot",
+            }),
         });
     }
     if let Some(path) = string_at_paths(payload, &["/snapshot/annotated_image_path"]) {
         artifacts.push(TaskArtifact {
             kind: "image".to_string(),
             label: "标注图片".to_string(),
-            mime_type: "image/jpeg".to_string(),
+            mime_type: snapshot_mime_type,
+            media_asset_id: annotated_media_asset_id.clone(),
             path: Some(path),
             url: None,
-            metadata: Value::Null,
+            metadata: json!({
+                "media_asset_id": annotated_media_asset_id,
+                "artifact_role": "analysis_annotation",
+            }),
         });
     }
     artifacts
@@ -1887,26 +2035,33 @@ fn build_vision_artifacts(payload: &Value) -> Vec<TaskArtifact> {
 fn build_snapshot_payload(
     target: &ResolvedCameraTarget,
     snapshot: &SnapshotCaptureResult,
+    media_asset: &MediaAsset,
 ) -> Value {
     json!({
         "camera_target": target,
         "snapshot": {
-            "mime_type": snapshot.mime_type,
+            "media_asset_id": media_asset.asset_id.clone(),
+            "mime_type": snapshot.mime_type.clone(),
             "byte_size": snapshot.byte_size,
             "captured_at_epoch_ms": snapshot.captured_at_epoch_ms,
-            "storage": snapshot.storage,
+            "storage": snapshot.storage.clone(),
         }
     })
 }
 
-fn build_snapshot_artifact(snapshot: &SnapshotCaptureResult) -> TaskArtifact {
+fn build_snapshot_artifact(
+    snapshot: &SnapshotCaptureResult,
+    media_asset: &MediaAsset,
+) -> TaskArtifact {
     TaskArtifact {
         kind: "image".to_string(),
         label: "抓拍图片".to_string(),
         mime_type: snapshot.mime_type.clone(),
+        media_asset_id: Some(media_asset.asset_id.clone()),
         path: Some(snapshot.storage.relative_path.clone()),
         url: None,
         metadata: json!({
+            "media_asset_id": media_asset.asset_id.clone(),
             "storage_target": snapshot.storage.target,
             "captured_at_epoch_ms": snapshot.captured_at_epoch_ms,
             "byte_size": snapshot.byte_size,
@@ -1914,18 +2069,169 @@ fn build_snapshot_artifact(snapshot: &SnapshotCaptureResult) -> TaskArtifact {
     }
 }
 
+fn build_snapshot_media_asset(
+    request: &TaskRequest,
+    target: &ResolvedCameraTarget,
+    snapshot: &SnapshotCaptureResult,
+) -> MediaAsset {
+    MediaAsset {
+        asset_id: new_media_asset_id(),
+        workspace_id: workspace_id_for_request(request),
+        device_id: Some(target.device_id.clone()),
+        asset_kind: MediaAssetKind::Snapshot,
+        storage_target: storage_target_kind_from_snapshot(snapshot.storage.target),
+        storage_uri: snapshot.storage.relative_path.clone(),
+        mime_type: snapshot.mime_type.clone(),
+        byte_size: snapshot.byte_size as u64,
+        checksum: snapshot_checksum(snapshot),
+        captured_at: Some(snapshot.captured_at_epoch_ms.to_string()),
+        started_at: None,
+        ended_at: None,
+        derived_from_asset_id: None,
+        tags: vec!["snapshot".to_string(), "camera".to_string()],
+        metadata: json!({
+            "task_id": request.task_id.clone(),
+            "step_id": step_id_for_request(request),
+            "trace_id": request.trace_id.clone(),
+            "source_channel": request.source.channel.clone(),
+            "source_surface": request.source.surface.clone(),
+            "camera_display_name": target.display_name.clone(),
+            "room_name": target.room_name.clone(),
+            "storage_relative_path": snapshot.storage.relative_path.clone(),
+        }),
+    }
+}
+
+fn build_vision_image_media_asset(
+    request: &TaskRequest,
+    target: &ResolvedCameraTarget,
+    image_path: &str,
+    mime_type: &str,
+    asset_kind: MediaAssetKind,
+    derived_from_asset_id: Option<String>,
+    artifact_role: &str,
+    captured_at: &str,
+    byte_size_override: Option<u64>,
+    source_storage: Value,
+    detection_summary: Option<&str>,
+    summary: Option<&str>,
+    summary_source: Option<&str>,
+) -> MediaAsset {
+    let tags = if asset_kind == MediaAssetKind::Derived {
+        vec![
+            "derived".to_string(),
+            "annotated".to_string(),
+            "camera".to_string(),
+            "vision_analysis".to_string(),
+        ]
+    } else {
+        vec![
+            "snapshot".to_string(),
+            "camera".to_string(),
+            "vision_analysis".to_string(),
+        ]
+    };
+
+    MediaAsset {
+        asset_id: new_media_asset_id(),
+        workspace_id: workspace_id_for_request(request),
+        device_id: Some(target.device_id.clone()),
+        asset_kind,
+        storage_target: StorageTargetKind::LocalDisk,
+        storage_uri: image_path.to_string(),
+        mime_type: mime_type.to_string(),
+        byte_size: byte_size_override.unwrap_or_else(|| file_byte_size(image_path)),
+        checksum: file_checksum(image_path),
+        captured_at: Some(captured_at.to_string()),
+        started_at: None,
+        ended_at: None,
+        derived_from_asset_id,
+        tags,
+        metadata: json!({
+            "task_id": request.task_id.clone(),
+            "step_id": step_id_for_request(request),
+            "trace_id": request.trace_id.clone(),
+            "source_channel": request.source.channel.clone(),
+            "source_surface": request.source.surface.clone(),
+            "camera_display_name": target.display_name.clone(),
+            "room_name": target.room_name.clone(),
+            "artifact_role": artifact_role,
+            "detection_summary": detection_summary,
+            "summary": summary,
+            "summary_source": summary_source,
+            "storage_path": image_path,
+            "source_storage": source_storage,
+        }),
+    }
+}
+
+fn storage_target_kind_from_snapshot(target: StorageTarget) -> StorageTargetKind {
+    match target {
+        StorageTarget::LocalDisk => StorageTargetKind::LocalDisk,
+        StorageTarget::HarborOsPool => StorageTargetKind::HarborOsPool,
+        StorageTarget::ExternalShare => StorageTargetKind::Nas,
+    }
+}
+
+fn snapshot_checksum(snapshot: &SnapshotCaptureResult) -> Option<String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(snapshot.bytes_base64.as_bytes())
+        .ok()?;
+    let digest = Sha256::digest(&bytes);
+    Some(format!(
+        "sha256:{}",
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
+}
+
+fn file_byte_size(path: &str) -> u64 {
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+fn file_checksum(path: &str) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    let digest = Sha256::digest(&bytes);
+    Some(format!(
+        "sha256:{}",
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
+}
+
+fn mime_type_from_path(path: &str) -> Option<String> {
+    let extension = Path::new(path).extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "jpg" | "jpeg" => Some("image/jpeg".to_string()),
+        "png" => Some("image/png".to_string()),
+        "webp" => Some("image/webp".to_string()),
+        _ => None,
+    }
+}
+
 fn build_share_link_payload(
     target: &ResolvedCameraTarget,
     issued: &remote_view::IssuedCameraShareToken,
+    media_session: &MediaSession,
+    share_link: &ShareLink,
 ) -> Value {
     let encoded_token = url_encode_path_segment(&issued.token);
     let relative_url = format!("/shared/cameras/{encoded_token}");
     let stream_url = format!("{relative_url}/live.mjpeg");
     json!({
+        "share_link_id": share_link.share_link_id,
+        "media_session_id": media_session.media_session_id,
         "device_id": target.device_id,
         "display_name": target.display_name,
         "url": relative_url,
         "stream_url": stream_url,
+        "access_scope": share_link.access_scope,
         "expires_at_unix_secs": issued.expires_at_unix_secs,
         "ttl_minutes": issued.ttl_minutes,
     })
@@ -1936,12 +2242,19 @@ fn build_share_link_artifact(share_link: &Value) -> TaskArtifact {
         kind: "link".to_string(),
         label: "共享观看链接".to_string(),
         mime_type: "text/uri-list".to_string(),
+        media_asset_id: None,
         path: None,
         url: share_link
             .get("url")
             .and_then(Value::as_str)
             .map(str::to_string),
         metadata: json!({
+            "share_link_id": share_link.get("share_link_id").cloned().unwrap_or(Value::Null),
+            "media_session_id": share_link
+                .get("media_session_id")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "access_scope": share_link.get("access_scope").cloned().unwrap_or(Value::Null),
             "stream_url": share_link.get("stream_url").cloned().unwrap_or(Value::Null),
             "expires_at_unix_secs": share_link
                 .get("expires_at_unix_secs")
@@ -1949,6 +2262,60 @@ fn build_share_link_artifact(share_link: &Value) -> TaskArtifact {
                 .unwrap_or(Value::Null),
             "ttl_minutes": share_link.get("ttl_minutes").cloned().unwrap_or(Value::Null),
         }),
+    }
+}
+
+fn build_share_media_session(
+    request: &TaskRequest,
+    target: &ResolvedCameraTarget,
+    media_session_id: &str,
+    share_link_id: &str,
+) -> MediaSession {
+    MediaSession {
+        media_session_id: media_session_id.to_string(),
+        device_id: target.device_id.clone(),
+        stream_profile_id: format!("{}::stream::primary", target.device_id),
+        session_kind: MediaSessionKind::Share,
+        delivery_mode: share_delivery_mode(target),
+        opened_by_user_id: (!request.source.user_id.trim().is_empty())
+            .then(|| request.source.user_id.clone()),
+        status: MediaSessionStatus::Active,
+        share_link_id: Some(share_link_id.to_string()),
+        started_at: Some(current_timestamp()),
+        ended_at: None,
+        metadata: json!({
+            "task_id": request.task_id.clone(),
+            "step_id": step_id_for_request(request),
+            "source_channel": request.source.channel.clone(),
+            "source_surface": request.source.surface.clone(),
+            "conversation_id": request.source.conversation_id.clone(),
+            "delivery_proxy": "mjpeg",
+            "stream_transport": serde_json::to_value(target.primary_stream.transport).unwrap_or(Value::Null),
+        }),
+    }
+}
+
+fn build_share_link_record(
+    issued: &remote_view::IssuedCameraShareToken,
+    media_session_id: &str,
+    share_link_id: &str,
+) -> ShareLink {
+    ShareLink {
+        share_link_id: share_link_id.to_string(),
+        media_session_id: media_session_id.to_string(),
+        token_hash: remote_view::camera_share_token_hash(&issued.token),
+        access_scope: ShareAccessScope::PublicLink,
+        expires_at: Some(issued.expires_at_unix_secs.to_string()),
+        revoked_at: None,
+    }
+}
+
+fn share_delivery_mode(target: &ResolvedCameraTarget) -> MediaDeliveryMode {
+    match target.primary_stream.transport {
+        crate::runtime::registry::StreamTransport::Webrtc => MediaDeliveryMode::Webrtc,
+        crate::runtime::registry::StreamTransport::Hls => MediaDeliveryMode::Hls,
+        crate::runtime::registry::StreamTransport::Rtsp
+        | crate::runtime::registry::StreamTransport::Unknown => MediaDeliveryMode::Hls,
     }
 }
 
@@ -2070,7 +2437,7 @@ fn build_artifact_records(
             artifact_kind: artifact_kind_from_name(&artifact.kind),
             label: artifact.label.clone(),
             mime_type: artifact.mime_type.clone(),
-            media_asset_id: None,
+            media_asset_id: artifact.media_asset_id.clone(),
             path: artifact.path.clone(),
             url: artifact.url.clone(),
             metadata: artifact.metadata.clone(),
@@ -2367,6 +2734,16 @@ fn usize_at_paths(value: &Value, paths: &[&str]) -> Option<usize> {
     })
 }
 
+fn u64_at_paths(value: &Value, paths: &[&str]) -> Option<u64> {
+    paths.iter().find_map(|path| {
+        let item = value.pointer(path)?;
+        if let Some(number) = item.as_u64() {
+            return Some(number);
+        }
+        item.as_str()?.trim().parse::<u64>().ok()
+    })
+}
+
 fn bool_at_paths(value: &Value, paths: &[&str]) -> Option<bool> {
     paths.iter().find_map(|path| {
         let item = value.pointer(path)?;
@@ -2485,6 +2862,7 @@ fn resolve_notification_recipient(
     state: &AdminConsoleState,
     requester_user_id: &str,
 ) -> Option<NotificationRecipient> {
+    let bindings = resolved_identity_binding_records(state);
     if request.destination.trim().is_empty() {
         return None;
     }
@@ -2497,20 +2875,16 @@ fn resolve_notification_recipient(
         });
     }
 
-    if let Some(recipient) =
-        recipient_from_literal_destination(&request.destination, &state.identity_bindings)
-    {
+    if let Some(recipient) = recipient_from_literal_destination(&request.destination, &bindings) {
         return Some(recipient);
     }
 
-    if let Some(recipient) =
-        recipient_from_binding_match(&request.destination, &state.identity_bindings)
-    {
+    if let Some(recipient) = recipient_from_binding_match(&request.destination, &bindings) {
         return Some(recipient);
     }
 
     if !requester_user_id.trim().is_empty() {
-        if let Some(binding) = state.identity_bindings.iter().find(|binding| {
+        if let Some(binding) = bindings.iter().find(|binding| {
             binding
                 .user_id
                 .as_deref()
@@ -2523,8 +2897,7 @@ fn resolve_notification_recipient(
         }
     }
 
-    let chat_bindings = state
-        .identity_bindings
+    let chat_bindings = bindings
         .iter()
         .filter_map(recipient_from_binding)
         .collect::<Vec<_>>();
@@ -2615,6 +2988,14 @@ fn current_timestamp() -> String {
         .to_string()
 }
 
+fn current_timestamp_millis() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .to_string()
+}
+
 fn new_event_id() -> String {
     Uuid::new_v4().as_simple().to_string()
 }
@@ -2635,11 +3016,24 @@ fn new_audit_ref() -> String {
     Uuid::new_v4().as_simple().to_string()[..12].to_string()
 }
 
+fn new_media_asset_id() -> String {
+    format!("asset-{}", Uuid::new_v4().as_simple())
+}
+
+fn new_media_session_id() -> String {
+    format!("media-session-{}", Uuid::new_v4().as_simple())
+}
+
+fn new_share_link_id() -> String {
+    format!("share-link-{}", Uuid::new_v4().as_simple())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use base64::Engine as _;
     use serde_json::{json, Value};
 
     use super::{
@@ -2654,12 +3048,17 @@ mod tests {
         NotificationChannel, NotificationPayloadFormat, NotificationRecipientIdType,
         NotificationRequest,
     };
+    use crate::connectors::storage::StorageTarget;
     use crate::control_plane::approvals::ApprovalStatus;
+    use crate::control_plane::auth::{AuthSource, IdentityBinding};
+    use crate::control_plane::media::{MediaAssetKind, StorageTargetKind};
     use crate::control_plane::tasks::{ArtifactKind, TaskRunStatus, TaskStepRunStatus};
     use crate::runtime::admin_console::{
         AdminConsoleState, AdminConsoleStore, BridgeProviderConfig, IdentityBindingRecord,
+        RemoteViewConfig,
     };
     use crate::runtime::hub::HubScanResultItem;
+    use crate::runtime::media::{SnapshotCaptureResult, SnapshotFormat};
     use crate::runtime::registry::{
         CameraCapabilities, CameraDevice, CameraStreamRef, DeviceRegistryStore, DeviceStatus,
         ResolvedCameraTarget, StreamTransport,
@@ -2816,6 +3215,7 @@ mod tests {
                 kind: "image".to_string(),
                 label: "抓拍图片".to_string(),
                 mime_type: "image/jpeg".to_string(),
+                media_asset_id: Some("asset-1".to_string()),
                 path: Some("snap.jpg".to_string()),
                 url: None,
                 metadata: Value::Null,
@@ -2824,7 +3224,277 @@ mod tests {
 
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].artifact_kind, ArtifactKind::Image);
+        assert_eq!(artifacts[0].media_asset_id.as_deref(), Some("asset-1"));
         assert_eq!(artifact_kind_from_name("json"), ArtifactKind::Json);
+    }
+
+    #[test]
+    fn build_snapshot_media_asset_populates_platform_fields() {
+        let request = TaskRequest {
+            task_id: "task-snapshot".to_string(),
+            trace_id: "trace-snapshot".to_string(),
+            step_id: "step-snapshot".to_string(),
+            source: TaskSource {
+                channel: "im_bridge".to_string(),
+                surface: "harborbeacon".to_string(),
+                conversation_id: "chat-1".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-1".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "camera".to_string(),
+                action: "snapshot".to_string(),
+                raw_text: "抓拍门口摄像头".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: Value::Null,
+            autonomy: Default::default(),
+        };
+        let target = ResolvedCameraTarget {
+            device_id: "cam-1".to_string(),
+            display_name: "Front Door".to_string(),
+            status: DeviceStatus::Online,
+            room_name: Some("Entry".to_string()),
+            vendor: Some("DemoCam".to_string()),
+            model: Some("C1".to_string()),
+            ip_address: Some("192.168.1.10".to_string()),
+            mac_address: None,
+            discovery_source: "manual_entry".to_string(),
+            primary_stream: CameraStreamRef {
+                transport: StreamTransport::Rtsp,
+                url: "rtsp://192.168.1.10/live".to_string(),
+                requires_auth: false,
+            },
+            onvif_device_service_url: None,
+            ezviz_device_serial: None,
+            ezviz_camera_no: None,
+            capabilities: CameraCapabilities {
+                snapshot: true,
+                stream: true,
+                ptz: false,
+                audio: false,
+            },
+            last_seen_at: None,
+        };
+        let bytes = b"fake-jpeg";
+        let snapshot = SnapshotCaptureResult::new(
+            "cam-1",
+            SnapshotFormat::Jpeg,
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+            bytes.len(),
+            StorageTarget::LocalDisk,
+        );
+        let expected_captured_at = snapshot.captured_at_epoch_ms.to_string();
+
+        let media_asset = super::build_snapshot_media_asset(&request, &target, &snapshot);
+        assert!(media_asset.asset_id.starts_with("asset-"));
+        assert_eq!(
+            media_asset.workspace_id,
+            super::workspace_id_for_request(&request)
+        );
+        assert_eq!(media_asset.device_id.as_deref(), Some("cam-1"));
+        assert_eq!(media_asset.asset_kind, MediaAssetKind::Snapshot);
+        assert_eq!(media_asset.storage_target, StorageTargetKind::LocalDisk);
+        assert_eq!(media_asset.storage_uri, snapshot.storage.relative_path);
+        assert_eq!(media_asset.mime_type, "image/jpeg");
+        assert_eq!(media_asset.byte_size, bytes.len() as u64);
+        assert_eq!(
+            media_asset.captured_at.as_deref(),
+            Some(expected_captured_at.as_str())
+        );
+        assert!(media_asset
+            .checksum
+            .as_deref()
+            .is_some_and(|value| value.starts_with("sha256:")));
+        assert_eq!(
+            media_asset
+                .metadata
+                .pointer("/task_id")
+                .and_then(Value::as_str),
+            Some("task-snapshot")
+        );
+
+        let payload = super::build_snapshot_payload(&target, &snapshot, &media_asset);
+        assert_eq!(
+            payload
+                .pointer("/snapshot/media_asset_id")
+                .and_then(Value::as_str),
+            Some(media_asset.asset_id.as_str())
+        );
+
+        let artifact = super::build_snapshot_artifact(&snapshot, &media_asset);
+        assert_eq!(
+            artifact.media_asset_id.as_deref(),
+            Some(media_asset.asset_id.as_str())
+        );
+        assert_eq!(
+            artifact
+                .metadata
+                .pointer("/media_asset_id")
+                .and_then(Value::as_str),
+            Some(media_asset.asset_id.as_str())
+        );
+
+        let records = build_artifact_records(&request, "step-snapshot", &[artifact]);
+        assert_eq!(
+            records[0].media_asset_id.as_deref(),
+            Some(media_asset.asset_id.as_str())
+        );
+    }
+
+    #[test]
+    fn persist_vision_media_assets_creates_snapshot_and_derived_records() {
+        let admin_path = unique_path("harbornas-admin-state");
+        let registry_path = unique_path("harbornas-device-registry");
+        let conversation_path = unique_path("harbornas-task-runtime");
+        let snapshot_path = unique_path("harbornas-vision-snapshot").with_extension("jpg");
+        let annotated_path = unique_path("harbornas-vision-annotated").with_extension("jpg");
+        fs::write(&snapshot_path, b"snapshot-bytes").expect("write snapshot image");
+        fs::write(&annotated_path, b"annotated-bytes").expect("write annotated image");
+
+        let service = TaskApiService::new(
+            AdminConsoleStore::new(
+                admin_path.clone(),
+                DeviceRegistryStore::new(registry_path.clone()),
+            ),
+            TaskConversationStore::new(conversation_path.clone()),
+        );
+        let request = TaskRequest {
+            task_id: "task-vision".to_string(),
+            trace_id: "trace-vision".to_string(),
+            step_id: "step-vision".to_string(),
+            source: TaskSource {
+                channel: "im_bridge".to_string(),
+                surface: "harborbeacon".to_string(),
+                conversation_id: "chat-1".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-1".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "camera".to_string(),
+                action: "analyze".to_string(),
+                raw_text: "分析门口摄像头".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: Value::Null,
+            autonomy: Default::default(),
+        };
+        let target = ResolvedCameraTarget {
+            device_id: "cam-1".to_string(),
+            display_name: "Front Door".to_string(),
+            status: DeviceStatus::Online,
+            room_name: Some("Entry".to_string()),
+            vendor: None,
+            model: None,
+            ip_address: Some("192.168.1.10".to_string()),
+            mac_address: None,
+            discovery_source: "manual_entry".to_string(),
+            primary_stream: CameraStreamRef {
+                transport: StreamTransport::Rtsp,
+                url: "rtsp://192.168.1.10/live".to_string(),
+                requires_auth: false,
+            },
+            onvif_device_service_url: None,
+            ezviz_device_serial: None,
+            ezviz_camera_no: None,
+            capabilities: CameraCapabilities {
+                snapshot: true,
+                stream: true,
+                ptz: false,
+                audio: false,
+            },
+            last_seen_at: None,
+        };
+        let mut payload = json!({
+            "summary": "检测到门口有人活动",
+            "summary_source": "heuristic_fallback",
+            "detection_summary": "检测到 1 个 person",
+            "snapshot": {
+                "image_path": snapshot_path.to_string_lossy().to_string(),
+                "annotated_image_path": annotated_path.to_string_lossy().to_string(),
+                "mime_type": "image/jpeg",
+                "source_storage": {
+                    "target": "local_disk",
+                    "relative_path": "snapshots/cam-1/1710000000000.jpg"
+                },
+                "byte_size": 14,
+                "captured_at_epoch_ms": 1710000000000u64
+            }
+        });
+
+        service
+            .persist_vision_media_assets(&request, &target, &mut payload)
+            .expect("persist vision media assets");
+
+        let snapshot_asset_id = payload
+            .pointer("/snapshot/media_asset_id")
+            .and_then(Value::as_str)
+            .expect("snapshot media asset id");
+        let annotated_asset_id = payload
+            .pointer("/snapshot/annotated_media_asset_id")
+            .and_then(Value::as_str)
+            .expect("annotated media asset id");
+
+        let snapshot_asset = service
+            .conversation_store()
+            .load_media_asset(snapshot_asset_id)
+            .expect("load snapshot media asset")
+            .expect("snapshot media asset");
+        let annotated_asset = service
+            .conversation_store()
+            .load_media_asset(annotated_asset_id)
+            .expect("load annotated media asset")
+            .expect("annotated media asset");
+
+        assert_eq!(snapshot_asset.asset_kind, MediaAssetKind::Snapshot);
+        assert_eq!(snapshot_asset.storage_target, StorageTargetKind::LocalDisk);
+        assert_eq!(snapshot_asset.byte_size, 14);
+        assert_eq!(snapshot_asset.captured_at.as_deref(), Some("1710000000000"));
+        assert!(snapshot_asset
+            .checksum
+            .as_deref()
+            .is_some_and(|value| value.starts_with("sha256:")));
+        assert_eq!(
+            snapshot_asset
+                .metadata
+                .pointer("/source_storage/relative_path")
+                .and_then(Value::as_str),
+            Some("snapshots/cam-1/1710000000000.jpg")
+        );
+
+        assert_eq!(annotated_asset.asset_kind, MediaAssetKind::Derived);
+        assert_eq!(
+            annotated_asset.derived_from_asset_id.as_deref(),
+            Some(snapshot_asset_id)
+        );
+        assert_eq!(
+            annotated_asset.captured_at.as_deref(),
+            Some("1710000000000")
+        );
+        assert_eq!(
+            annotated_asset
+                .metadata
+                .pointer("/artifact_role")
+                .and_then(Value::as_str),
+            Some("analysis_annotation")
+        );
+
+        let artifacts = super::build_vision_artifacts(&payload);
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(
+            artifacts[0].media_asset_id.as_deref(),
+            Some(snapshot_asset_id)
+        );
+        assert_eq!(
+            artifacts[1].media_asset_id.as_deref(),
+            Some(annotated_asset_id)
+        );
+
+        let _ = fs::remove_file(snapshot_path);
+        let _ = fs::remove_file(annotated_path);
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
     }
 
     #[test]
@@ -2900,6 +3570,7 @@ mod tests {
                     kind: "image".to_string(),
                     label: "抓拍图片".to_string(),
                     mime_type: "image/jpeg".to_string(),
+                    media_asset_id: None,
                     path: Some("snap.jpg".to_string()),
                     url: None,
                     metadata: Value::Null,
@@ -2939,6 +3610,14 @@ mod tests {
         registry_store
             .save_devices(&[device])
             .expect("save registry device");
+        service
+            .clone()
+            .admin_store
+            .save_remote_view_config(RemoteViewConfig {
+                share_secret: "platform-share-secret".to_string(),
+                share_link_ttl_minutes: 45,
+            })
+            .expect("save remote view config");
 
         let response = service.handle_task(TaskRequest {
             task_id: "task-share".to_string(),
@@ -2968,6 +3647,12 @@ mod tests {
             response.risk_level,
             crate::orchestrator::contracts::RiskLevel::Medium
         );
+        let share_link_id = response.result.data["share_link"]["share_link_id"]
+            .as_str()
+            .expect("share link id");
+        let media_session_id = response.result.data["share_link"]["media_session_id"]
+            .as_str()
+            .expect("media session id");
         assert_eq!(response.result.artifacts.len(), 1);
         assert_eq!(response.result.artifacts[0].kind, "link");
         assert!(response.result.artifacts[0]
@@ -2975,11 +3660,36 @@ mod tests {
             .as_deref()
             .expect("share url")
             .starts_with("/shared/cameras/"));
-        assert_eq!(response.result.data["share_link"]["ttl_minutes"], 120);
+        assert_eq!(response.result.data["share_link"]["ttl_minutes"], 45);
+        assert_eq!(
+            response.result.artifacts[0].metadata["share_link_id"],
+            json!(share_link_id)
+        );
         assert_eq!(
             response.result.events[0]["event_type"],
             "task.share_link_issued"
         );
+        let share_url = response.result.artifacts[0]
+            .url
+            .as_deref()
+            .expect("share url");
+        let share_token = share_url.trim_start_matches("/shared/cameras/");
+        let share_link = service
+            .conversation_store()
+            .load_share_link(share_link_id)
+            .expect("load share link")
+            .expect("share link");
+        let media_session = service
+            .conversation_store()
+            .load_media_session(media_session_id)
+            .expect("load media session")
+            .expect("media session");
+        assert_eq!(
+            share_link.token_hash,
+            crate::runtime::remote_view::camera_share_token_hash(share_token)
+        );
+        assert_eq!(share_link.media_session_id, media_session.media_session_id);
+        assert_eq!(media_session.device_id, "cam-share");
 
         let _ = fs::remove_file(admin_path);
         let _ = fs::remove_file(registry_path);
@@ -3025,6 +3735,44 @@ mod tests {
             NotificationRecipientIdType::ChatId
         );
         assert_eq!(recipient.receive_id, "oc_demo");
+    }
+
+    #[test]
+    fn resolve_notification_recipient_prefers_platform_binding_when_legacy_empty() {
+        let mut state = AdminConsoleState::default();
+        state.platform.identity_bindings.push(IdentityBinding {
+            identity_id: "identity-ou_platform".to_string(),
+            user_id: "user-1".to_string(),
+            auth_source: AuthSource::ImChannel,
+            provider_key: "im_bridge".to_string(),
+            external_user_id: "ou_platform".to_string(),
+            external_union_id: None,
+            external_chat_id: Some("oc_platform".to_string()),
+            profile_snapshot: json!({
+                "display_name": "平台通知频道",
+            }),
+            last_seen_at: None,
+        });
+
+        let request = NotificationRequest {
+            channel: NotificationChannel::ImBridge,
+            destination: "平台通知频道".to_string(),
+            title: "AI 分析".to_string(),
+            body: "检测到人员活动".to_string(),
+            payload_format: NotificationPayloadFormat::PlainText,
+            structured_payload: Value::Null,
+            attachments: Vec::new(),
+            correlation_id: Some("trace-1".to_string()),
+        };
+
+        let recipient =
+            resolve_notification_recipient(&request, &state, "user-1").expect("recipient");
+
+        assert_eq!(
+            recipient.receive_id_type,
+            NotificationRecipientIdType::ChatId
+        );
+        assert_eq!(recipient.receive_id, "oc_platform");
     }
 
     #[test]

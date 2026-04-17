@@ -602,6 +602,40 @@ select:focus {
   align-items: start;
 }
 
+.share-link-card {
+  margin-top: 18px;
+}
+
+.share-link-item {
+  align-items: start;
+}
+
+.share-link-copy {
+  display: grid;
+  gap: 8px;
+}
+
+.share-link-pill-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.share-link-submeta {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.share-link-actions {
+  align-items: flex-start;
+  justify-content: flex-end;
+}
+
+.compact-share-link-list {
+  margin-top: 16px;
+}
+
 .member-copy {
   display: grid;
   gap: 8px;

@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::connectors::storage::StorageObjectRef;
 use crate::runtime::registry::ResolvedCameraTarget;
 
 pub const DOMAIN: &str = "vision";
@@ -34,6 +35,12 @@ pub struct VisionImageArtifact {
     pub image_path: String,
     pub annotated_image_path: Option<String>,
     pub mime_type: String,
+    #[serde(default)]
+    pub source_storage: Option<StorageObjectRef>,
+    #[serde(default)]
+    pub byte_size: Option<u64>,
+    #[serde(default)]
+    pub captured_at_epoch_ms: Option<u128>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -122,7 +129,10 @@ mod tests {
             "snapshot": {
                 "image_path": "snap.jpg",
                 "annotated_image_path": null,
-                "mime_type": "image/jpeg"
+                "mime_type": "image/jpeg",
+                "source_storage": null,
+                "byte_size": null,
+                "captured_at_epoch_ms": null
             },
             "detection_summary": "检测到 1 个 person，最高置信度 88%。",
             "feishu_card": {"header": {"title": {"content": "Front Door AI 分析"}}}
@@ -132,6 +142,9 @@ mod tests {
         assert_eq!(payload.notification_channel, "im_bridge");
         assert_eq!(payload.notification_format, "lark_card");
         assert_eq!(payload.camera_target.device_id, "cam-1");
+        assert_eq!(payload.snapshot.source_storage, None);
+        assert_eq!(payload.snapshot.byte_size, None);
+        assert_eq!(payload.snapshot.captured_at_epoch_ms, None);
         assert_eq!(
             payload.notification_card["header"]["title"]["content"],
             "Front Door AI 分析"

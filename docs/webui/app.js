@@ -41,6 +41,9 @@ const state = {
   accessMembers: [],
   accessMembersLoaded: false,
   accessMembersError: "",
+  shareLinks: [],
+  shareLinksLoaded: false,
+  shareLinksError: "",
   latestTaskOutcome: null,
   scanResults: [],
   events: [
@@ -67,6 +70,7 @@ const els = {
   scanResults: document.querySelector("#scan-results"),
   approvalList: document.querySelector("#approval-list"),
   accessMemberList: document.querySelector("#access-member-list"),
+  shareLinkList: document.querySelector("#share-link-list"),
   cameraTabs: document.querySelector("#camera-tabs"),
   activeName: document.querySelector("#active-camera-name"),
   activeMeta: document.querySelector("#active-camera-meta"),
@@ -101,6 +105,7 @@ const els = {
   bindTestOpenId: document.querySelector("#bind-test-open-id"),
   refreshApprovals: document.querySelector("#refresh-approvals"),
   refreshAccessMembers: document.querySelector("#refresh-access-members"),
+  refreshShareLinks: document.querySelector("#refresh-share-links"),
   taskOutcomeStatus: document.querySelector("#task-outcome-status"),
   taskOutcomeMessage: document.querySelector("#task-outcome-message"),
   taskOutcomeAction: document.querySelector("#task-outcome-action"),
@@ -346,6 +351,76 @@ function mapAccessMember(member) {
     chatId: member?.chat_id || "",
     canEdit: Boolean(member?.can_edit),
     isOwner: Boolean(member?.is_owner),
+  };
+}
+
+function toShareLinkStatusLabel(status) {
+  switch (String(status || "").toLowerCase()) {
+    case "revoked":
+      return "已撤销";
+    case "expired":
+      return "已过期";
+    case "closed":
+      return "已关闭";
+    case "failed":
+      return "会话失败";
+    default:
+      return "生效中";
+  }
+}
+
+function toShareLinkStatusClass(status) {
+  switch (String(status || "").toLowerCase()) {
+    case "revoked":
+    case "failed":
+      return "approval-status-rejected";
+    case "expired":
+    case "closed":
+      return "approval-status-pending";
+    default:
+      return "approval-status-approved";
+  }
+}
+
+function toShareAccessScopeLabel(scope) {
+  switch (String(scope || "").toLowerCase()) {
+    case "workspace":
+      return "工作区内";
+    case "invite_only":
+      return "仅邀请";
+    default:
+      return "公开链接";
+  }
+}
+
+function toShareSessionStatusLabel(status) {
+  switch (String(status || "").toLowerCase()) {
+    case "opening":
+      return "会话建立中";
+    case "closed":
+      return "会话已关闭";
+    case "failed":
+      return "会话失败";
+    default:
+      return "会话活跃";
+  }
+}
+
+function mapShareLink(item) {
+  return {
+    shareLinkId: item?.share_link_id || "",
+    mediaSessionId: item?.media_session_id || "",
+    deviceId: item?.device_id || "",
+    deviceName: item?.device_name || item?.device_id || "未命名设备",
+    openedByUserId: item?.opened_by_user_id || "",
+    accessScope: item?.access_scope || "public_link",
+    sessionStatus: item?.session_status || "active",
+    status: item?.status || "active",
+    expiresAt: item?.expires_at || "",
+    revokedAt: item?.revoked_at || "",
+    startedAt: item?.started_at || "",
+    endedAt: item?.ended_at || "",
+    canRevoke: Boolean(item?.can_revoke),
   };
 }
 
@@ -861,6 +936,32 @@ async function loadAccessMembers(options = {}) {
   }
 }
 
+async function loadShareLinks(options = {}) {
+  const { silent = false } = options;
+  try {
+    const payload = await api("/share-links");
+    state.shareLinks = Array.isArray(payload) ? payload.map(mapShareLink) : [];
+    state.shareLinksLoaded = true;
+    state.shareLinksError = "";
+    renderShareLinks();
+    return state.shareLinks;
+  } catch (error) {
+    state.shareLinks = [];
+    state.shareLinksLoaded = true;
+    state.shareLinksError = error.message;
+    renderShareLinks();
+    if (!silent) {
+      pushEvent({
+        type: "warning",
+        title: "共享链接列表读取失败",
+        body: error.message,
+        time: "刚刚",
+      });
+    }
+    throw error;
+  }
+}
+
 function stopPreviewLoop() {
   if (previewState.timer) {
     window.clearInterval(previewState.timer);
@@ -1064,6 +1165,7 @@ function renderDevicePanel() {
     els.deviceBadge.style.color = "#cc7420";
     els.deviceBadge.style.background = "rgba(204, 116, 32, 0.14)";
     renderOverlay(null);
+    renderShareLinks();
     syncPreviewLoop();
     return;
   }
@@ -1093,7 +1195,133 @@ function renderDevicePanel() {
   }
 
   renderOverlay(camera);
+  renderShareLinks();
   syncPreviewLoop();
+}
+
+function renderShareLinks() {
+  if (!els.shareLinkList) {
+    return;
+  }
+
+  const camera = getActiveCamera();
+  els.shareLinkList.innerHTML = "";
+
+  if (!camera) {
+    const item = document.createElement("li");
+    item.className = "scan-result-item share-link-item";
+    item.innerHTML = `
+      <div class="scan-result-main share-link-copy">
+        <span class="scan-result-title">等待选择设备</span>
+        <span class="scan-result-note">选中一台摄像头后，这里会展示它已经登记过的共享链接记录。</span>
+      </div>
+      <div class="scan-result-actions share-link-actions">
+        <span class="status-chip">尚无设备</span>
+      </div>
+    `;
+    els.shareLinkList.appendChild(item);
+    return;
+  }
+
+  if (!state.shareLinksLoaded) {
+    const item = document.createElement("li");
+    item.className = "scan-result-item share-link-item";
+    item.innerHTML = `
+      <div class="scan-result-main share-link-copy">
+        <span class="scan-result-title">正在读取共享链接</span>
+        <span class="scan-result-note">后台会返回已经登记的 ShareLink / MediaSession 记录，方便直接撤销。</span>
+      </div>
+      <div class="scan-result-actions share-link-actions">
+        <span class="status-chip">加载中</span>
+      </div>
+    `;
+    els.shareLinkList.appendChild(item);
+    return;
+  }
+
+  if (state.shareLinksError) {
+    const item = document.createElement("li");
+    item.className = "scan-result-item share-link-item";
+    item.innerHTML = `
+      <div class="scan-result-main share-link-copy">
+        <span class="scan-result-title">共享链接列表暂不可用</span>
+        <span class="scan-result-note">${state.shareLinksError}</span>
+      </div>
+      <div class="scan-result-actions share-link-actions">
+        <span class="status-chip approval-status-rejected">读取失败</span>
+      </div>
+    `;
+    els.shareLinkList.appendChild(item);
+    return;
+  }
+
+  const visibleLinks = state.shareLinks.filter((link) => link.deviceId === camera.id);
+  if (!visibleLinks.length) {
+    const item = document.createElement("li");
+    item.className = "scan-result-item share-link-item";
+    item.innerHTML = `
+      <div class="scan-result-main share-link-copy">
+        <span class="scan-result-title">这个设备还没有共享链接记录</span>
+        <span class="scan-result-note">原始 token 不会在后台再次明文回显；如果要重新外发，请点上面的“生成共享链接”。</span>
+      </div>
+      <div class="scan-result-actions share-link-actions">
+        <span class="status-chip">尚无记录</span>
+      </div>
+    `;
+    els.shareLinkList.appendChild(item);
+    return;
+  }
+
+  visibleLinks.forEach((link) => {
+    const item = document.createElement("li");
+    item.className = "scan-result-item share-link-item";
+
+    const copy = document.createElement("div");
+    copy.className = "scan-result-main share-link-copy";
+    copy.innerHTML = `
+      <span class="scan-result-title">${link.deviceName} · ${link.shareLinkId}</span>
+      <div class="approval-pill-row share-link-pill-row">
+        <span class="status-chip ${toShareLinkStatusClass(link.status)}">${toShareLinkStatusLabel(link.status)}</span>
+        <span class="status-chip">${toShareAccessScopeLabel(link.accessScope)}</span>
+        <span class="status-chip">${toShareSessionStatusLabel(link.sessionStatus)}</span>
+      </div>
+      <span class="share-link-submeta">
+        Media Session: ${link.mediaSessionId || "未知"} · 发起时间 ${formatTimestamp(link.startedAt)}
+        ${link.openedByUserId ? ` · 发起人 ${link.openedByUserId}` : ""}
+      </span>
+      <span class="scan-result-note">
+        ${
+          link.revokedAt
+            ? `这条共享链路已在 ${formatTimestamp(link.revokedAt)} 被撤销。`
+            : link.expiresAt
+              ? `这条共享链路会在 ${formatTimestamp(link.expiresAt)} 过期；原始 token 不会在后台再次回显。`
+              : "这条共享链路没有显式过期时间；原始 token 不会在后台再次回显。"
+        }
+      </span>
+    `;
+
+    const actions = document.createElement("div");
+    actions.className = "scan-result-actions share-link-actions";
+    if (link.canRevoke) {
+      const revokeButton = document.createElement("button");
+      revokeButton.className = "button button-danger";
+      revokeButton.type = "button";
+      revokeButton.textContent = "撤销链接";
+      revokeButton.addEventListener("click", () => {
+        handleShareLinkRevoke(link, revokeButton);
+      });
+      actions.appendChild(revokeButton);
+    } else {
+      const chip = document.createElement("span");
+      chip.className = `status-chip ${toShareLinkStatusClass(link.status)}`.trim();
+      chip.textContent = toShareLinkStatusLabel(link.status);
+      actions.appendChild(chip);
+    }
+
+    item.appendChild(copy);
+    item.appendChild(actions);
+    els.shareLinkList.appendChild(item);
+  });
 }
 
 function renderEvents() {
@@ -1486,6 +1714,40 @@ async function handleMemberRoleSave(member, select, button) {
   }
 }
 
+async function handleShareLinkRevoke(link, button) {
+  try {
+    await withBusy(button, "撤销中...", async () => {
+      await api(`/share-links/${encodeURIComponent(link.shareLinkId)}/revoke`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      try {
+        await loadShareLinks({ silent: true });
+      } catch (_error) {
+        // Revocation already succeeded; keep the dashboard usable with the last known list.
+      }
+      state.lastCommand = `撤销共享链接 ${link.shareLinkId}`;
+      renderAll();
+      pushEvent({
+        type: "warning",
+        title: `共享链接已撤销：${link.deviceName}`,
+        body: `后台已经关闭 ${link.shareLinkId} 对应的共享会话，旧的 shared 页面会立即失效。`,
+        time: "刚刚",
+      });
+      showToast(`已撤销 ${link.shareLinkId}。`);
+    });
+  } catch (error) {
+    pushEvent({
+      type: "warning",
+      title: `撤销共享链接失败：${link.deviceName}`,
+      body: error.message,
+      time: "刚刚",
+    });
+    renderAll();
+    showToast(error.message);
+  }
+}
+
 document.querySelector("#refresh-qr").addEventListener("click", (event) => {
   withBusy(event.currentTarget, "刷新中...", async () => {
     const payload = await api("/binding/refresh", { method: "POST" });
@@ -1516,6 +1778,23 @@ els.refreshAccessMembers.addEventListener("click", (event) => {
       time: "刚刚",
     });
     showToast("已刷新成员角色列表。");
+  }).catch((error) => {
+    showToast(error.message);
+  });
+});
+
+els.refreshShareLinks.addEventListener("click", (event) => {
+  withBusy(event.currentTarget, "刷新中...", async () => {
+    await loadShareLinks();
+    state.lastCommand = "刷新共享链接列表";
+    renderAll();
+    pushEvent({
+      type: "info",
+      title: "共享链接列表已刷新",
+      body: `当前平台里登记了 ${state.shareLinks.length} 条共享链路记录。`,
+      time: "刚刚",
+    });
+    showToast("已刷新共享链接列表。");
   }).catch((error) => {
     showToast(error.message);
   });
@@ -1858,6 +2137,11 @@ document.querySelector("#share-link-button").addEventListener("click", async (ev
       });
       const taskResponse = payload.task_response || null;
       const shareUrl = extractShareLinkUrl(taskResponse);
+      try {
+        await loadShareLinks({ silent: true });
+      } catch (_error) {
+        // Keep the immediate share flow usable even if the follow-up list refresh fails.
+      }
       state.latestTaskOutcome = buildOutcomeFromTaskResponse(
         taskResponse,
         `生成共享链接 ${camera.name}`
@@ -1941,14 +2225,20 @@ async function boot() {
     } catch (_error) {
       // Keep the dashboard usable even if the member list is temporarily unavailable.
     }
+    try {
+      await loadShareLinks({ silent: true });
+    } catch (_error) {
+      // Keep the dashboard usable even if the share-link list is temporarily unavailable.
+    }
     state.lastCommand = state.cameras.length ? "已载入设备库" : "等待首次接入";
     renderAll();
     pushEvent({
       type: "normal",
       title: "本地管理 API 已连接",
       body:
-        `已经读取到 ${state.cameras.length} 台真实设备，当前成员 ${state.accessMembers.length} 项，默认策略来自 .harbornas 下的本地状态文件。` +
+        `已经读取到 ${state.cameras.length} 台真实设备，当前成员 ${state.accessMembers.length} 项，已登记共享链路 ${state.shareLinks.length} 条，默认策略来自 .harbornas 下的本地状态文件。` +
         (state.approvalsError ? "审批队列当前暂不可用。" : `当前待审批 ${state.approvals.length} 项。`) +
+        (state.shareLinksError ? "共享链接列表当前暂不可用。" : "") +
         (state.accessMembersError ? "成员角色列表当前暂不可用。" : ""),
       time: "刚刚",
     });

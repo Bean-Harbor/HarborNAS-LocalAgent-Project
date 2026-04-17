@@ -174,21 +174,21 @@ impl CameraHubService {
         request: HubScanRequest,
         public_origin: Option<&str>,
     ) -> Result<HubScanSummary, String> {
-        let mut state = self.load_admin_state()?;
+        let mut defaults = self.load_admin_state()?.defaults;
         if let Some(cidr) = request.cidr {
             let trimmed = cidr.trim();
             if !trimmed.is_empty() {
-                state.defaults.cidr = trimmed.to_string();
+                defaults.cidr = trimmed.to_string();
             }
         }
         if let Some(protocol) = request.protocol {
             let trimmed = protocol.trim();
             if !trimmed.is_empty() {
-                state.defaults.discovery = trimmed.to_string();
+                defaults.discovery = trimmed.to_string();
             }
         }
-        state.defaults = sanitize_defaults(state.defaults);
-        self.admin_store.save_state(&state)?;
+        defaults = sanitize_defaults(defaults);
+        let state = self.admin_store.save_defaults(defaults)?;
 
         let protocols = resolve_discovery_protocols(&state.defaults.discovery);
         if protocols.iter().any(|p| {

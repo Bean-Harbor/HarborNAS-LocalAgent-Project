@@ -234,6 +234,10 @@ impl CommandRtspAdapter {
     }
 
     fn player_args(player: &str, stream_url: &str) -> Result<Vec<String>, String> {
+        if player == "open" {
+            return Ok(vec![stream_url.to_string()]);
+        }
+
         if cfg!(target_os = "macos") {
             match player {
                 "vlc" => {
@@ -250,7 +254,6 @@ impl CommandRtspAdapter {
                         stream_url.to_string(),
                     ]);
                 }
-                "open" => return Ok(vec![stream_url.to_string()]),
                 _ => {}
             }
         }

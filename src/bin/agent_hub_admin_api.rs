@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{Cursor, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, ResponseBox, Server, StatusCode};
 
+use harbornas_local_agent::control_plane::media::{MediaSession, MediaSessionStatus, ShareLink};
 use harbornas_local_agent::control_plane::users::{MembershipStatus, RoleKind};
 use harbornas_local_agent::runtime::access_control::{
     authorize_access, AccessAction, AccessIdentityHints, AccessPrincipal,
@@ -163,6 +165,28 @@ struct AccessMemberSummary {
     is_owner: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct ShareLinkSummary {
+    share_link_id: String,
+    media_session_id: String,
+    device_id: String,
+    device_name: String,
+    #[serde(default)]
+    opened_by_user_id: Option<String>,
+    access_scope: String,
+    session_status: String,
+    status: String,
+    #[serde(default)]
+    expires_at: Option<String>,
+    #[serde(default)]
+    revoked_at: Option<String>,
+    #[serde(default)]
+    started_at: Option<String>,
+    #[serde(default)]
+    ended_at: Option<String>,
+    can_revoke: bool,
+}
+
 type StateResponse = HubStateSnapshot;
 type ScanRequest = HubScanRequest;
 type ScanResponse = HubScanSummary;
@@ -237,6 +261,9 @@ impl AdminApi {
             Method::Get if path == "/api/access/members" => {
                 self.handle_access_members(&identity_hints).boxed()
             }
+            Method::Get if path == "/api/share-links" => {
+                self.handle_share_links(&raw_url, &identity_hints).boxed()
+            }
             Method::Get if path == "/api/tasks/approvals" => {
                 self.handle_pending_approvals(&identity_hints).boxed()
             }
@@ -305,6 +332,10 @@ impl AdminApi {
                 self.handle_camera_share_link(&path, &identity_hints)
                     .boxed()
             }
+            Method::Post if path.starts_with("/api/share-links/") && path.ends_with("/revoke") => {
+                self.handle_revoke_share_link(&path, &identity_hints)
+                    .boxed()
+            }
             Method::Post if path.starts_with("/api/cameras/") && path.ends_with("/snapshot") => {
                 self.handle_camera_task_snapshot(&path, &identity_hints)
                     .boxed()
@@ -346,6 +377,25 @@ impl AdminApi {
         };
 
         ok_json(&build_access_member_summaries(&state))
+    }
+
+    fn handle_share_links(
+        &self,
+        url: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+
+        let device_filter = parse_query_param(url, "device_id")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
+        match self.list_share_links(device_filter.as_deref()) {
+            Ok(payload) => ok_json(&payload),
+            Err(error) => error_json(StatusCode(500), &error),
+        }
     }
 
     fn handle_pending_approvals(
@@ -886,6 +936,45 @@ impl AdminApi {
         })
     }
 
+    fn handle_revoke_share_link(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+
+        let share_link_id = match parse_share_link_revoke_path(path) {
+            Some(share_link_id) => share_link_id,
+            None => return error_json(StatusCode(400), "invalid share-link revoke path"),
+        };
+
+        let store = self.task_service.conversation_store();
+        let share_link = match store.load_share_link(&share_link_id) {
+            Ok(Some(share_link)) => share_link,
+            Ok(None) => return error_json(StatusCode(404), "share link not found"),
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+
+        let revoked_at = remote_view::now_unix_secs().to_string();
+        let revoked = match store.revoke_share_link(&share_link_id, Some(revoked_at.clone())) {
+            Ok(Some(share_link)) => share_link,
+            Ok(None) => return error_json(StatusCode(404), "share link not found"),
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let media_session =
+            match store.close_media_session(&share_link.media_session_id, Some(revoked_at)) {
+                Ok(media_session) => media_session,
+                Err(error) => return error_json(StatusCode(500), &error),
+            };
+
+        ok_json(&json!({
+            "share_link": revoked,
+            "media_session": media_session,
+        }))
+    }
+
     fn handle_camera_snapshot(
         &self,
         path: &str,
@@ -1151,8 +1240,105 @@ impl AdminApi {
         &self,
         token: &str,
     ) -> Result<remote_view::CameraShareClaims, String> {
-        let state = self.admin_store.load_or_create_state()?;
-        remote_view::verify_camera_share_token(&state.remote_view.share_secret, token)
+        let remote_view_config = self.admin_store.load_remote_view_config()?;
+        let claims =
+            remote_view::verify_camera_share_token(&remote_view_config.share_secret, token)?;
+        let token_hash = remote_view::camera_share_token_hash(token);
+        let share_link = self
+            .task_service
+            .conversation_store()
+            .find_share_link_by_token_hash(&token_hash)?
+            .ok_or_else(|| "share token is not registered".to_string())?;
+        if share_link
+            .revoked_at
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some()
+        {
+            return Err("share token revoked".to_string());
+        }
+        if let Some(expires_at) = share_link.expires_at.as_deref() {
+            let expires_at = expires_at
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| "share token expiry is invalid".to_string())?;
+            if remote_view::now_unix_secs() > expires_at {
+                return Err("share token expired".to_string());
+            }
+        }
+
+        let media_session = self
+            .task_service
+            .conversation_store()
+            .load_media_session(&share_link.media_session_id)?
+            .ok_or_else(|| {
+                format!(
+                    "share media session not found: {}",
+                    share_link.media_session_id
+                )
+            })?;
+        if media_session.device_id != claims.device_id {
+            return Err("share token device mismatch".to_string());
+        }
+        if media_session.share_link_id.as_deref() != Some(share_link.share_link_id.as_str()) {
+            return Err("share token session mismatch".to_string());
+        }
+        if !matches!(
+            media_session.status,
+            MediaSessionStatus::Opening | MediaSessionStatus::Active
+        ) {
+            return Err("share session is no longer active".to_string());
+        }
+
+        Ok(claims)
+    }
+
+    fn list_share_links(
+        &self,
+        device_filter: Option<&str>,
+    ) -> Result<Vec<ShareLinkSummary>, String> {
+        let share_links = self.task_service.conversation_store().list_share_links()?;
+        let media_sessions = self
+            .task_service
+            .conversation_store()
+            .list_media_sessions()?;
+        let media_session_map: HashMap<String, MediaSession> = media_sessions
+            .into_iter()
+            .map(|media_session| (media_session.media_session_id.clone(), media_session))
+            .collect();
+        let device_name_map: HashMap<String, String> = self
+            .hub()
+            .load_registered_cameras()?
+            .into_iter()
+            .map(|device| (device.device_id.clone(), device.name))
+            .collect();
+        let now = remote_view::now_unix_secs();
+
+        let mut summaries = share_links
+            .into_iter()
+            .filter_map(|share_link| {
+                let media_session = media_session_map.get(&share_link.media_session_id)?;
+                if let Some(device_filter) = device_filter {
+                    if media_session.device_id != device_filter {
+                        return None;
+                    }
+                }
+                Some(build_share_link_summary(
+                    share_link,
+                    media_session,
+                    device_name_map.get(&media_session.device_id),
+                    now,
+                ))
+            })
+            .collect::<Vec<_>>();
+        summaries.sort_by(|left, right| {
+            right
+                .started_at
+                .cmp(&left.started_at)
+                .then(right.share_link_id.cmp(&left.share_link_id))
+        });
+        Ok(summaries)
     }
 
     fn build_camera_task_request(
@@ -2009,6 +2195,7 @@ fn add_common_headers<R: Read>(response: &mut Response<R>) {
 fn is_admin_surface_path(path: &str) -> bool {
     path == "/api/state"
         || path == "/api/access/members"
+        || path == "/api/share-links"
         || path == "/api/binding/qr.svg"
         || path == "/api/binding/static-qr.svg"
         || path == "/setup/mobile"
@@ -2022,9 +2209,72 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/discovery/scan"
         || path == "/api/devices/manual"
         || (path.starts_with("/api/cameras/") && path.ends_with("/share-link"))
+        || (path.starts_with("/api/share-links/") && path.ends_with("/revoke"))
         || (path.starts_with("/api/cameras/") && path.ends_with("/snapshot"))
         || (path.starts_with("/api/cameras/") && path.ends_with("/analyze"))
         || path == "/api/defaults"
+}
+
+fn build_share_link_summary(
+    share_link: ShareLink,
+    media_session: &MediaSession,
+    device_name: Option<&String>,
+    now_unix_secs: u64,
+) -> ShareLinkSummary {
+    let status = share_link_status(&share_link, media_session, now_unix_secs);
+    ShareLinkSummary {
+        share_link_id: share_link.share_link_id.clone(),
+        media_session_id: media_session.media_session_id.clone(),
+        device_id: media_session.device_id.clone(),
+        device_name: device_name
+            .cloned()
+            .unwrap_or_else(|| media_session.device_id.clone()),
+        opened_by_user_id: media_session.opened_by_user_id.clone(),
+        access_scope: serde_json::to_value(share_link.access_scope)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "public_link".to_string()),
+        session_status: serde_json::to_value(media_session.status)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "unknown".to_string()),
+        status: status.to_string(),
+        expires_at: share_link.expires_at.clone(),
+        revoked_at: share_link.revoked_at.clone(),
+        started_at: media_session.started_at.clone(),
+        ended_at: media_session.ended_at.clone(),
+        can_revoke: status == "active",
+    }
+}
+
+fn share_link_status(
+    share_link: &ShareLink,
+    media_session: &MediaSession,
+    now_unix_secs: u64,
+) -> &'static str {
+    if share_link
+        .revoked_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        return "revoked";
+    }
+
+    if let Some(expires_at) = share_link.expires_at.as_deref() {
+        if let Ok(expires_at) = expires_at.trim().parse::<u64>() {
+            if now_unix_secs > expires_at {
+                return "expired";
+            }
+        }
+    }
+
+    match media_session.status {
+        MediaSessionStatus::Opening | MediaSessionStatus::Active => "active",
+        MediaSessionStatus::Closed => "closed",
+        MediaSessionStatus::Failed => "failed",
+    }
 }
 
 fn ensure_local_admin_access(
@@ -2176,6 +2426,16 @@ fn parse_camera_share_link_path(path: &str) -> Option<String> {
     }
 }
 
+fn parse_share_link_revoke_path(path: &str) -> Option<String> {
+    let trimmed = path.strip_prefix("/api/share-links/")?;
+    let share_link_id = trimmed.strip_suffix("/revoke")?;
+    if share_link_id.is_empty() {
+        None
+    } else {
+        percent_decode_path_segment(share_link_id).ok()
+    }
+}
+
 fn parse_camera_live_page_path(path: &str) -> Option<String> {
     let device_id = path.strip_prefix("/live/cameras/")?;
     if device_id.is_empty() {
@@ -2318,12 +2578,33 @@ mod tests {
         identity_query_suffix, is_admin_surface_path, parse_approval_decision_path,
         parse_camera_analyze_path, parse_camera_live_page_path, parse_camera_live_stream_path,
         parse_camera_share_link_path, parse_camera_snapshot_path, parse_camera_task_snapshot_path,
-        parse_member_role_update_path, parse_shared_camera_live_page_path,
-        parse_shared_camera_live_stream_path, percent_decode_path_segment,
-        redact_bridge_provider_config, request_identity_hints, url_encode_path_segment,
+        parse_member_role_update_path, parse_share_link_revoke_path,
+        parse_shared_camera_live_page_path, parse_shared_camera_live_stream_path,
+        percent_decode_path_segment, redact_bridge_provider_config, request_identity_hints,
+        url_encode_path_segment, AdminApi,
     };
+    use harbornas_local_agent::control_plane::media::{
+        MediaDeliveryMode, MediaSession, MediaSessionKind, MediaSessionStatus, ShareAccessScope,
+        ShareLink,
+    };
+    use harbornas_local_agent::runtime::admin_console::{AdminConsoleStore, RemoteViewConfig};
+    use harbornas_local_agent::runtime::registry::DeviceRegistryStore;
+    use harbornas_local_agent::runtime::remote_view;
+    use harbornas_local_agent::runtime::task_api::TaskApiService;
+    use harbornas_local_agent::runtime::task_session::TaskConversationStore;
+    use serde_json::json;
+    use std::fs;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tiny_http::Header;
+
+    fn unique_store_path(prefix: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{unique}.json"))
+    }
 
     #[test]
     fn camera_paths_decode_percent_encoded_device_ids() {
@@ -2364,6 +2645,10 @@ mod tests {
         assert_eq!(
             parse_shared_camera_live_stream_path(&format!("/shared/cameras/{encoded}/live.mjpeg")),
             Some("abc.def-123".to_string())
+        );
+        assert_eq!(
+            parse_share_link_revoke_path("/api/share-links/share-link-1/revoke"),
+            Some("share-link-1".to_string())
         );
     }
 
@@ -2433,6 +2718,7 @@ mod tests {
     fn approval_routes_are_admin_surface_paths() {
         assert!(is_admin_surface_path("/api/tasks/approvals"));
         assert!(is_admin_surface_path("/api/access/members"));
+        assert!(is_admin_surface_path("/api/share-links"));
         assert!(is_admin_surface_path("/api/access/members/user-1/role"));
         assert!(is_admin_surface_path(
             "/api/tasks/approvals/approval-1/approve"
@@ -2441,6 +2727,9 @@ mod tests {
             "/api/tasks/approvals/approval-1/reject"
         ));
         assert!(is_admin_surface_path("/api/cameras/camera-1/share-link"));
+        assert!(is_admin_surface_path(
+            "/api/share-links/share-link-1/revoke"
+        ));
         assert!(is_admin_surface_path("/api/cameras/camera-1/snapshot"));
         assert!(is_admin_surface_path("/api/cameras/camera-1/analyze"));
     }
@@ -2478,5 +2767,185 @@ mod tests {
             "?open_id=ou_demo&user_id=u_demo"
         );
         assert!(identity_query_suffix("/live/cameras/cam-1").is_empty());
+    }
+
+    #[test]
+    fn verify_shared_camera_token_requires_persisted_active_share_link() {
+        let admin_path = unique_store_path("harbornas-admin-state");
+        let registry_path = unique_store_path("harbornas-device-registry");
+        let conversation_path = unique_store_path("harbornas-task-runtime");
+        let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
+        admin_store
+            .save_remote_view_config(RemoteViewConfig {
+                share_secret: "platform-share-secret".to_string(),
+                share_link_ttl_minutes: 45,
+            })
+            .expect("save remote view");
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let task_service = TaskApiService::new(admin_store.clone(), conversation_store.clone());
+        let api = AdminApi::new(
+            admin_store,
+            task_service,
+            "http://harbornas.local:4174".to_string(),
+        );
+
+        let issued = remote_view::issue_camera_share_token("platform-share-secret", "cam-1", 15)
+            .expect("issue token");
+        let media_session = MediaSession {
+            media_session_id: "media-session-1".to_string(),
+            device_id: "cam-1".to_string(),
+            stream_profile_id: "cam-1::stream::primary".to_string(),
+            session_kind: MediaSessionKind::Share,
+            delivery_mode: MediaDeliveryMode::Hls,
+            opened_by_user_id: Some("user-1".to_string()),
+            status: MediaSessionStatus::Active,
+            share_link_id: Some("share-link-1".to_string()),
+            started_at: Some(remote_view::now_unix_secs().to_string()),
+            ended_at: None,
+            metadata: json!({
+                "task_id": "task-1",
+            }),
+        };
+        let share_link = ShareLink {
+            share_link_id: "share-link-1".to_string(),
+            media_session_id: media_session.media_session_id.clone(),
+            token_hash: remote_view::camera_share_token_hash(&issued.token),
+            access_scope: ShareAccessScope::PublicLink,
+            expires_at: Some(issued.expires_at_unix_secs.to_string()),
+            revoked_at: None,
+        };
+        conversation_store
+            .save_share_link_bundle(&media_session, &share_link)
+            .expect("save share bundle");
+
+        let claims = api
+            .verify_shared_camera_token(&issued.token)
+            .expect("claims");
+        assert_eq!(claims.device_id, "cam-1");
+
+        conversation_store
+            .revoke_share_link(
+                "share-link-1",
+                Some(remote_view::now_unix_secs().to_string()),
+            )
+            .expect("revoke");
+        assert!(api.verify_shared_camera_token(&issued.token).is_err());
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn list_share_links_surfaces_registered_status() {
+        let admin_path = unique_store_path("harbornas-admin-state");
+        let registry_path = unique_store_path("harbornas-device-registry");
+        let conversation_path = unique_store_path("harbornas-task-runtime");
+        let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let task_service = TaskApiService::new(admin_store.clone(), conversation_store.clone());
+        let api = AdminApi::new(
+            admin_store,
+            task_service,
+            "http://harbornas.local:4174".to_string(),
+        );
+
+        conversation_store
+            .save_share_link_bundle(
+                &MediaSession {
+                    media_session_id: "media-session-active".to_string(),
+                    device_id: "cam-1".to_string(),
+                    stream_profile_id: "cam-1::stream::primary".to_string(),
+                    session_kind: MediaSessionKind::Share,
+                    delivery_mode: MediaDeliveryMode::Hls,
+                    opened_by_user_id: Some("user-1".to_string()),
+                    status: MediaSessionStatus::Active,
+                    share_link_id: Some("share-link-active".to_string()),
+                    started_at: Some(remote_view::now_unix_secs().to_string()),
+                    ended_at: None,
+                    metadata: json!({}),
+                },
+                &ShareLink {
+                    share_link_id: "share-link-active".to_string(),
+                    media_session_id: "media-session-active".to_string(),
+                    token_hash: "hash-active".to_string(),
+                    access_scope: ShareAccessScope::PublicLink,
+                    expires_at: Some((remote_view::now_unix_secs() + 600).to_string()),
+                    revoked_at: None,
+                },
+            )
+            .expect("save active share link");
+        conversation_store
+            .save_share_link_bundle(
+                &MediaSession {
+                    media_session_id: "media-session-revoked".to_string(),
+                    device_id: "cam-1".to_string(),
+                    stream_profile_id: "cam-1::stream::primary".to_string(),
+                    session_kind: MediaSessionKind::Share,
+                    delivery_mode: MediaDeliveryMode::Hls,
+                    opened_by_user_id: Some("user-1".to_string()),
+                    status: MediaSessionStatus::Closed,
+                    share_link_id: Some("share-link-revoked".to_string()),
+                    started_at: Some((remote_view::now_unix_secs() - 300).to_string()),
+                    ended_at: Some(remote_view::now_unix_secs().to_string()),
+                    metadata: json!({}),
+                },
+                &ShareLink {
+                    share_link_id: "share-link-revoked".to_string(),
+                    media_session_id: "media-session-revoked".to_string(),
+                    token_hash: "hash-revoked".to_string(),
+                    access_scope: ShareAccessScope::PublicLink,
+                    expires_at: Some((remote_view::now_unix_secs() + 600).to_string()),
+                    revoked_at: Some(remote_view::now_unix_secs().to_string()),
+                },
+            )
+            .expect("save revoked share link");
+        conversation_store
+            .save_share_link_bundle(
+                &MediaSession {
+                    media_session_id: "media-session-expired".to_string(),
+                    device_id: "cam-2".to_string(),
+                    stream_profile_id: "cam-2::stream::primary".to_string(),
+                    session_kind: MediaSessionKind::Share,
+                    delivery_mode: MediaDeliveryMode::Hls,
+                    opened_by_user_id: Some("user-2".to_string()),
+                    status: MediaSessionStatus::Active,
+                    share_link_id: Some("share-link-expired".to_string()),
+                    started_at: Some((remote_view::now_unix_secs() - 1200).to_string()),
+                    ended_at: None,
+                    metadata: json!({}),
+                },
+                &ShareLink {
+                    share_link_id: "share-link-expired".to_string(),
+                    media_session_id: "media-session-expired".to_string(),
+                    token_hash: "hash-expired".to_string(),
+                    access_scope: ShareAccessScope::PublicLink,
+                    expires_at: Some((remote_view::now_unix_secs() - 30).to_string()),
+                    revoked_at: None,
+                },
+            )
+            .expect("save expired share link");
+
+        let all_links = api.list_share_links(None).expect("list share links");
+        assert_eq!(all_links.len(), 3);
+        assert!(all_links
+            .iter()
+            .any(|link| link.share_link_id == "share-link-active" && link.status == "active"));
+        assert!(all_links
+            .iter()
+            .any(|link| link.share_link_id == "share-link-revoked" && link.status == "revoked"));
+        assert!(all_links
+            .iter()
+            .any(|link| link.share_link_id == "share-link-expired" && link.status == "expired"));
+
+        let cam1_links = api.list_share_links(Some("cam-1")).expect("filter links");
+        assert_eq!(cam1_links.len(), 2);
+        assert!(cam1_links.iter().all(|link| link.device_id == "cam-1"));
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
     }
 }

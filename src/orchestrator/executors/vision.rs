@@ -81,6 +81,9 @@ impl VisionExecutor {
                     .annotated_image_path
                     .map(|path| path.to_string_lossy().to_string()),
                 mime_type: snapshot.mime_type,
+                source_storage: Some(snapshot.storage.clone()),
+                byte_size: Some(snapshot.byte_size as u64),
+                captured_at_epoch_ms: Some(snapshot.captured_at_epoch_ms),
             },
             detection_summary,
             notification_channel: "im_bridge".to_string(),
@@ -134,6 +137,9 @@ impl VisionExecutor {
             image_path: image_path.to_string_lossy().to_string(),
             annotated_image_path: None,
             mime_type: snapshot.mime_type.clone(),
+            source_storage: Some(snapshot.storage.clone()),
+            byte_size: Some(snapshot.byte_size as u64),
+            captured_at_epoch_ms: Some(snapshot.captured_at_epoch_ms),
         })
     }
 
