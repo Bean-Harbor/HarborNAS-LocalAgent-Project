@@ -1,6 +1,6 @@
 # Platform + Home Agent Hub Unified Architecture
 
-更新时间：2026-04-13
+更新时间：2026-04-15
 
 ## 1. 结论
 
@@ -20,24 +20,60 @@ HarborNAS 后续长期框架不再采用“两条并行主链路”：
 
 `平台主干统一 + Home Agent Hub 入轨成为首个域产品`
 
+当前已经冻结的项目北极星定义是：
+
+`一个以 IM 为统一入口、以设备协同和媒体数据流为核心、以本地优先与云端补能为原则、通过智能编排、数据脱敏与统一账号凭据治理，统一编排家庭 AIoT 设备与 NAS/HarborOS 的本地优先家庭智能平台。`
+
 ---
 
 ## 2. 分层定义
 
-### 2.1 平台主干（Platform Backbone）
+### 2.1 统一入口层（Entry Layer）
+
+统一入口层只承担用户进入系统与管理系统的职责，当前固定为两类入口：
+
+- `IM 入口`
+- `配置入口 / 管理后台`
+
+两者是并列入口，都属于北向产品面，不应在业务上各自维护独立执行链。
+
+### 2.2 HarborBeacon 交互层（Interaction Gateway）
+
+HarborBeacon 负责：
+
+- IM 渠道接入
+- 会话管理
+- 自然语义理解与意图整理
+- 多轮补参与富媒体回包
+
+HarborBeacon 不直接访问云端模型、不直接管理凭据、不直接访问设备后端；它只负责把自然语言和交互上下文送入统一 runtime。
+
+### 2.3 平台主干 / Runtime + Control Plane
 
 平台主干负责所有跨域通用能力：
 
-- HarborBeacon 统一入口（IM / Web / Mobile）
 - 统一 task intake / session / task state
-- planner / router / runtime
+- task decompose / planner / router / runtime
 - policy / approval / audit
 - skill registry / manifest / capability routing
+- 本地执行 / 云端补能决策
+- 数据脱敏与最小化上传
+- 统一账号与凭据治理
 - artifact / event / notification 的公共协议
 
-这些能力不应该携带任何摄像头、RTSP、飞书卡片、房间命名等垂直细节。
+这些能力不应在入口层重复实现，也不应携带摄像头品牌细节、RTSP 路径、飞书卡片样式等垂直产品细节。
 
-### 2.2 垂直域（Vertical Domain）
+### 2.4 硬件与系统层（Hardware and System Layer）
+
+底层真实交互对象统一归于硬件与系统层：
+
+- NAS / HarborOS 服务
+- 摄像头
+- 其他 AIoT 设备
+
+平台与设备的交互必须经过 Runtime / Control Plane 统一调度。
+
+### 2.5 垂直域（Vertical Domain）
 
 Home Agent Hub 作为首个垂直域，负责：
 
@@ -50,7 +86,7 @@ Home Agent Hub 作为首个垂直域，负责：
 
 这些能力由域模块承载，但对平台暴露标准化 domain actions。
 
-### 2.3 产品面（Product Surface）
+### 2.6 产品面（Product Surface）
 
 以下组件属于产品面，而不是平台内核：
 
@@ -63,21 +99,70 @@ Home Agent Hub 作为首个垂直域，负责：
 
 ---
 
-## 3. 统一目标链路
+## 3. 统一总框架
 
-长期目标链路统一为：
+当前冻结的总框架如下：
 
-`IM / Web / Mobile -> HarborBeacon -> Assistant Task API -> Planner / Router / Runtime -> Domain Skills -> Artifact / Event / Notification -> HarborBeacon / UI`
+```mermaid
+flowchart TB
+    subgraph L1["1. 统一入口层"]
+        IM["IM 入口层
+飞书 / Slack / Discord / 微信 / 企微 / Telegram"]
 
-具体分解：
+        MGMT["配置入口 / 管理后台
+WebUI / Admin API / IM 配置能力"]
+    end
 
-1. 用户从飞书、Web、Mobile 发起请求
-2. HarborBeacon 负责渠道适配、会话关联、缺失参数补问
-3. HarborBeacon 将请求转换成统一 task request，提交给 Assistant Task API
-4. Assistant Core 负责任务状态、planner、policy、route、approval、audit
-5. Runtime 调用具体 domain action
-6. 结果以统一 artifact / event / notification envelope 返回
-7. HarborBeacon 或 WebUI 根据结果类型做回显、跳转或消息投递
+    HB["2. HarborBeacon
+会话管理 / 自然语义理解 / 意图整理 / 多轮补参 / 富媒体回包"]
+
+    subgraph L3["3. HarborOS Runtime / Control Plane"]
+        A["Task Entry
+统一任务入口"]
+
+        B["Task Decompose
+任务拆解 / 子任务生成"]
+
+        C["Policy / Approval / Audit
+权限 / 审批 / 审计 / Trace"]
+
+        E["Execution Engine
+统一执行调度 / 设备交互 / 媒体处理 / 自动化协作 / HarborOS 调用"]
+
+        D1["本地执行"]
+
+        D2["数据脱敏"]
+
+        D3["调用云端模型
+统一凭据治理"]
+
+        A --> B --> C --> E
+        E --> D1
+        E --> D2 --> D3
+        D1 --> E
+        D3 --> E
+    end
+
+    L4["4. 硬件与系统层
+NAS / HarborOS 服务 / 摄像头 / 其他 AIoT 设备"]
+
+    IM --> HB --> A
+    MGMT --> A
+    E --> L4
+```
+
+主链固定为：
+
+`IM / 管理后台 -> HarborBeacon -> Runtime / Control Plane -> 硬件与系统层`
+
+具体约束：
+
+1. `HarborBeacon` 不直接绕过 Runtime 去调用云端模型、凭据系统或设备后端
+2. `本地优先 / 云端补能` 是 Runtime 内部的执行路径，而不是独立主层
+3. `统一凭据治理` 与 `数据脱敏` 都属于 Runtime / Control Plane 内部能力
+4. 管理后台是并列入口，不是独立业务后端
+
+完整数据模型已冻结在：[platform-home-agent-hub-data-model.md](./platform-home-agent-hub-data-model.md)
 
 ---
 

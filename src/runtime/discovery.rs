@@ -11,7 +11,9 @@ use crate::adapters::ssdp::SsdpDiscoveryAdapter;
 use crate::runtime::media::{
     SnapshotCaptureRequest, SnapshotCaptureResult, StreamOpenRequest, StreamOpenResult,
 };
-use crate::runtime::registry::{CameraCapabilities, CameraDevice, DeviceStatus, StreamTransport};
+use crate::runtime::registry::{
+    CameraCapabilities, CameraDevice, DeviceRegistrySnapshot, DeviceStatus, StreamTransport,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -148,14 +150,11 @@ impl DiscoveryService {
             }
         }
 
-        if request.include_rtsp_probe
-            && request.protocols.contains(&DiscoveryProtocol::RtspProbe)
-            && candidates.is_empty()
-        {
+        if request.include_rtsp_probe && should_seed_rtsp_candidates(request, &candidates) {
             candidates.extend(self.seed_rtsp_candidates(request)?);
         }
 
-        let mut connected_devices = Vec::new();
+        let mut connected_snapshot = DeviceRegistrySnapshot::default();
         let mut probe_results = Vec::new();
         if request.include_rtsp_probe {
             for candidate in &candidates {
@@ -165,21 +164,19 @@ impl DiscoveryService {
                     port: candidate.port.or(request.rtsp_port).unwrap_or(554),
                     username: request.rtsp_username.clone(),
                     password: request.rtsp_password.clone(),
-                    path_candidates: if candidate.rtsp_paths.is_empty() {
-                        default_rtsp_paths()
-                    } else {
-                        candidate.rtsp_paths.clone()
-                    },
+                    path_candidates: preferred_rtsp_paths(request, candidate),
                 };
                 let result = self.rtsp.probe(&probe_request)?;
                 probe_results.push(result.clone());
                 if let Some(device) =
                     result.into_camera_device(candidate, format!("cam-{}", candidate.candidate_id))
                 {
-                    connected_devices.push(device);
+                    connected_snapshot.upsert_camera_devices_preserving_platform_records(&[device]);
                 }
             }
         }
+
+        let connected_devices = connected_snapshot.to_camera_devices();
 
         Ok(DiscoveryBatchResult {
             scan_id: request.scan_id.clone(),
@@ -249,6 +246,28 @@ impl DiscoveryService {
 
         Ok(candidates)
     }
+}
+
+fn preferred_rtsp_paths(request: &DiscoveryRequest, candidate: &DiscoveryCandidate) -> Vec<String> {
+    if !candidate.rtsp_paths.is_empty() {
+        candidate.rtsp_paths.clone()
+    } else if !request.rtsp_paths.is_empty() {
+        request.rtsp_paths.clone()
+    } else {
+        default_rtsp_paths()
+    }
+}
+
+fn should_seed_rtsp_candidates(
+    request: &DiscoveryRequest,
+    candidates: &[DiscoveryCandidate],
+) -> bool {
+    candidates.is_empty()
+        && request.protocols.contains(&DiscoveryProtocol::RtspProbe)
+        && request
+            .protocols
+            .iter()
+            .all(|protocol| *protocol == DiscoveryProtocol::RtspProbe)
 }
 
 fn default_rtsp_paths() -> Vec<String> {
@@ -324,8 +343,10 @@ impl RtspProbeResult {
         device.capabilities = self.capabilities;
         if matches!(candidate.protocol, DiscoveryProtocol::Onvif) {
             device.capabilities.ptz = true;
-            device.onvif_device_service_url =
-                Some(format!("http://{}/onvif/device_service", candidate.ip_address));
+            device.onvif_device_service_url = Some(format!(
+                "http://{}/onvif/device_service",
+                candidate.ip_address
+            ));
         }
         Some(device)
     }
@@ -343,6 +364,8 @@ fn protocol_name(protocol: DiscoveryProtocol) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::{
         DiscoveryBatchResult, DiscoveryCandidate, DiscoveryCandidateStatus, DiscoveryProtocol,
         DiscoveryRequest, DiscoveryService, RtspProbeRequest, RtspProbeResult,
@@ -359,9 +382,13 @@ mod tests {
     use crate::runtime::registry::StreamTransport;
 
     struct StaticOnvifAdapter;
+    struct PathlessOnvifAdapter;
     struct EmptySsdpAdapter;
     struct EmptyMdnsAdapter;
     struct StaticRtspAdapter;
+    struct RecordingRtspAdapter {
+        seen_requests: Arc<Mutex<Vec<RtspProbeRequest>>>,
+    }
 
     impl OnvifDiscoveryAdapter for StaticOnvifAdapter {
         fn discover(&self, _request: &DiscoveryRequest) -> Result<Vec<DiscoveryCandidate>, String> {
@@ -374,6 +401,22 @@ mod tests {
                 vendor: Some("Demo".to_string()),
                 model: Some("X1".to_string()),
                 rtsp_paths: vec!["/live".to_string()],
+                status: DiscoveryCandidateStatus::Discovered,
+            }])
+        }
+    }
+
+    impl OnvifDiscoveryAdapter for PathlessOnvifAdapter {
+        fn discover(&self, _request: &DiscoveryRequest) -> Result<Vec<DiscoveryCandidate>, String> {
+            Ok(vec![DiscoveryCandidate {
+                candidate_id: "cand-pathless".to_string(),
+                protocol: DiscoveryProtocol::Onvif,
+                name: Some("Yard Cam".to_string()),
+                ip_address: "192.168.1.30".to_string(),
+                port: Some(554),
+                vendor: Some("Demo".to_string()),
+                model: Some("Y1".to_string()),
+                rtsp_paths: vec![],
                 status: DiscoveryCandidateStatus::Discovered,
             }])
         }
@@ -397,6 +440,52 @@ mod tests {
                 candidate_id: request.candidate_id.clone(),
                 reachable: true,
                 stream_url: Some(format!("rtsp://{}{}", request.ip_address, "/live")),
+                transport: StreamTransport::Rtsp,
+                requires_auth: request.username.is_some(),
+                capabilities: Default::default(),
+                error_message: None,
+            })
+        }
+
+        fn capture_snapshot(
+            &self,
+            request: &SnapshotCaptureRequest,
+        ) -> Result<SnapshotCaptureResult, String> {
+            Ok(SnapshotCaptureResult::new(
+                request.device_id.clone(),
+                request.format,
+                "ZmFrZS1qcGVn",
+                9,
+                request.storage_target,
+            ))
+        }
+
+        fn open_stream(&self, request: &StreamOpenRequest) -> Result<StreamOpenResult, String> {
+            Ok(StreamOpenResult::new(
+                request.device_id.clone(),
+                request.stream_url.clone(),
+                "ffplay",
+                "/usr/bin/ffplay".into(),
+                4242,
+            ))
+        }
+    }
+
+    impl RtspProbeAdapter for RecordingRtspAdapter {
+        fn probe(&self, request: &RtspProbeRequest) -> Result<RtspProbeResult, String> {
+            self.seen_requests
+                .lock()
+                .expect("record probe requests")
+                .push(request.clone());
+            let suffix = request
+                .path_candidates
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "/".to_string());
+            Ok(RtspProbeResult {
+                candidate_id: request.candidate_id.clone(),
+                reachable: true,
+                stream_url: Some(format!("rtsp://{}{}", request.ip_address, suffix)),
                 transport: StreamTransport::Rtsp,
                 requires_auth: request.username.is_some(),
                 capabilities: Default::default(),
@@ -555,6 +644,72 @@ mod tests {
     }
 
     #[test]
+    fn discovery_service_does_not_seed_rtsp_scan_when_onvif_finds_nothing() {
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let service = DiscoveryService::new(
+            Box::new(RecordingRtspAdapter {
+                seen_requests: Arc::clone(&seen_requests),
+            }),
+            Some(Box::new(EmptyOnvifAdapter)),
+            None,
+            None,
+        );
+        let request = DiscoveryRequest {
+            scan_id: "scan-onvif-empty".to_string(),
+            network_cidr: "192.168.3.0/24".to_string(),
+            protocols: vec![DiscoveryProtocol::Onvif, DiscoveryProtocol::RtspProbe],
+            include_rtsp_probe: true,
+            rtsp_port: Some(554),
+            rtsp_username: Some("admin".to_string()),
+            rtsp_password: None,
+            rtsp_paths: vec!["/ch1/main".to_string()],
+        };
+
+        let result = service.discover(&request).expect("discovery result");
+        let seen_requests = seen_requests.lock().expect("read probe requests");
+
+        assert!(result.candidates.is_empty());
+        assert!(result.connected_devices.is_empty());
+        assert!(seen_requests.is_empty());
+    }
+
+    #[test]
+    fn discovery_service_uses_request_rtsp_paths_for_discovered_candidates_without_paths() {
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let service = DiscoveryService::new(
+            Box::new(RecordingRtspAdapter {
+                seen_requests: Arc::clone(&seen_requests),
+            }),
+            Some(Box::new(PathlessOnvifAdapter)),
+            None,
+            None,
+        );
+        let request = DiscoveryRequest {
+            scan_id: "scan-onvif".to_string(),
+            network_cidr: "192.168.1.0/24".to_string(),
+            protocols: vec![DiscoveryProtocol::Onvif],
+            include_rtsp_probe: true,
+            rtsp_port: Some(554),
+            rtsp_username: Some("admin".to_string()),
+            rtsp_password: None,
+            rtsp_paths: vec!["/ch1/main".to_string()],
+        };
+
+        let result = service.discover(&request).expect("discovery result");
+        let seen_requests = seen_requests.lock().expect("read probe requests");
+
+        assert_eq!(seen_requests.len(), 1);
+        assert_eq!(
+            seen_requests[0].path_candidates,
+            vec!["/ch1/main".to_string()]
+        );
+        assert_eq!(
+            result.connected_devices[0].primary_stream.url,
+            "rtsp://192.168.1.30/ch1/main"
+        );
+    }
+
+    #[test]
     fn discovery_service_rejects_overly_large_rtsp_seed_scan() {
         let service = DiscoveryService::new(Box::new(StaticRtspAdapter), None, None, None);
         let request = DiscoveryRequest {
@@ -572,5 +727,13 @@ mod tests {
             .discover(&request)
             .expect_err("large scan should be rejected");
         assert!(error.contains("too large"));
+    }
+
+    struct EmptyOnvifAdapter;
+
+    impl OnvifDiscoveryAdapter for EmptyOnvifAdapter {
+        fn discover(&self, _request: &DiscoveryRequest) -> Result<Vec<DiscoveryCandidate>, String> {
+            Ok(vec![])
+        }
     }
 }

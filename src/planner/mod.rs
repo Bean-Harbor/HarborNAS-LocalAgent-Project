@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::orchestrator::contracts::{Action, RiskLevel, Route};
+use crate::orchestrator::policy::apply_governance_defaults;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlannerIntent {
@@ -19,7 +20,7 @@ pub struct PlannedStep {
 }
 
 pub fn plan_task(intent: PlannerIntent) -> Vec<PlannedStep> {
-    let mut action = Action {
+    let action = apply_governance_defaults(Action {
         domain: intent.domain,
         operation: intent.operation,
         resource: intent.resource,
@@ -27,36 +28,7 @@ pub fn plan_task(intent: PlannerIntent) -> Vec<PlannedStep> {
         risk_level: RiskLevel::Low,
         requires_approval: false,
         dry_run: false,
-    };
-
-    action.risk_level = match action.domain.as_str() {
-        "service" => match action.operation.as_str() {
-            "status" => RiskLevel::Low,
-            "start" | "enable" => RiskLevel::Medium,
-            "stop" | "restart" => RiskLevel::High,
-            _ => RiskLevel::Low,
-        },
-        "files" => match action.operation.as_str() {
-            "search" => RiskLevel::Low,
-            "copy" => {
-                let overwrite = action
-                    .args
-                    .get("overwrite")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if overwrite {
-                    RiskLevel::High
-                } else {
-                    RiskLevel::Medium
-                }
-            }
-            "move" => RiskLevel::High,
-            "archive" => RiskLevel::Medium,
-            _ => RiskLevel::Low,
-        },
-        _ => RiskLevel::Low,
-    };
-    action.normalize();
+    });
 
     let route_candidates = if matches!(action.domain.as_str(), "service" | "files") {
         vec![Route::MiddlewareApi, Route::Midcli]

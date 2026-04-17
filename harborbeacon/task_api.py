@@ -72,10 +72,25 @@ class TaskApiClient:
         trace_id = str(source.get("trace_id") or f"{task_id}:{step_id}")
         raw_text = str(source.get("raw_text") or "")
         autonomy_level = str(source.get("autonomy_level") or "supervised")
+        approval_token = source.get("approval_token")
+        approver_id = source.get("approver_id")
+
+        approval = args.get("approval")
+        if not isinstance(approval, dict):
+            approval = {}
+        else:
+            approval = dict(approval)
+        if approval_token and "token" not in approval and "approval_token" not in args:
+            approval["token"] = str(approval_token)
+        if approver_id and "approver_id" not in approval and "approver_id" not in args:
+            approval["approver_id"] = str(approver_id)
+        if approval:
+            args["approval"] = approval
 
         return {
             "task_id": task_id,
             "trace_id": trace_id,
+            "step_id": step_id,
             "source": {
                 "channel": source.get("channel", ""),
                 "surface": source.get("surface", "harborbeacon"),

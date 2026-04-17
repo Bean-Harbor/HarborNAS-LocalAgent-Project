@@ -6,7 +6,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -59,10 +59,7 @@ pub fn issue_camera_share_token(
     })
 }
 
-pub fn verify_camera_share_token(
-    secret: &str,
-    token: &str,
-) -> Result<CameraShareClaims, String> {
+pub fn verify_camera_share_token(secret: &str, token: &str) -> Result<CameraShareClaims, String> {
     if secret.trim().is_empty() {
         return Err("share secret is empty".to_string());
     }
@@ -108,6 +105,11 @@ pub fn verify_camera_share_token(
     Ok(claims)
 }
 
+pub fn camera_share_token_hash(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 pub fn now_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -128,7 +130,7 @@ fn new_hmac(secret: &str) -> Result<HmacSha256, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{issue_camera_share_token, verify_camera_share_token};
+    use super::{camera_share_token_hash, issue_camera_share_token, verify_camera_share_token};
 
     #[test]
     fn issued_camera_share_tokens_round_trip() {
@@ -146,5 +148,17 @@ mod tests {
             issue_camera_share_token("test-secret", "cam-1", 15).expect("share token issued");
         let tampered = format!("{}x", issued.token);
         assert!(verify_camera_share_token("test-secret", &tampered).is_err());
+    }
+
+    #[test]
+    fn camera_share_token_hash_is_stable() {
+        assert_eq!(
+            camera_share_token_hash("demo-token"),
+            camera_share_token_hash("demo-token")
+        );
+        assert_ne!(
+            camera_share_token_hash("demo-token"),
+            camera_share_token_hash("other-token")
+        );
     }
 }

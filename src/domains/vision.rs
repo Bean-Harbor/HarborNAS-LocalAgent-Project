@@ -1,8 +1,10 @@
 //! Vision domain actions for detection and image understanding.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-use crate::runtime::registry::CameraDevice;
+use crate::connectors::storage::StorageObjectRef;
+use crate::runtime::registry::ResolvedCameraTarget;
 
 pub const DOMAIN: &str = "vision";
 pub const OP_ANALYZE_CAMERA: &str = "analyze_camera";
@@ -33,18 +35,30 @@ pub struct VisionImageArtifact {
     pub image_path: String,
     pub annotated_image_path: Option<String>,
     pub mime_type: String,
+    #[serde(default)]
+    pub source_storage: Option<StorageObjectRef>,
+    #[serde(default)]
+    pub byte_size: Option<u64>,
+    #[serde(default)]
+    pub captured_at_epoch_ms: Option<u128>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VisionAnalyzeCameraPayload {
-    pub device: CameraDevice,
+    #[serde(rename = "camera_target", alias = "device")]
+    pub camera_target: ResolvedCameraTarget,
     pub summary: String,
     pub summary_source: String,
     #[serde(default)]
     pub detections: Vec<VisionDetection>,
     pub snapshot: VisionImageArtifact,
     pub detection_summary: String,
-    pub feishu_card: serde_json::Value,
+    #[serde(default = "default_notification_channel")]
+    pub notification_channel: String,
+    #[serde(default = "default_notification_format")]
+    pub notification_format: String,
+    #[serde(default, alias = "feishu_card")]
+    pub notification_card: Value,
 }
 
 fn default_detect_label() -> String {
@@ -55,9 +69,19 @@ fn default_min_confidence() -> f32 {
     0.25
 }
 
+fn default_notification_channel() -> String {
+    "im_bridge".to_string()
+}
+
+fn default_notification_format() -> String {
+    "lark_card".to_string()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{VisionAnalyzeCameraArgs, OP_ANALYZE_CAMERA};
+    use serde_json::json;
+
+    use super::{VisionAnalyzeCameraArgs, VisionAnalyzeCameraPayload, OP_ANALYZE_CAMERA};
 
     #[test]
     fn analyze_camera_args_use_person_defaults() {
@@ -67,5 +91,63 @@ mod tests {
         assert_eq!(OP_ANALYZE_CAMERA, "analyze_camera");
         assert_eq!(args.detect_label, "person");
         assert!((args.min_confidence - 0.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn payload_accepts_legacy_feishu_card_alias() {
+        let payload: VisionAnalyzeCameraPayload = serde_json::from_value(json!({
+            "device": {
+                "device_id": "cam-1",
+                "name": "Front Door",
+                "kind": "camera",
+                "status": "online",
+                "room": null,
+                "vendor": null,
+                "model": null,
+                "ip_address": "192.168.1.10",
+                "mac_address": null,
+                "discovery_source": "onvif",
+                "primary_stream": {
+                    "transport": "rtsp",
+                    "url": "rtsp://192.168.1.10/live",
+                    "requires_auth": false
+                },
+                "onvif_device_service_url": null,
+                "ezviz_device_serial": null,
+                "ezviz_camera_no": null,
+                "capabilities": {
+                    "snapshot": true,
+                    "stream": true,
+                    "ptz": false,
+                    "audio": false
+                },
+                "last_seen_at": null
+            },
+            "summary": "画面中有 1 人",
+            "summary_source": "openai_compatible",
+            "detections": [],
+            "snapshot": {
+                "image_path": "snap.jpg",
+                "annotated_image_path": null,
+                "mime_type": "image/jpeg",
+                "source_storage": null,
+                "byte_size": null,
+                "captured_at_epoch_ms": null
+            },
+            "detection_summary": "检测到 1 个 person，最高置信度 88%。",
+            "feishu_card": {"header": {"title": {"content": "Front Door AI 分析"}}}
+        }))
+        .expect("payload");
+
+        assert_eq!(payload.notification_channel, "im_bridge");
+        assert_eq!(payload.notification_format, "lark_card");
+        assert_eq!(payload.camera_target.device_id, "cam-1");
+        assert_eq!(payload.snapshot.source_storage, None);
+        assert_eq!(payload.snapshot.byte_size, None);
+        assert_eq!(payload.snapshot.captured_at_epoch_ms, None);
+        assert_eq!(
+            payload.notification_card["header"]["title"]["content"],
+            "Front Door AI 分析"
+        );
     }
 }

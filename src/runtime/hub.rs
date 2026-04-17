@@ -15,19 +15,19 @@ use crate::adapters::ssdp::UdpSsdpAdapter;
 use crate::connectors::storage::StorageTarget;
 use crate::runtime::admin_console::{
     sanitize_defaults, AdminBindingState, AdminConsoleState, AdminConsoleStore, AdminDefaults,
-    FeishuBotConfig,
+    BridgeProviderConfig,
 };
 use crate::runtime::discovery::{
     DiscoveryProtocol, DiscoveryRequest, DiscoveryService, RtspProbeRequest,
 };
-use crate::runtime::media::{SnapshotCaptureRequest, SnapshotFormat};
+use crate::runtime::media::{SnapshotCaptureRequest, SnapshotCaptureResult, SnapshotFormat};
 use crate::runtime::registry::{CameraDevice, DeviceRegistryStore, DeviceStatus, StreamTransport};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HubStateSnapshot {
     pub binding: AdminBindingState,
     pub defaults: AdminDefaults,
-    pub feishu_bot: FeishuBotConfig,
+    pub bridge_provider: BridgeProviderConfig,
     pub devices: Vec<CameraDevice>,
 }
 
@@ -129,7 +129,7 @@ impl CameraHubService {
         Ok(HubStateSnapshot {
             binding: enrich_binding_urls(state.binding, public_origin),
             defaults: state.defaults,
-            feishu_bot: state.feishu_bot,
+            bridge_provider: state.bridge_provider,
             devices,
         })
     }
@@ -143,7 +143,7 @@ impl CameraHubService {
         self.state_snapshot(public_origin)
     }
 
-    pub fn configure_feishu_bot(
+    pub fn configure_bridge_provider(
         &self,
         app_id: &str,
         app_secret: &str,
@@ -155,15 +155,16 @@ impl CameraHubService {
             return Err("app_id 和 app_secret 都不能为空".to_string());
         }
 
-        let (app_name, bot_open_id) = validate_feishu_bot(app_id, app_secret)?;
-        self.admin_store.save_feishu_bot_config(FeishuBotConfig {
-            configured: true,
-            app_id: app_id.to_string(),
-            app_secret: app_secret.to_string(),
-            app_name,
-            bot_open_id,
-            status: "已连接".to_string(),
-        })?;
+        let (app_name, bot_open_id) = validate_bridge_provider(app_id, app_secret)?;
+        self.admin_store
+            .save_bridge_provider_config(BridgeProviderConfig {
+                configured: true,
+                app_id: app_id.to_string(),
+                app_secret: app_secret.to_string(),
+                app_name,
+                bot_open_id,
+                status: "已连接".to_string(),
+            })?;
 
         self.state_snapshot(public_origin)
     }
@@ -173,21 +174,21 @@ impl CameraHubService {
         request: HubScanRequest,
         public_origin: Option<&str>,
     ) -> Result<HubScanSummary, String> {
-        let mut state = self.load_admin_state()?;
+        let mut defaults = self.load_admin_state()?.defaults;
         if let Some(cidr) = request.cidr {
             let trimmed = cidr.trim();
             if !trimmed.is_empty() {
-                state.defaults.cidr = trimmed.to_string();
+                defaults.cidr = trimmed.to_string();
             }
         }
         if let Some(protocol) = request.protocol {
             let trimmed = protocol.trim();
             if !trimmed.is_empty() {
-                state.defaults.discovery = trimmed.to_string();
+                defaults.discovery = trimmed.to_string();
             }
         }
-        state.defaults = sanitize_defaults(state.defaults);
-        self.admin_store.save_state(&state)?;
+        defaults = sanitize_defaults(defaults);
+        let state = self.admin_store.save_defaults(defaults)?;
 
         let protocols = resolve_discovery_protocols(&state.defaults.discovery);
         if protocols.iter().any(|p| {
@@ -287,7 +288,10 @@ impl CameraHubService {
         })
     }
 
-    pub fn capture_camera_snapshot(&self, device_id: &str) -> Result<Vec<u8>, String> {
+    pub fn capture_camera_snapshot_result(
+        &self,
+        device_id: &str,
+    ) -> Result<SnapshotCaptureResult, String> {
         let device = self
             .load_registered_cameras()?
             .into_iter()
@@ -295,12 +299,16 @@ impl CameraHubService {
             .ok_or_else(|| format!("device not found: {device_id}"))?;
 
         let adapter = CommandRtspAdapter::default();
-        let result = adapter.capture_snapshot(&SnapshotCaptureRequest::new(
+        adapter.capture_snapshot(&SnapshotCaptureRequest::new(
             device.device_id,
             device.primary_stream.url,
             SnapshotFormat::Jpeg,
             StorageTarget::LocalDisk,
-        ))?;
+        ))
+    }
+
+    pub fn capture_camera_snapshot(&self, device_id: &str) -> Result<Vec<u8>, String> {
+        let result = self.capture_camera_snapshot_result(device_id)?;
 
         base64::engine::general_purpose::STANDARD
             .decode(result.bytes_base64.as_bytes())
@@ -612,19 +620,8 @@ pub fn upsert_devices(
     store: &DeviceRegistryStore,
     discovered: &[CameraDevice],
 ) -> Result<Vec<CameraDevice>, String> {
-    let mut devices = store.load_devices()?;
-    for incoming in discovered {
-        if let Some(existing) = devices
-            .iter_mut()
-            .find(|existing| same_camera(existing, incoming))
-        {
-            *existing = merge_camera(existing.clone(), incoming.clone());
-        } else {
-            devices.push(normalize_camera_metadata(incoming.clone()));
-        }
-    }
-    store.save_devices(&devices)?;
-    Ok(devices)
+    let snapshot = store.upsert_devices(discovered)?;
+    Ok(snapshot.to_camera_devices())
 }
 
 pub fn same_camera(existing: &CameraDevice, incoming: &CameraDevice) -> bool {
@@ -659,7 +656,9 @@ pub fn merge_camera(existing: CameraDevice, incoming: CameraDevice) -> CameraDev
         onvif_device_service_url: incoming
             .onvif_device_service_url
             .or(existing.onvif_device_service_url),
-        ezviz_device_serial: incoming.ezviz_device_serial.or(existing.ezviz_device_serial),
+        ezviz_device_serial: incoming
+            .ezviz_device_serial
+            .or(existing.ezviz_device_serial),
         ezviz_camera_no: incoming.ezviz_camera_no.or(existing.ezviz_camera_no),
         capabilities: incoming.capabilities,
         last_seen_at: incoming.last_seen_at.or(existing.last_seen_at),
@@ -726,44 +725,47 @@ pub fn collect_candidate_ips(
     Ok(ordered)
 }
 
-pub fn validate_feishu_bot(app_id: &str, app_secret: &str) -> Result<(String, String), String> {
+pub fn validate_bridge_provider(
+    app_id: &str,
+    app_secret: &str,
+) -> Result<(String, String), String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
-        .map_err(|error| format!("failed to build Feishu HTTP client: {error}"))?;
+        .map_err(|error| format!("failed to build bridge provider HTTP client: {error}"))?;
 
     let token_resp: serde_json::Value = client
         .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
         .json(&serde_json::json!({ "app_id": app_id, "app_secret": app_secret }))
         .send()
-        .map_err(|error| format!("Feishu token request failed: {error}"))?
+        .map_err(|error| format!("bridge provider token request failed: {error}"))?
         .json()
-        .map_err(|error| format!("Feishu token response parse failed: {error}"))?;
+        .map_err(|error| format!("bridge provider token response parse failed: {error}"))?;
     if token_resp.get("code").and_then(|value| value.as_i64()) != Some(0) {
         let msg = token_resp
             .get("msg")
             .and_then(|value| value.as_str())
             .unwrap_or("unknown error");
-        return Err(format!("Feishu 凭证校验失败: {msg}"));
+        return Err(format!("Bridge Provider 凭证校验失败: {msg}"));
     }
     let token = token_resp
         .get("tenant_access_token")
         .and_then(|value| value.as_str())
-        .ok_or_else(|| "Feishu 校验成功但未返回 tenant_access_token".to_string())?;
+        .ok_or_else(|| "Bridge Provider 校验成功但未返回 tenant_access_token".to_string())?;
 
     let bot_resp: serde_json::Value = client
         .get("https://open.feishu.cn/open-apis/bot/v3/info")
         .header("Authorization", format!("Bearer {token}"))
         .send()
-        .map_err(|error| format!("Feishu bot info request failed: {error}"))?
+        .map_err(|error| format!("bridge provider bot info request failed: {error}"))?
         .json()
-        .map_err(|error| format!("Feishu bot info parse failed: {error}"))?;
+        .map_err(|error| format!("bridge provider bot info parse failed: {error}"))?;
     if bot_resp.get("code").and_then(|value| value.as_i64()) != Some(0) {
         let msg = bot_resp
             .get("msg")
             .and_then(|value| value.as_str())
             .unwrap_or("unknown error");
-        return Err(format!("Feishu Bot 信息读取失败: {msg}"));
+        return Err(format!("Bridge Provider 信息读取失败: {msg}"));
     }
 
     let data = bot_resp.get("data").cloned().unwrap_or_default();

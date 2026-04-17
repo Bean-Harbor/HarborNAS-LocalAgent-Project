@@ -19,7 +19,7 @@ use crate::domains::vision::{
 use crate::orchestrator::contracts::{Action, ExecutionResult, Route, StepStatus};
 use crate::orchestrator::router::Executor;
 use crate::runtime::media::{SnapshotCaptureRequest, SnapshotCaptureResult, SnapshotFormat};
-use crate::runtime::registry::{CameraDevice, DeviceRegistryStore};
+use crate::runtime::registry::{DeviceRegistryStore, ResolvedCameraTarget};
 
 pub struct VisionExecutor {
     registry_store: DeviceRegistryStore,
@@ -67,10 +67,11 @@ impl VisionExecutor {
         let detection_summary = describe_detections(&detections.detections, &args.detect_label);
         let (summary, summary_source) =
             self.describe_with_model_or_fallback(&snapshot, &detection_summary, args)?;
-        let feishu_card = build_feishu_card(&device, &summary, &summary_source, &detection_summary);
+        let notification_card =
+            build_notification_card(&device, &summary, &summary_source, &detection_summary);
 
         Ok(VisionAnalyzeCameraPayload {
-            device,
+            camera_target: device.clone(),
             summary,
             summary_source,
             detections: detections.detections,
@@ -80,21 +81,25 @@ impl VisionExecutor {
                     .annotated_image_path
                     .map(|path| path.to_string_lossy().to_string()),
                 mime_type: snapshot.mime_type,
+                source_storage: Some(snapshot.storage.clone()),
+                byte_size: Some(snapshot.byte_size as u64),
+                captured_at_epoch_ms: Some(snapshot.captured_at_epoch_ms),
             },
             detection_summary,
-            feishu_card,
+            notification_channel: "im_bridge".to_string(),
+            notification_format: "lark_card".to_string(),
+            notification_card,
         })
     }
 
-    fn find_device(&self, device_id: &str) -> Result<CameraDevice, String> {
-        let devices = self.registry_store.load_devices()?;
-        devices
-            .into_iter()
-            .find(|device| device.device_id == device_id)
-            .ok_or_else(|| format!("device not found in registry: {device_id}"))
+    fn find_device(&self, device_id: &str) -> Result<ResolvedCameraTarget, String> {
+        self.registry_store.resolve_camera_target(device_id)
     }
 
-    fn capture_snapshot(&self, device: &CameraDevice) -> Result<SnapshotCaptureResult, String> {
+    fn capture_snapshot(
+        &self,
+        device: &ResolvedCameraTarget,
+    ) -> Result<SnapshotCaptureResult, String> {
         self.rtsp.capture_snapshot(&SnapshotCaptureRequest::new(
             device.device_id.clone(),
             device.primary_stream.url.clone(),
@@ -105,7 +110,7 @@ impl VisionExecutor {
 
     fn persist_snapshot(
         &self,
-        device: &CameraDevice,
+        device: &ResolvedCameraTarget,
         snapshot: &SnapshotCaptureResult,
     ) -> Result<VisionImageArtifact, String> {
         let image_bytes = base64::engine::general_purpose::STANDARD
@@ -132,6 +137,9 @@ impl VisionExecutor {
             image_path: image_path.to_string_lossy().to_string(),
             annotated_image_path: None,
             mime_type: snapshot.mime_type.clone(),
+            source_storage: Some(snapshot.storage.clone()),
+            byte_size: Some(snapshot.byte_size as u64),
+            captured_at_epoch_ms: Some(snapshot.captured_at_epoch_ms),
         })
     }
 
@@ -385,8 +393,8 @@ fn describe_detections(detections: &[VisionDetection], label: &str) -> String {
     )
 }
 
-fn build_feishu_card(
-    device: &CameraDevice,
+fn build_notification_card(
+    device: &ResolvedCameraTarget,
     summary: &str,
     summary_source: &str,
     detection_summary: &str,
@@ -394,7 +402,7 @@ fn build_feishu_card(
     json!({
         "config": {"wide_screen_mode": true},
         "header": {
-            "title": {"tag": "plain_text", "content": format!("{} AI 分析", device.name)},
+            "title": {"tag": "plain_text", "content": format!("{} AI 分析", device.display_name)},
             "template": "green"
         },
         "elements": [
@@ -443,9 +451,11 @@ struct DetectionOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_feishu_card, describe_detections, heuristic_summary};
+    use super::{build_notification_card, describe_detections, heuristic_summary};
     use crate::domains::vision::VisionDetection;
-    use crate::runtime::registry::CameraDevice;
+    use crate::runtime::registry::{
+        CameraCapabilities, CameraStreamRef, DeviceStatus, ResolvedCameraTarget, StreamTransport,
+    };
 
     #[test]
     fn detection_summary_reports_empty_result() {
@@ -461,9 +471,29 @@ mod tests {
     }
 
     #[test]
-    fn feishu_card_includes_summary_text() {
-        let device = CameraDevice::new("cam-1", "Front Door", "rtsp://192.168.1.10/live");
-        let card = build_feishu_card(
+    fn notification_card_includes_summary_text() {
+        let device = ResolvedCameraTarget {
+            device_id: "cam-1".to_string(),
+            display_name: "Front Door".to_string(),
+            status: DeviceStatus::Online,
+            room_name: None,
+            vendor: None,
+            model: None,
+            ip_address: Some("192.168.1.10".to_string()),
+            mac_address: None,
+            discovery_source: "onvif".to_string(),
+            primary_stream: CameraStreamRef {
+                transport: StreamTransport::Rtsp,
+                url: "rtsp://192.168.1.10/live".to_string(),
+                requires_auth: false,
+            },
+            onvif_device_service_url: None,
+            ezviz_device_serial: None,
+            ezviz_camera_no: None,
+            capabilities: CameraCapabilities::default(),
+            last_seen_at: None,
+        };
+        let card = build_notification_card(
             &device,
             "画面中有 1 人",
             "openai_compatible",

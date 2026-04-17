@@ -209,7 +209,10 @@ impl EzvizCloudPtzConnector {
             started_at.elapsed().as_millis()
         );
 
-        let code = payload.get("code").and_then(|value| value.as_str()).unwrap_or("0");
+        let code = payload
+            .get("code")
+            .and_then(|value| value.as_str())
+            .unwrap_or("0");
         if code != "200" && code != "0" {
             let message = payload
                 .get("msg")

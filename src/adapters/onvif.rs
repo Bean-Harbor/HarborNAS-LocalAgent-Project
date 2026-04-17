@@ -111,12 +111,7 @@ impl SoapOnvifPtzAdapter {
         Ok(Self { client })
     }
 
-    fn post_soap(
-        &self,
-        url: &str,
-        action: &str,
-        body: &str,
-    ) -> Result<String, String> {
+    fn post_soap(&self, url: &str, action: &str, body: &str) -> Result<String, String> {
         let mut headers = HeaderMap::new();
         headers.insert(
             CONTENT_TYPE,
@@ -158,13 +153,11 @@ impl OnvifPtzAdapter for SoapOnvifPtzAdapter {
         )?;
         let media_url = parse_xaddr(&capabilities, "Media")
             .unwrap_or_else(|| request.device_service_url.clone());
-        let ptz_url = parse_xaddr(&capabilities, "PTZ")
-            .unwrap_or_else(|| request.device_service_url.clone());
+        let ptz_url =
+            parse_xaddr(&capabilities, "PTZ").unwrap_or_else(|| request.device_service_url.clone());
 
-        let profiles_xml = build_get_profiles_envelope(
-            request.username.as_deref(),
-            request.password.as_deref(),
-        );
+        let profiles_xml =
+            build_get_profiles_envelope(request.username.as_deref(), request.password.as_deref());
         let profiles = self.post_soap(
             &media_url,
             "http://www.onvif.org/ver10/media/wsdl/GetProfiles",
@@ -192,7 +185,9 @@ impl OnvifPtzAdapter for SoapOnvifPtzAdapter {
                 })
             }
             _ => {
-                let (x, y) = request.direction.velocity(request.pan_speed, request.tilt_speed);
+                let (x, y) = request
+                    .direction
+                    .velocity(request.pan_speed, request.tilt_speed);
                 let move_xml = build_continuous_move_envelope(
                     request.username.as_deref(),
                     request.password.as_deref(),
@@ -238,15 +233,12 @@ impl PtzDirection {
 }
 
 pub fn default_onvif_device_service_url(device: &CameraDevice) -> Option<String> {
-    device
-        .onvif_device_service_url
-        .clone()
-        .or_else(|| {
-            device
-                .ip_address
-                .as_ref()
-                .map(|ip| format!("http://{ip}/onvif/device_service"))
-        })
+    device.onvif_device_service_url.clone().or_else(|| {
+        device
+            .ip_address
+            .as_ref()
+            .map(|ip| format!("http://{ip}/onvif/device_service"))
+    })
 }
 
 impl OnvifDiscoveryAdapter for WsDiscoveryOnvifAdapter {
@@ -687,7 +679,8 @@ mod tests {
 
     #[test]
     fn ptz_move_and_stop_envelopes_include_profile_token() {
-        let move_xml = build_continuous_move_envelope(Some("admin"), Some("secret"), "profile_1", -0.4, 0.0);
+        let move_xml =
+            build_continuous_move_envelope(Some("admin"), Some("secret"), "profile_1", -0.4, 0.0);
         assert!(move_xml.contains("<tptz:ProfileToken>profile_1</tptz:ProfileToken>"));
         assert!(move_xml.contains("x=\"-0.400\""));
 
