@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -12,10 +12,11 @@ use crate::adapters::mdns::AvahiMdnsAdapter;
 use crate::adapters::onvif::WsDiscoveryOnvifAdapter;
 use crate::adapters::rtsp::{CommandRtspAdapter, RtspProbeAdapter};
 use crate::adapters::ssdp::UdpSsdpAdapter;
+use crate::connectors::im_gateway::{GatewayPlatformStatus, GatewayStatusClient};
 use crate::connectors::storage::StorageTarget;
 use crate::runtime::admin_console::{
     sanitize_defaults, AdminBindingState, AdminConsoleState, AdminConsoleStore, AdminDefaults,
-    BridgeProviderConfig,
+    BridgeProviderCapabilities, BridgeProviderConfig,
 };
 use crate::runtime::discovery::{
     DiscoveryProtocol, DiscoveryRequest, DiscoveryService, RtspProbeRequest,
@@ -143,29 +144,17 @@ impl CameraHubService {
         self.state_snapshot(public_origin)
     }
 
-    pub fn configure_bridge_provider(
+    pub fn refresh_bridge_provider_status(
         &self,
-        app_id: &str,
-        app_secret: &str,
         public_origin: Option<&str>,
     ) -> Result<HubStateSnapshot, String> {
-        let app_id = app_id.trim();
-        let app_secret = app_secret.trim();
-        if app_id.is_empty() || app_secret.is_empty() {
-            return Err("app_id 和 app_secret 都不能为空".to_string());
-        }
-
-        let (app_name, bot_open_id) = validate_bridge_provider(app_id, app_secret)?;
-        self.admin_store
-            .save_bridge_provider_config(BridgeProviderConfig {
-                configured: true,
-                app_id: app_id.to_string(),
-                app_secret: app_secret.to_string(),
-                app_name,
-                bot_open_id,
-                status: "已连接".to_string(),
-            })?;
-
+        let client = GatewayStatusClient::new()?;
+        let status = client.fetch_status()?;
+        let provider = bridge_provider_status_from_gateway_response(
+            client.config().base_url.as_str(),
+            &status.platforms,
+        );
+        self.admin_store.save_bridge_provider_status(provider)?;
         self.state_snapshot(public_origin)
     }
 
@@ -385,7 +374,7 @@ impl CameraHubService {
                     ip: ip.clone(),
                     port: state.defaults.rtsp_port,
                     protocol: "RTSP / 已验证".to_string(),
-                    note: "RTSP 链路已验证，可直接加入设备库并在飞书中调用。".to_string(),
+                    note: "RTSP 链路已验证，可直接加入设备库并在 IM 对话中调用。".to_string(),
                     reachable: true,
                     registered: true,
                     requires_auth,
@@ -725,62 +714,50 @@ pub fn collect_candidate_ips(
     Ok(ordered)
 }
 
-pub fn validate_bridge_provider(
-    app_id: &str,
-    app_secret: &str,
-) -> Result<(String, String), String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| format!("failed to build bridge provider HTTP client: {error}"))?;
+fn bridge_provider_status_from_gateway_response(
+    gateway_base_url: &str,
+    platforms: &[GatewayPlatformStatus],
+) -> BridgeProviderConfig {
+    let selected = platforms
+        .iter()
+        .find(|platform| platform.connected)
+        .or_else(|| platforms.iter().find(|platform| platform.enabled))
+        .or_else(|| platforms.first());
+    let mut provider = BridgeProviderConfig {
+        gateway_base_url: gateway_base_url.trim().to_string(),
+        last_checked_at: current_timestamp(),
+        ..Default::default()
+    };
+    let Some(selected) = selected else {
+        provider.status = "IM Gateway 未配置平台".to_string();
+        return provider;
+    };
 
-    let token_resp: serde_json::Value = client
-        .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
-        .json(&serde_json::json!({ "app_id": app_id, "app_secret": app_secret }))
-        .send()
-        .map_err(|error| format!("bridge provider token request failed: {error}"))?
-        .json()
-        .map_err(|error| format!("bridge provider token response parse failed: {error}"))?;
-    if token_resp.get("code").and_then(|value| value.as_i64()) != Some(0) {
-        let msg = token_resp
-            .get("msg")
-            .and_then(|value| value.as_str())
-            .unwrap_or("unknown error");
-        return Err(format!("Bridge Provider 凭证校验失败: {msg}"));
-    }
-    let token = token_resp
-        .get("tenant_access_token")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| "Bridge Provider 校验成功但未返回 tenant_access_token".to_string())?;
+    provider.configured = selected.enabled;
+    provider.connected = selected.connected;
+    provider.platform = selected.platform.trim().to_string();
+    provider.app_name = selected.display_name.trim().to_string();
+    provider.status = if selected.connected {
+        "已连接".to_string()
+    } else if selected.enabled {
+        "已启用，待连接".to_string()
+    } else {
+        "未启用".to_string()
+    };
+    provider.capabilities = BridgeProviderCapabilities {
+        reply: selected.capabilities.reply,
+        update: selected.capabilities.update,
+        attachments: selected.capabilities.attachments,
+    };
+    provider
+}
 
-    let bot_resp: serde_json::Value = client
-        .get("https://open.feishu.cn/open-apis/bot/v3/info")
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
-        .map_err(|error| format!("bridge provider bot info request failed: {error}"))?
-        .json()
-        .map_err(|error| format!("bridge provider bot info parse failed: {error}"))?;
-    if bot_resp.get("code").and_then(|value| value.as_i64()) != Some(0) {
-        let msg = bot_resp
-            .get("msg")
-            .and_then(|value| value.as_str())
-            .unwrap_or("unknown error");
-        return Err(format!("Bridge Provider 信息读取失败: {msg}"));
-    }
-
-    let data = bot_resp.get("data").cloned().unwrap_or_default();
-    let app_name = data
-        .get("app_name")
-        .and_then(|value| value.as_str())
-        .or_else(|| data.get("bot_name").and_then(|value| value.as_str()))
-        .unwrap_or("HarborNAS Bot")
-        .to_string();
-    let bot_open_id = data
-        .get("open_id")
-        .and_then(|value| value.as_str())
+fn current_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .to_string();
-    Ok((app_name, bot_open_id))
+        .as_secs()
+        .to_string()
 }
 
 fn discover_open_rtsp_hosts(hosts: &[String], port: u16) -> Vec<String> {
@@ -876,9 +853,11 @@ fn normalize_network(network: Ipv4Addr, prefix: u8) -> Ipv4Addr {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_mobile_setup_url, humanize_probe_error, looks_like_auth_error, merge_camera,
-        normalize_camera_metadata, resolve_discovery_protocols,
+        bridge_provider_status_from_gateway_response, build_mobile_setup_url, humanize_probe_error,
+        looks_like_auth_error, merge_camera, normalize_camera_metadata,
+        resolve_discovery_protocols,
     };
+    use crate::connectors::im_gateway::{GatewayPlatformCapabilities, GatewayPlatformStatus};
     use crate::runtime::registry::{CameraDevice, StreamTransport};
 
     #[test]
@@ -930,5 +909,71 @@ mod tests {
         assert!(protocols.contains(&crate::runtime::discovery::DiscoveryProtocol::Mdns));
         assert!(protocols.contains(&crate::runtime::discovery::DiscoveryProtocol::Ssdp));
         assert!(protocols.contains(&crate::runtime::discovery::DiscoveryProtocol::RtspProbe));
+    }
+
+    #[test]
+    fn gateway_status_maps_to_redacted_bridge_provider_state() {
+        let provider = bridge_provider_status_from_gateway_response(
+            "http://gateway.local:4180",
+            &[GatewayPlatformStatus {
+                platform: "feishu".to_string(),
+                enabled: true,
+                connected: true,
+                display_name: "HarborNAS Bot".to_string(),
+                capabilities: GatewayPlatformCapabilities {
+                    reply: true,
+                    update: false,
+                    attachments: true,
+                },
+            }],
+        );
+
+        assert!(provider.configured);
+        assert!(provider.connected);
+        assert_eq!(provider.platform, "feishu");
+        assert_eq!(provider.app_name, "HarborNAS Bot");
+        assert_eq!(provider.gateway_base_url, "http://gateway.local:4180");
+        assert_eq!(provider.status, "已连接");
+        assert!(provider.capabilities.reply);
+        assert!(!provider.capabilities.update);
+        assert!(provider.capabilities.attachments);
+        assert_eq!(provider.app_secret, "");
+        assert_eq!(provider.bot_open_id, "");
+    }
+
+    #[test]
+    fn gateway_status_prefers_connected_platform_without_feishu_bias() {
+        let provider = bridge_provider_status_from_gateway_response(
+            "http://gateway.local:4180",
+            &[
+                GatewayPlatformStatus {
+                    platform: "feishu".to_string(),
+                    enabled: true,
+                    connected: false,
+                    display_name: "Feishu Bot".to_string(),
+                    capabilities: GatewayPlatformCapabilities {
+                        reply: true,
+                        update: false,
+                        attachments: true,
+                    },
+                },
+                GatewayPlatformStatus {
+                    platform: "telegram".to_string(),
+                    enabled: true,
+                    connected: true,
+                    display_name: "Telegram Bot".to_string(),
+                    capabilities: GatewayPlatformCapabilities {
+                        reply: true,
+                        update: true,
+                        attachments: false,
+                    },
+                },
+            ],
+        );
+
+        assert_eq!(provider.platform, "telegram");
+        assert_eq!(provider.app_name, "Telegram Bot");
+        assert_eq!(provider.status, "已连接");
+        assert!(provider.capabilities.update);
     }
 }

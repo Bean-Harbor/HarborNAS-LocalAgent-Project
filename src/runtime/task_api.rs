@@ -11,9 +11,11 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::connectors::notifications::{
-    NotificationAttachment, NotificationAttachmentKind, NotificationBridgeConfig,
-    NotificationChannel, NotificationDeliveryService, NotificationPayloadFormat,
-    NotificationRecipient, NotificationRecipientIdType, NotificationRequest,
+    NotificationAttachment, NotificationAttachmentKind, NotificationContent, NotificationDelivery,
+    NotificationDeliveryError, NotificationDeliveryMode, NotificationDeliveryService,
+    NotificationDestination, NotificationDestinationKind, NotificationMetadata,
+    NotificationPayloadFormat, NotificationRecipient, NotificationRecipientIdType,
+    NotificationRequest, NotificationSource,
 };
 use crate::connectors::storage::StorageTarget;
 use crate::control_plane::approvals::{ApprovalStatus, ApprovalTicket};
@@ -62,6 +64,70 @@ pub struct TaskSource {
     pub user_id: String,
     #[serde(default)]
     pub session_id: String,
+    #[serde(default)]
+    pub route_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TaskMessageMention {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TaskMessageAttachmentDownloadAuth {
+    #[serde(rename = "type", default)]
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TaskMessageAttachmentDownload {
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub method: String,
+    #[serde(default)]
+    pub headers: Value,
+    #[serde(default)]
+    pub auth: Option<TaskMessageAttachmentDownloadAuth>,
+    #[serde(default)]
+    pub expires_at: String,
+    #[serde(default)]
+    pub max_size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TaskMessageAttachment {
+    #[serde(default)]
+    pub attachment_id: String,
+    #[serde(rename = "type", default)]
+    pub attachment_type: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub mime_type: String,
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
+    #[serde(default)]
+    pub download: Option<TaskMessageAttachmentDownload>,
+    #[serde(default)]
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TaskMessage {
+    #[serde(default)]
+    pub message_id: String,
+    #[serde(default)]
+    pub chat_type: String,
+    #[serde(default)]
+    pub mentions: Vec<TaskMessageMention>,
+    #[serde(default)]
+    pub attachments: Vec<TaskMessageAttachment>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -106,6 +172,8 @@ pub struct TaskRequest {
     pub args: Value,
     #[serde(default)]
     pub autonomy: TaskAutonomy,
+    #[serde(default)]
+    pub message: Option<TaskMessage>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -180,6 +248,13 @@ pub struct TaskApprovalSummary {
     pub risk_level: RiskLevel,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum TaskRequestAcceptance {
+    Accept,
+    Replay(TaskResponse),
+    Conflict(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskApiService {
     admin_store: AdminConsoleStore,
@@ -210,6 +285,31 @@ impl TaskApiService {
 
     pub fn conversation_store(&self) -> &TaskConversationStore {
         &self.conversation_store
+    }
+
+    pub fn accept_or_replay_task(
+        &self,
+        request: &TaskRequest,
+    ) -> Result<TaskRequestAcceptance, String> {
+        if request.task_id.trim().is_empty() {
+            return Ok(TaskRequestAcceptance::Accept);
+        }
+
+        let Some(task_run) = self.conversation_store.load_task_run(&request.task_id)? else {
+            return Ok(TaskRequestAcceptance::Accept);
+        };
+
+        let incoming_identity = task_request_identity(request);
+        let existing_identity = persisted_task_request_identity(&task_run);
+        if existing_identity != incoming_identity {
+            return Ok(TaskRequestAcceptance::Conflict(
+                "task_id already exists with a different request identity".to_string(),
+            ));
+        }
+
+        Ok(TaskRequestAcceptance::Replay(
+            self.replay_task_response(&task_run)?,
+        ))
     }
 
     pub fn pending_approvals(&self) -> Result<Vec<TaskApprovalSummary>, String> {
@@ -332,6 +432,78 @@ impl TaskApiService {
         self.append_task_lifecycle_event(&request, &tracking, &mut response);
         let _ = self.finish_task_tracking(&request, &response, &tracking);
         response
+    }
+
+    fn replay_task_response(&self, task_run: &TaskRun) -> Result<TaskResponse, String> {
+        let trace_id = task_run
+            .metadata
+            .pointer("/trace_id")
+            .and_then(Value::as_str)
+            .map(|value| value.to_string())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| task_run.task_id.clone());
+        let step_id = task_run
+            .metadata
+            .pointer("/step_id")
+            .and_then(Value::as_str)
+            .map(|value| value.to_string())
+            .filter(|value| !value.trim().is_empty());
+        let task_step = step_id
+            .as_deref()
+            .map(|value| self.conversation_store.load_task_step(value))
+            .transpose()?
+            .flatten();
+
+        let artifacts = self
+            .conversation_store
+            .artifacts_for_task(&task_run.task_id)?
+            .into_iter()
+            .filter(|artifact| {
+                step_id.is_none() || artifact.step_id.as_deref() == step_id.as_deref()
+            })
+            .map(task_artifact_from_record)
+            .collect::<Vec<_>>();
+        let events = self
+            .conversation_store
+            .events_for_task(&task_run.task_id)?
+            .into_iter()
+            .filter(|event| {
+                step_id.is_none() || event.causation_id.as_deref() == step_id.as_deref()
+            })
+            .map(|event| serde_json::to_value(event).unwrap_or(Value::Null))
+            .collect::<Vec<_>>();
+
+        let (executor_used, audit_ref, output_payload) = if let Some(task_step) = task_step {
+            (
+                task_step.executor_used,
+                task_step.audit_ref.unwrap_or_default(),
+                task_step.output_payload,
+            )
+        } else {
+            ("task_api_dispatch".to_string(), String::new(), Value::Null)
+        };
+
+        Ok(TaskResponse {
+            task_id: task_run.task_id.clone(),
+            trace_id,
+            status: task_status_from_task_run_status(task_run.status),
+            executor_used,
+            risk_level: task_run.risk_level,
+            result: TaskResultEnvelope {
+                message: string_at_paths(&output_payload, &["/message"]).unwrap_or_default(),
+                data: output_payload
+                    .pointer("/data")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+                artifacts,
+                events,
+                next_actions: string_vec_at_paths(&output_payload, &["/next_actions"]),
+            },
+            audit_ref,
+            missing_fields: string_vec_at_paths(&output_payload, &["/missing_fields"]),
+            prompt: string_at_paths(&output_payload, &["/prompt"]),
+            resume_token: string_at_paths(&output_payload, &["/resume_token"]),
+        })
     }
 
     fn handle_camera_scan(&self, request: &TaskRequest) -> TaskResponse {
@@ -688,8 +860,13 @@ impl TaskApiService {
                     );
                 }
                 let artifacts = build_vision_artifacts(&payload);
-                let notification_request =
-                    self.build_notification_request(request, &target, &payload, &artifacts);
+                let notification_request = self.build_notification_request(
+                    request,
+                    "task.completed",
+                    &target,
+                    &payload,
+                    &artifacts,
+                );
                 let mut events = Vec::new();
                 if let Some(notification_request) = notification_request {
                     let encoded =
@@ -707,8 +884,7 @@ impl TaskApiService {
                             "notification": encoded,
                         }),
                     )));
-                    let delivery_outcome =
-                        self.deliver_notification_request(request, &notification_request);
+                    let delivery_outcome = self.deliver_notification_request(&notification_request);
                     if let Some(object) = payload.as_object_mut() {
                         object.insert(
                             "notification_delivery".to_string(),
@@ -1130,6 +1306,8 @@ impl TaskApiService {
             let ticket = ApprovalTicket {
                 approval_id: approval_id.clone(),
                 task_id: request.task_id.clone(),
+                trace_id: request.trace_id.clone(),
+                route_key: request.source.route_key.clone(),
                 policy_ref: format!("{}.{}", action.domain, action.operation),
                 requester_user_id: request.source.user_id.clone(),
                 approver_user_id: None,
@@ -1216,57 +1394,177 @@ impl TaskApiService {
     fn build_notification_request(
         &self,
         request: &TaskRequest,
+        event_type: &str,
         target: &ResolvedCameraTarget,
         payload: &Value,
         artifacts: &[TaskArtifact],
     ) -> Option<NotificationRequest> {
-        let admin_state = self.admin_store.load_state().ok()?;
-        let destination = first_string(
+        let route_key = first_string(
+            &[&request.args],
+            &["/notification/route_key", "/destination/route_key"],
+        )
+        .or_else(|| {
+            let value = request.source.route_key.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        })
+        .or_else(|| {
+            self.conversation_store
+                .load_session(&session_id_for_request(request))
+                .ok()
+                .flatten()
+                .map(|session| session.route_key.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_default();
+        let legacy_destination = first_string(
             &[&request.args],
             &["/notification/destination", "/notification_channel"],
-        )
-        .unwrap_or_else(|| admin_state.defaults.notification_channel.clone());
-        if destination.trim().is_empty() {
-            return None;
-        }
-
-        let channel = notification_channel_from_value(
+        );
+        let platform_hint = notification_platform_from_value(
             payload
                 .pointer("/notification_channel")
                 .and_then(Value::as_str)
                 .unwrap_or("im_bridge"),
-        )?;
+        );
         let payload_format = notification_payload_format_from_value(
             payload
                 .pointer("/notification_format")
                 .and_then(Value::as_str)
                 .unwrap_or("plain_text"),
         );
-        let title = format!("{} AI 分析", target.display_name);
+        let title = string_at_paths(payload, &["/notification_card/header/title/content"])
+            .unwrap_or_else(|| format!("{} AI 分析", target.display_name));
         let body = string_at_paths(payload, &["/summary", "/detection_summary"])
             .unwrap_or_else(|| format!("{} 分析完成", target.display_name));
-
-        Some(NotificationRequest {
-            channel,
-            destination,
-            title,
-            body,
-            payload_format,
-            structured_payload: payload
-                .pointer("/notification_card")
-                .cloned()
-                .unwrap_or(Value::Null),
-            attachments: artifacts
-                .iter()
-                .filter_map(task_artifact_to_notification_attachment)
-                .collect(),
-            correlation_id: Some(request.trace_id.clone()),
+        let requested_mode = first_string(
+            &[&request.args],
+            &["/notification/delivery/mode", "/notification/mode"],
+        )
+        .map(|value| notification_delivery_mode_from_value(&value))
+        .unwrap_or(NotificationDeliveryMode::Send);
+        let reply_to_message_id = first_string(
+            &[&request.args],
+            &[
+                "/notification/delivery/reply_to_message_id",
+                "/notification/reply_to_message_id",
+            ],
+        )
+        .or_else(|| {
+            let message_id = task_message_id(request);
+            (!message_id.is_empty()).then_some(message_id)
         })
+        .unwrap_or_default();
+        let update_message_id = first_string(
+            &[&request.args],
+            &[
+                "/notification/delivery/update_message_id",
+                "/notification/update_message_id",
+            ],
+        )
+        .unwrap_or_default();
+        let (delivery_mode, reply_to_message_id, update_message_id) = match requested_mode {
+            NotificationDeliveryMode::Reply if !reply_to_message_id.is_empty() => (
+                NotificationDeliveryMode::Reply,
+                reply_to_message_id,
+                String::new(),
+            ),
+            NotificationDeliveryMode::Update if !update_message_id.is_empty() => (
+                NotificationDeliveryMode::Update,
+                String::new(),
+                update_message_id,
+            ),
+            _ => (NotificationDeliveryMode::Send, String::new(), String::new()),
+        };
+        let explicit_recipient = notification_recipient_from_args(&request.args);
+        let admin_state = self.admin_store.load_state().ok();
+        let fallback_recipient = explicit_recipient.or_else(|| {
+            if !route_key.is_empty() {
+                return None;
+            }
+            let destination = legacy_destination.as_deref().unwrap_or_default();
+            admin_state.as_ref().and_then(|state| {
+                resolve_notification_recipient(destination, state, request.source.user_id.as_str())
+            })
+        });
+        let destination = if matches!(platform_hint.as_deref(), Some("local_ui")) {
+            NotificationDestination {
+                kind: NotificationDestinationKind::LocalUi,
+                route_key: String::new(),
+                id: legacy_destination
+                    .clone()
+                    .unwrap_or_else(|| request.source.conversation_id.clone()),
+                platform: "local_ui".to_string(),
+                recipient: None,
+            }
+        } else if !route_key.is_empty() {
+            NotificationDestination {
+                kind: NotificationDestinationKind::Conversation,
+                route_key,
+                id: String::new(),
+                platform: String::new(),
+                recipient: None,
+            }
+        } else if let Some(recipient) = fallback_recipient {
+            NotificationDestination {
+                kind: NotificationDestinationKind::Recipient,
+                route_key: String::new(),
+                id: legacy_destination.clone().unwrap_or_default(),
+                platform: platform_hint.unwrap_or_default(),
+                recipient: Some(recipient),
+            }
+        } else if let Some(destination_id) = legacy_destination.clone() {
+            NotificationDestination {
+                kind: NotificationDestinationKind::Conversation,
+                route_key: String::new(),
+                id: destination_id,
+                platform: platform_hint.unwrap_or_default(),
+                recipient: None,
+            }
+        } else {
+            return None;
+        };
+
+        let mut notification_request = NotificationRequest {
+            notification_id: String::new(),
+            trace_id: request.trace_id.clone(),
+            source: NotificationSource {
+                service: "harbornas".to_string(),
+                module: "task_api".to_string(),
+                event_type: event_type.to_string(),
+            },
+            destination,
+            content: NotificationContent {
+                title,
+                body,
+                payload_format,
+                structured_payload: payload
+                    .pointer("/notification_card")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                attachments: artifacts
+                    .iter()
+                    .filter_map(task_artifact_to_notification_attachment)
+                    .collect(),
+            },
+            delivery: NotificationDelivery {
+                mode: delivery_mode,
+                reply_to_message_id,
+                update_message_id,
+                idempotency_key: String::new(),
+            },
+            metadata: NotificationMetadata {
+                correlation_id: request.trace_id.clone(),
+            },
+        };
+        let notification_hash = notification_request_hash(&notification_request);
+        notification_request.notification_id = format!("notif_{}", &notification_hash[..24]);
+        notification_request.delivery.idempotency_key =
+            format!("idem_{}", &notification_hash[..24]);
+        Some(notification_request)
     }
 
     fn deliver_notification_request(
         &self,
-        request: &TaskRequest,
         notification_request: &NotificationRequest,
     ) -> NotificationDeliveryOutcome {
         let service = match NotificationDeliveryService::new() {
@@ -1282,48 +1580,8 @@ impl TaskApiService {
                 };
             }
         };
-        let admin_state = match self.admin_store.load_state() {
-            Ok(state) => state,
-            Err(error) => {
-                return NotificationDeliveryOutcome {
-                    event_type: "task.notification_failed",
-                    severity: EventSeverity::Error,
-                    payload: json!({
-                        "status": "failed",
-                        "error": error,
-                    }),
-                };
-            }
-        };
 
-        let bridge_provider = bridge_provider_config_from_state(&admin_state);
-        let recipient = resolve_notification_recipient(
-            notification_request,
-            &admin_state,
-            request.source.user_id.as_str(),
-        );
-        match service.deliver(
-            notification_request,
-            bridge_provider.as_ref(),
-            recipient.as_ref(),
-        ) {
-            Ok(record) => NotificationDeliveryOutcome {
-                event_type: "task.notification_delivered",
-                severity: EventSeverity::Info,
-                payload: serde_json::to_value(record).unwrap_or(Value::Null),
-            },
-            Err(error) => NotificationDeliveryOutcome {
-                event_type: "task.notification_failed",
-                severity: EventSeverity::Warning,
-                payload: json!({
-                    "status": "failed",
-                    "channel": notification_request.channel,
-                    "destination": notification_request.destination,
-                    "recipient": recipient,
-                    "error": error,
-                }),
-            },
-        }
+        notification_delivery_outcome(notification_request, service.deliver(notification_request))
     }
 
     fn serialize_event_record(&self, event: &EventRecord) -> Value {
@@ -1485,6 +1743,8 @@ impl TaskApiService {
             .unwrap_or_else(|| TaskStepRun {
                 step_id: tracking.step_id.clone(),
                 task_id: request.task_id.clone(),
+                trace_id: request.trace_id.clone(),
+                route_key: request.source.route_key.clone(),
                 domain: request.intent.domain.clone(),
                 operation: request.intent.action.clone(),
                 route: ExecutionRoute::Local,
@@ -1499,6 +1759,8 @@ impl TaskApiService {
                 ended_at: None,
             });
         task_step.task_id = request.task_id.clone();
+        task_step.trace_id = request.trace_id.clone();
+        task_step.route_key = request.source.route_key.clone();
         task_step.domain = request.intent.domain.clone();
         task_step.operation = request.intent.action.clone();
         task_step.route = ExecutionRoute::Local;
@@ -1572,6 +1834,8 @@ impl TaskApiService {
             .unwrap_or_else(|| TaskStepRun {
                 step_id: tracking.step_id.clone(),
                 task_id: request.task_id.clone(),
+                trace_id: request.trace_id.clone(),
+                route_key: request.source.route_key.clone(),
                 domain: step_domain.clone(),
                 operation: step_operation.clone(),
                 route: ExecutionRoute::Local,
@@ -1586,6 +1850,8 @@ impl TaskApiService {
                 ended_at: None,
             });
         task_step.task_id = request.task_id.clone();
+        task_step.trace_id = request.trace_id.clone();
+        task_step.route_key = request.source.route_key.clone();
         task_step.domain = step_domain;
         task_step.operation = step_operation;
         task_step.route = ExecutionRoute::Local;
@@ -1646,6 +1912,9 @@ impl TaskApiService {
                 surface: request.source.surface.clone(),
                 conversation_id: request.source.conversation_id.clone(),
                 user_id: request.source.user_id.clone(),
+                route_key: request.source.route_key.clone(),
+                last_message_id: task_message_id(request),
+                chat_type: task_chat_type(request),
                 state: Value::Null,
                 resume_token: None,
                 expires_at: None,
@@ -1655,6 +1924,17 @@ impl TaskApiService {
         session.surface = request.source.surface.clone();
         session.conversation_id = request.source.conversation_id.clone();
         session.user_id = request.source.user_id.clone();
+        if !request.source.route_key.trim().is_empty() {
+            session.route_key = request.source.route_key.clone();
+        }
+        let message_id = task_message_id(request);
+        if !message_id.is_empty() {
+            session.last_message_id = message_id;
+        }
+        let chat_type = task_chat_type(request);
+        if !chat_type.is_empty() {
+            session.chat_type = chat_type;
+        }
         session.state = self
             .load_conversation(request)
             .and_then(|conversation| {
@@ -1705,6 +1985,9 @@ impl TaskApiService {
                 surface: request.source.surface.clone(),
                 conversation_id: request.source.conversation_id.clone(),
                 user_id: request.source.user_id.clone(),
+                route_key: request.source.route_key.clone(),
+                last_message_id: task_message_id(request),
+                chat_type: task_chat_type(request),
                 state: Value::Null,
                 resume_token: None,
                 expires_at: None,
@@ -1800,6 +2083,7 @@ impl TaskApiService {
                     .map(|session| session.user_id.clone())
                     .unwrap_or_else(|| approval.requester_user_id.clone()),
                 session_id: task_run.session_id.clone(),
+                route_key: source_route_key_from_context(task_run, session),
             },
             intent: TaskIntent {
                 domain: task_run.domain.clone(),
@@ -1811,6 +2095,7 @@ impl TaskApiService {
             autonomy: TaskAutonomy {
                 level: normalize_task_autonomy_level(&task_run.autonomy_level),
             },
+            message: None,
         }
     }
 
@@ -1851,6 +2136,7 @@ impl TaskApiService {
                     .map(|session| session.user_id.clone())
                     .unwrap_or_else(|| approval.requester_user_id.clone()),
                 session_id: task_run.session_id.clone(),
+                route_key: source_route_key_from_context(task_run, session),
             },
             intent: TaskIntent {
                 domain: task_run.domain.clone(),
@@ -1862,6 +2148,7 @@ impl TaskApiService {
             autonomy: TaskAutonomy {
                 level: normalize_task_autonomy_level(&task_run.autonomy_level),
             },
+            message: None,
         };
         let step_id = approval_event_step_id(&approval.approval_id);
         let event = build_task_event_record(
@@ -2324,6 +2611,20 @@ fn build_task_run_metadata(request: &TaskRequest, step_id: &str) -> Value {
         "trace_id": request.trace_id.clone(),
         "step_id": step_id,
         "surface": request.source.surface.clone(),
+        "conversation_id": request.source.conversation_id.clone(),
+        "route_key": request.source.route_key.clone(),
+        "message_id": request
+            .message
+            .as_ref()
+            .map(|message| message.message_id.clone())
+            .unwrap_or_default(),
+        "chat_type": request
+            .message
+            .as_ref()
+            .map(|message| message.chat_type.clone())
+            .unwrap_or_default(),
+        "attachments": task_attachment_transport_contract(request),
+        "request_identity": task_request_identity(request),
     })
 }
 
@@ -2407,6 +2708,7 @@ fn build_step_input_payload(request: &TaskRequest) -> Value {
         "intent": request.intent.clone(),
         "entity_refs": request.entity_refs.clone(),
         "args": request.args.clone(),
+        "message": request.message.clone(),
     })
 }
 
@@ -2433,7 +2735,9 @@ fn build_artifact_records(
         .map(|(index, artifact)| ArtifactRecord {
             artifact_id: format!("{}:{}:artifact-{}", request.task_id, step_id, index + 1),
             task_id: request.task_id.clone(),
+            trace_id: request.trace_id.clone(),
             step_id: Some(step_id.to_string()),
+            route_key: request.source.route_key.clone(),
             artifact_kind: artifact_kind_from_name(&artifact.kind),
             label: artifact.label.clone(),
             mime_type: artifact.mime_type.clone(),
@@ -2504,6 +2808,200 @@ fn artifact_kind_from_name(kind: &str) -> ArtifactKind {
         "card" => ArtifactKind::Card,
         "json" => ArtifactKind::Json,
         _ => ArtifactKind::Text,
+    }
+}
+
+fn task_artifact_from_record(record: ArtifactRecord) -> TaskArtifact {
+    TaskArtifact {
+        kind: task_artifact_kind_name(record.artifact_kind).to_string(),
+        label: record.label,
+        mime_type: record.mime_type,
+        media_asset_id: record.media_asset_id,
+        path: record.path,
+        url: record.url,
+        metadata: record.metadata,
+    }
+}
+
+fn task_artifact_kind_name(kind: ArtifactKind) -> &'static str {
+    match kind {
+        ArtifactKind::Text => "text",
+        ArtifactKind::Image => "image",
+        ArtifactKind::Video => "video",
+        ArtifactKind::Link => "link",
+        ArtifactKind::Card => "card",
+        ArtifactKind::Json => "json",
+    }
+}
+
+fn task_request_identity(request: &TaskRequest) -> Value {
+    json!({
+        "route_key": request.source.route_key.trim(),
+        "conversation_id": request.source.conversation_id.trim(),
+        "message_id": task_message_id(request),
+        "intent": {
+            "domain": request.intent.domain.trim(),
+            "action": request.intent.action.trim(),
+            "raw_text": request.intent.raw_text.trim(),
+        },
+        "entity_refs": normalized_contract_value(&request.entity_refs),
+        "args": normalized_contract_value(&request.args),
+    })
+}
+
+fn persisted_task_request_identity(task_run: &TaskRun) -> Value {
+    if let Some(identity) = task_run.metadata.pointer("/request_identity") {
+        return identity.clone();
+    }
+
+    json!({
+        "route_key": task_run
+            .metadata
+            .pointer("/route_key")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        "conversation_id": task_run
+            .metadata
+            .pointer("/conversation_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        "message_id": task_run
+            .metadata
+            .pointer("/message_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        "intent": {
+            "domain": task_run.domain.trim(),
+            "action": task_run.action.trim(),
+            "raw_text": task_run.intent_text.trim(),
+        },
+        "entity_refs": normalized_contract_value(&task_run.entity_refs),
+        "args": normalized_contract_value(&task_run.args),
+    })
+}
+
+fn normalized_contract_value(value: &Value) -> Value {
+    match value {
+        Value::Null => json!({}),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(normalized_contract_value)
+                .collect::<Vec<_>>(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), normalized_contract_value(value)))
+                .collect(),
+        ),
+        Value::String(value) => Value::String(value.trim().to_string()),
+        _ => value.clone(),
+    }
+}
+
+fn task_message_id(request: &TaskRequest) -> String {
+    request
+        .message
+        .as_ref()
+        .map(|message| message.message_id.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
+}
+
+fn task_chat_type(request: &TaskRequest) -> String {
+    request
+        .message
+        .as_ref()
+        .map(|message| message.chat_type.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
+}
+
+fn task_attachment_transport_contract(request: &TaskRequest) -> Value {
+    let Some(message) = request.message.as_ref() else {
+        return Value::Array(Vec::new());
+    };
+
+    Value::Array(
+        message
+            .attachments
+            .iter()
+            .map(|attachment| {
+                let download = attachment
+                    .download
+                    .as_ref()
+                    .map(|download| {
+                        json!({
+                            "mode": download.mode.trim(),
+                            "url": download.url.trim(),
+                            "method": download.method.trim(),
+                            "headers": normalized_contract_value(&download.headers),
+                            "auth": download
+                                .auth
+                                .as_ref()
+                                .map(|auth| json!({"type": auth.kind.trim()}))
+                                .unwrap_or(Value::Null),
+                            "expires_at": download.expires_at.trim(),
+                            "max_size_bytes": download.max_size_bytes,
+                        })
+                    })
+                    .unwrap_or(Value::Null);
+
+                json!({
+                    "attachment_id": attachment.attachment_id.trim(),
+                    "type": attachment.attachment_type.trim(),
+                    "name": attachment.name.trim(),
+                    "mime_type": attachment.mime_type.trim(),
+                    "size_bytes": attachment.size_bytes,
+                    "download": download,
+                    "metadata": normalized_contract_value(&attachment.metadata),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn string_vec_at_paths(value: &Value, paths: &[&str]) -> Vec<String> {
+    paths
+        .iter()
+        .find_map(|path| {
+            value.pointer(path).and_then(Value::as_array).map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|item| item.trim().to_string())
+                    .filter(|item| !item.is_empty())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn source_route_key_from_context(
+    task_run: &TaskRun,
+    session: Option<&ConversationSession>,
+) -> String {
+    session
+        .map(|session| session.route_key.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            task_run
+                .metadata
+                .pointer("/route_key")
+                .and_then(Value::as_str)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_default()
+}
+
+fn task_status_from_task_run_status(status: TaskRunStatus) -> TaskStatus {
+    match status {
+        TaskRunStatus::Completed => TaskStatus::Completed,
+        TaskRunStatus::NeedsInput | TaskRunStatus::Blocked => TaskStatus::NeedsInput,
+        TaskRunStatus::Queued | TaskRunStatus::Running | TaskRunStatus::Failed => {
+            TaskStatus::Failed
+        }
     }
 }
 
@@ -2802,13 +3300,29 @@ fn first_non_empty<'a>(values: &[&'a str]) -> Option<&'a str> {
         .find(|value| !value.trim().is_empty())
 }
 
-fn notification_channel_from_value(value: &str) -> Option<NotificationChannel> {
+fn notification_platform_from_value(value: &str) -> Option<String> {
     match value.trim().to_lowercase().as_str() {
-        "im_bridge" | "feishu" => Some(NotificationChannel::ImBridge),
-        "wecom" => Some(NotificationChannel::Wecom),
-        "telegram" => Some(NotificationChannel::Telegram),
-        "webhook" => Some(NotificationChannel::Webhook),
-        "local_ui" => Some(NotificationChannel::LocalUi),
+        "im_bridge" | "feishu" => Some("feishu".to_string()),
+        "wecom" => Some("wecom".to_string()),
+        "telegram" => Some("telegram".to_string()),
+        "webhook" => Some("webhook".to_string()),
+        "local_ui" => Some("local_ui".to_string()),
+        _ => None,
+    }
+}
+
+fn notification_delivery_mode_from_value(value: &str) -> NotificationDeliveryMode {
+    match value.trim().to_lowercase().as_str() {
+        "reply" => NotificationDeliveryMode::Reply,
+        "update" => NotificationDeliveryMode::Update,
+        _ => NotificationDeliveryMode::Send,
+    }
+}
+
+fn notification_recipient_type_from_value(value: &str) -> Option<NotificationRecipientIdType> {
+    match value.trim().to_lowercase().as_str() {
+        "chat_id" => Some(NotificationRecipientIdType::ChatId),
+        "open_id" => Some(NotificationRecipientIdType::OpenId),
         _ => None,
     }
 }
@@ -2842,44 +3356,55 @@ fn task_artifact_to_notification_attachment(
     })
 }
 
-fn bridge_provider_config_from_state(
-    state: &AdminConsoleState,
-) -> Option<NotificationBridgeConfig> {
-    if state.bridge_provider.app_id.trim().is_empty()
-        || state.bridge_provider.app_secret.trim().is_empty()
-    {
-        return None;
-    }
-    Some(NotificationBridgeConfig {
-        app_id: state.bridge_provider.app_id.clone(),
-        app_secret: state.bridge_provider.app_secret.clone(),
-        bot_open_id: state.bridge_provider.bot_open_id.clone(),
+fn notification_recipient_from_args(args: &Value) -> Option<NotificationRecipient> {
+    let recipient_id = first_string(
+        &[args],
+        &[
+            "/notification/destination/recipient/recipient_id",
+            "/notification/recipient/recipient_id",
+            "/notification/recipient_id",
+        ],
+    )?;
+    let recipient_type = first_string(
+        &[args],
+        &[
+            "/notification/destination/recipient/recipient_type",
+            "/notification/recipient/recipient_type",
+            "/notification/recipient_type",
+        ],
+    )
+    .and_then(|value| notification_recipient_type_from_value(&value))
+    .or_else(|| {
+        if recipient_id.starts_with("oc_") {
+            Some(NotificationRecipientIdType::ChatId)
+        } else if recipient_id.starts_with("ou_") {
+            Some(NotificationRecipientIdType::OpenId)
+        } else {
+            None
+        }
+    })?;
+
+    Some(NotificationRecipient {
+        recipient_id,
+        recipient_type,
     })
 }
 
 fn resolve_notification_recipient(
-    request: &NotificationRequest,
+    destination: &str,
     state: &AdminConsoleState,
     requester_user_id: &str,
 ) -> Option<NotificationRecipient> {
     let bindings = resolved_identity_binding_records(state);
-    if request.destination.trim().is_empty() {
+    if destination.trim().is_empty() {
         return None;
     }
 
-    if request.channel == NotificationChannel::LocalUi {
-        return Some(NotificationRecipient {
-            receive_id_type: NotificationRecipientIdType::ChatId,
-            receive_id: request.destination.clone(),
-            label: request.destination.clone(),
-        });
-    }
-
-    if let Some(recipient) = recipient_from_literal_destination(&request.destination, &bindings) {
+    if let Some(recipient) = recipient_from_literal_destination(destination, &bindings) {
         return Some(recipient);
     }
 
-    if let Some(recipient) = recipient_from_binding_match(&request.destination, &bindings) {
+    if let Some(recipient) = recipient_from_binding_match(destination, &bindings) {
         return Some(recipient);
     }
 
@@ -2914,21 +3439,19 @@ fn recipient_from_literal_destination(
 ) -> Option<NotificationRecipient> {
     if destination.starts_with("oc_") {
         return Some(NotificationRecipient {
-            receive_id_type: NotificationRecipientIdType::ChatId,
-            receive_id: destination.to_string(),
-            label: destination.to_string(),
+            recipient_id: destination.to_string(),
+            recipient_type: NotificationRecipientIdType::ChatId,
         });
     }
     if destination.starts_with("ou_") {
-        let label = bindings
+        let _label = bindings
             .iter()
             .find(|binding| binding.open_id == destination)
             .map(|binding| binding.display_name.clone())
             .unwrap_or_else(|| destination.to_string());
         return Some(NotificationRecipient {
-            receive_id_type: NotificationRecipientIdType::OpenId,
-            receive_id: destination.to_string(),
-            label,
+            recipient_id: destination.to_string(),
+            recipient_type: NotificationRecipientIdType::OpenId,
         });
     }
     None
@@ -2965,19 +3488,124 @@ fn recipient_from_binding(binding: &IdentityBindingRecord) -> Option<Notificatio
         .filter(|value| !value.trim().is_empty())
     {
         return Some(NotificationRecipient {
-            receive_id_type: NotificationRecipientIdType::ChatId,
-            receive_id: chat_id.clone(),
-            label: binding.display_name.clone(),
+            recipient_id: chat_id.clone(),
+            recipient_type: NotificationRecipientIdType::ChatId,
         });
     }
     if !binding.open_id.trim().is_empty() {
         return Some(NotificationRecipient {
-            receive_id_type: NotificationRecipientIdType::OpenId,
-            receive_id: binding.open_id.clone(),
-            label: binding.display_name.clone(),
+            recipient_id: binding.open_id.clone(),
+            recipient_type: NotificationRecipientIdType::OpenId,
         });
     }
     None
+}
+
+fn notification_request_hash(request: &NotificationRequest) -> String {
+    let identity = notification_request_identity(request);
+    let bytes = serde_json::to_vec(&identity).unwrap_or_default();
+    let digest = Sha256::digest(&bytes);
+    digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+fn notification_request_identity(request: &NotificationRequest) -> Value {
+    json!({
+        "trace_id": request.trace_id.trim(),
+        "source": {
+            "service": request.source.service.trim(),
+            "module": request.source.module.trim(),
+            "event_type": request.source.event_type.trim(),
+        },
+        "destination": {
+            "kind": serde_json::to_value(request.destination.kind).unwrap_or(Value::Null),
+            "route_key": request.destination.route_key.trim(),
+            "id": request.destination.id.trim(),
+            "platform": request.destination.platform.trim(),
+            "recipient": request.destination.recipient.as_ref().map(|recipient| json!({
+                "recipient_id": recipient.recipient_id.trim(),
+                "recipient_type": serde_json::to_value(recipient.recipient_type).unwrap_or(Value::Null),
+            })).unwrap_or(Value::Null),
+        },
+        "content": {
+            "title": request.content.title.trim(),
+            "body": request.content.body.trim(),
+            "payload_format": serde_json::to_value(request.content.payload_format).unwrap_or(Value::Null),
+            "structured_payload": normalized_contract_value(&request.content.structured_payload),
+            "attachments": request.content.attachments.iter().map(|attachment| {
+                json!({
+                    "kind": serde_json::to_value(attachment.kind).unwrap_or(Value::Null),
+                    "label": attachment.label.trim(),
+                    "mime_type": attachment.mime_type.trim(),
+                    "path": attachment.path.clone().unwrap_or_default(),
+                    "url": attachment.url.clone().unwrap_or_default(),
+                    "metadata": normalized_contract_value(&attachment.metadata),
+                })
+            }).collect::<Vec<_>>(),
+        },
+        "delivery": {
+            "mode": serde_json::to_value(request.delivery.mode).unwrap_or(Value::Null),
+            "reply_to_message_id": request.delivery.reply_to_message_id.trim(),
+            "update_message_id": request.delivery.update_message_id.trim(),
+        },
+        "metadata": {
+            "correlation_id": request.metadata.correlation_id.trim(),
+        },
+    })
+}
+
+fn notification_delivery_outcome(
+    notification_request: &NotificationRequest,
+    result: Result<
+        crate::connectors::notifications::NotificationDeliveryRecord,
+        NotificationDeliveryError,
+    >,
+) -> NotificationDeliveryOutcome {
+    match result {
+        Ok(record) if record.ok => NotificationDeliveryOutcome {
+            event_type: "task.notification_delivered",
+            severity: EventSeverity::Info,
+            payload: serde_json::to_value(record).unwrap_or(Value::Null),
+        },
+        Ok(record) => NotificationDeliveryOutcome {
+            event_type: "task.notification_failed",
+            severity: EventSeverity::Warning,
+            payload: serde_json::to_value(record).unwrap_or(Value::Null),
+        },
+        Err(NotificationDeliveryError::RequestRejected {
+            status_code,
+            envelope,
+        }) => NotificationDeliveryOutcome {
+            event_type: "task.notification_rejected",
+            severity: if status_code >= 500 {
+                EventSeverity::Error
+            } else {
+                EventSeverity::Warning
+            },
+            payload: json!({
+                "status": "rejected",
+                "http_status": status_code,
+                "notification_id": notification_request.notification_id,
+                "idempotency_key": notification_request.delivery.idempotency_key,
+                "destination": notification_request.destination,
+                "error": envelope.error,
+                "trace_id": envelope.trace_id,
+            }),
+        },
+        Err(error) => NotificationDeliveryOutcome {
+            event_type: "task.notification_failed",
+            severity: EventSeverity::Error,
+            payload: json!({
+                "status": "failed",
+                "notification_id": notification_request.notification_id,
+                "idempotency_key": notification_request.delivery.idempotency_key,
+                "destination": notification_request.destination,
+                "error": error.to_string(),
+            }),
+        },
+    }
 }
 
 fn current_timestamp() -> String {
@@ -3040,13 +3668,16 @@ mod tests {
         artifact_kind_from_name, build_artifact_records, conversation_key,
         effective_autonomy_level, effective_autonomy_level_for_task_run,
         effective_requires_approval, format_pending_candidates, normalize_command_text,
-        pending_candidates_from_results, protocol_string, resolve_notification_recipient,
-        room_aliases, PendingTaskCandidate, TaskApiService, TaskArtifact, TaskIntent, TaskRequest,
-        TaskSource, TaskStatus,
+        notification_delivery_outcome, pending_candidates_from_results, protocol_string,
+        resolve_notification_recipient, room_aliases, PendingTaskCandidate, TaskApiService,
+        TaskArtifact, TaskIntent, TaskMessage, TaskRequest, TaskRequestAcceptance, TaskSource,
+        TaskStatus,
     };
     use crate::connectors::notifications::{
-        NotificationChannel, NotificationPayloadFormat, NotificationRecipientIdType,
-        NotificationRequest,
+        NotificationDelivery, NotificationDeliveryError, NotificationDeliveryMode,
+        NotificationDestination, NotificationDestinationKind, NotificationMetadata,
+        NotificationPayloadFormat, NotificationRecipientIdType, NotificationRequest,
+        NotificationSource, SharedHttpErrorDetail, SharedHttpErrorEnvelope,
     };
     use crate::connectors::storage::StorageTarget;
     use crate::control_plane::approvals::ApprovalStatus;
@@ -3054,8 +3685,7 @@ mod tests {
     use crate::control_plane::media::{MediaAssetKind, StorageTargetKind};
     use crate::control_plane::tasks::{ArtifactKind, TaskRunStatus, TaskStepRunStatus};
     use crate::runtime::admin_console::{
-        AdminConsoleState, AdminConsoleStore, BridgeProviderConfig, IdentityBindingRecord,
-        RemoteViewConfig,
+        AdminConsoleState, AdminConsoleStore, IdentityBindingRecord, RemoteViewConfig,
     };
     use crate::runtime::hub::HubScanResultItem;
     use crate::runtime::media::{SnapshotCaptureResult, SnapshotFormat};
@@ -3085,14 +3715,262 @@ mod tests {
                 conversation_id: "chat-1".to_string(),
                 user_id: "user-1".to_string(),
                 session_id: "session-1".to_string(),
+                route_key: String::new(),
             },
             intent: TaskIntent::default(),
             entity_refs: Value::Null,
             args: Value::Null,
             autonomy: Default::default(),
+            message: None,
         };
 
         assert_eq!(conversation_key(&request), Some("chat-1".to_string()));
+    }
+
+    #[test]
+    fn handle_task_persists_route_key_and_message_summary() {
+        let admin_path = unique_path("harbornas-admin-state");
+        let registry_path = unique_path("harbornas-device-registry");
+        let conversation_path = unique_path("harbornas-task-route-message");
+        let service = TaskApiService::new(
+            AdminConsoleStore::new(
+                admin_path.clone(),
+                DeviceRegistryStore::new(registry_path.clone()),
+            ),
+            TaskConversationStore::new(conversation_path.clone()),
+        );
+        let request = TaskRequest {
+            task_id: "task-route-message".to_string(),
+            trace_id: "trace-route-message".to_string(),
+            step_id: "step-route-message".to_string(),
+            source: TaskSource {
+                channel: "im_bridge".to_string(),
+                surface: "im_gateway".to_string(),
+                conversation_id: "chat-route-message".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-route-message".to_string(),
+                route_key: "gw_route_01".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "system".to_string(),
+                action: "ping".to_string(),
+                raw_text: "ping".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: Value::Null,
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_01".to_string(),
+                chat_type: "group".to_string(),
+                mentions: Vec::new(),
+                attachments: vec![super::TaskMessageAttachment {
+                    attachment_id: "att_01".to_string(),
+                    attachment_type: "file".to_string(),
+                    name: "front-door.jpg".to_string(),
+                    mime_type: "image/jpeg".to_string(),
+                    size_bytes: Some(2048),
+                    download: Some(super::TaskMessageAttachmentDownload {
+                        mode: "proxy".to_string(),
+                        url: "https://gateway.local/files/att_01".to_string(),
+                        method: "GET".to_string(),
+                        headers: json!({
+                            "Authorization": "Bearer opaque-download-token"
+                        }),
+                        auth: Some(super::TaskMessageAttachmentDownloadAuth {
+                            kind: "bearer".to_string(),
+                        }),
+                        expires_at: "2026-04-18T12:00:00Z".to_string(),
+                        max_size_bytes: Some(4096),
+                    }),
+                    metadata: json!({
+                        "transport": "opaque",
+                        "provider_file_key": "file_key_01"
+                    }),
+                }],
+            }),
+        };
+
+        let response = service.handle_task(request);
+        assert_eq!(response.status, TaskStatus::Failed);
+
+        let session = service
+            .conversation_store()
+            .load_session("sess-route-message")
+            .expect("load session")
+            .expect("session");
+        assert_eq!(session.route_key, "gw_route_01");
+        assert_eq!(session.last_message_id, "om_01");
+        assert_eq!(session.chat_type, "group");
+
+        let task_run = service
+            .conversation_store()
+            .load_task_run("task-route-message")
+            .expect("load task run")
+            .expect("task run");
+        assert_eq!(task_run.metadata["route_key"], "gw_route_01");
+        assert_eq!(task_run.metadata["message_id"], "om_01");
+        assert_eq!(task_run.metadata["chat_type"], "group");
+        assert_eq!(
+            task_run.metadata["attachments"][0]["attachment_id"],
+            "att_01"
+        );
+        assert_eq!(
+            task_run.metadata["attachments"][0]["download"]["headers"]["Authorization"],
+            "Bearer opaque-download-token"
+        );
+        assert_eq!(
+            task_run.metadata["attachments"][0]["metadata"]["provider_file_key"],
+            "file_key_01"
+        );
+
+        let task_step = service
+            .conversation_store()
+            .load_task_step("step-route-message")
+            .expect("load task step")
+            .expect("task step");
+        assert_eq!(task_step.trace_id, "trace-route-message");
+        assert_eq!(task_step.route_key, "gw_route_01");
+        assert_eq!(
+            task_step.input_payload["source"]["route_key"],
+            "gw_route_01"
+        );
+        assert_eq!(task_step.input_payload["message"]["message_id"], "om_01");
+        assert_eq!(task_step.input_payload["message"]["chat_type"], "group");
+        assert_eq!(
+            task_step.input_payload["message"]["attachments"][0]["download"]["mode"],
+            "proxy"
+        );
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn accept_or_replay_task_returns_replayed_response_for_identical_task_id() {
+        let admin_path = unique_path("harbornas-admin-state");
+        let registry_path = unique_path("harbornas-device-registry");
+        let conversation_path = unique_path("harbornas-task-idempotent-replay");
+        let service = TaskApiService::new(
+            AdminConsoleStore::new(
+                admin_path.clone(),
+                DeviceRegistryStore::new(registry_path.clone()),
+            ),
+            TaskConversationStore::new(conversation_path.clone()),
+        );
+        let request = TaskRequest {
+            task_id: "task-idempotent".to_string(),
+            trace_id: "trace-idempotent".to_string(),
+            step_id: "step-idempotent".to_string(),
+            source: TaskSource {
+                channel: "im_bridge".to_string(),
+                surface: "im_gateway".to_string(),
+                conversation_id: "chat-idempotent".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-idempotent".to_string(),
+                route_key: "gw_route_idempotent".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "system".to_string(),
+                action: "ping".to_string(),
+                raw_text: "ping".to_string(),
+            },
+            entity_refs: json!({}),
+            args: json!({}),
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_idempotent".to_string(),
+                chat_type: "group".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+
+        let initial = service.handle_task(request.clone());
+        assert_eq!(initial.status, TaskStatus::Failed);
+
+        let replay = service
+            .accept_or_replay_task(&request)
+            .expect("idempotency decision");
+        match replay {
+            TaskRequestAcceptance::Replay(response) => {
+                assert_eq!(response.task_id, "task-idempotent");
+                assert_eq!(response.trace_id, "trace-idempotent");
+                assert_eq!(response.status, TaskStatus::Failed);
+                assert_eq!(response.executor_used, initial.executor_used);
+            }
+            other => panic!("expected replay, got {other:?}"),
+        }
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn accept_or_replay_task_rejects_conflicting_task_identity() {
+        let admin_path = unique_path("harbornas-admin-state");
+        let registry_path = unique_path("harbornas-device-registry");
+        let conversation_path = unique_path("harbornas-task-idempotent-conflict");
+        let service = TaskApiService::new(
+            AdminConsoleStore::new(
+                admin_path.clone(),
+                DeviceRegistryStore::new(registry_path.clone()),
+            ),
+            TaskConversationStore::new(conversation_path.clone()),
+        );
+        let request = TaskRequest {
+            task_id: "task-idempotent-conflict".to_string(),
+            trace_id: "trace-idempotent-conflict".to_string(),
+            step_id: "step-idempotent-conflict".to_string(),
+            source: TaskSource {
+                channel: "im_bridge".to_string(),
+                surface: "im_gateway".to_string(),
+                conversation_id: "chat-idempotent-conflict".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-idempotent-conflict".to_string(),
+                route_key: "gw_route_conflict".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "system".to_string(),
+                action: "ping".to_string(),
+                raw_text: "ping".to_string(),
+            },
+            entity_refs: json!({}),
+            args: json!({}),
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_conflict".to_string(),
+                chat_type: "group".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+        let conflicting = TaskRequest {
+            intent: TaskIntent {
+                domain: "system".to_string(),
+                action: "ping".to_string(),
+                raw_text: "ping again".to_string(),
+            },
+            ..request.clone()
+        };
+
+        let initial = service.handle_task(request);
+        assert_eq!(initial.status, TaskStatus::Failed);
+
+        let replay = service
+            .accept_or_replay_task(&conflicting)
+            .expect("idempotency decision");
+        match replay {
+            TaskRequestAcceptance::Conflict(message) => {
+                assert!(message.contains("different request identity"));
+            }
+            other => panic!("expected conflict, got {other:?}"),
+        }
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
     }
 
     #[test]
@@ -3207,6 +4085,7 @@ mod tests {
             entity_refs: Value::Null,
             args: Value::Null,
             autonomy: Default::default(),
+            message: None,
         };
         let artifacts = build_artifact_records(
             &request,
@@ -3225,6 +4104,8 @@ mod tests {
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].artifact_kind, ArtifactKind::Image);
         assert_eq!(artifacts[0].media_asset_id.as_deref(), Some("asset-1"));
+        assert_eq!(artifacts[0].trace_id, "trace-1");
+        assert_eq!(artifacts[0].route_key, "");
         assert_eq!(artifact_kind_from_name("json"), ArtifactKind::Json);
     }
 
@@ -3240,6 +4121,7 @@ mod tests {
                 conversation_id: "chat-1".to_string(),
                 user_id: "user-1".to_string(),
                 session_id: "sess-1".to_string(),
+                route_key: "gw_route_snapshot".to_string(),
             },
             intent: TaskIntent {
                 domain: "camera".to_string(),
@@ -3249,6 +4131,12 @@ mod tests {
             entity_refs: Value::Null,
             args: Value::Null,
             autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_snapshot".to_string(),
+                chat_type: "p2p".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
         };
         let target = ResolvedCameraTarget {
             device_id: "cam-1".to_string(),
@@ -3369,6 +4257,7 @@ mod tests {
                 conversation_id: "chat-1".to_string(),
                 user_id: "user-1".to_string(),
                 session_id: "sess-1".to_string(),
+                route_key: "gw_route_vision".to_string(),
             },
             intent: TaskIntent {
                 domain: "camera".to_string(),
@@ -3378,6 +4267,12 @@ mod tests {
             entity_refs: Value::Null,
             args: Value::Null,
             autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_vision".to_string(),
+                chat_type: "group".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
         };
         let target = ResolvedCameraTarget {
             device_id: "cam-1".to_string(),
@@ -3498,7 +4393,7 @@ mod tests {
     }
 
     #[test]
-    fn build_notification_request_uses_generic_contract() {
+    fn build_notification_request_prefers_route_key_contract_shape() {
         let admin_path = unique_path("harbornas-admin-state");
         let registry_path = unique_path("harbornas-device-registry");
         let conversation_path = unique_path("harbornas-task-runtime");
@@ -3518,6 +4413,7 @@ mod tests {
                 conversation_id: "chat-1".to_string(),
                 user_id: "user-1".to_string(),
                 session_id: "sess-1".to_string(),
+                route_key: "gw_route_notify".to_string(),
             },
             intent: TaskIntent {
                 domain: "camera".to_string(),
@@ -3527,6 +4423,12 @@ mod tests {
             entity_refs: Value::Null,
             args: Value::Null,
             autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_notify".to_string(),
+                chat_type: "group".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
         };
         let target = ResolvedCameraTarget {
             device_id: "cam-1".to_string(),
@@ -3557,6 +4459,7 @@ mod tests {
         let notification = service
             .build_notification_request(
                 &request,
+                "task.completed",
                 &target,
                 &json!({
                     "summary": "检测到门口有人活动",
@@ -3577,15 +4480,57 @@ mod tests {
                 }],
             )
             .expect("notification request");
+        let replay_notification = service
+            .build_notification_request(
+                &request,
+                "task.completed",
+                &target,
+                &json!({
+                    "summary": "检测到门口有人活动",
+                    "notification_channel": "im_bridge",
+                    "notification_format": "lark_card",
+                    "notification_card": {
+                        "header": {"title": {"content": "Front Door AI 分析"}}
+                    }
+                }),
+                &[TaskArtifact {
+                    kind: "image".to_string(),
+                    label: "抓拍图片".to_string(),
+                    mime_type: "image/jpeg".to_string(),
+                    media_asset_id: None,
+                    path: Some("snap.jpg".to_string()),
+                    url: None,
+                    metadata: Value::Null,
+                }],
+            )
+            .expect("replayed notification request");
 
-        assert_eq!(notification.channel, NotificationChannel::ImBridge);
         assert_eq!(
-            notification.payload_format,
+            notification.content.payload_format,
             NotificationPayloadFormat::LarkCard
         );
-        assert_eq!(notification.destination, "家庭通知频道");
-        assert_eq!(notification.attachments.len(), 1);
-        assert_eq!(notification.title, "Front Door AI 分析");
+        assert_eq!(
+            notification.destination.kind,
+            NotificationDestinationKind::Conversation
+        );
+        assert_eq!(notification.destination.route_key, "gw_route_notify");
+        assert_eq!(notification.destination.platform, "");
+        assert_eq!(notification.content.attachments.len(), 1);
+        assert_eq!(notification.content.title, "Front Door AI 分析");
+        assert_eq!(notification.source.service, "harbornas");
+        assert_eq!(notification.source.module, "task_api");
+        assert_eq!(notification.source.event_type, "task.completed");
+        assert_eq!(notification.delivery.mode, NotificationDeliveryMode::Send);
+        assert!(notification.notification_id.starts_with("notif_"));
+        assert!(notification.delivery.idempotency_key.starts_with("idem_"));
+        assert_eq!(
+            notification.notification_id,
+            replay_notification.notification_id
+        );
+        assert_eq!(
+            notification.delivery.idempotency_key,
+            replay_notification.delivery.idempotency_key
+        );
 
         let _ = fs::remove_file(admin_path);
         let _ = fs::remove_file(registry_path);
@@ -3629,6 +4574,7 @@ mod tests {
                 conversation_id: "admin-console".to_string(),
                 user_id: "local-admin".to_string(),
                 session_id: "admin-console".to_string(),
+                route_key: String::new(),
             },
             intent: TaskIntent {
                 domain: "camera".to_string(),
@@ -3640,6 +4586,7 @@ mod tests {
                 "device_id": "cam-share",
             }),
             autonomy: Default::default(),
+            message: None,
         });
 
         assert_eq!(response.status, TaskStatus::Completed);
@@ -3699,14 +4646,6 @@ mod tests {
     #[test]
     fn resolve_notification_recipient_prefers_bound_chat_id() {
         let state = AdminConsoleState {
-            bridge_provider: BridgeProviderConfig {
-                configured: true,
-                app_id: "cli_xxx".to_string(),
-                app_secret: "secret".to_string(),
-                app_name: "Harbor Bridge".to_string(),
-                bot_open_id: "ou_bot".to_string(),
-                status: "已连接".to_string(),
-            },
             identity_bindings: vec![IdentityBindingRecord {
                 open_id: "ou_demo".to_string(),
                 user_id: Some("user-1".to_string()),
@@ -3716,25 +4655,14 @@ mod tests {
             }],
             ..Default::default()
         };
-        let request = NotificationRequest {
-            channel: NotificationChannel::ImBridge,
-            destination: "家庭通知频道".to_string(),
-            title: "AI 分析".to_string(),
-            body: "检测到人员活动".to_string(),
-            payload_format: NotificationPayloadFormat::PlainText,
-            structured_payload: Value::Null,
-            attachments: Vec::new(),
-            correlation_id: Some("trace-1".to_string()),
-        };
-
         let recipient =
-            resolve_notification_recipient(&request, &state, "user-1").expect("recipient");
+            resolve_notification_recipient("家庭通知频道", &state, "user-1").expect("recipient");
 
         assert_eq!(
-            recipient.receive_id_type,
+            recipient.recipient_type,
             NotificationRecipientIdType::ChatId
         );
-        assert_eq!(recipient.receive_id, "oc_demo");
+        assert_eq!(recipient.recipient_id, "oc_demo");
     }
 
     #[test]
@@ -3754,78 +4682,69 @@ mod tests {
             last_seen_at: None,
         });
 
-        let request = NotificationRequest {
-            channel: NotificationChannel::ImBridge,
-            destination: "平台通知频道".to_string(),
-            title: "AI 分析".to_string(),
-            body: "检测到人员活动".to_string(),
-            payload_format: NotificationPayloadFormat::PlainText,
-            structured_payload: Value::Null,
-            attachments: Vec::new(),
-            correlation_id: Some("trace-1".to_string()),
-        };
-
         let recipient =
-            resolve_notification_recipient(&request, &state, "user-1").expect("recipient");
+            resolve_notification_recipient("平台通知频道", &state, "user-1").expect("recipient");
 
         assert_eq!(
-            recipient.receive_id_type,
+            recipient.recipient_type,
             NotificationRecipientIdType::ChatId
         );
-        assert_eq!(recipient.receive_id, "oc_platform");
+        assert_eq!(recipient.recipient_id, "oc_platform");
     }
 
     #[test]
-    fn deliver_notification_request_reports_failure_without_bridge_config() {
-        let admin_path = unique_path("harbornas-admin-state");
-        let registry_path = unique_path("harbornas-device-registry");
-        let conversation_path = unique_path("harbornas-task-runtime");
-        let admin_store = AdminConsoleStore::new(
-            admin_path.clone(),
-            DeviceRegistryStore::new(registry_path.clone()),
-        );
-        let conversation_store = TaskConversationStore::new(conversation_path);
-        let service = TaskApiService::new(admin_store, conversation_store);
-        let request = TaskRequest {
-            task_id: "task-notify".to_string(),
-            trace_id: "trace-notify".to_string(),
-            step_id: "step-notify".to_string(),
-            source: TaskSource {
-                channel: "im_bridge".to_string(),
-                surface: "harborbeacon".to_string(),
-                conversation_id: "chat-1".to_string(),
-                user_id: "user-1".to_string(),
-                session_id: "sess-1".to_string(),
+    fn notification_delivery_outcome_marks_rejected_requests() {
+        let request = NotificationRequest {
+            notification_id: "notif_01JABC".to_string(),
+            trace_id: "trace_01JABC".to_string(),
+            source: NotificationSource {
+                service: "harbornas".to_string(),
+                module: "task_api".to_string(),
+                event_type: "task.completed".to_string(),
             },
-            intent: TaskIntent {
-                domain: "camera".to_string(),
-                action: "analyze".to_string(),
-                raw_text: "分析门口摄像头".to_string(),
+            destination: NotificationDestination {
+                kind: NotificationDestinationKind::Conversation,
+                route_key: "gw_route_notify_fail".to_string(),
+                id: String::new(),
+                platform: String::new(),
+                recipient: None,
             },
-            entity_refs: Value::Null,
-            args: Value::Null,
-            autonomy: Default::default(),
-        };
-        let outcome = service.deliver_notification_request(
-            &request,
-            &NotificationRequest {
-                channel: NotificationChannel::ImBridge,
-                destination: "家庭通知频道".to_string(),
+            content: crate::connectors::notifications::NotificationContent {
                 title: "AI 分析".to_string(),
                 body: "检测到人员活动".to_string(),
                 payload_format: NotificationPayloadFormat::PlainText,
                 structured_payload: Value::Null,
                 attachments: Vec::new(),
-                correlation_id: Some("trace-notify".to_string()),
             },
+            delivery: NotificationDelivery {
+                mode: NotificationDeliveryMode::Send,
+                reply_to_message_id: String::new(),
+                update_message_id: String::new(),
+                idempotency_key: "idem_01JABC".to_string(),
+            },
+            metadata: NotificationMetadata {
+                correlation_id: "trace_01JABC".to_string(),
+            },
+        };
+        let outcome = notification_delivery_outcome(
+            &request,
+            Err(NotificationDeliveryError::RequestRejected {
+                status_code: 404,
+                envelope: SharedHttpErrorEnvelope {
+                    ok: false,
+                    error: SharedHttpErrorDetail {
+                        code: "ROUTE_NOT_FOUND".to_string(),
+                        message: "route expired".to_string(),
+                    },
+                    trace_id: Some("trace_01JABC".to_string()),
+                },
+            }),
         );
 
-        assert_eq!(outcome.event_type, "task.notification_failed");
-        assert_eq!(outcome.payload["status"], "failed");
-        assert!(outcome.payload["error"].is_string());
-
-        let _ = fs::remove_file(admin_path);
-        let _ = fs::remove_file(registry_path);
+        assert_eq!(outcome.event_type, "task.notification_rejected");
+        assert_eq!(outcome.payload["status"], "rejected");
+        assert_eq!(outcome.payload["http_status"], 404);
+        assert_eq!(outcome.payload["error"]["code"], "ROUTE_NOT_FOUND");
     }
 
     #[test]
@@ -3840,6 +4759,7 @@ mod tests {
                 conversation_id: "chat-1".to_string(),
                 user_id: "user-1".to_string(),
                 session_id: "sess-1".to_string(),
+                route_key: String::new(),
             },
             intent: TaskIntent {
                 domain: "camera".to_string(),
@@ -3849,6 +4769,7 @@ mod tests {
             entity_refs: Value::Null,
             args: Value::Null,
             autonomy: Default::default(),
+            message: None,
         };
         let scan_request = TaskRequest {
             task_id: "task-scan".to_string(),
@@ -3863,6 +4784,7 @@ mod tests {
             entity_refs: Value::Null,
             args: Value::Null,
             autonomy: Default::default(),
+            message: None,
         };
 
         assert!(effective_requires_approval(&connect_request));
@@ -3884,6 +4806,7 @@ mod tests {
             entity_refs: Value::Null,
             args: Value::Null,
             autonomy: Default::default(),
+            message: None,
         };
         let readonly_request = TaskRequest {
             task_id: "task-autonomy-readonly".to_string(),
@@ -3900,6 +4823,7 @@ mod tests {
             autonomy: super::TaskAutonomy {
                 level: "ReadOnly".to_string(),
             },
+            message: None,
         };
 
         assert_eq!(
@@ -3941,6 +4865,7 @@ mod tests {
                 conversation_id: "chat-1".to_string(),
                 user_id: "user-1".to_string(),
                 session_id: "sess-1".to_string(),
+                route_key: "gw_route_connect_approval".to_string(),
             },
             intent: TaskIntent {
                 domain: "camera".to_string(),
@@ -3950,6 +4875,7 @@ mod tests {
             entity_refs: Value::Null,
             args: Value::Null,
             autonomy: Default::default(),
+            message: None,
         };
 
         let response = service.handle_task(request);
@@ -4001,6 +4927,7 @@ mod tests {
                 conversation_id: "chat-1".to_string(),
                 user_id: "user-1".to_string(),
                 session_id: "sess-1".to_string(),
+                route_key: "gw_route_connect_readonly".to_string(),
             },
             intent: TaskIntent {
                 domain: "camera".to_string(),
@@ -4012,6 +4939,7 @@ mod tests {
             autonomy: super::TaskAutonomy {
                 level: "ReadOnly".to_string(),
             },
+            message: None,
         };
 
         let response = service.handle_task(request);
@@ -4066,6 +4994,7 @@ mod tests {
                 conversation_id: "chat-1".to_string(),
                 user_id: "user-1".to_string(),
                 session_id: "sess-1".to_string(),
+                route_key: "gw_route_connect_full".to_string(),
             },
             intent: TaskIntent {
                 domain: "camera".to_string(),
@@ -4082,6 +5011,7 @@ mod tests {
             autonomy: super::TaskAutonomy {
                 level: "full".to_string(),
             },
+            message: None,
         };
 
         let response = service.handle_task(request);
@@ -4141,6 +5071,7 @@ mod tests {
                 conversation_id: "chat-1".to_string(),
                 user_id: "user-1".to_string(),
                 session_id: "sess-1".to_string(),
+                route_key: "gw_route_approve_replay".to_string(),
             },
             intent: TaskIntent {
                 domain: "camera".to_string(),
@@ -4150,6 +5081,7 @@ mod tests {
             entity_refs: Value::Null,
             args: Value::Null,
             autonomy: Default::default(),
+            message: None,
         };
 
         let initial = service.handle_task(request);
@@ -4213,6 +5145,7 @@ mod tests {
                 conversation_id: "chat-1".to_string(),
                 user_id: "user-1".to_string(),
                 session_id: "sess-1".to_string(),
+                route_key: "gw_route_reject_approval".to_string(),
             },
             intent: TaskIntent {
                 domain: "camera".to_string(),
@@ -4222,6 +5155,7 @@ mod tests {
             entity_refs: Value::Null,
             args: Value::Null,
             autonomy: Default::default(),
+            message: None,
         };
 
         let initial = service.handle_task(request);
@@ -4286,6 +5220,7 @@ mod tests {
                 conversation_id: "chat-1".to_string(),
                 user_id: "user-1".to_string(),
                 session_id: "sess-1".to_string(),
+                route_key: "gw_route_task_approval".to_string(),
             },
             intent: TaskIntent {
                 domain: "camera".to_string(),
@@ -4299,6 +5234,7 @@ mod tests {
                 }
             }),
             autonomy: Default::default(),
+            message: None,
         };
 
         let response = service.handle_task(request);
@@ -4322,6 +5258,8 @@ mod tests {
             .expect("load approvals");
         assert_eq!(approvals.len(), 1);
         assert_eq!(approvals[0].status, ApprovalStatus::Pending);
+        assert_eq!(approvals[0].trace_id, "trace-approval");
+        assert_eq!(approvals[0].route_key, "gw_route_task_approval");
 
         let events = conversation_store
             .events_for_task("task-approval")
@@ -4359,6 +5297,7 @@ mod tests {
                 conversation_id: "chat-1".to_string(),
                 user_id: "user-1".to_string(),
                 session_id: "sess-1".to_string(),
+                route_key: "gw_route_unsupported".to_string(),
             },
             intent: TaskIntent {
                 domain: "system".to_string(),
@@ -4368,6 +5307,7 @@ mod tests {
             entity_refs: Value::Null,
             args: Value::Null,
             autonomy: Default::default(),
+            message: None,
         };
 
         let response = service.handle_task(request);

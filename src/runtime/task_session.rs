@@ -950,6 +950,9 @@ mod tests {
             surface: "harborbeacon".to_string(),
             conversation_id: "chat-1".to_string(),
             user_id: "user-1".to_string(),
+            route_key: "gw_route_1".to_string(),
+            last_message_id: "om_1".to_string(),
+            chat_type: "p2p".to_string(),
             state: json!({"pending_candidates": 1}),
             resume_token: Some("resume-1".to_string()),
             expires_at: None,
@@ -979,6 +982,8 @@ mod tests {
         let task_step = TaskStepRun {
             step_id: "step-1".to_string(),
             task_id: "task-1".to_string(),
+            trace_id: "trace-1".to_string(),
+            route_key: "gw_route_1".to_string(),
             domain: "camera".to_string(),
             operation: "connect".to_string(),
             route: ExecutionRoute::Local,
@@ -997,7 +1002,9 @@ mod tests {
         let artifacts = vec![ArtifactRecord {
             artifact_id: "artifact-1".to_string(),
             task_id: "task-1".to_string(),
+            trace_id: "trace-1".to_string(),
             step_id: Some("step-1".to_string()),
+            route_key: "gw_route_1".to_string(),
             artifact_kind: ArtifactKind::Json,
             label: "候选设备".to_string(),
             mime_type: "application/json".to_string(),
@@ -1041,6 +1048,9 @@ mod tests {
             surface: "harborbeacon".to_string(),
             conversation_id: "chat-1".to_string(),
             user_id: "user-1".to_string(),
+            route_key: "gw_route_state".to_string(),
+            last_message_id: "om_state".to_string(),
+            chat_type: "group".to_string(),
             state: json!({
                 "pending_candidates": [{
                     "candidate_id": "cand-1",
@@ -1079,6 +1089,9 @@ mod tests {
             surface: "harborbeacon".to_string(),
             conversation_id: "chat-1".to_string(),
             user_id: "user-1".to_string(),
+            route_key: "gw_route_envelope".to_string(),
+            last_message_id: "om_envelope".to_string(),
+            chat_type: "group".to_string(),
             state: serde_json::to_value(TaskSessionStateEnvelope {
                 schema_version: 1,
                 namespace: "task_api".to_string(),
@@ -1123,6 +1136,9 @@ mod tests {
             surface: "harborbeacon".to_string(),
             conversation_id: "chat-1".to_string(),
             user_id: "user-1".to_string(),
+            route_key: "gw_route_resume".to_string(),
+            last_message_id: "om_resume".to_string(),
+            chat_type: "group".to_string(),
             state: json!({
                 "pending_connect": {
                     "resume_token": "resume-1",
@@ -1173,6 +1189,9 @@ mod tests {
             surface: "harborbeacon".to_string(),
             conversation_id: "chat-1".to_string(),
             user_id: "user-1".to_string(),
+            route_key: "gw_route_save".to_string(),
+            last_message_id: "om_save".to_string(),
+            chat_type: "group".to_string(),
             state: Value::Null,
             resume_token: Some("resume-1".to_string()),
             expires_at: None,
@@ -1226,6 +1245,8 @@ mod tests {
         let approval = ApprovalTicket {
             approval_id: "approval-1".to_string(),
             task_id: "task-1".to_string(),
+            trace_id: "trace-1".to_string(),
+            route_key: "gw_route_1".to_string(),
             policy_ref: "camera.connect".to_string(),
             requester_user_id: "user-1".to_string(),
             approver_user_id: None,
@@ -1260,6 +1281,8 @@ mod tests {
 
         assert_eq!(approvals.len(), 1);
         assert_eq!(approvals[0].status, ApprovalStatus::Pending);
+        assert_eq!(approvals[0].trace_id, "trace-1");
+        assert_eq!(approvals[0].route_key, "gw_route_1");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "task.needs_input");
 

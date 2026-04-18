@@ -1,9 +1,16 @@
 # HarborNAS Local Agent V2 路线图与任务分配
 
-> 当前定位说明（2026-04-13）  
-> 本文档现在代表 HarborNAS Assistant / Orchestrator 的长期平台主干路线。  
-> 当前正在执行的产品落地线是 `Home Agent Hub MVP`，详见 [docs/home-agent-hub-roadmap.md](docs/home-agent-hub-roadmap.md)。  
-> 后续原则是“平台主干统一 + Home Agent Hub 作为首个垂直域入轨”，而不是两条长期并行主链路。
+> 当前定位说明（2026-04-18）  
+> 本文档当前执行线切换为 `HarborNAS x IM Gateway v1.5 cutover`。  
+> 双仓边界已经明确：IM 仓库负责 `adapter/gateway/route/平台凭据`，HarborNAS 负责 `task/business state/approval/artifact/audit`。  
+> 两边只通过 HTTP/JSON contract 通信，不互相 import，也不共享 `.harbornas/*.json`。  
+> 本仓库只负责 HarborNAS 侧工作项；IM 仓库能力只作为外部依赖与联调对象跟踪。  
+> 协作术语统一以 `HarborNAS-Harbor-Collaboration-Contract-v2` 与 `harbor-*` lane 命名为准。
+>
+> 当前进展快照（2026-04-18）  
+> 已完成：`/api/tasks` v1.5 入站对齐、`route_key/message` 持久化、审批 / artifact / audit 关联补齐、附件 transport metadata opaque 持久化、通知出站切到 IM Gateway、管理面去凭据化与 redacted status 接入。  
+> 进行中：跨仓 contract / integration / E2E 联调。  
+> 待完成：迁移期开关、回滚清单、旧路径彻底下线。
 
 ## 1. 目标重申（真实北极星）
 
@@ -30,118 +37,135 @@
 
 ## 2. V2 分阶段路线图（12 周）
 
-### Phase 0（Week 1）目标对齐与治理基线
+### Phase 0（Week 1）边界冻结与现状盘点
 
 交付物:
 
-- V2 统一术语与能力边界（orchestrator / skill / executor / audit）
-- 路由与风险策略冻结（API > CLI > Browser > MCP）
-- 发布门禁基线（contract + e2e + drift + release gate）
+- v1.5 双仓边界在 HarborNAS 侧冻结
+- HarborNAS 现有 IM 耦合点清单（直连发送、凭据校验、状态共享假设）
+- cutover 特性开关与回滚预案草案
 
 关键任务:
 
-- 冻结 V2 能力清单（P0/P1/P2）
-- 对齐现有 contract 与真实产品目标
-- 建立版本化里程碑追踪（每周评审）
+- 逐项确认 HarborNAS 只保留 `task/business state/approval/artifact/audit`
+- 盘点 `assistant_task_api`、`runtime/task_api`、`admin_console` 中的 IM 平台耦合
+- 建立 HarborNAS 侧 contract regression 基线
 
-### Phase 1（Week 2-3）Assistant 核心闭环
+### Phase 1（Week 2-3）Inbound Task Contract 对齐
 
 交付物:
 
-- 多终端统一会话入口（Web/Mobile API + IM 通道）
-- HarborBeacon IM 接入：飞书 / 企微 / Telegram / Discord / 钉钉 / Slack / MQTT 手动填凭证并校验
-- 任务状态机：`queued -> planned -> executing -> completed/failed`
-- 第一条端到端链路：IM → HarborBeacon → Planner → MiddlewareExecutor → Result
+- HarborNAS `POST /api/tasks` 对齐 v1.5 inbound contract
+- 统一支持 `X-Contract-Version: 1.5`、服务鉴权、RFC 3339 UTC
+- 非 200 错误统一为 shared error envelope
 
 关键任务:
 
-- 构建 session API 与任务持久化
-- 集成 HarborBeacon channels.py，打通 IM → 意图解析 → MCP adapter 链路
-- 规范统一任务 envelope（task_id/trace_id/executor_used/risk_level）
-- 打通 HarborOS 常见系统类动作（query/start/stop/restart）
+- 扩展 `TaskRequest`，支持 `source.route_key` 与顶层 `message` block
+- 建立基于 `task_id` 的幂等重放与冲突检测
+- 固化 `task_id/trace_id/source.route_key/message.message_id` 观测字段
+- 为 legacy 非 IM caller 保留受控兼容路径
 
-### Phase 2（Week 4-5）Skills Runtime 与智能编排
+### Phase 2（Week 4-5）Business State / Approval / Artifact / Audit 加固
 
 交付物:
 
-- Skill registry + manifest loader + schema 校验
-- Planner v1（意图拆解、依赖编排、路由候选）
-- Policy gate（高风险确认、dry-run、路径策略）
+- HarborNAS 继续作为业务会话与流程状态唯一事实源
+- `needs_input` / `resume_token` / approval / artifact / audit 全链路与 v1.5 对齐
+- 会话状态中持久化 `route_key`，但不解释其平台语义
 
 关键任务:
 
-- 定义 skill manifest 与版本策略
-- 编排器支持 DAG 与失败重试
-- 高风险动作审批流程接入
+- 将 `route_key` 纳入业务会话持久化与恢复逻辑
+- 审批、artifact、audit 记录补齐 `trace_id`、`task_id`、`route_key` 关联
+- 明确附件下载信息为 opaque transport contract，不落入 HarborNAS 平台逻辑
+- 补齐会话恢复与长任务通知场景测试
 
-### Phase 3（Week 6-8）多模态 RAG 产品化
+### Phase 3（Week 6-8）Outbound Notification Intent Cutover
 
 交付物:
 
-- 多模态 ingestion pipeline（text/image/audio/video）
-- 统一检索接口（dense+sparse+rerank）
-- Assistant 可调用 RAG skill 回答真实用户问题
+- HarborNAS 改为只生成 notification intent
+- HarborNAS 通过 HTTP 调用 IM Gateway `POST /api/notifications/deliveries`
+- HarborNAS 不再直接投递 Feishu/Telegram/其他平台消息
 
 关键任务:
 
-- 建立多模态 embedding 与索引策略
-- 建设 metadata filter 与检索评估集
-- 打通回答引用、溯源、审计记录
+- 将当前通知发送逻辑替换为 IM Gateway client
+- 对齐 `destination.route_key`、`delivery.mode`、`delivery.idempotency_key` 语义
+- 按 v1.5 处理 accepted-request delivery failure 与 non-200 request rejection
+- 增加通知链路的 contract / retry / observability 回归
 
-### Phase 4（Week 9-10）智能回退与可靠性工程
+### Phase 4（Week 9-10）管理面去凭据化与状态解耦
 
 交付物:
 
-- Route fallback engine（API->CLI->Browser->MCP）
-- 失败分类、重试策略、熔断策略
-- 可观测性面板（route ratio、失败原因、P95）
+- HarborNAS 不再保存或校验 IM 平台原始凭据
+- HarborNAS UI / setup flow 改读 IM Gateway redacted status
+- 旧桥接配置迁移方案与兼容策略明确
 
 关键任务:
 
-- route 决策日志与 replay 能力
-- drift matrix 升级为周度兼容报告
-- 关键链路压测与容量基线
+- 移除 HarborNAS 对 `app_id/app_secret/bot token` 的长期 ownership
+- 将管理台连接状态改为消费 `GET /api/gateway/status` 一类 redacted 接口
+- 清理 `bridge_provider`、凭据脚本、直连验证入口中的平台耦合
+- 固化迁移期 feature flag 与灰度开关
 
-### Phase 5（Week 11-12）Beta 发布与运营闭环
+### Phase 5（Week 11-12）联调发布与旧路径清理
 
 交付物:
 
-- V2 beta 版本（可供真实用户试用）
-- 运维手册、应急预案、回滚策略
-- 版本验收报告与下一阶段 backlog
+- HarborNAS x IM Gateway 双仓联调通过
+- cutover 清单、回滚清单、验收报告完成
+- HarborNAS 旧直连 IM 路径完成下线
 
 关键任务:
 
-- beta 用户灰度与反馈收集
-- 缺陷收敛与高优先级修复
-- V2 GA 前置清单输出
+- 执行跨仓 E2E：inbound、resume、approval、artifact、notification
+- 清理 HarborNAS 残留的 IM 运行时代码与平台凭据校验逻辑
+- 观察 cutover 后指标并收敛高优先级缺陷
+- 输出 cutover 后 backlog，把更长期的 RAG / assistant 能力重新排期
 
 ---
 
-## 3. 任务分配（按工作流，不按文件）
+## 3. 任务分配（按 `harbor-*` lane，不按文件）
 
-## 3.1 角色定义
+## 3.1 当前 lane 定义
 
-- 架构/编排负责人（A）
-- 平台/数据负责人（B）
-- 可靠性/安全/QA 负责人（C）
-- PM（P）
+- `harbor-architect`
+  跨 lane 边界治理、cutover 节奏、发布/回滚 gate、最终验收。
+- `harbor-framework`
+  HarborNAS 共享 runtime、北向 contract、task/business state、approval、artifact、audit、本地推理、账号与智能编排。
+- `harbor-im-gateway`
+  外部 IM 仓库 owner，负责 adapter/gateway/route/平台凭据/outbound delivery；在本仓库中主要作为 contract 与联调协作者出现。
+- `harbor-hos-control`
+  HarborOS System Domain owner，负责 `Middleware API -> MidCLI -> Browser/MCP fallback` 这一条系统域 southbound。
+- `harbor-aiot`
+  Home Device Domain owner，负责 camera / AIoT / LAN device 的南向协议与控制，不与 HarborOS system control 混同。
+
+当前阶段补充说明:
+
+- HarborNAS 仓库内当前主实施 owner 默认是 `harbor-framework`。
+- 只有涉及跨 lane 边界、cutover 策略或发布 gate 时，`harbor-architect` 才作为批准与仲裁 owner 介入。
+- `harbor-im-gateway` 在本表中出现时，表示外部协作与联调责任，不表示本仓库会直接实现 IM 仓库代码。
 
 ## 3.2 RACI（核心工作包）
 
 | 工作包 | R | A | C | I |
 |---|---|---|---|---|
-| HarborBeacon IM 通道接入 | B | A | C,P | 全员 |
-| Assistant 会话与任务状态机 | B | A | C,P | 全员 |
-| Planner 与路由策略 | A | A | B,C | P |
-| MiddlewareExecutor | A | A | B,C | P |
-| MidCLIExecutor | B | A | C | P |
-| Browser/MCP fallback | B | A | C | P |
-| Skills registry/runtime | B | A | C | P |
-| 多模态 RAG pipeline | B | A | C | P |
-| 风险门禁（审批/dry-run/path policy） | C | A | B | P |
-| 可观测性与审计 | C | A | B | P |
-| CI/CD 门禁与发布 | C | A | B,P | 全员 |
+| v1.5 contract 治理与兼容性 | `harbor-framework` | `harbor-architect` | `harbor-im-gateway` | 全员 |
+| `assistant_task_api` 入站 contract 改造 | `harbor-framework` | `harbor-architect` | `harbor-im-gateway` | 全员 |
+| 业务会话 / approval / artifact / audit | `harbor-framework` | `harbor-architect` | `harbor-im-gateway` | 全员 |
+| 通知意图与 IM Gateway client | `harbor-framework` | `harbor-architect` | `harbor-im-gateway` | 全员 |
+| 管理台去凭据化与状态解耦 | `harbor-framework` | `harbor-architect` | `harbor-im-gateway` | 全员 |
+| Planner 与路由策略 | `harbor-framework` | `harbor-architect` | `harbor-hos-control`, `harbor-aiot` | `harbor-im-gateway` |
+| MiddlewareExecutor | `harbor-hos-control` | `harbor-architect` | `harbor-framework` | `harbor-im-gateway`, `harbor-aiot` |
+| MidCLIExecutor | `harbor-hos-control` | `harbor-architect` | `harbor-framework` | `harbor-im-gateway`, `harbor-aiot` |
+| Browser/MCP fallback | `harbor-hos-control` | `harbor-architect` | `harbor-framework` | `harbor-im-gateway`, `harbor-aiot` |
+| Skills registry/runtime | `harbor-framework` | `harbor-architect` | `harbor-hos-control`, `harbor-aiot` | `harbor-im-gateway` |
+| 多模态 RAG pipeline | `harbor-framework` | `harbor-architect` | `harbor-aiot`, `harbor-hos-control` | `harbor-im-gateway` |
+| 可观测性与审计 | `harbor-framework` | `harbor-architect` | `harbor-im-gateway`, `harbor-hos-control`, `harbor-aiot` | 全员 |
+| CI/CD 门禁与发布 | `harbor-architect` | `harbor-architect` | `harbor-framework`, `harbor-im-gateway`, `harbor-hos-control`, `harbor-aiot` | 全员 |
 
 ---
 
@@ -163,44 +187,45 @@
 
 ### M1（Week 3）
 
-- 用户能通过 IM 通道（飞书/企微/Telegram 等） → HarborBeacon → 统一入口触发 HarborOS 系统类操作
-- 审计字段完整：`task_id`、`trace_id`、`executor_used`
+- HarborNAS `POST /api/tasks` 可接受 v1.5 IM Gateway request
+- `source.route_key`、`message.message_id`、`task_id`、`trace_id` 均可被正确校验与记录
+- 非 200 请求错误统一为 shared error envelope
 - 核心回归测试通过
 
 ### M2（Week 5）
 
-- Skills runtime 可加载/执行/隔离技能
-- Planner 可输出结构化计划并执行
-- 高风险操作必须确认
+- HarborNAS 继续独占 business session / resumable workflow / approval / artifact / audit 真相
+- `needs_input`、`resume_token`、审批恢复链路可稳定工作
+- 高风险操作仍必须确认，且审批结果与任务审计可关联回溯
 
 ### M3（Week 8）
 
-- 多模态 RAG 可在真实文件上稳定工作
-- 检索质量达标（有基准集和报告）
-- Assistant 回答含来源引用
+- HarborNAS 只向 IM Gateway 发 notification intent，不再直接触达平台
+- `route_key` 仅作为写入型路由元数据使用，不承载平台语义
+- 通知链路支持 accepted-request delivery failure 与 retry 语义
 
 ### M4（Week 10）
 
-- fallback 链路可观测、可复现、可解释
-- midcli-only 场景不阻断发布（按降级策略）
-- 关键链路 P95 可控
+- HarborNAS 管理面不再长期保存或校验 IM 原始凭据
+- 连接状态改由 IM Gateway redacted status 提供
+- 迁移期特性开关、灰度与回滚策略可用
 
 ### M5（Week 12）
 
-- beta 版对外可用
-- 运行手册与回滚策略完备
-- 发布评审通过
+- 双仓 cutover 联调完成且核心回归通过
+- HarborNAS 旧直连 IM 路径与残留平台凭据校验逻辑清理完成
+- 发布评审通过，cutover 后 backlog 明确
 
 ---
 
 ## 6. V2 KPI（发布门禁）
 
-1. HarborOS 领域任务 API 路由占比 >= 70%
-2. fallback 成功率 >= 95%
-3. 高风险确认覆盖率 = 100%
-4. 任务成功率 >= 95%（排除外部依赖故障）
-5. 编排启动 P95 <= 2s
-6. 回归通过率 >= 98%
+1. HarborNAS 侧 v1.5 contract 回归通过率 = 100%
+2. `task_id` 幂等重放与冲突检测覆盖率 = 100%
+3. 业务会话 / approval / artifact / audit 真相仍全部落在 HarborNAS
+4. HarborNAS 直连平台消息投递次数在 cutover 后 = 0
+5. HarborNAS 持有原始 IM 平台凭据数量在 cutover 后 = 0
+6. 双仓联调回归通过率 >= 98%
 
 ---
 
@@ -208,18 +233,19 @@
 
 P0:
 
-1. 完成 HarborBeacon IM 接入 → Assistant 主链路闭环（IM → HarborBeacon → Planner → API executor）
-2. 固化 skill manifest 与运行时约束
-3. 完成多模态 RAG 最小可用链路（text + image）
+1. 完成 `POST /api/tasks` 的 v1.5 入站对齐：`message`、`route_key`、鉴权、版本头、幂等、错误信封
+2. 固化 HarborNAS 作为 business state / approval / artifact / audit 的唯一事实源
+3. 将通知链路改为 HarborNAS → IM Gateway HTTP intent，停止 HarborNAS 直连平台发送
+4. 推进管理台去凭据化，移除 HarborNAS 对 IM 原始凭据的长期 ownership
 
 P1:
 
-1. 补齐 audio/video ingestion
-2. 强化 fallback 可观测与自动化分析
-3. 建立 beta 用户反馈闭环
+1. 补齐双仓 contract / E2E / observability 回归
+2. 清理 HarborNAS 内残留 HarborBeacon / Feishu / 直连 IM 代码路径
+3. 为 cutover 增加灰度、特性开关与回滚开关
 
 P2:
 
-1. Browser/MCP 场景深度优化
-2. 编排策略自适应优化
-3. 成本优化与缓存层强化
+1. cutover 稳定后再恢复更长期的 RAG / assistant backlog
+2. Browser/MCP fallback 场景继续优化
+3. 编排策略、成本与缓存层按 cutover 后优先级重排

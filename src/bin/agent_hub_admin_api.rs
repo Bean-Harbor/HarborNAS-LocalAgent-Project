@@ -122,10 +122,7 @@ struct DefaultsRequest {
 }
 
 #[derive(Debug, Deserialize)]
-struct BridgeConfigRequest {
-    app_id: String,
-    app_secret: String,
-}
+struct BridgeConfigRequest {}
 
 #[derive(Debug, Deserialize, Default)]
 struct ApprovalDecisionRequest {
@@ -791,11 +788,12 @@ impl AdminApi {
             Err(error) => return error_json(StatusCode(400), &error),
         };
 
-        match self.hub().configure_bridge_provider(
-            &body.app_id,
-            &body.app_secret,
-            Some(&self.public_origin),
-        ) {
+        let _ = body;
+
+        match self
+            .hub()
+            .refresh_bridge_provider_status(Some(&self.public_origin))
+        {
             Ok(payload) => ok_json(&payload),
             Err(error) => error_json(StatusCode(422), &error),
         }
@@ -1358,6 +1356,7 @@ impl AdminApi {
                 conversation_id: format!("admin-console:{}", principal.user_id),
                 user_id: principal.user_id.clone(),
                 session_id: format!("admin-console:{}", principal.user_id),
+                route_key: String::new(),
             },
             intent: TaskIntent {
                 domain: "camera".to_string(),
@@ -1367,6 +1366,7 @@ impl AdminApi {
             entity_refs: Value::Null,
             args,
             autonomy: Default::default(),
+            message: None,
         }
     }
 }
@@ -1564,12 +1564,28 @@ fn render_mobile_setup_page(
     static_setup_url: &str,
     session_code: &str,
 ) -> String {
-    let app_id = html_escape(&state.bridge_provider.app_id);
     let bot_name = if state.bridge_provider.app_name.trim().is_empty() {
         "尚未配置".to_string()
     } else {
         html_escape(&state.bridge_provider.app_name)
     };
+    let platform = if state.bridge_provider.platform.trim().is_empty() {
+        "未配置".to_string()
+    } else {
+        html_escape(&state.bridge_provider.platform)
+    };
+    let gateway_url = if state.bridge_provider.gateway_base_url.trim().is_empty() {
+        "尚未配置".to_string()
+    } else {
+        html_escape(&state.bridge_provider.gateway_base_url)
+    };
+    let capability_summary = format!(
+        "reply={} / update={} / attachments={}",
+        yes_no(state.bridge_provider.capabilities.reply),
+        yes_no(state.bridge_provider.capabilities.update),
+        yes_no(state.bridge_provider.capabilities.attachments)
+    );
+    let capability_summary = html_escape(&capability_summary);
     let status = html_escape(&state.binding.metric);
     let session_code = html_escape(session_code);
     let setup_url = html_escape(setup_url);
@@ -1580,7 +1596,7 @@ fn render_mobile_setup_page(
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>HarborNAS IM Bridge 配置</title>
+  <title>HarborNAS IM Gateway 状态</title>
   <style>
     body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #f4efe7; color: #1e1b18; margin: 0; }}
     .wrap {{ max-width: 560px; margin: 0 auto; padding: 24px 18px 40px; }}
@@ -1601,21 +1617,20 @@ fn render_mobile_setup_page(
   <div class="wrap">
     <div class="card">
       <div class="meta">HarborNAS Agent Hub · 手机配置页</div>
-      <h1>配置消息桥接 Provider</h1>
-      <p>在这台手机上填入外部消息桥接应用的 <code>app_id</code> 和 <code>app_secret</code>。保存成功后，这台 Agent Hub 就能记录统一的 bridge/provider 凭据。</p>
+      <h1>查看 IM Gateway 状态</h1>
+      <p>HarborNAS 不再保存平台侧 <code>app_id</code> / <code>app_secret</code>。这个页面只会让 HarborNAS 后端去读取 IM Gateway 的脱敏状态，并同步显示连接结果。</p>
       <div class="status">
         <div><strong>当前状态：</strong><span id="status-text">{status}</span></div>
         <div><strong>当前会话：</strong>{session_code}</div>
-        <div><strong>已连接 Provider：</strong><span id="bot-name">{bot_name}</span></div>
+        <div><strong>连接显示名：</strong><span id="bot-name">{bot_name}</span></div>
+        <div><strong>平台：</strong><span id="platform-name">{platform}</span></div>
+        <div><strong>Gateway：</strong><span id="gateway-url">{gateway_url}</span></div>
+        <div><strong>能力：</strong><span id="capabilities">{capability_summary}</span></div>
       </div>
       <p class="hint">当前打开的是本地配置入口：<code>{setup_url}</code></p>
-      <label for="app-id">App ID</label>
-      <input id="app-id" value="{app_id}" autocomplete="off" />
-      <label for="app-secret">App Secret</label>
-      <input id="app-secret" type="password" value="" autocomplete="off" placeholder="为安全起见，这里不会回显已保存的 secret" />
-      <button id="submit-btn">保存并验证 Bridge 连接</button>
-      <p class="hint">保存时会立即校验兼容桥接凭证，并读取应用信息。当前实现仍按飞书 Open API 做兼容验证。成功后桌面端后台会同步显示“Bridge 已连接”。你也可以把这台机器上贴的静态二维码固定为 <code>{static_setup_url}</code>。</p>
-      <p class="hint">如果当前已经配过 bridge provider，但你没有要更换凭证，请不要把空白的 secret 直接提交；这里不会显示历史 secret，是为了避免硬件二维码泄露后被他人看到现有密钥。</p>
+      <button id="submit-btn">刷新 Gateway 状态</button>
+      <p class="hint">点击后，HarborNAS 会使用服务端配置的 IM Gateway 地址与服务 token 访问 <code>GET /api/gateway/status</code>。返回结果必须是脱敏状态，不会把原始平台凭据写进 HarborNAS。</p>
+      <p class="hint">如果这里刷新失败，请检查 HarborNAS 机器上的 <code>HARBOR_IM_GATEWAY_BASE_URL</code> 和 <code>HARBOR_IM_GATEWAY_BEARER_TOKEN</code>，以及 IM Gateway 是否已实现推荐的状态接口。静态配置页仍然可以固定在 <code>{static_setup_url}</code>。</p>
       <p id="result" class="hint"></p>
     </div>
   </div>
@@ -1623,24 +1638,25 @@ fn render_mobile_setup_page(
     document.getElementById('submit-btn').addEventListener('click', async () => {{
       const result = document.getElementById('result');
       result.className = 'hint';
-      result.textContent = '正在验证 bridge 凭证...';
+      result.textContent = '正在刷新 IM Gateway 状态...';
       try {{
         const response = await fetch('/api/bridge/configure', {{
           method: 'POST',
           headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{
-            app_id: document.getElementById('app-id').value.trim(),
-            app_secret: document.getElementById('app-secret').value.trim()
-          }})
+          body: JSON.stringify({{}})
         }});
         const payload = await response.json();
         if (!response.ok) {{
-          throw new Error(payload.error || '保存失败');
+          throw new Error(payload.error || '刷新失败');
         }}
-        document.getElementById('status-text').textContent = payload.binding.metric || 'Bridge 已连接';
-        document.getElementById('bot-name').textContent = payload.bridge_provider?.app_name || '已连接';
+        document.getElementById('status-text').textContent = payload.binding.metric || 'Gateway 在线';
+        document.getElementById('bot-name').textContent = payload.bridge_provider?.app_name || '未配置';
+        document.getElementById('platform-name').textContent = payload.bridge_provider?.platform || '未配置';
+        document.getElementById('gateway-url').textContent = payload.bridge_provider?.gateway_base_url || '尚未配置';
+        const caps = payload.bridge_provider?.capabilities || {{}};
+        document.getElementById('capabilities').textContent = `reply=${{caps.reply ? 'yes' : 'no'}} / update=${{caps.update ? 'yes' : 'no'}} / attachments=${{caps.attachments ? 'yes' : 'no'}}`;
         result.className = 'hint ok';
-        result.textContent = 'Bridge provider 已验证成功，后台已经记录了统一 provider 凭据。';
+        result.textContent = 'IM Gateway 状态已刷新，HarborNAS 只保存了脱敏状态。';
       }} catch (error) {{
         result.className = 'hint err';
         result.textContent = error.message;
@@ -2075,6 +2091,14 @@ fn html_escape(value: &str) -> String {
     escaped
 }
 
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
 fn qr_to_svg(qr: &QrCode, border: i32) -> String {
     let size = qr.size();
     let dimension = size + border * 2;
@@ -2344,7 +2368,9 @@ fn redact_state_snapshot(mut state: StateResponse) -> StateResponse {
 }
 
 fn redact_bridge_provider_config(mut config: BridgeProviderConfig) -> BridgeProviderConfig {
+    config.app_id.clear();
     config.app_secret.clear();
+    config.bot_open_id.clear();
     config
 }
 
@@ -2685,14 +2711,26 @@ mod tests {
         let redacted = redact_bridge_provider_config(
             harbornas_local_agent::runtime::admin_console::BridgeProviderConfig {
                 configured: true,
+                connected: true,
+                platform: "feishu".to_string(),
+                gateway_base_url: "http://gateway.local:4180".to_string(),
                 app_id: "cli_xxx".to_string(),
                 app_secret: "super-secret".to_string(),
                 app_name: "HarborNAS Bot".to_string(),
                 bot_open_id: "ou_xxx".to_string(),
                 status: "已连接".to_string(),
+                last_checked_at: "2026-04-18T10:00:00Z".to_string(),
+                capabilities:
+                    harbornas_local_agent::runtime::admin_console::BridgeProviderCapabilities {
+                        reply: true,
+                        update: true,
+                        attachments: true,
+                    },
             },
         );
+        assert_eq!(redacted.app_id, "");
         assert_eq!(redacted.app_secret, "");
+        assert_eq!(redacted.bot_open_id, "");
     }
 
     #[test]

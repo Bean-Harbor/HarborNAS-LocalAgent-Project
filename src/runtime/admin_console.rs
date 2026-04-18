@@ -23,6 +23,9 @@ use crate::control_plane::users::{
 };
 use crate::runtime::registry::{CameraDevice, DeviceRegistryStore};
 
+const DEFAULT_BINDING_CHANNEL_LABEL: &str = "Harbor IM Gateway";
+const DEFAULT_PROVIDER_ACCOUNT_DISPLAY_NAME: &str = "Harbor IM Gateway";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AdminBindingState {
     pub status: String,
@@ -46,7 +49,7 @@ impl Default for AdminBindingState {
             status: "等待扫码".to_string(),
             metric: "等待绑定".to_string(),
             bound_user: None,
-            channel: "Harbor IM Bridge".to_string(),
+            channel: DEFAULT_BINDING_CHANNEL_LABEL.to_string(),
             session_code: session_code.clone(),
             qr_token: generate_qr_token(&session_code),
             setup_url: String::new(),
@@ -56,9 +59,25 @@ impl Default for AdminBindingState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BridgeProviderCapabilities {
+    #[serde(default)]
+    pub reply: bool,
+    #[serde(default)]
+    pub update: bool,
+    #[serde(default)]
+    pub attachments: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct BridgeProviderConfig {
     #[serde(default)]
     pub configured: bool,
+    #[serde(default)]
+    pub connected: bool,
+    #[serde(default)]
+    pub platform: String,
+    #[serde(default)]
+    pub gateway_base_url: String,
     #[serde(default)]
     pub app_id: String,
     #[serde(default)]
@@ -69,6 +88,10 @@ pub struct BridgeProviderConfig {
     pub bot_open_id: String,
     #[serde(default)]
     pub status: String,
+    #[serde(default)]
+    pub last_checked_at: String,
+    #[serde(default)]
+    pub capabilities: BridgeProviderCapabilities,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -184,7 +207,6 @@ const DEFAULT_WORKSPACE_OWNER_ID: &str = "local-owner";
 const LOCAL_RTSP_PROVIDER_ACCOUNT_ID: &str = "provider-local-rtsp";
 const LOCAL_RTSP_CREDENTIAL_ID: &str = "credential-local-rtsp-password";
 const BRIDGE_PROVIDER_ACCOUNT_ID: &str = "provider-im-bridge";
-const BRIDGE_APP_SECRET_CREDENTIAL_ID: &str = "credential-im-bridge-app-secret";
 const DEFAULT_RECORDING_POLICY_ID: &str = "recording-policy-default";
 
 impl AdminConsoleStore {
@@ -420,18 +442,28 @@ impl AdminConsoleStore {
         Ok(resolved_remote_view_config(&state))
     }
 
-    pub fn save_bridge_provider_config(
+    pub fn save_bridge_provider_status(
         &self,
         config: BridgeProviderConfig,
     ) -> Result<AdminConsoleState, String> {
         let mut state = self.load_or_create_state()?;
         state.bridge_provider = sanitize_bridge_provider_config(config);
-        if state.bridge_provider.configured {
-            state.binding.status = "Bridge 已配置".to_string();
-            state.binding.metric = "Bridge 已连接".to_string();
-            if !state.bridge_provider.app_name.trim().is_empty() {
-                state.binding.bound_user = Some(state.bridge_provider.app_name.clone());
-            }
+        if state.bridge_provider.connected {
+            state.binding.status = "Gateway 已连接".to_string();
+            state.binding.metric = "Gateway 在线".to_string();
+        } else if state.bridge_provider.configured {
+            state.binding.status = "Gateway 已启用".to_string();
+            state.binding.metric = "Gateway 未连通".to_string();
+        } else {
+            state.binding.status = "等待 Gateway".to_string();
+            state.binding.metric = "Gateway 未配置".to_string();
+        }
+        if !state.bridge_provider.app_name.trim().is_empty() {
+            state.binding.bound_user = Some(state.bridge_provider.app_name.clone());
+        } else if !state.bridge_provider.platform.trim().is_empty() {
+            state.binding.bound_user = Some(format!("{} gateway", state.bridge_provider.platform));
+        } else {
+            state.binding.bound_user = None;
         }
 
         state
@@ -444,14 +476,6 @@ impl AdminConsoleStore {
             state.platform.identity_bindings.len(),
         ) {
             upsert_provider_account(&mut state.platform.provider_accounts, provider);
-        }
-
-        state
-            .platform
-            .credentials
-            .retain(|credential| credential.credential_id != BRIDGE_APP_SECRET_CREDENTIAL_ID);
-        if let Some(credential) = build_bridge_secret_credential(&state.bridge_provider) {
-            upsert_credential(&mut state.platform.credentials, credential);
         }
 
         if let Some(workspace) = preferred_workspace_mut(&mut state.platform) {
@@ -537,7 +561,7 @@ pub fn sanitize_binding(mut binding: AdminBindingState) -> AdminBindingState {
         binding.metric = "等待绑定".to_string();
     }
     if binding.channel.trim().is_empty() {
-        binding.channel = "Harbor IM Bridge".to_string();
+        binding.channel = DEFAULT_BINDING_CHANNEL_LABEL.to_string();
     }
     if let Some(token_code) = normalize_binding_code(&binding.qr_token) {
         if binding.session_code.trim().is_empty() || binding.session_code != token_code {
@@ -556,9 +580,18 @@ pub fn sanitize_binding(mut binding: AdminBindingState) -> AdminBindingState {
 }
 
 pub fn sanitize_bridge_provider_config(mut config: BridgeProviderConfig) -> BridgeProviderConfig {
+    config.app_id.clear();
+    config.app_secret.clear();
+    config.bot_open_id.clear();
+    config.platform = config.platform.trim().to_string();
+    config.gateway_base_url = config.gateway_base_url.trim().to_string();
+    config.app_name = config.app_name.trim().to_string();
+    config.last_checked_at = config.last_checked_at.trim().to_string();
     if config.status.trim().is_empty() {
-        config.status = if config.configured {
+        config.status = if config.connected {
             "已连接".to_string()
+        } else if config.configured {
+            "已启用，待连接".to_string()
         } else {
             "未配置".to_string()
         };
@@ -687,27 +720,48 @@ fn apply_provider_projections_to_legacy(state: &mut AdminConsoleState) {
         .iter()
         .find(|provider| provider.provider_account_id == BRIDGE_PROVIDER_ACCOUNT_ID)
     {
-        state.bridge_provider.configured = bridge_provider.status == ProviderAccountStatus::Active;
-        assign_string(
-            &mut state.bridge_provider.bot_open_id,
-            bridge_provider.capabilities.get("bot_open_id"),
-        );
+        state.bridge_provider.connected = bridge_provider.status == ProviderAccountStatus::Active;
+        state.bridge_provider.configured =
+            !matches!(bridge_provider.status, ProviderAccountStatus::Disabled);
         assign_string(
             &mut state.defaults.notification_channel,
             bridge_provider.capabilities.get("channel"),
         );
         assign_string(
-            &mut state.bridge_provider.app_id,
-            bridge_provider.metadata.get("app_id"),
+            &mut state.bridge_provider.platform,
+            bridge_provider.metadata.get("platform"),
         );
         assign_string(
             &mut state.bridge_provider.app_name,
-            bridge_provider.metadata.get("app_name"),
+            bridge_provider.metadata.get("display_name"),
         );
         assign_string(
             &mut state.bridge_provider.status,
             bridge_provider.metadata.get("status"),
         );
+        assign_string(
+            &mut state.bridge_provider.gateway_base_url,
+            bridge_provider.metadata.get("gateway_base_url"),
+        );
+        assign_string(
+            &mut state.bridge_provider.last_checked_at,
+            bridge_provider.metadata.get("last_checked_at"),
+        );
+        state.bridge_provider.capabilities.reply = bridge_provider
+            .capabilities
+            .get("reply")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        state.bridge_provider.capabilities.update = bridge_provider
+            .capabilities
+            .get("update")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        state.bridge_provider.capabilities.attachments = bridge_provider
+            .capabilities
+            .get("attachments")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     }
 
     if let Some(local_rtsp_credential) = state
@@ -727,18 +781,6 @@ fn apply_provider_projections_to_legacy(state: &mut AdminConsoleState) {
         {
             state.defaults.rtsp_port = port as u16;
         }
-    }
-
-    if let Some(bridge_secret_credential) = state
-        .platform
-        .credentials
-        .iter()
-        .find(|credential| credential.credential_id == BRIDGE_APP_SECRET_CREDENTIAL_ID)
-    {
-        assign_string(
-            &mut state.bridge_provider.app_id,
-            bridge_secret_credential.scope.get("app_id"),
-        );
     }
 }
 
@@ -850,10 +892,9 @@ fn sync_platform_from_legacy(state: &AdminConsoleState) -> AdminPlatformState {
         .provider_accounts
         .extend(build_provider_accounts(state));
 
-    platform.credentials.retain(|credential| {
-        credential.credential_id != LOCAL_RTSP_CREDENTIAL_ID
-            && credential.credential_id != BRIDGE_APP_SECRET_CREDENTIAL_ID
-    });
+    platform
+        .credentials
+        .retain(|credential| credential.credential_id != LOCAL_RTSP_CREDENTIAL_ID);
     platform.credentials.extend(build_credentials(state));
 
     platform
@@ -896,17 +937,6 @@ fn upsert_provider_account(providers: &mut Vec<ProviderAccount>, provider: Provi
         *existing = provider;
     } else {
         providers.push(provider);
-    }
-}
-
-fn upsert_credential(credentials: &mut Vec<CredentialRecord>, credential: CredentialRecord) {
-    if let Some(existing) = credentials
-        .iter_mut()
-        .find(|existing| existing.credential_id == credential.credential_id)
-    {
-        *existing = credential;
-    } else {
-        credentials.push(credential);
     }
 }
 
@@ -1226,7 +1256,11 @@ fn build_bridge_provider_account(
     notification_channel: &str,
     bound_users: usize,
 ) -> Option<ProviderAccount> {
-    if !config.configured && config.app_id.trim().is_empty() {
+    if !config.configured
+        && !config.connected
+        && config.app_name.trim().is_empty()
+        && config.gateway_base_url.trim().is_empty()
+    {
         return None;
     }
 
@@ -1235,23 +1269,29 @@ fn build_bridge_provider_account(
         workspace_id: DEFAULT_WORKSPACE_ID.to_string(),
         provider_key: "im_bridge".to_string(),
         provider_kind: ProviderKind::Bridge,
-        display_name: "Harbor IM Bridge".to_string(),
+        display_name: DEFAULT_PROVIDER_ACCOUNT_DISPLAY_NAME.to_string(),
         owner_scope: ProviderOwnerScope::Workspace,
         owner_user_id: None,
-        status: if config.configured {
+        status: if config.connected {
             ProviderAccountStatus::Active
-        } else {
+        } else if config.configured {
             ProviderAccountStatus::NeedsReauth
+        } else {
+            ProviderAccountStatus::Disabled
         },
         capabilities: json!({
-            "bot_open_id": config.bot_open_id.clone(),
             "channel": notification_channel,
             "bound_users": bound_users,
+            "reply": config.capabilities.reply,
+            "update": config.capabilities.update,
+            "attachments": config.capabilities.attachments,
         }),
         metadata: json!({
-            "app_id": config.app_id.clone(),
-            "app_name": config.app_name.clone(),
+            "platform": config.platform.clone(),
+            "display_name": config.app_name.clone(),
             "status": config.status.clone(),
+            "gateway_base_url": config.gateway_base_url.clone(),
+            "last_checked_at": config.last_checked_at.clone(),
         }),
     })
 }
@@ -1463,32 +1503,7 @@ fn build_credentials(state: &AdminConsoleState) -> Vec<CredentialRecord> {
             }),
         });
     }
-    if let Some(credential) = build_bridge_secret_credential(&state.bridge_provider) {
-        credentials.push(credential);
-    }
     credentials
-}
-
-fn build_bridge_secret_credential(config: &BridgeProviderConfig) -> Option<CredentialRecord> {
-    if config.app_secret.trim().is_empty() {
-        return None;
-    }
-
-    Some(CredentialRecord {
-        credential_id: BRIDGE_APP_SECRET_CREDENTIAL_ID.to_string(),
-        provider_account_id: BRIDGE_PROVIDER_ACCOUNT_ID.to_string(),
-        credential_kind: CredentialKind::ApiKey,
-        vault_key: "admin_console.bridge_provider.app_secret".to_string(),
-        scope: json!({
-            "app_id": config.app_id.clone(),
-        }),
-        expires_at: None,
-        rotation_state: CredentialRotationState::Valid,
-        last_verified_at: None,
-        metadata: json!({
-            "configured": config.configured,
-        }),
-    })
 }
 
 fn build_recording_policy(state: &AdminConsoleState) -> RecordingPolicy {
@@ -1711,10 +1726,10 @@ mod tests {
     use super::{
         build_platform_state, dedupe_rtsp_paths, derive_rtsp_hints, normalize_binding_code,
         normalize_loaded_admin_state, parse_rtsp_auth, parse_rtsp_path,
-        resolved_identity_binding_records, resolved_remote_view_config, AdminConsoleStore,
-        AdminDefaults, BridgeProviderConfig, IdentityBindingRecord, RemoteViewConfig,
-        BRIDGE_APP_SECRET_CREDENTIAL_ID, BRIDGE_PROVIDER_ACCOUNT_ID, LOCAL_RTSP_CREDENTIAL_ID,
-        LOCAL_RTSP_PROVIDER_ACCOUNT_ID,
+        resolved_identity_binding_records, resolved_remote_view_config,
+        sanitize_bridge_provider_config, AdminConsoleStore, AdminDefaults,
+        BridgeProviderCapabilities, BridgeProviderConfig, IdentityBindingRecord, RemoteViewConfig,
+        BRIDGE_PROVIDER_ACCOUNT_ID, LOCAL_RTSP_CREDENTIAL_ID, LOCAL_RTSP_PROVIDER_ACCOUNT_ID,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -1976,52 +1991,86 @@ mod tests {
     }
 
     #[test]
-    fn save_bridge_provider_config_returns_updated_platform_projection() {
+    fn save_bridge_provider_status_returns_updated_platform_projection() {
         let registry_path = temp_path("registry-bridge");
         let admin_path = temp_path("admin-bridge");
         let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
         let store = AdminConsoleStore::new(admin_path.clone(), registry);
 
         let updated = store
-            .save_bridge_provider_config(BridgeProviderConfig {
+            .save_bridge_provider_status(BridgeProviderConfig {
                 configured: true,
-                app_id: "cli_a1".to_string(),
-                app_secret: "secret".to_string(),
-                app_name: "HarborNAS".to_string(),
-                bot_open_id: "ou_bot".to_string(),
+                connected: true,
+                platform: "feishu".to_string(),
+                gateway_base_url: "http://gateway.local:4180".to_string(),
+                app_name: "HarborNAS Bot".to_string(),
                 status: "已连接".to_string(),
+                last_checked_at: "2026-04-18T10:00:00Z".to_string(),
+                capabilities: BridgeProviderCapabilities {
+                    reply: true,
+                    update: true,
+                    attachments: true,
+                },
+                ..Default::default()
             })
-            .expect("save bridge provider");
+            .expect("save bridge provider status");
 
-        assert_eq!(updated.binding.metric, "Bridge 已连接");
-        assert_eq!(updated.binding.bound_user.as_deref(), Some("HarborNAS"));
+        assert_eq!(updated.binding.metric, "Gateway 在线");
+        assert_eq!(updated.binding.bound_user.as_deref(), Some("HarborNAS Bot"));
         assert!(updated.platform.provider_accounts.iter().any(|provider| {
             provider.provider_account_id == BRIDGE_PROVIDER_ACCOUNT_ID
-                && provider.metadata["app_id"] == json!("cli_a1")
+                && provider.metadata["platform"] == json!("feishu")
+                && provider.metadata["display_name"] == json!("HarborNAS Bot")
         }));
-        assert!(updated.platform.credentials.iter().any(|credential| {
-            credential.credential_id == BRIDGE_APP_SECRET_CREDENTIAL_ID
-                && credential.vault_key == "admin_console.bridge_provider.app_secret"
-        }));
+        assert!(updated.platform.credentials.is_empty());
 
         let reloaded = store.load_or_create_state().expect("reload");
-        assert_eq!(reloaded.bridge_provider.app_id, "cli_a1");
-        assert_eq!(reloaded.bridge_provider.app_name, "HarborNAS");
+        assert_eq!(reloaded.bridge_provider.app_name, "HarborNAS Bot");
+        assert_eq!(
+            reloaded.bridge_provider.gateway_base_url,
+            "http://gateway.local:4180"
+        );
+        assert_eq!(reloaded.bridge_provider.app_secret, "");
+        assert_eq!(reloaded.bridge_provider.bot_open_id, "");
 
         let _ = std::fs::remove_file(admin_path);
         let _ = std::fs::remove_file(registry_path);
     }
 
     #[test]
-    fn platform_projection_adds_bridge_provider_and_secret_metadata() {
+    fn sanitize_bridge_provider_status_keeps_platform_empty_without_feishu_fallback() {
+        let sanitized = sanitize_bridge_provider_config(BridgeProviderConfig {
+            configured: false,
+            connected: false,
+            platform: "   ".to_string(),
+            gateway_base_url: "  http://gateway.local:4180  ".to_string(),
+            app_name: "  HarborNAS Bot  ".to_string(),
+            ..Default::default()
+        });
+
+        assert_eq!(sanitized.platform, "");
+        assert_eq!(sanitized.gateway_base_url, "http://gateway.local:4180");
+        assert_eq!(sanitized.app_name, "HarborNAS Bot");
+        assert_eq!(sanitized.status, "未配置");
+    }
+
+    #[test]
+    fn platform_projection_adds_bridge_provider_without_secret_metadata() {
         let mut state = super::AdminConsoleState::default();
         state.bridge_provider = BridgeProviderConfig {
             configured: true,
-            app_id: "cli_a1".to_string(),
-            app_secret: "secret".to_string(),
-            app_name: "HarborNAS".to_string(),
-            bot_open_id: "ou_bot".to_string(),
+            connected: true,
+            platform: "feishu".to_string(),
+            gateway_base_url: "http://gateway.local:4180".to_string(),
+            app_name: "HarborNAS Bot".to_string(),
             status: "已连接".to_string(),
+            last_checked_at: "2026-04-18T10:00:00Z".to_string(),
+            capabilities: BridgeProviderCapabilities {
+                reply: true,
+                update: false,
+                attachments: true,
+            },
+            ..Default::default()
         };
         state.identity_bindings.push(IdentityBindingRecord {
             open_id: "ou_demo".to_string(),
@@ -2038,11 +2087,15 @@ mod tests {
         assert_eq!(platform.identity_bindings.len(), 1);
         assert!(!platform.permission_bindings.is_empty());
         assert_eq!(platform.provider_accounts.len(), 2);
-        assert_eq!(platform.credentials.len(), 1);
+        assert!(platform.credentials.is_empty());
         assert_eq!(platform.provider_accounts[1].provider_key, "im_bridge");
         assert_eq!(
-            platform.credentials[0].vault_key,
-            "admin_console.bridge_provider.app_secret"
+            platform.provider_accounts[1].metadata["display_name"],
+            json!("HarborNAS Bot")
+        );
+        assert_eq!(
+            platform.provider_accounts[1].capabilities["reply"],
+            json!(true)
         );
     }
 

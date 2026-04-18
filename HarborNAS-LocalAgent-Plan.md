@@ -1,5 +1,33 @@
 # HarborNAS 本地智能体规划文档
 
+> 当前执行更新（2026-04-18）  
+> 当前落地重点不是继续扩张单仓 IM 能力，而是按 `HarborNAS-IM-Gateway-Agent-Contract-v1.5` 完成双仓边界。  
+> IM 仓库负责 `adapter/gateway/route/平台凭据`；HarborNAS 负责 `task/business state/approval/artifact/audit`。  
+> 两边只通过 HTTP/JSON contract 通信，不互相 import，也不共享 `.harbornas/*.json`。  
+> 本文档以下实施阶段与近期行动，均以 HarborNAS 侧可执行工作为准。  
+> 协作术语统一以 `HarborNAS-Harbor-Collaboration-Contract-v2` 与 `harbor-*` lane 命名为准。
+
+## 0. 当前协作口径
+
+- `harbor-architect`
+  负责跨 lane 边界治理、cutover sequencing、发布/回滚 gate 与最终验收。
+- `harbor-framework`
+  负责 HarborNAS 共享 runtime、北向 contract、task/session lifecycle、approval、artifact、audit、本地推理抽象、账号权限与智能编排。
+- `harbor-im-gateway`
+  负责外部 IM 仓库的 adapter/gateway/route/平台凭据/outbound delivery；在本计划中主要作为跨仓 contract 与联调协作者出现。
+- `harbor-hos-control`
+  负责 HarborOS System Domain，即 `Middleware API -> MidCLI -> Browser/MCP fallback`。
+- `harbor-aiot`
+  负责 Home Device Domain，即 camera / AIoT / LAN device 的 southbound 控制与协议适配。
+
+当前阶段默认分工:
+
+- HarborNAS 仓库内的主实施 owner 默认是 `harbor-framework`。
+- 本地推理、审计、账号管理、智能编排默认归 `harbor-framework`。
+- 跨 lane 边界变更由 `harbor-architect` 做最终批准。
+- 每天收工时，各 lane owner 负责各自仓库或职责线的 GitHub 同步；`harbor-architect` 负责跨 lane 的日终收口与是否可合并/可发布判断。
+- 每日同步默认模板见 `docs/daily/harbor-daily-sync-template.md`。
+
 ## 1. 项目目标
 
 为 HarborNAS 构建一个 **混合计算智能体**，具备：
@@ -16,42 +44,48 @@
 ### 2.1 三层编排框架
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│           IM 接入层 (HarborBeacon — ZeroClaw 二次开发)         │
-│  飞书 | 企微 | Telegram | Discord | 钉钉 | Slack | MQTT    │
-│  channels.py → 意图解析 → mcp_adapter / autonomy            │
-└───────────────────┬─────────────────────────────────────────┘
-                    │
-┌───────────────────▼─────────────────────────────────────────┐
-│              用户交互层 (Task Intake)                        │
-│  - WebUI 对话入口  - API Gateway  - 消息队列              │
-└───────────────────┬─────────────────────────────────────────┘
-                    │
-┌───────────────────▼─────────────────────────────────────────┐
-│           智能决策层 (Task Router)                          │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │  • 复杂度评估器 (Complexity Assessor)                │  │
-│  │  • 隐私风险分类器 (Privacy Classifier)               │  │
-│  │  • 资源需求预测器 (Resource Predictor)              │  │
-│  │  • 路由决策引擎 (Routing Engine)                     │  │
-│  └──────────────────────────────────────────────────────┘  │
-└───────┬─────────────────┬──────────────────┬────────────────┘
-        │                 │                  │
-        ▼                 ▼                  ▼
+┌──────────────────────────────────────────────────────────────┐
+│             外部 IM Gateway Repo（非本仓实现范围）            │
+│  adapters / webhook / websocket / long-poll / route registry │
+│  platform credentials / outbound delivery / attachment proxy │
+└──────────────────────┬───────────────────────────────────────┘
+                       │  HTTP/JSON contract only
+                       │  POST /api/tasks
+                       │  POST /api/notifications/deliveries
+                       │  GET  /api/gateway/status (optional)
+┌──────────────────────▼───────────────────────────────────────┐
+│                HarborNAS 用户交互与任务入口                  │
+│  assistant_task_api / admin API / WebUI / local automation  │
+└──────────────────────┬───────────────────────────────────────┘
+                       │
+┌──────────────────────▼───────────────────────────────────────┐
+│                HarborNAS 业务与编排核心                      │
+│  task intake / task router / workflow state / approvals     │
+│  artifacts / audit / notification intent generation         │
+└────────┬─────────────────┬──────────────────┬───────────────┘
+         │                 │                  │
+         ▼                 ▼                  ▼
    ┌─────────────┐  ┌──────────────┐  ┌─────────────────┐
    │ 本地执行器   │  │ 混合执行器    │  │ 云协作执行器     │
    │(L1-Simple)  │  │(L2-Medium)   │  │(L3-Complex)     │
    └─────────────┘  └──────────────┘  └─────────────────┘
-        │                 │                  │
-        └────────┬────────┴──────────┬───────┘
-                 │                  │
-         ┌───────▼──────────┐   ┌───▼────────────┐
-         │  本地 RAG + 推理  │   │ 脱敏 + 云推理  │
-         │  • Ollama/LLaMA  │   │ • 数据脱敏器   │
-         │  • LocalAI       │   │ • 云API调用    │
-         │  • Vector DB     │   │ • 结果转换     │
-         └──────────────────┘   └────────────────┘
+         │                 │                  │
+         └────────┬────────┴──────────┬───────┘
+                  │                   │
+          ┌───────▼──────────┐   ┌────▼────────────┐
+          │  本地 RAG + 推理  │   │ 脱敏 + 云推理   │
+          │  • Ollama/LLaMA  │   │ • 数据脱敏器    │
+          │  • LocalAI       │   │ • 云 API 调用   │
+          │  • Vector DB     │   │ • 结果转换      │
+          └──────────────────┘   └─────────────────┘
 ```
+
+当前边界约束:
+
+- IM Gateway 拥有 route key 生命周期、平台凭据、平台 payload 格式与实际消息投递。
+- HarborNAS 拥有业务会话真相、可恢复流程、审批、artifact、audit 与 notification intent。
+- HarborNAS 可以持久化 `route_key` 作为写入型路由元数据，但不得解释其平台语义。
+- HarborNAS 不得再依赖 IM 仓库内部模型、运行时代码或 `.harbornas/*.json`。
 
 ### 2.2 任务分类与路由规则
 
@@ -574,45 +608,53 @@ harbor-local-agent/
 
 ## 6. 实现阶段规划
 
-### Phase 1: 核心框架 (Weeks 1-2)
-- [ ] 设计路由决策引擎
-- [ ] 实现本地执行器 (Ollama 集成)
-- [ ] 基础日志系统
-- [ ] API 框架搭建
+### Phase 1: HarborNAS 边界冻结与 Contract 对齐 (Weeks 1-2)
+- Owner: `harbor-framework`
+- Collaborators: `harbor-architect`, `harbor-im-gateway`
+- [x] 将 HarborNAS 入站接口对齐到 v1.5 `POST /api/tasks`
+- [x] 支持 `source.route_key`、顶层 `message` block、RFC 3339 UTC
+- [x] 增加 `X-Contract-Version: 1.5` 与服务鉴权校验
+- [x] 统一 non-200 shared error envelope
+- [x] 建立 `task_id` 幂等重放与冲突检测
 
-### Phase 2: 数据脱敏与隐私 (Weeks 3-4)
-- [ ] PII 检测模块
-- [ ] 数据脱敏器
-- [ ] 密钥管理系统
-- [ ] 审计日志
+### Phase 2: Business State / Approval / Artifact / Audit 加固 (Weeks 3-4)
+- Owner: `harbor-framework`
+- Collaborators: `harbor-architect`, `harbor-im-gateway`
+- [x] 会话状态中持久化 `route_key`，但保持其为 opaque metadata
+- [x] 保持 HarborNAS 独占业务会话真相与 `resume_token` 流程
+- [x] 审批、artifact、audit 补齐 `task_id/trace_id/route_key` 关联
+- [x] 处理附件 transport metadata，但不引入平台文件语义
 
-### Phase 3: 多模态 RAG (Weeks 5-7)
-- [ ] 向量 DB 集成 (Milvus)
-- [ ] 文本摄入管道
-- [ ] 图像摄入管道 (CLIP)
-- [ ] 音频处理 (Whisper)
-- [ ] 视频索引 (关键帧)
-- [ ] 混合查询检索
+### Phase 3: Outbound Notification Intent Cutover (Weeks 5-7)
+- Owner: `harbor-framework`
+- Collaborators: `harbor-architect`, `harbor-im-gateway`
+- [x] 将通知投递改为 HarborNAS -> IM Gateway `POST /api/notifications/deliveries`
+- [x] 对齐 `delivery.mode`、`destination.route_key`、`idempotency_key`
+- [x] 增加 delivery success / accepted failure / request rejection 处理逻辑
+- [x] 删除 HarborNAS 直连 Feishu / Telegram 等平台消息发送路径
 
-### Phase 4: 云协作与混合执行 (Weeks 8-9)
-- [ ] 云 API 适配层
-- [ ] 混合执行器实现
-- [ ] 结果融合策略
-- [ ] 容错与重试机制
+### Phase 4: 管理面去凭据化与状态解耦 (Weeks 8-9)
+- Owner: `harbor-framework`
+- Collaborators: `harbor-architect`, `harbor-im-gateway`
+- [x] 移除 HarborNAS 对 `app_id/app_secret/bot token` 的长期职责
+- [x] 改为读取 IM Gateway redacted status，而非本地校验平台凭据
+- [x] 清理 `bridge_provider` 与管理台配置中的平台耦合
+- [ ] 为迁移期保留受控兼容开关与回滚方案
 
-### Phase 5: 性能优化与部署 (Weeks 10-12)
-- [ ] 模型量化 (4-bit, 8-bit)
-- [ ] 批处理与异步任务
-- [ ] 缓存策略
-- [ ] Docker 部署
-- [ ] 性能基准测试
+### Phase 5: Cutover 联调与发布准备 (Weeks 10-12)
+- Owner: `harbor-framework`
+- Collaborators: `harbor-architect`, `harbor-im-gateway`, `harbor-hos-control`, `harbor-aiot`
+- [ ] HarborNAS 侧 contract / integration / E2E 测试补齐
+- [ ] 联调 inbound / resume / approval / artifact / notification 全链路
+- [ ] 增加 cutover 清单、回滚清单、迁移文档
+- [ ] 清理旧代码路径并完成发布评审
 
-### Phase 6: 测试与文档 (Weeks 13-14)
-- [ ] 单元测试覆盖
-- [ ] 集成测试
-- [ ] E2E 测试
-- [ ] API 文档
-- [ ] 部署指南
+### Phase 6: Cutover 后恢复长期能力建设 (Weeks 13-14)
+- Owner: `harbor-framework`
+- Collaborators: `harbor-architect`, `harbor-hos-control`, `harbor-aiot`
+- [ ] 将更长期的多模态 RAG / skills / reliability backlog 重新排期
+- [ ] 继续推进本地执行器、混合执行器与云协作能力
+- [ ] 依据 cutover 结果调整后续架构演化路线
 
 ---
 
@@ -673,19 +715,20 @@ metrics = {
 ## 9. 下一步行动
 
 ### 立即行动 (Week 0)
-1. **技术选型确认** - 确定具体模型、DB、云服务商
-2. **环境搭建** - Docker Compose 本地开发环境
-3. **代码库初始化** - Git 仓库 + CI/CD 流程
-4. **团队熟悉** - 阅读 HarborNAS 源码架构
+1. **入站 Contract 对齐** - 更新 `assistant_task_api` / `runtime/task_api` 支持 v1.5 字段与错误模型
+2. **耦合点盘点** - 列出 HarborNAS 内所有直连 IM 发送、平台凭据校验、状态共享假设
+3. **测试基线建立** - 为 inbound/outbound contract、幂等、resume、approval 建立 HarborNAS 侧回归
+4. **cutover 策略确认** - 定义 feature flag、灰度步骤、回滚开关
 
 ### Week 1 优先事项
-- 完成 `core/router.py` 原型 (路由决策引擎)
-- Ollama 本地模型部署测试
-- 第一个 API 端点 (Task Intake)
+- 扩展 `TaskRequest`，纳入 `source.route_key` 与顶层 `message` block
+- 在会话状态中持久化 `route_key`，打通 `needs_input` / `resume_token`
+- 统一 `X-Contract-Version: 1.5`、服务鉴权与 shared error envelope
+- 抽象 HarborNAS 侧 notification client，为切换 IM Gateway delivery 做准备
 
 ### 风险检查清单
-- [ ] 本地推理延迟是否可接受？ (需要 benchmark)
-- [ ] 云 API 成本是否在预算内？ (需要定价方案)
-- [ ] 脱敏流程是否符合法规？ (GDPR/CCPA/中国隐私法)
-- [ ] 向量 DB 可扩展性？ (模拟百万级数据)
+- [ ] HarborNAS 是否仍在任何路径上保存原始 IM 平台凭据？
+- [ ] HarborNAS 是否仍有直接调用平台消息发送接口的路径？
+- [ ] `route_key` 是否在 HarborNAS 中被错误解释为平台 recipient 语义？
+- [ ] 是否仍存在依赖 IM 仓库或共享 `.harbornas/*.json` 的假设？
 
