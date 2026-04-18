@@ -1,4 +1,4 @@
-# HarborNAS Local Agent V2 启动清单
+# HarborBeacon Local Agent V2 启动清单
 
 ## 1. 启动原则
 
@@ -6,6 +6,20 @@
 2. 先保证治理与审计，再放开自动化。
 3. 路由优先级固定：API > MidCLI > Browser > MCP。
 4. 用户入口：IM 通道 → HarborBeacon → Orchestrator → HarborOS。
+
+---
+
+## 1.1 关联支持包
+
+配套 operator / cutover 文档：
+
+- `docs/im-v1.5-cutover-rollback-observability-gates.md`
+- `docs/retrieval-roundtrip-launch-pack.md`
+- `docs/retrieval-canary-roundtrip-evidence.md`
+- `docs/cited-retrieval-reply-pack.md`
+
+这份启动清单只保留主时间线；IM v1.5 cutover gate 和 retrieval round-trip
+handoff pack 细节统一收在上面的支持文档里，避免重复维护两套门槛。
 
 ---
 

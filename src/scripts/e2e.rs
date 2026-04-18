@@ -77,10 +77,10 @@ pub fn run_e2e(
     require_live: bool,
 ) -> (E2ePayload, LatencyPayload, AuditPayload) {
     let required_docs = [
-        "HarborNAS-Contract-E2E-Test-Plan-v1.md",
-        "HarborNAS-Middleware-Endpoint-Contract-v1.md",
-        "HarborNAS-Files-BatchOps-Contract-v1.md",
-        "HarborNAS-Planner-TaskDecompose-Contract-v1.md",
+        "HarborBeacon-Contract-E2E-Test-Plan-v1.md",
+        "HarborBeacon-Middleware-Endpoint-Contract-v1.md",
+        "HarborBeacon-Files-BatchOps-Contract-v1.md",
+        "HarborBeacon-Planner-TaskDecompose-Contract-v1.md",
     ];
     let missing_docs = required_docs
         .iter()

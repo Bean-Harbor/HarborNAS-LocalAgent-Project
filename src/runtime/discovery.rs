@@ -614,6 +614,51 @@ mod tests {
     }
 
     #[test]
+    fn probe_result_preserves_device_media_and_control_metadata() {
+        let candidate = DiscoveryCandidate {
+            candidate_id: "cand-onvif".to_string(),
+            protocol: DiscoveryProtocol::Onvif,
+            name: Some("Front Door".to_string()),
+            ip_address: "192.168.1.20".to_string(),
+            port: Some(554),
+            vendor: Some("Demo".to_string()),
+            model: Some("X1".to_string()),
+            rtsp_paths: vec!["/live".to_string()],
+            status: DiscoveryCandidateStatus::Validated,
+        };
+        let probe = RtspProbeResult {
+            candidate_id: "cand-onvif".to_string(),
+            reachable: true,
+            stream_url: Some("rtsp://192.168.1.20/live".to_string()),
+            transport: StreamTransport::Rtsp,
+            requires_auth: true,
+            capabilities: crate::runtime::registry::CameraCapabilities {
+                snapshot: true,
+                stream: true,
+                ptz: true,
+                audio: true,
+            },
+            error_message: None,
+        };
+
+        let device = probe
+            .into_camera_device(&candidate, "cam-1")
+            .expect("camera device");
+
+        assert_eq!(device.discovery_source, "onvif");
+        assert_eq!(device.primary_stream.url, "rtsp://192.168.1.20/live");
+        assert!(device.primary_stream.requires_auth);
+        assert!(device.capabilities.snapshot);
+        assert!(device.capabilities.stream);
+        assert!(device.capabilities.ptz);
+        assert!(device.capabilities.audio);
+        assert_eq!(
+            device.onvif_device_service_url.as_deref(),
+            Some("http://192.168.1.20/onvif/device_service")
+        );
+    }
+
+    #[test]
     fn discovery_service_can_seed_rtsp_scan_from_cidr() {
         let service = DiscoveryService::new(Box::new(StaticRtspAdapter), None, None, None);
         let request = DiscoveryRequest {

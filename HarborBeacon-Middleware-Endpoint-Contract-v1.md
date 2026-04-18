@@ -1,4 +1,4 @@
-# HarborNAS Middleware Endpoint Contract v1
+# HarborBeacon Middleware Endpoint Contract v1
 
 ## Purpose
 This document defines the executable contract for HarborOS-domain skills that use middleware API as primary route and midcli as fallback.
@@ -111,7 +111,7 @@ All NL intents must normalize into this action object before routing.
 
 ## Compatibility Matrix Template
 
-| Capability | HarborNAS middleware ref | Upstream middleware ref | Contract test | MidCLI fallback test | Decision |
+| Capability | HarborBeacon middleware ref | Upstream middleware ref | Contract test | MidCLI fallback test | Decision |
 |---|---|---|---|---|---|
 | service.query | develop | master | pass/fail | pass/fail | keep/block |
 | service.start | develop | master | pass/fail | pass/fail | keep/block |
@@ -124,7 +124,7 @@ All NL intents must normalize into this action object before routing.
 2. Validation: reject illegal service names and unsupported operations.
 3. Approval: enforce token for HIGH operations.
 4. Fallback: force middleware failure and verify midcli route.
-5. Drift: run compatibility matrix against HarborNAS + upstream refs.
+5. Drift: run compatibility matrix against HarborBeacon + upstream refs.
 
 ## Release Gate
 A release is allowed only when:

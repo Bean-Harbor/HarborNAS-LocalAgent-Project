@@ -17,6 +17,7 @@ from harbor_integration import (  # noqa: E402
     execute_file_action,
     execute_service_action,
     parse_csv_rows,
+    validate_path_policy,
 )
 
 
@@ -136,6 +137,16 @@ def test_execute_file_action_blocks_denied_path(monkeypatch) -> None:
         pass
     else:
         raise AssertionError("denied read path should be blocked")
+
+
+def test_validate_path_policy_keeps_contract_paths_on_allowlist() -> None:
+    policy = validate_path_policy(
+        read_paths=[r"C:\mnt\agent-ci\copy-source.txt"],
+        write_paths=[r"C:\mnt\agent-ci\copy-destination.txt"],
+    )
+
+    assert policy["read_paths"] == ["/mnt/agent-ci/copy-source.txt"]
+    assert policy["write_paths"] == ["/mnt/agent-ci/copy-destination.txt"]
 
 
 def test_execute_file_action_dry_run_returns_preview(monkeypatch) -> None:

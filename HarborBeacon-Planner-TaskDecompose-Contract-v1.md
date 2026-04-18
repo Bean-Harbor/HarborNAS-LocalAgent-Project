@@ -1,4 +1,4 @@
-# HarborNAS Planner TaskDecompose Contract v1
+# HarborBeacon Planner TaskDecompose Contract v1
 
 ## Purpose
 This document defines the executable contract for `planner.task_decompose` so natural-language requests can be transformed into deterministic execution plans aligned with route priority:
@@ -118,7 +118,7 @@ This document defines the executable contract for `planner.task_decompose` so na
 
 ## Compatibility Matrix Template
 
-| Planner Capability | HarborNAS policy ref | Upstream policy ref | Plan schema test | Route compliance test | Decision |
+| Planner Capability | HarborBeacon policy ref | Upstream policy ref | Plan schema test | Route compliance test | Decision |
 |---|---|---|---|---|---|
 | service.enable decomposition | develop | master | pass/fail | pass/fail | keep/block |
 | service.restart decomposition | develop | master | pass/fail | pass/fail | keep/block |

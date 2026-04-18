@@ -79,9 +79,9 @@ def main() -> int:
     args = parser.parse_args()
 
     checks = [
-        "HarborNAS-Middleware-Endpoint-Contract-v1.md",
-        "HarborNAS-Files-BatchOps-Contract-v1.md",
-        "HarborNAS-Planner-TaskDecompose-Contract-v1.md",
+        "HarborBeacon-Middleware-Endpoint-Contract-v1.md",
+        "HarborBeacon-Files-BatchOps-Contract-v1.md",
+        "HarborBeacon-Planner-TaskDecompose-Contract-v1.md",
     ]
     missing = [name for name in checks if not (ROOT / name).exists()]
 

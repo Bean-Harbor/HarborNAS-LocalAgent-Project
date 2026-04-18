@@ -1188,7 +1188,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("harbornas-device-registry-{unique}.json"));
+        let path = std::env::temp_dir().join(format!("harborbeacon-device-registry-{unique}.json"));
         let store = DeviceRegistryStore::new(&path);
         let mut device = CameraDevice::new("cam-1", "Front Door", "rtsp://192.168.1.10/live");
         device.capabilities.stream = true;
@@ -1265,7 +1265,7 @@ mod tests {
             .expect("clock")
             .as_nanos();
         let path =
-            std::env::temp_dir().join(format!("harbornas-device-registry-legacy-{unique}.json"));
+            std::env::temp_dir().join(format!("harborbeacon-device-registry-legacy-{unique}.json"));
         let store = DeviceRegistryStore::new(&path);
         let legacy_payload = json!([
             {
@@ -1314,8 +1314,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("harbornas-device-registry-preserve-{unique}.json"));
+        let path = std::env::temp_dir().join(format!(
+            "harborbeacon-device-registry-preserve-{unique}.json"
+        ));
         let store = DeviceRegistryStore::new(&path);
 
         let snapshot = DeviceRegistrySnapshot {
@@ -1536,7 +1537,7 @@ mod tests {
             .expect("clock")
             .as_nanos();
         let path =
-            std::env::temp_dir().join(format!("harbornas-device-registry-upsert-{unique}.json"));
+            std::env::temp_dir().join(format!("harborbeacon-device-registry-upsert-{unique}.json"));
         let store = DeviceRegistryStore::new(&path);
 
         let mut existing_a = CameraDevice::new("cam-a", "Front Door", "rtsp://192.168.1.10/live");

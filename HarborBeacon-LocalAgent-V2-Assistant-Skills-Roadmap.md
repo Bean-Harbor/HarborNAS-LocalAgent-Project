@@ -1,7 +1,7 @@
-# HarborNAS Local Agent V2 Roadmap
+# HarborBeacon Local Agent V2 Roadmap
 
 ## Scope
-This V2 roadmap extends the existing HarborNAS local-agent plan with two priorities:
+This V2 roadmap extends the existing HarborBeacon local-agent plan with two priorities:
 1. Multi-terminal natural-language assistant (mobile/web/desktop).
 2. Skills framework with HarborOS control-plane-first execution.
 3. Reuse HarborOS existing `middleware` API as primary execution route.
@@ -161,7 +161,7 @@ Deliverable:
 4. Browser/MCP overuse.
 - Control: hard routing policy and route-ratio alerting.
 
-5. Upstream sync drift between HarborNAS and upstream TrueNAS.
+5. Upstream sync drift between HarborBeacon and upstream TrueNAS.
 - Control: compatibility matrix tests for endpoint/field changes and fallback validation.
 
 ## HarborOS Action Mapping (system.harbor_ops)
@@ -176,7 +176,7 @@ Deliverable:
 
 ## Upstream Compatibility Test Matrix (Template)
 
-| Capability | HarborNAS Branch | Upstream Ref | API Contract Test | MidCLI Fallback Test | Result |
+| Capability | HarborBeacon Branch | Upstream Ref | API Contract Test | MidCLI Fallback Test | Result |
 |---|---|---|---|---|---|
 | service.status | develop | truenas/master | pass/fail | pass/fail | pending |
 | service.start | develop | truenas/master | pass/fail | pass/fail | pending |
@@ -190,4 +190,4 @@ Deliverable:
 3. Implement `MidCLIExecutor` fallback with dry-run and risk tagging.
 3. Add approval API for high-risk actions.
 4. Add first two skills and contract tests.
-5. Add compatibility matrix CI job for HarborNAS/upstream drift.
+5. Add compatibility matrix CI job for HarborBeacon/upstream drift.

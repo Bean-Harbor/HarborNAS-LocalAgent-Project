@@ -15,6 +15,7 @@ use crate::connectors::ai_provider::{
 use crate::connectors::storage::StorageTarget;
 use crate::domains::vision::{
     VisionAnalyzeCameraArgs, VisionAnalyzeCameraPayload, VisionDetection, VisionImageArtifact,
+    VisionImageIndexSidecar,
 };
 use crate::orchestrator::contracts::{Action, ExecutionResult, Route, StepStatus};
 use crate::orchestrator::router::Executor;
@@ -35,7 +36,7 @@ impl VisionExecutor {
         let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let detector_script = repo_root.join("tools/detect_person_yolo.py");
         let bridge_script = repo_root.join("tools/vision_detect_bridge.sh");
-        let default_venv_python = repo_root.join(".harbornas/.venv-vision/bin/python");
+        let default_venv_python = repo_root.join(".harborbeacon/.venv-vision/bin/python");
         let python_bin = std::env::var("HARBOR_VISION_PYTHON").unwrap_or_else(|_| {
             if default_venv_python.exists() {
                 return default_venv_python.to_string_lossy().to_string();
@@ -52,7 +53,7 @@ impl VisionExecutor {
             python_bin,
             detector_script,
             bridge_script,
-            artifact_root: PathBuf::from(".harbornas/vision"),
+            artifact_root: PathBuf::from(".harborbeacon/vision"),
         }
     }
 
@@ -61,12 +62,79 @@ impl VisionExecutor {
         args: &VisionAnalyzeCameraArgs,
     ) -> Result<VisionAnalyzeCameraPayload, String> {
         let device = self.find_device(&args.device_id)?;
-        let snapshot = self.capture_snapshot(&device)?;
+        let snapshot = self.capture_snapshot(&device)?.with_device_context(
+            Some(device.display_name.clone()),
+            device.room_name.clone(),
+            device.vendor.clone(),
+            device.model.clone(),
+            Some(device.discovery_source.clone()),
+            Some(format!("{:?}", device.primary_stream.transport).to_lowercase()),
+            Some(device.primary_stream.requires_auth),
+        );
         let stored_snapshot = self.persist_snapshot(&device, &snapshot)?;
         let detections = self.run_detection(&stored_snapshot.image_path, args)?;
+        let detection_labels = collect_detection_labels(&detections.detections, &args.detect_label);
         let detection_summary = describe_detections(&detections.detections, &args.detect_label);
         let (summary, summary_source) =
             self.describe_with_model_or_fallback(&snapshot, &detection_summary, args)?;
+        let candidate_caption = Some(summary.clone());
+        let candidate_derived_text = Some(build_candidate_derived_text(
+            &summary,
+            &detection_summary,
+            &detection_labels,
+            &detections.detections,
+        ));
+        self.write_image_index_sidecar(
+            &stored_snapshot,
+            "analysis_snapshot",
+            Some(Path::new(&stored_snapshot.image_path)),
+            detections.annotated_image_path.as_deref().map(Path::new),
+            vec![
+                "camera".to_string(),
+                "snapshot".to_string(),
+                "vision_analysis".to_string(),
+            ],
+            detection_labels.clone(),
+            candidate_caption.clone(),
+            candidate_derived_text.clone(),
+        )?;
+        if let Some(annotated_image_path) = detections.annotated_image_path.as_deref() {
+            let annotated_artifact = VisionImageArtifact {
+                image_path: annotated_image_path.to_string_lossy().to_string(),
+                annotated_image_path: Some(stored_snapshot.image_path.clone()),
+                caption: candidate_caption.clone(),
+                derived_text: candidate_derived_text.clone(),
+                mime_type: stored_snapshot.mime_type.clone(),
+                source_storage: stored_snapshot.source_storage.clone(),
+                byte_size: stored_snapshot.byte_size,
+                captured_at_epoch_ms: stored_snapshot.captured_at_epoch_ms,
+                index_sidecar_path: Some(
+                    Path::new(annotated_image_path)
+                        .with_extension("json")
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                ingest_metadata: stored_snapshot.ingest_metadata.clone(),
+                source_image_path: Some(stored_snapshot.image_path.clone()),
+                tags: vec![
+                    "camera".to_string(),
+                    "derived".to_string(),
+                    "annotated".to_string(),
+                    "vision_analysis".to_string(),
+                ],
+                labels: detection_labels.clone(),
+            };
+            self.write_image_index_sidecar(
+                &annotated_artifact,
+                "analysis_annotation",
+                Some(Path::new(&stored_snapshot.image_path)),
+                Some(Path::new(annotated_image_path)),
+                annotated_artifact.tags.clone(),
+                annotated_artifact.labels.clone(),
+                annotated_artifact.caption.clone(),
+                annotated_artifact.derived_text.clone(),
+            )?;
+        }
         let notification_card =
             build_notification_card(&device, &summary, &summary_source, &detection_summary);
 
@@ -76,14 +144,25 @@ impl VisionExecutor {
             summary_source,
             detections: detections.detections,
             snapshot: VisionImageArtifact {
-                image_path: stored_snapshot.image_path,
+                image_path: stored_snapshot.image_path.clone(),
                 annotated_image_path: detections
                     .annotated_image_path
                     .map(|path| path.to_string_lossy().to_string()),
+                caption: candidate_caption,
+                derived_text: candidate_derived_text,
                 mime_type: snapshot.mime_type,
                 source_storage: Some(snapshot.storage.clone()),
                 byte_size: Some(snapshot.byte_size as u64),
                 captured_at_epoch_ms: Some(snapshot.captured_at_epoch_ms),
+                index_sidecar_path: stored_snapshot.index_sidecar_path.clone(),
+                ingest_metadata: stored_snapshot.ingest_metadata.clone(),
+                source_image_path: Some(stored_snapshot.image_path.clone()),
+                tags: vec![
+                    "camera".to_string(),
+                    "snapshot".to_string(),
+                    "vision_analysis".to_string(),
+                ],
+                labels: detection_labels.clone(),
             },
             detection_summary,
             notification_channel: "im_bridge".to_string(),
@@ -133,14 +212,23 @@ impl VisionExecutor {
         fs::write(&image_path, image_bytes)
             .map_err(|e| format!("failed to write snapshot {}: {e}", image_path.display()))?;
 
-        Ok(VisionImageArtifact {
-            image_path: image_path.to_string_lossy().to_string(),
-            annotated_image_path: None,
-            mime_type: snapshot.mime_type.clone(),
-            source_storage: Some(snapshot.storage.clone()),
-            byte_size: Some(snapshot.byte_size as u64),
-            captured_at_epoch_ms: Some(snapshot.captured_at_epoch_ms),
-        })
+        let artifact = build_persisted_snapshot_artifact(
+            image_path.to_string_lossy().to_string(),
+            None,
+            snapshot,
+        );
+        self.write_image_index_sidecar(
+            &artifact,
+            "snapshot",
+            Some(Path::new(&artifact.image_path)),
+            None,
+            vec!["camera".to_string(), "snapshot".to_string()],
+            Vec::new(),
+            None,
+            None,
+        )?;
+
+        Ok(artifact)
     }
 
     fn run_detection(
@@ -236,6 +324,53 @@ impl VisionExecutor {
             detected.annotated_image_path = Some(annotated_path.to_path_buf());
         }
         Ok(detected)
+    }
+
+    fn write_image_index_sidecar(
+        &self,
+        artifact: &VisionImageArtifact,
+        artifact_role: &str,
+        source_image_path: Option<&Path>,
+        annotated_image_path: Option<&Path>,
+        tags: Vec<String>,
+        labels: Vec<String>,
+        caption: Option<String>,
+        derived_text: Option<String>,
+    ) -> Result<PathBuf, String> {
+        let sidecar = build_image_index_sidecar(
+            artifact,
+            artifact_role,
+            source_image_path,
+            annotated_image_path,
+            tags,
+            labels,
+            caption,
+            derived_text,
+        );
+        let sidecar_path = artifact.index_sidecar_path.clone().unwrap_or_else(|| {
+            Path::new(&artifact.image_path)
+                .with_extension("json")
+                .to_string_lossy()
+                .to_string()
+        });
+        let sidecar_path = PathBuf::from(sidecar_path);
+        if let Some(parent) = sidecar_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "failed to create vision sidecar directory {}: {e}",
+                    parent.display()
+                )
+            })?;
+        }
+        let content = serde_json::to_string_pretty(&sidecar)
+            .map_err(|e| format!("failed to serialize vision sidecar: {e}"))?;
+        fs::write(&sidecar_path, content).map_err(|e| {
+            format!(
+                "failed to write vision sidecar {}: {e}",
+                sidecar_path.display()
+            )
+        })?;
+        Ok(sidecar_path)
     }
 
     #[allow(dead_code)]
@@ -437,6 +572,102 @@ fn sanitize_path_segment(value: &str) -> String {
         .collect()
 }
 
+fn build_persisted_snapshot_artifact(
+    image_path: String,
+    annotated_image_path: Option<PathBuf>,
+    snapshot: &SnapshotCaptureResult,
+) -> VisionImageArtifact {
+    let index_sidecar_path = Path::new(&image_path)
+        .with_extension("json")
+        .to_string_lossy()
+        .to_string();
+    VisionImageArtifact {
+        image_path: image_path.clone(),
+        annotated_image_path: annotated_image_path.map(|path| path.to_string_lossy().to_string()),
+        mime_type: snapshot.mime_type.clone(),
+        source_storage: Some(snapshot.storage.clone()),
+        byte_size: Some(snapshot.byte_size as u64),
+        captured_at_epoch_ms: Some(snapshot.captured_at_epoch_ms),
+        index_sidecar_path: Some(index_sidecar_path),
+        ingest_metadata: snapshot.ingest_metadata.clone(),
+        source_image_path: Some(image_path.clone()),
+        tags: vec!["camera".to_string(), "snapshot".to_string()],
+        labels: Vec::new(),
+        caption: None,
+        derived_text: None,
+    }
+}
+
+fn build_image_index_sidecar(
+    artifact: &VisionImageArtifact,
+    artifact_role: &str,
+    source_image_path: Option<&Path>,
+    annotated_image_path: Option<&Path>,
+    tags: Vec<String>,
+    labels: Vec<String>,
+    caption: Option<String>,
+    derived_text: Option<String>,
+) -> VisionImageIndexSidecar {
+    VisionImageIndexSidecar {
+        artifact_role: artifact_role.to_string(),
+        image_path: artifact.image_path.clone(),
+        source_image_path: source_image_path
+            .map(|path| path.to_string_lossy().to_string())
+            .or_else(|| artifact.source_image_path.clone()),
+        annotated_image_path: annotated_image_path.map(|path| path.to_string_lossy().to_string()),
+        caption: caption.or_else(|| artifact.caption.clone()),
+        derived_text: derived_text.or_else(|| artifact.derived_text.clone()),
+        mime_type: artifact.mime_type.clone(),
+        source_storage: artifact.source_storage.clone(),
+        byte_size: artifact.byte_size,
+        captured_at_epoch_ms: artifact.captured_at_epoch_ms,
+        tags,
+        labels,
+        ingest_metadata: artifact.ingest_metadata.clone(),
+    }
+}
+
+fn collect_detection_labels(detections: &[VisionDetection], requested_label: &str) -> Vec<String> {
+    let mut labels = Vec::new();
+    push_unique_label(&mut labels, requested_label);
+    for detection in detections {
+        push_unique_label(&mut labels, &detection.label);
+    }
+    labels
+}
+
+fn build_candidate_derived_text(
+    summary: &str,
+    detection_summary: &str,
+    detection_labels: &[String],
+    detections: &[VisionDetection],
+) -> String {
+    let labels_text = if detection_labels.is_empty() {
+        "labels: none".to_string()
+    } else {
+        format!("labels: {}", detection_labels.join(", "))
+    };
+    let detections_text = if detections.is_empty() {
+        "detections: none".to_string()
+    } else {
+        let values = detections
+            .iter()
+            .map(|detection| format!("{}:{:.2}", detection.label, detection.confidence))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("detections: {}", values)
+    };
+    format!("{summary}; {detection_summary}; {labels_text}; {detections_text}")
+}
+
+fn push_unique_label(labels: &mut Vec<String>, label: &str) {
+    let trimmed = label.trim();
+    if trimmed.is_empty() || labels.iter().any(|existing| existing == trimmed) {
+        return;
+    }
+    labels.push(trimmed.to_string());
+}
+
 fn shell_escape(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
@@ -451,10 +682,19 @@ struct DetectionOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_notification_card, describe_detections, heuristic_summary};
-    use crate::domains::vision::VisionDetection;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use super::{
+        build_image_index_sidecar, build_notification_card, build_persisted_snapshot_artifact,
+        describe_detections, heuristic_summary, VisionExecutor,
+    };
+    use crate::connectors::storage::StorageTarget;
+    use crate::domains::vision::{VisionDetection, VisionImageArtifact};
+    use crate::runtime::media::{ArtifactIngestDisposition, ArtifactProvenance, SnapshotFormat};
     use crate::runtime::registry::{
-        CameraCapabilities, CameraStreamRef, DeviceStatus, ResolvedCameraTarget, StreamTransport,
+        CameraCapabilities, CameraStreamRef, DeviceRegistryStore, DeviceStatus,
+        ResolvedCameraTarget, StreamTransport,
     };
 
     #[test]
@@ -504,6 +744,237 @@ mod tests {
             .as_str()
             .expect("summary text")
             .contains("画面中有 1 人"));
+    }
+
+    #[test]
+    fn persisted_snapshot_artifact_keeps_ingest_metadata() {
+        let snapshot = crate::runtime::media::SnapshotCaptureResult::new(
+            "cam-1",
+            SnapshotFormat::Jpeg,
+            "ZmFrZS1qcGVn",
+            9,
+            StorageTarget::LocalDisk,
+        )
+        .with_device_context(
+            Some("Front Door".to_string()),
+            Some("Entry".to_string()),
+            Some("DemoCam".to_string()),
+            Some("C1".to_string()),
+            Some("manual_entry".to_string()),
+            Some("rtsp".to_string()),
+            Some(false),
+        );
+
+        let artifact = build_persisted_snapshot_artifact(
+            "snapshot.jpg".to_string(),
+            Some(PathBuf::from("annotated.jpg")),
+            &snapshot,
+        );
+
+        assert_eq!(artifact.image_path, "snapshot.jpg");
+        assert_eq!(
+            artifact.annotated_image_path.as_deref(),
+            Some("annotated.jpg")
+        );
+        assert_eq!(
+            artifact.index_sidecar_path.as_deref(),
+            Some("snapshot.json")
+        );
+        assert_eq!(artifact.source_image_path.as_deref(), Some("snapshot.jpg"));
+        assert_eq!(artifact.tags, vec!["camera", "snapshot"]);
+        assert!(artifact.labels.is_empty());
+        let metadata = artifact.ingest_metadata.as_ref().expect("metadata");
+        assert_eq!(metadata.device_id, "cam-1");
+        assert_eq!(metadata.provenance, ArtifactProvenance::Media);
+        assert_eq!(
+            metadata.ingest_disposition,
+            ArtifactIngestDisposition::KnowledgeIndexCandidate
+        );
+        assert_eq!(metadata.room.as_deref(), Some("Entry"));
+
+        let sidecar = build_image_index_sidecar(
+            &artifact,
+            "analysis_snapshot",
+            Some(Path::new("snapshot.jpg")),
+            Some(Path::new("annotated.jpg")),
+            vec!["camera".to_string(), "snapshot".to_string()],
+            vec!["person".to_string()],
+            Some("Front Door AI snapshot".to_string()),
+            Some("snapshot caption".to_string()),
+        );
+        assert_eq!(sidecar.artifact_role, "analysis_snapshot");
+        assert_eq!(sidecar.source_image_path.as_deref(), Some("snapshot.jpg"));
+        assert_eq!(
+            sidecar.annotated_image_path.as_deref(),
+            Some("annotated.jpg")
+        );
+        assert_eq!(sidecar.caption.as_deref(), Some("Front Door AI snapshot"));
+        assert_eq!(sidecar.derived_text.as_deref(), Some("snapshot caption"));
+        assert_eq!(sidecar.tags, vec!["camera", "snapshot"]);
+        assert_eq!(sidecar.labels, vec!["person"]);
+    }
+
+    #[test]
+    fn snapshot_sidecar_is_written_as_file_candidate() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let artifact_root = std::env::temp_dir().join(format!("vision-sidecar-{unique}"));
+        fs::create_dir_all(&artifact_root).expect("create temp root");
+
+        let executor = VisionExecutor {
+            registry_store: DeviceRegistryStore::new(&artifact_root.join("registry.json")),
+            rtsp: Box::new(crate::adapters::rtsp::CommandRtspAdapter::default()),
+            python_bin: "python3".to_string(),
+            detector_script: artifact_root.join("detector.py"),
+            bridge_script: artifact_root.join("bridge.sh"),
+            artifact_root: artifact_root.clone(),
+        };
+
+        let snapshot = crate::runtime::media::SnapshotCaptureResult::new(
+            "cam-1",
+            SnapshotFormat::Jpeg,
+            "ZmFrZS1qcGVn",
+            9,
+            StorageTarget::LocalDisk,
+        )
+        .with_device_context(
+            Some("Front Door".to_string()),
+            Some("Entry".to_string()),
+            Some("DemoCam".to_string()),
+            Some("C1".to_string()),
+            Some("manual_entry".to_string()),
+            Some("rtsp".to_string()),
+            Some(false),
+        );
+        let artifact = build_persisted_snapshot_artifact(
+            artifact_root
+                .join("snapshots")
+                .join("cam-1-123.jpg")
+                .to_string_lossy()
+                .to_string(),
+            None,
+            &snapshot,
+        );
+
+        let sidecar_path = executor
+            .write_image_index_sidecar(
+                &artifact,
+                "snapshot",
+                Some(Path::new(&artifact.image_path)),
+                None,
+                vec!["camera".to_string(), "snapshot".to_string()],
+                Vec::new(),
+                None,
+                None,
+            )
+            .expect("write sidecar");
+        let content = fs::read_to_string(&sidecar_path).expect("read sidecar");
+        let json: serde_json::Value = serde_json::from_str(&content).expect("parse sidecar");
+        assert_eq!(json["artifact_role"], "snapshot");
+        assert_eq!(json["image_path"], artifact.image_path);
+        assert_eq!(json["source_image_path"], artifact.image_path);
+        assert_eq!(json["ingest_metadata"]["device_id"], "cam-1");
+        assert_eq!(json["tags"], serde_json::json!(["camera", "snapshot"]));
+    }
+
+    #[test]
+    fn analysis_sidecar_keeps_round_trip_candidate_linkage_stable() {
+        let artifact = VisionImageArtifact {
+            image_path: "artifacts/vision/annotated/cam-1-1700000000000.jpg".to_string(),
+            source_image_path: Some("artifacts/vision/snapshots/cam-1-1700000000000.jpg".to_string()),
+            annotated_image_path: Some(
+                "artifacts/vision/annotated/cam-1-1700000000000.jpg".to_string(),
+            ),
+            caption: Some("Front Door AI snapshot".to_string()),
+            derived_text: Some(
+                "Front Door AI snapshot; detected person; labels: person, door; detections: person:0.92, door:0.71"
+                    .to_string(),
+            ),
+            mime_type: "image/jpeg".to_string(),
+            source_storage: Some(crate::connectors::storage::StorageObjectRef {
+                target: StorageTarget::LocalDisk,
+                relative_path: "snapshots/cam-1/1700000000000.jpg".to_string(),
+            }),
+            byte_size: Some(2048),
+            captured_at_epoch_ms: Some(1700000000000),
+            index_sidecar_path: Some(
+                "artifacts/vision/annotated/cam-1-1700000000000.json".to_string(),
+            ),
+            tags: vec![
+                "camera".to_string(),
+                "snapshot".to_string(),
+                "vision_analysis".to_string(),
+            ],
+            labels: vec!["person".to_string(), "door".to_string()],
+            ingest_metadata: Some(
+                crate::runtime::media::DeviceArtifactMetadata::knowledge_index_candidate(
+                    "cam-1",
+                    1700000000000,
+                )
+                .with_device_context(
+                    Some("Front Door".to_string()),
+                    Some("Entry".to_string()),
+                    Some("DemoCam".to_string()),
+                    Some("C1".to_string()),
+                    Some("manual_entry".to_string()),
+                    Some("rtsp".to_string()),
+                    Some(false),
+                ),
+            ),
+        };
+
+        let sidecar = build_image_index_sidecar(
+            &artifact,
+            "analysis_snapshot",
+            Some(Path::new(
+                "artifacts/vision/snapshots/cam-1-1700000000000.jpg",
+            )),
+            Some(Path::new(
+                "artifacts/vision/annotated/cam-1-1700000000000.jpg",
+            )),
+            artifact.tags.clone(),
+            artifact.labels.clone(),
+            artifact.caption.clone(),
+            artifact.derived_text.clone(),
+        );
+        let encoded = serde_json::to_value(&sidecar).expect("serialize sidecar");
+
+        assert_eq!(encoded["artifact_role"], "analysis_snapshot");
+        assert_eq!(
+            encoded["image_path"],
+            "artifacts/vision/annotated/cam-1-1700000000000.jpg"
+        );
+        assert_eq!(
+            encoded["source_image_path"],
+            "artifacts/vision/snapshots/cam-1-1700000000000.jpg"
+        );
+        assert_eq!(
+            encoded["annotated_image_path"],
+            "artifacts/vision/annotated/cam-1-1700000000000.jpg"
+        );
+        assert_eq!(encoded["caption"], "Front Door AI snapshot");
+        assert_eq!(
+            encoded["derived_text"],
+            "Front Door AI snapshot; detected person; labels: person, door; detections: person:0.92, door:0.71"
+        );
+        assert_eq!(
+            encoded["tags"],
+            serde_json::json!(["camera", "snapshot", "vision_analysis"])
+        );
+        assert_eq!(encoded["labels"], serde_json::json!(["person", "door"]));
+        assert_eq!(
+            encoded["source_storage"]["relative_path"],
+            "snapshots/cam-1/1700000000000.jpg"
+        );
+        assert_eq!(encoded["ingest_metadata"]["device_id"], "cam-1");
+        assert_eq!(encoded["ingest_metadata"]["device_name"], "Front Door");
+        assert_eq!(encoded["ingest_metadata"]["provenance"], "media");
+        assert_eq!(
+            encoded["ingest_metadata"]["ingest_disposition"],
+            "knowledge_index_candidate"
+        );
     }
 
     #[test]

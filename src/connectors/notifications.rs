@@ -1,4 +1,4 @@
-//! Outbound notification contract for IM Gateway delivery and local UI alerts.
+//! Outbound notification contract for HarborGate delivery and local UI alerts.
 
 use std::env;
 use std::time::Duration;
@@ -9,8 +9,10 @@ use serde_json::Value;
 use uuid::Uuid;
 
 pub const CONTRACT_VERSION: &str = "1.5";
-const IM_GATEWAY_BASE_URL_ENV: &str = "HARBOR_IM_GATEWAY_BASE_URL";
-const IM_GATEWAY_BEARER_TOKEN_ENV: &str = "HARBOR_IM_GATEWAY_BEARER_TOKEN";
+const IM_GATEWAY_BASE_URL_ENV: &str = "HARBORGATE_BASE_URL";
+const IM_GATEWAY_BEARER_TOKEN_ENV: &str = "HARBORGATE_BEARER_TOKEN";
+const LEGACY_IM_GATEWAY_BASE_URL_ENV: &str = "HARBOR_IM_GATEWAY_BASE_URL";
+const LEGACY_IM_GATEWAY_BEARER_TOKEN_ENV: &str = "HARBOR_IM_GATEWAY_BEARER_TOKEN";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -186,10 +188,14 @@ pub struct NotificationGatewayConfig {
 
 impl NotificationGatewayConfig {
     pub fn from_env() -> Result<Self, String> {
-        let base_url = env::var(IM_GATEWAY_BASE_URL_ENV)
-            .map_err(|_| format!("missing required env var {IM_GATEWAY_BASE_URL_ENV}"))?;
-        let bearer_token = env::var(IM_GATEWAY_BEARER_TOKEN_ENV)
-            .map_err(|_| format!("missing required env var {IM_GATEWAY_BEARER_TOKEN_ENV}"))?;
+        let base_url =
+            env_var_with_legacy_alias(IM_GATEWAY_BASE_URL_ENV, LEGACY_IM_GATEWAY_BASE_URL_ENV)
+                .ok_or_else(|| format!("missing required env var {IM_GATEWAY_BASE_URL_ENV}"))?;
+        let bearer_token = env_var_with_legacy_alias(
+            IM_GATEWAY_BEARER_TOKEN_ENV,
+            LEGACY_IM_GATEWAY_BEARER_TOKEN_ENV,
+        )
+        .ok_or_else(|| format!("missing required env var {IM_GATEWAY_BEARER_TOKEN_ENV}"))?;
         Self::new(base_url, bearer_token)
     }
 
@@ -199,17 +205,35 @@ impl NotificationGatewayConfig {
     ) -> Result<Self, String> {
         let base_url = base_url.into().trim().to_string();
         if base_url.is_empty() {
-            return Err("IM Gateway base URL cannot be empty".to_string());
+            return Err("HarborGate base URL cannot be empty".to_string());
         }
         let bearer_token = bearer_token.into().trim().to_string();
         if bearer_token.is_empty() {
-            return Err("IM Gateway bearer token cannot be empty".to_string());
+            return Err("HarborGate bearer token cannot be empty".to_string());
         }
         Ok(Self {
             base_url,
             bearer_token,
         })
     }
+}
+
+fn env_var_with_legacy_alias(primary: &str, legacy: &str) -> Option<String> {
+    if let Some(value) = env::var(primary)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(value);
+    }
+
+    env::var(legacy)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .inspect(|_| {
+            eprintln!("warning: {legacy} is deprecated; prefer {primary}");
+        })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -365,7 +389,7 @@ mod tests {
             notification_id: "notif_01JABC".to_string(),
             trace_id: "trace_01JABC".to_string(),
             source: NotificationSource {
-                service: "harbornas".to_string(),
+                service: "harborbeacon".to_string(),
                 module: "task_api".to_string(),
                 event_type: "task.completed".to_string(),
             },
@@ -387,7 +411,7 @@ mod tests {
                     kind: NotificationAttachmentKind::Image,
                     label: "snapshot".to_string(),
                     mime_type: "image/jpeg".to_string(),
-                    path: Some(".harbornas/vision/snapshot.jpg".to_string()),
+                    path: Some(".harborbeacon/vision/snapshot.jpg".to_string()),
                     url: None,
                     metadata: Value::Null,
                 }],

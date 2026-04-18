@@ -36,11 +36,24 @@ from harborbeacon.webhook import WebhookRequest
 
 logger = logging.getLogger("harborbeacon.bridge_runner")
 
+def _resolve_admin_state_path(path: Path) -> Path:
+    if path.exists() or ".harborbeacon" not in str(path):
+        return path
+    legacy = Path(str(path).replace(".harborbeacon", ".harbornas"))
+    if legacy.exists():
+        print(
+            f"warning: legacy HarborNAS state path {legacy} is deprecated; prefer {path}",
+            flush=True,
+        )
+        return legacy
+    return path
+
+
 DEFAULT_CHANNELS_CONFIG_PATH = Path(
     os.environ.get("HARBORBEACON_CHANNELS_CONFIG", "/etc/harborbeacon/channels.yaml")
 )
-DEFAULT_ADMIN_STATE_PATH = Path(
-    os.environ.get("HARBORBEACON_ADMIN_STATE", ".harbornas/admin-console.json")
+DEFAULT_ADMIN_STATE_PATH = _resolve_admin_state_path(
+    Path(os.environ.get("HARBORBEACON_ADMIN_STATE", ".harborbeacon/admin-console.json"))
 )
 
 
@@ -356,6 +369,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Python logging level",
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
+    args.admin_state = str(_resolve_admin_state_path(Path(args.admin_state)))
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),

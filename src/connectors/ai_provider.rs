@@ -150,7 +150,7 @@ impl OpenAiCompatibleVisionClient {
         &self,
         request: &VisionSummaryRequest,
     ) -> Result<VisionSummaryResponse, String> {
-        let system_prompt = "You are a concise Chinese security-camera analyst. Summarize what matters for a HarborNAS user. Mention detected people count, approximate position, and whether the frame needs attention. Keep it under 80 Chinese characters.";
+        let system_prompt = "You are a concise Chinese security-camera analyst. Summarize what matters for a HarborBeacon user. Mention detected people count, approximate position, and whether the frame needs attention. Keep it under 80 Chinese characters.";
         let user_prompt = request.user_prompt.clone().unwrap_or_else(|| {
             "请根据检测结果和图片，用中文总结当前画面。优先说明是否有人、人数、位置和是否需要关注。".to_string()
         });

@@ -1,4 +1,5 @@
 import importlib.util
+import sys
 from pathlib import Path
 
 
@@ -54,3 +55,11 @@ def test_rows_to_csv():
         ["service", "state", "enable"],
     )
     assert output == "service,state,enable\nssh,STOPPED,False\n"
+
+
+def test_module_imports_without_websocket_dependency(monkeypatch):
+    monkeypatch.setitem(sys.modules, "websocket", None)
+    shim = _load_shim_module()
+
+    assert shim.websocket is None
+    assert shim.parse_service_action("service restart service=ftp") == ("restart", "ftp")

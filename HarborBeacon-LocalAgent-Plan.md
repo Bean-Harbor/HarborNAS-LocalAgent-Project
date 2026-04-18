@@ -1,18 +1,18 @@
-# HarborNAS 本地智能体规划文档
+# HarborBeacon 本地智能体规划文档
 
 > 当前执行更新（2026-04-18）  
-> 当前落地重点不是继续扩张单仓 IM 能力，而是按 `HarborNAS-IM-Gateway-Agent-Contract-v1.5` 完成双仓边界。  
-> IM 仓库负责 `adapter/gateway/route/平台凭据`；HarborNAS 负责 `task/business state/approval/artifact/audit`。  
-> 两边只通过 HTTP/JSON contract 通信，不互相 import，也不共享 `.harbornas/*.json`。  
-> 本文档以下实施阶段与近期行动，均以 HarborNAS 侧可执行工作为准。  
-> 协作术语统一以 `HarborNAS-Harbor-Collaboration-Contract-v2` 与 `harbor-*` lane 命名为准。
+> 当前落地重点不是继续扩张单仓 IM 能力，而是按 `HarborBeacon-IM-Gateway-Agent-Contract-v1.5` 完成双仓边界。  
+> IM 仓库负责 `adapter/gateway/route/平台凭据`；HarborBeacon 负责 `task/business state/approval/artifact/audit`。  
+> 两边只通过 HTTP/JSON contract 通信，不互相 import，也不共享 `.harborbeacon/*.json`。  
+> 本文档以下实施阶段与近期行动，均以 HarborBeacon 侧可执行工作为准。  
+> 协作术语统一以 `HarborBeacon-Harbor-Collaboration-Contract-v2` 与 `harbor-*` lane 命名为准。
 
 ## 0. 当前协作口径
 
 - `harbor-architect`
   负责跨 lane 边界治理、cutover sequencing、发布/回滚 gate 与最终验收。
 - `harbor-framework`
-  负责 HarborNAS 共享 runtime、北向 contract、task/session lifecycle、approval、artifact、audit、本地推理抽象、账号权限与智能编排。
+  负责 HarborBeacon 共享 runtime、北向 contract、task/session lifecycle、approval、artifact、audit、本地推理抽象、账号权限与智能编排。
 - `harbor-im-gateway`
   负责外部 IM 仓库的 adapter/gateway/route/平台凭据/outbound delivery；在本计划中主要作为跨仓 contract 与联调协作者出现。
 - `harbor-hos-control`
@@ -22,7 +22,7 @@
 
 当前阶段默认分工:
 
-- HarborNAS 仓库内的主实施 owner 默认是 `harbor-framework`。
+- HarborBeacon 仓库内的主实施 owner 默认是 `harbor-framework`。
 - 本地推理、审计、账号管理、智能编排默认归 `harbor-framework`。
 - 跨 lane 边界变更由 `harbor-architect` 做最终批准。
 - 每天收工时，各 lane owner 负责各自仓库或职责线的 GitHub 同步；`harbor-architect` 负责跨 lane 的日终收口与是否可合并/可发布判断。
@@ -30,7 +30,7 @@
 
 ## 1. 项目目标
 
-为 HarborNAS 构建一个 **混合计算智能体**，具备：
+为 HarborBeacon 构建一个 **混合计算智能体**，具备：
 - ✅ **多模态 RAG** - 支持文本、图像、音频、视频的检索增强生成
 - ✅ **智能任务编排** - 动态判断任务复杂度，选择最优执行路径
 - ✅ **本地优先策略** - 隐私优先，敏感任务不出本地
@@ -45,7 +45,7 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│             外部 IM Gateway Repo（非本仓实现范围）            │
+│             外部 HarborGate Repo（非本仓实现范围）            │
 │  adapters / webhook / websocket / long-poll / route registry │
 │  platform credentials / outbound delivery / attachment proxy │
 └──────────────────────┬───────────────────────────────────────┘
@@ -54,12 +54,12 @@
                        │  POST /api/notifications/deliveries
                        │  GET  /api/gateway/status (optional)
 ┌──────────────────────▼───────────────────────────────────────┐
-│                HarborNAS 用户交互与任务入口                  │
+│                HarborBeacon 用户交互与任务入口                  │
 │  assistant_task_api / admin API / WebUI / local automation  │
 └──────────────────────┬───────────────────────────────────────┘
                        │
 ┌──────────────────────▼───────────────────────────────────────┐
-│                HarborNAS 业务与编排核心                      │
+│                HarborBeacon 业务与编排核心                      │
 │  task intake / task router / workflow state / approvals     │
 │  artifacts / audit / notification intent generation         │
 └────────┬─────────────────┬──────────────────┬───────────────┘
@@ -82,10 +82,10 @@
 
 当前边界约束:
 
-- IM Gateway 拥有 route key 生命周期、平台凭据、平台 payload 格式与实际消息投递。
-- HarborNAS 拥有业务会话真相、可恢复流程、审批、artifact、audit 与 notification intent。
-- HarborNAS 可以持久化 `route_key` 作为写入型路由元数据，但不得解释其平台语义。
-- HarborNAS 不得再依赖 IM 仓库内部模型、运行时代码或 `.harbornas/*.json`。
+- HarborGate 拥有 route key 生命周期、平台凭据、平台 payload 格式与实际消息投递。
+- HarborBeacon 拥有业务会话真相、可恢复流程、审批、artifact、audit 与 notification intent。
+- HarborBeacon 可以持久化 `route_key` 作为写入型路由元数据，但不得解释其平台语义。
+- HarborBeacon 不得再依赖 IM 仓库内部模型、运行时代码或 `.harborbeacon/*.json`。
 
 ### 2.2 任务分类与路由规则
 
@@ -390,7 +390,7 @@ class CloudExecutor:
 ### 4.1 数据摄入管道
 
 ```
-HarborNAS 文件系统
+HarborBeacon 文件系统
   └─ 文本: Markdown, PDF, TXT
      └─ OCR 提取 (local: PaddleOCR)
      └─ 分块策略: 递归分块 (segment_size=512, overlap=50)
@@ -608,10 +608,10 @@ harbor-local-agent/
 
 ## 6. 实现阶段规划
 
-### Phase 1: HarborNAS 边界冻结与 Contract 对齐 (Weeks 1-2)
+### Phase 1: HarborBeacon 边界冻结与 Contract 对齐 (Weeks 1-2)
 - Owner: `harbor-framework`
 - Collaborators: `harbor-architect`, `harbor-im-gateway`
-- [x] 将 HarborNAS 入站接口对齐到 v1.5 `POST /api/tasks`
+- [x] 将 HarborBeacon 入站接口对齐到 v1.5 `POST /api/tasks`
 - [x] 支持 `source.route_key`、顶层 `message` block、RFC 3339 UTC
 - [x] 增加 `X-Contract-Version: 1.5` 与服务鉴权校验
 - [x] 统一 non-200 shared error envelope
@@ -621,30 +621,30 @@ harbor-local-agent/
 - Owner: `harbor-framework`
 - Collaborators: `harbor-architect`, `harbor-im-gateway`
 - [x] 会话状态中持久化 `route_key`，但保持其为 opaque metadata
-- [x] 保持 HarborNAS 独占业务会话真相与 `resume_token` 流程
+- [x] 保持 HarborBeacon 独占业务会话真相与 `resume_token` 流程
 - [x] 审批、artifact、audit 补齐 `task_id/trace_id/route_key` 关联
 - [x] 处理附件 transport metadata，但不引入平台文件语义
 
 ### Phase 3: Outbound Notification Intent Cutover (Weeks 5-7)
 - Owner: `harbor-framework`
 - Collaborators: `harbor-architect`, `harbor-im-gateway`
-- [x] 将通知投递改为 HarborNAS -> IM Gateway `POST /api/notifications/deliveries`
+- [x] 将通知投递改为 HarborBeacon -> HarborGate `POST /api/notifications/deliveries`
 - [x] 对齐 `delivery.mode`、`destination.route_key`、`idempotency_key`
 - [x] 增加 delivery success / accepted failure / request rejection 处理逻辑
-- [x] 删除 HarborNAS 直连 Feishu / Telegram 等平台消息发送路径
+- [x] 删除 HarborBeacon 直连 Feishu / Telegram 等平台消息发送路径
 
 ### Phase 4: 管理面去凭据化与状态解耦 (Weeks 8-9)
 - Owner: `harbor-framework`
 - Collaborators: `harbor-architect`, `harbor-im-gateway`
-- [x] 移除 HarborNAS 对 `app_id/app_secret/bot token` 的长期职责
-- [x] 改为读取 IM Gateway redacted status，而非本地校验平台凭据
+- [x] 移除 HarborBeacon 对 `app_id/app_secret/bot token` 的长期职责
+- [x] 改为读取 HarborGate redacted status，而非本地校验平台凭据
 - [x] 清理 `bridge_provider` 与管理台配置中的平台耦合
 - [ ] 为迁移期保留受控兼容开关与回滚方案
 
 ### Phase 5: Cutover 联调与发布准备 (Weeks 10-12)
 - Owner: `harbor-framework`
 - Collaborators: `harbor-architect`, `harbor-im-gateway`, `harbor-hos-control`, `harbor-aiot`
-- [ ] HarborNAS 侧 contract / integration / E2E 测试补齐
+- [ ] HarborBeacon 侧 contract / integration / E2E 测试补齐
 - [ ] 联调 inbound / resume / approval / artifact / notification 全链路
 - [ ] 增加 cutover 清单、回滚清单、迁移文档
 - [ ] 清理旧代码路径并完成发布评审
@@ -716,19 +716,19 @@ metrics = {
 
 ### 立即行动 (Week 0)
 1. **入站 Contract 对齐** - 更新 `assistant_task_api` / `runtime/task_api` 支持 v1.5 字段与错误模型
-2. **耦合点盘点** - 列出 HarborNAS 内所有直连 IM 发送、平台凭据校验、状态共享假设
-3. **测试基线建立** - 为 inbound/outbound contract、幂等、resume、approval 建立 HarborNAS 侧回归
+2. **耦合点盘点** - 列出 HarborBeacon 内所有直连 IM 发送、平台凭据校验、状态共享假设
+3. **测试基线建立** - 为 inbound/outbound contract、幂等、resume、approval 建立 HarborBeacon 侧回归
 4. **cutover 策略确认** - 定义 feature flag、灰度步骤、回滚开关
 
 ### Week 1 优先事项
 - 扩展 `TaskRequest`，纳入 `source.route_key` 与顶层 `message` block
 - 在会话状态中持久化 `route_key`，打通 `needs_input` / `resume_token`
 - 统一 `X-Contract-Version: 1.5`、服务鉴权与 shared error envelope
-- 抽象 HarborNAS 侧 notification client，为切换 IM Gateway delivery 做准备
+- 抽象 HarborBeacon 侧 notification client，为切换 HarborGate delivery 做准备
 
 ### 风险检查清单
-- [ ] HarborNAS 是否仍在任何路径上保存原始 IM 平台凭据？
-- [ ] HarborNAS 是否仍有直接调用平台消息发送接口的路径？
-- [ ] `route_key` 是否在 HarborNAS 中被错误解释为平台 recipient 语义？
-- [ ] 是否仍存在依赖 IM 仓库或共享 `.harbornas/*.json` 的假设？
+- [ ] HarborBeacon 是否仍在任何路径上保存原始 IM 平台凭据？
+- [ ] HarborBeacon 是否仍有直接调用平台消息发送接口的路径？
+- [ ] `route_key` 是否在 HarborBeacon 中被错误解释为平台 recipient 语义？
+- [ ] 是否仍存在依赖 IM 仓库或共享 `.harborbeacon/*.json` 的假设？
 

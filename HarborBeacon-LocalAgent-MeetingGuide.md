@@ -1,4 +1,4 @@
-# HarborNAS 本地智能体 - 架构评审会议指南
+# HarborBeacon 本地智能体 - 架构评审会议指南
 
 ## 会议目标
 
@@ -17,8 +17,8 @@
 ### 参与者预阅
 
 所有参与者需先阅读:
-1. [快速参考指南](./HarborNAS-LocalAgent-QuickRef.md) (15 分钟)
-2. 完整规划中的 [核心架构](./HarborNAS-LocalAgent-Plan.md#2-核心架构设计) 部分 (20 分钟)
+1. [快速参考指南](./HarborBeacon-LocalAgent-QuickRef.md) (15 分钟)
+2. 完整规划中的 [核心架构](./HarborBeacon-LocalAgent-Plan.md#2-核心架构设计) 部分 (20 分钟)
 
 ### 关键背景
 

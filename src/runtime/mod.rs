@@ -6,6 +6,8 @@ pub mod automation;
 pub mod discovery;
 pub mod events;
 pub mod hub;
+pub mod knowledge;
+pub mod knowledge_index;
 pub mod media;
 pub mod node_runtime;
 pub mod registry;

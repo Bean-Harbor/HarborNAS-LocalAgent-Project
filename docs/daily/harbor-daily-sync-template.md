@@ -34,7 +34,7 @@ end, `harbor-architect` appends the integration closeout section.
 
 1. Each lane owner finishes code, tests, commit/push/PR hygiene, then fills in
    one lane section.
-2. `harbor-framework` reports HarborNAS shared-runtime and core-platform work.
+2. `harbor-framework` reports HarborBeacon shared-runtime and core-platform work.
 3. `harbor-im-gateway` reports IM Gateway repo work.
 4. `harbor-hos-control` reports HarborOS System Domain work.
 5. `harbor-aiot` reports Home Device Domain / camera / AIoT work.
@@ -67,6 +67,22 @@ Copy one block per lane:
 - Ran:
 - Result:
 
+### IM Seam / Rollback Gate
+
+- Inbound task seam status:
+- Outbound delivery seam status:
+- Redacted gateway status available: yes / no / n-a
+- Retrieval launch / handoff pack referenced: yes / no / n-a
+- Explicit `knowledge.search` available: yes / no / n-a
+- NL retrieval fallback canary state: enabled / disabled / n-a
+- Rollback safety status:
+- HarborBeacon direct platform delivery reintroduced: yes / no
+- HarborBeacon direct platform delivery count on canary path = 0: yes / no
+- HarborBeacon raw credential ownership or validation reintroduced: yes / no
+- HarborOS scope drift into IM transport ownership: yes / no
+- Observability fields seen:
+- Missing fields or notes:
+
 ### GitHub Status
 
 - Commit/push status:
@@ -77,6 +93,7 @@ Copy one block per lane:
 - Touched seam:
 - Required collaborators:
 - Frozen boundary affected: yes / no
+- IM v1.5 cutover gate package used: yes / no
 
 ### Risks / Blockers
 
@@ -121,6 +138,7 @@ Append this after all lane sections:
 - Safe to merge today: yes / no
 - Safe to cut over today: yes / no
 - Highest current risk:
+- Retrieval handoff notes:
 
 ### Next-Day Order
 

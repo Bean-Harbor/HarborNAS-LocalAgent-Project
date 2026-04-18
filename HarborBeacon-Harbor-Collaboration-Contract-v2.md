@@ -1,12 +1,12 @@
-# HarborNAS Harbor Collaboration Contract v2
+# HarborBeacon Harbor Collaboration Contract v2
 
 ## Status
 
 This document is the working freeze candidate for the current multi-lane
 development model across:
 
-- the HarborNAS repo
-- the external IM Gateway repo
+- the HarborBeacon repo
+- the external HarborGate repo
 - the `harbor-*` skill topology used to organize ownership
 
 It supersedes the narrower HarborOS-control-only collaboration model as the
@@ -18,16 +18,16 @@ This document does not replace or reinterpret the external IM contract.
 
 The authoritative cross-repo IM boundary remains:
 
-- `C:\Users\beanw\OpenSource\IM\HarborNAS-IM-Gateway-Agent-Contract-v1.5.md`
+- `C:\Users\beanw\OpenSource\IM\HarborBeacon-HarborGate-Agent-Contract-v1.5.md`
 
 Execution planning references:
 
-- `C:\Users\beanw\HarborNAS-LocalAgent-Project-git\HarborNAS-LocalAgent-Roadmap.md`
-- `C:\Users\beanw\HarborNAS-LocalAgent-Project-git\HarborNAS-LocalAgent-Plan.md`
+- `C:\Users\beanw\HarborBeacon-LocalAgent-Project-git\HarborBeacon-LocalAgent-Roadmap.md`
+- `C:\Users\beanw\HarborBeacon-LocalAgent-Project-git\HarborBeacon-LocalAgent-Plan.md`
 
 Historical same-repo HarborOS-only collaboration context:
 
-- `C:\Users\beanw\HarborNAS-LocalAgent-Project-git\HarborNAS-HarborOS-Control-Collaboration-Contract-v1.md`
+- `C:\Users\beanw\HarborBeacon-LocalAgent-Project-git\HarborBeacon-HarborOS-Control-Collaboration-Contract-v1.md`
 
 If this document conflicts with the IM contract v1.5 on cross-repo interface
 semantics, the IM contract v1.5 wins.
@@ -40,7 +40,7 @@ without re-coupling the system.
 The intended operating model for this phase is:
 
 - IM remains in a separate repo
-- HarborNAS remains the business-core repo
+- HarborBeacon remains the business-core repo
 - southbound work is domain-split, not one generic adapter bucket
 - each lane owns implementation inside a frozen collaboration boundary
 
@@ -65,7 +65,7 @@ Do not automatically own:
 Own:
 
 - shared runtime and control-plane boundaries
-- northbound task ingress and response semantics inside HarborNAS
+- northbound task ingress and response semantics inside HarborBeacon
 - task/session lifecycle
 - approval, artifact, event, and audit semantics
 - local inference runtime abstraction and provider-policy seams
@@ -91,8 +91,8 @@ Own:
 
 Do not automatically own:
 
-- HarborNAS business state
-- HarborNAS approval, artifact, audit, or task-session truth
+- HarborBeacon business state
+- HarborBeacon approval, artifact, audit, or task-session truth
 
 ### `harbor-hos-control`
 
@@ -124,19 +124,19 @@ Do not automatically own:
 
 - IM transport
 - HarborOS system-domain execution
-- HarborNAS business-state ownership
+- HarborBeacon business-state ownership
 
 ## System Boundary
 
 ### Cross-Repo Boundary
 
-- IM Gateway and HarborNAS communicate only through HTTP/JSON contracts.
+- HarborGate and HarborBeacon communicate only through HTTP/JSON contracts.
 - The repos MUST NOT import each other's runtime code.
-- The repos MUST NOT share `.harbornas/*.json` or other runtime state files.
+- The repos MUST NOT share `.harborbeacon/*.json` or other runtime state files.
 
 ### Business Source Of Truth
 
-HarborNAS remains the source of truth for:
+HarborBeacon remains the source of truth for:
 
 - business session state
 - resumable workflow state
@@ -145,7 +145,7 @@ HarborNAS remains the source of truth for:
 - audit trail
 - business conversation continuity
 
-IM Gateway owns transport and platform concerns only.
+HarborGate owns transport and platform concerns only.
 
 ### Southbound Domain Split
 
@@ -172,9 +172,9 @@ Meaning:
 
 ## Hard Boundary Rules
 
-- HarborNAS MUST NOT directly deliver IM platform messages after cutover.
-- HarborNAS MUST NOT become the long-term owner of IM platform credentials.
-- IM Gateway MUST NOT absorb HarborNAS business semantics.
+- HarborBeacon MUST NOT directly deliver IM platform messages after cutover.
+- HarborBeacon MUST NOT become the long-term owner of IM platform credentials.
+- HarborGate MUST NOT absorb HarborBeacon business semantics.
 - HarborOS control MUST NOT silently absorb Home Device Domain ownership.
 - AIoT work MUST NOT silently collapse device-native control into HarborOS
   system control.
@@ -332,9 +332,9 @@ closeout.
 
 - each lane owner syncs their own repo or lane changes to GitHub before ending
   the workday
-- `harbor-framework` is the default daily sync owner for HarborNAS-repo core
+- `harbor-framework` is the default daily sync owner for HarborBeacon-repo core
   work
-- `harbor-im-gateway` is the daily sync owner for the external IM Gateway repo
+- `harbor-im-gateway` is the daily sync owner for the external HarborGate repo
 - `harbor-hos-control` syncs HarborOS System Domain changes
 - `harbor-aiot` syncs AIoT and Home Device Domain changes
 
@@ -347,7 +347,7 @@ At minimum, the lane owner should leave behind:
 
 The default reporting template lives at:
 
-- `C:\Users\beanw\HarborNAS-LocalAgent-Project-git\docs\daily\harbor-daily-sync-template.md`
+- `C:\Users\beanw\HarborBeacon-LocalAgent-Project-git\docs\daily\harbor-daily-sync-template.md`
 
 Lane owners should not wait for `harbor-architect` to do basic commit, push, or
 pull-request hygiene on their behalf.
@@ -396,7 +396,7 @@ A cross-lane release is allowed only when:
 - frozen contract tests pass when applicable
 - rollback shape is documented for boundary-moving changes
 - no repo import or runtime-state sharing violation was introduced
-- IM credential ownership did not leak into HarborNAS
+- IM credential ownership did not leak into HarborBeacon
 - device-native ownership did not collapse into HarborOS system control
 
 ## Working Principle

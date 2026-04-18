@@ -1,8 +1,8 @@
-# HarborNAS HarborOS Control Collaboration Contract v1
+# HarborBeacon HarborOS Control Collaboration Contract v1
 
 > Superseded note (2026-04-18)  
 > For the current multi-lane collaboration model, use
-> `C:\Users\beanw\HarborNAS-LocalAgent-Project-git\HarborNAS-Harbor-Collaboration-Contract-v2.md`
+> `C:\Users\beanw\OpenSource\HarborBeacon\HarborBeacon-Harbor-Collaboration-Contract-v2.md`
 > as the primary coordination contract.  
 > This file remains useful as historical HarborOS-control-specific context.
 
@@ -37,9 +37,9 @@ Rules:
   - resumed turn semantics using `args.resume_token`
   - outbound notification delivery semantics
   - `X-Contract-Version`
-  - shared HTTP auth and error envelope rules
+- shared HTTP auth and error envelope rules
 - This document governs only HarborOS control implementation inside the
-  HarborNAS repo.
+  HarborBeacon repo.
 - If this document conflicts with IM contract v1.5, IM contract v1.5 wins.
 - HarborOS control work MUST NOT directly modify the external IM contract file.
 

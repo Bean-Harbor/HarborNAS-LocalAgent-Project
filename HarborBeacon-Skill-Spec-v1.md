@@ -1,4 +1,4 @@
-# HarborNAS Skill Specification v1
+# HarborBeacon Skill Specification v1
 
 ## Purpose
 This document defines the standard contract for Skills so teams can build, test, and run skills consistently with HarborOS control-plane-first execution. For HarborOS-domain capabilities, execution should bind to `middleware` API first, then `midcli` as fallback.
@@ -221,7 +221,7 @@ Rules:
 - invalid args, timeout, non-zero exit code.
 
 5. Compatibility test:
-- validate API schema and fallback behavior across HarborNAS and upstream versions.
+- validate API schema and fallback behavior across HarborBeacon and upstream versions.
 
 A skill is release-ready only if all tests pass.
 

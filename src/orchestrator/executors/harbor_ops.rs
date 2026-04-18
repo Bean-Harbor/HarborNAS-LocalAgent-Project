@@ -15,12 +15,21 @@ use crate::orchestrator::router::Executor;
 const ALLOWED_READ_ROOTS: [&str; 2] = ["/mnt", "/data"];
 const ALLOWED_WRITE_ROOTS: [&str; 3] = ["/mnt", "/data", "/tmp/agent"];
 const DENIED_ROOTS: [&str; 5] = ["/", "/etc", "/boot", "/root", "/var/lib"];
+const MAX_READ_TEXT_BYTES: u64 = 256 * 1024;
+const DEFAULT_READ_TEXT_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileOperationContext {
     source_path: String,
     target_path: String,
     recursive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadOnlyFileOperationContext {
+    path: String,
+    recursive: bool,
+    max_bytes: u64,
 }
 
 pub struct MiddlewareExecutor {
@@ -76,17 +85,28 @@ impl Executor for MiddlewareExecutor {
                 )
             }
             "files" => {
-                let file_ctx = extract_file_operation_context(action)?;
-                let (method, call_args) = map_files_operation(&action.operation, &file_ctx)?;
-                (
-                    method,
-                    call_args,
-                    json!({
-                        "source_path": file_ctx.source_path,
-                        "target_path": file_ctx.target_path,
-                        "recursive": file_ctx.recursive,
-                    }),
-                )
+                if is_read_only_file_operation(&action.operation) {
+                    let file_ctx = extract_read_only_file_operation_context(action)?;
+                    let (method, call_args) =
+                        map_read_only_files_operation(&action.operation, &file_ctx)?;
+                    (
+                        method,
+                        call_args,
+                        build_read_only_preview_context(&action.operation, &file_ctx),
+                    )
+                } else {
+                    let file_ctx = extract_file_operation_context(action)?;
+                    let (method, call_args) = map_files_operation(&action.operation, &file_ctx)?;
+                    (
+                        method,
+                        call_args,
+                        json!({
+                            "source_path": file_ctx.source_path,
+                            "target_path": file_ctx.target_path,
+                            "recursive": file_ctx.recursive,
+                        }),
+                    )
+                }
             }
             other => return Err(format!("unsupported harbor domain: {other}")),
         };
@@ -158,15 +178,23 @@ impl Executor for MidcliExecutor {
                 )
             }
             "files" => {
-                let file_ctx = extract_file_operation_context(action)?;
-                (
-                    build_midcli_files_command(&action.operation, &file_ctx)?,
-                    json!({
-                        "source_path": file_ctx.source_path,
-                        "target_path": file_ctx.target_path,
-                        "recursive": file_ctx.recursive,
-                    }),
-                )
+                if is_read_only_file_operation(&action.operation) {
+                    let file_ctx = extract_read_only_file_operation_context(action)?;
+                    (
+                        build_midcli_read_only_files_command(&action.operation, &file_ctx)?,
+                        build_read_only_preview_context(&action.operation, &file_ctx),
+                    )
+                } else {
+                    let file_ctx = extract_file_operation_context(action)?;
+                    (
+                        build_midcli_files_command(&action.operation, &file_ctx)?,
+                        json!({
+                            "source_path": file_ctx.source_path,
+                            "target_path": file_ctx.target_path,
+                            "recursive": file_ctx.recursive,
+                        }),
+                    )
+                }
             }
             other => return Err(format!("unsupported harbor domain: {other}")),
         };
@@ -257,6 +285,45 @@ fn map_files_operation(
     }
 }
 
+fn map_read_only_files_operation(
+    operation: &str,
+    file_ctx: &ReadOnlyFileOperationContext,
+) -> Result<(String, serde_json::Value), String> {
+    match operation {
+        "list" => Ok((
+            "filesystem.listdir".to_string(),
+            json!([file_ctx.path, {"recursive": file_ctx.recursive, "limit": 200}]),
+        )),
+        "stat" => Ok(("filesystem.stat".to_string(), json!([file_ctx.path]))),
+        "read_text" => Ok((
+            "filesystem.read_text".to_string(),
+            json!([file_ctx.path, {"max_bytes": file_ctx.max_bytes}]),
+        )),
+        _ => Err(format!("Unmapped read-only file operation: {operation}")),
+    }
+}
+
+fn build_read_only_preview_context(
+    operation: &str,
+    file_ctx: &ReadOnlyFileOperationContext,
+) -> serde_json::Value {
+    let mut context = serde_json::Map::new();
+    context.insert("path".to_string(), json!(file_ctx.path));
+    context.insert("normalized_path".to_string(), json!(file_ctx.path));
+    context.insert("preview_kind".to_string(), json!(operation));
+    context.insert("read_only".to_string(), json!(true));
+
+    if file_ctx.recursive {
+        context.insert("recursive".to_string(), json!(true));
+    }
+
+    if operation == "read_text" {
+        context.insert("max_bytes".to_string(), json!(file_ctx.max_bytes));
+    }
+
+    serde_json::Value::Object(context)
+}
+
 fn build_midcli_service_command(
     operation: &str,
     service_name: &str,
@@ -329,6 +396,37 @@ fn build_midcli_files_command(
     }
 }
 
+fn build_midcli_read_only_files_command(
+    operation: &str,
+    file_ctx: &ReadOnlyFileOperationContext,
+) -> Result<Vec<String>, String> {
+    match operation {
+        "list" => {
+            let mut command = vec![
+                "filesystem".to_string(),
+                "listdir".to_string(),
+                format!("path={}", file_ctx.path),
+            ];
+            if file_ctx.recursive {
+                command.push("recursive=true".to_string());
+            }
+            Ok(command)
+        }
+        "stat" => Ok(vec![
+            "filesystem".to_string(),
+            "stat".to_string(),
+            format!("path={}", file_ctx.path),
+        ]),
+        "read_text" => Ok(vec![
+            "filesystem".to_string(),
+            "read_text".to_string(),
+            format!("path={}", file_ctx.path),
+            format!("max_bytes={}", file_ctx.max_bytes),
+        ]),
+        _ => Err(format!("Unmapped midcli read-only operation: {operation}")),
+    }
+}
+
 fn extract_service_name<'a>(action: &'a Action) -> Result<&'a str, String> {
     let service_name = action
         .resource
@@ -398,6 +496,59 @@ fn extract_file_operation_context(action: &Action) -> Result<FileOperationContex
     })
 }
 
+fn extract_read_only_file_operation_context(
+    action: &Action,
+) -> Result<ReadOnlyFileOperationContext, String> {
+    if action.resource.get("target").is_some()
+        || action.resource.get("destination").is_some()
+        || action.resource.get("dst").is_some()
+    {
+        return Err("read-only file operations cannot include destination fields".to_string());
+    }
+
+    let path = action
+        .resource
+        .get("paths")
+        .and_then(|value| value.as_array())
+        .and_then(|paths| paths.first())
+        .and_then(|value| value.as_str())
+        .or_else(|| action.resource.get("path").and_then(|value| value.as_str()))
+        .or_else(|| {
+            action
+                .resource
+                .get("source")
+                .and_then(|value| value.as_str())
+        })
+        .or_else(|| action.resource.get("src").and_then(|value| value.as_str()))
+        .ok_or_else(|| {
+            "read-only files action requires resource.path or resource.paths[0]".to_string()
+        })?;
+
+    let path = normalize_contract_path(path)?;
+    validate_read_only_path(&path)?;
+
+    let max_bytes = action
+        .args
+        .get("max_bytes")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(DEFAULT_READ_TEXT_BYTES);
+    if max_bytes == 0 || max_bytes > MAX_READ_TEXT_BYTES {
+        return Err(format!(
+            "read_text max_bytes must be between 1 and {MAX_READ_TEXT_BYTES}"
+        ));
+    }
+
+    Ok(ReadOnlyFileOperationContext {
+        path,
+        recursive: action
+            .args
+            .get("recursive")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        max_bytes,
+    })
+}
+
 fn normalize_contract_path(path: &str) -> Result<String, String> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
@@ -454,12 +605,31 @@ fn validate_file_paths(source_path: &str, target_path: &str) -> Result<(), Strin
     Ok(())
 }
 
+fn validate_read_only_path(path: &str) -> Result<(), String> {
+    if DENIED_ROOTS.iter().any(|root| is_under_root(path, root)) {
+        return Err(format!("denied path: {path}"));
+    }
+
+    if !ALLOWED_READ_ROOTS
+        .iter()
+        .any(|root| is_under_root(path, root))
+    {
+        return Err(format!("read path outside allowlist: {path}"));
+    }
+
+    Ok(())
+}
+
 fn is_under_root(path: &str, root: &str) -> bool {
     path == root
         || path
             .strip_prefix(root)
             .map(|suffix| suffix.starts_with('/'))
             .unwrap_or(false)
+}
+
+fn is_read_only_file_operation(operation: &str) -> bool {
+    matches!(operation, "list" | "stat" | "read_text")
 }
 
 // ---------------------------------------------------------------------------
@@ -1044,5 +1214,289 @@ mod tests {
         assert!(MiddlewareExecutor::new(true).supports(&action));
         assert!(MidcliExecutor::new(true, "midcli".to_string(), false).supports(&action));
         assert!(MiddlewareWsExecutor::new("http://nas.local", "root", "secret").supports(&action));
+    }
+
+    #[test]
+    fn harboros_executors_do_not_claim_device_native_domains() {
+        let action = Action {
+            domain: "device".to_string(),
+            operation: "inspect".to_string(),
+            resource: json!({
+                "device_id": "cam-1"
+            }),
+            args: json!({}),
+            risk_level: RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+
+        assert!(!MiddlewareExecutor::new(true).supports(&action));
+        assert!(!MidcliExecutor::new(true, "midcli".to_string(), false).supports(&action));
+        assert!(!MiddlewareWsExecutor::new("http://nas.local", "root", "secret").supports(&action));
+    }
+
+    #[test]
+    fn readonly_files_are_supported_by_harbor_executors() {
+        let action = Action {
+            domain: "files".to_string(),
+            operation: "read_text".to_string(),
+            resource: json!({
+                "path": "/mnt/notes/brief.txt"
+            }),
+            args: json!({
+                "max_bytes": 4096
+            }),
+            risk_level: RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+
+        assert!(MiddlewareExecutor::new(true).supports(&action));
+        assert!(MidcliExecutor::new(true, "midcli".to_string(), false).supports(&action));
+        assert!(MiddlewareWsExecutor::new("http://nas.local", "root", "secret").supports(&action));
+    }
+
+    #[test]
+    fn readonly_list_rejects_destination_fields() {
+        let executor = MidcliExecutor::new(true, "midcli".to_string(), false);
+        let action = Action {
+            domain: "files".to_string(),
+            operation: "list".to_string(),
+            resource: json!({
+                "path": "/mnt/notes",
+                "destination": "/tmp/agent/should_not_be_here"
+            }),
+            args: json!({}),
+            risk_level: RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+
+        let err = executor
+            .execute(&action, "task-5", "step-1")
+            .expect_err("guardrail");
+        assert!(err.contains("destination fields"));
+    }
+
+    #[test]
+    fn readonly_read_text_caps_max_bytes_and_stays_read_only() {
+        let executor = MiddlewareExecutor::new(true);
+        let action = Action {
+            domain: "files".to_string(),
+            operation: "read_text".to_string(),
+            resource: json!({
+                "path": "/mnt/notes/brief.txt"
+            }),
+            args: json!({
+                "max_bytes": 1024
+            }),
+            risk_level: RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+
+        let result = executor
+            .execute(&action, "task-6", "step-1")
+            .expect("readonly preview");
+
+        assert_eq!(result.executor_used, "middleware_api");
+        assert_eq!(result.result_payload["method"], "filesystem.read_text");
+        assert_eq!(
+            result.result_payload["context"]["path"],
+            "/mnt/notes/brief.txt"
+        );
+        assert_eq!(
+            result.result_payload["context"]["normalized_path"],
+            "/mnt/notes/brief.txt"
+        );
+        assert_eq!(
+            result.result_payload["context"]["preview_kind"],
+            "read_text"
+        );
+        assert_eq!(result.result_payload["context"]["read_only"], true);
+        assert_eq!(result.result_payload["context"]["max_bytes"], 1024);
+    }
+
+    #[test]
+    fn readonly_read_text_rejects_out_of_bounds_requests() {
+        let executor = MidcliExecutor::new(true, "midcli".to_string(), false);
+        let oversized = Action {
+            domain: "files".to_string(),
+            operation: "read_text".to_string(),
+            resource: json!({
+                "path": "/mnt/notes/brief.txt"
+            }),
+            args: json!({
+                "max_bytes": 1024 * 1024
+            }),
+            risk_level: RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+        let outside_root = Action {
+            domain: "files".to_string(),
+            operation: "read_text".to_string(),
+            resource: json!({
+                "path": "/etc/passwd"
+            }),
+            args: json!({
+                "max_bytes": 1024
+            }),
+            risk_level: RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+
+        let oversized_err = executor
+            .execute(&oversized, "task-7", "step-1")
+            .expect_err("oversized read should fail");
+        let root_err = executor
+            .execute(&outside_root, "task-7", "step-2")
+            .expect_err("root-escape read should fail");
+
+        assert!(oversized_err.contains("max_bytes"));
+        assert!(root_err.contains("denied path"));
+    }
+
+    #[test]
+    fn readonly_files_normalize_paths_before_execution() {
+        let executor = MiddlewareExecutor::new(true);
+        let action = Action {
+            domain: "files".to_string(),
+            operation: "list".to_string(),
+            resource: json!({
+                "path": "/mnt/library/../library/docs"
+            }),
+            args: json!({
+                "recursive": true
+            }),
+            risk_level: RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+
+        let result = executor
+            .execute(&action, "task-8", "step-1")
+            .expect("normalized read-only list");
+
+        assert_eq!(result.result_payload["method"], "filesystem.listdir");
+        assert_eq!(
+            result.result_payload["context"]["path"],
+            "/mnt/library/docs"
+        );
+        assert_eq!(
+            result.result_payload["context"]["normalized_path"],
+            "/mnt/library/docs"
+        );
+        assert_eq!(result.result_payload["context"]["preview_kind"], "list");
+        assert_eq!(result.result_payload["context"]["read_only"], true);
+    }
+
+    #[test]
+    fn readonly_list_and_stat_map_to_filesystem_primitives() {
+        let executor = MidcliExecutor::new(true, "midcli".to_string(), false);
+
+        let list_action = Action {
+            domain: "files".to_string(),
+            operation: "list".to_string(),
+            resource: json!({
+                "path": "/mnt/library"
+            }),
+            args: json!({
+                "recursive": false
+            }),
+            risk_level: RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+        let stat_action = Action {
+            domain: "files".to_string(),
+            operation: "stat".to_string(),
+            resource: json!({
+                "path": "/mnt/library/book.md"
+            }),
+            args: json!({}),
+            risk_level: RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+
+        let list_result = executor
+            .execute(&list_action, "task-9", "step-1")
+            .expect("list preview");
+        let stat_result = executor
+            .execute(&stat_action, "task-9", "step-2")
+            .expect("stat preview");
+
+        assert_eq!(list_result.result_payload["command"][1], "listdir");
+        assert_eq!(stat_result.result_payload["command"][1], "stat");
+        assert_eq!(list_result.result_payload["context"]["read_only"], true);
+        assert_eq!(stat_result.result_payload["context"]["read_only"], true);
+        assert_eq!(
+            list_result.result_payload["context"]["preview_kind"],
+            "list"
+        );
+        assert_eq!(
+            stat_result.result_payload["context"]["preview_kind"],
+            "stat"
+        );
+        assert_eq!(
+            stat_result.result_payload["context"]["normalized_path"],
+            "/mnt/library/book.md"
+        );
+    }
+
+    #[test]
+    fn readonly_preview_accepts_path_aliases_without_changing_shape() {
+        let executor = MiddlewareExecutor::new(true);
+        let source_action = Action {
+            domain: "files".to_string(),
+            operation: "stat".to_string(),
+            resource: json!({
+                "source": "/mnt/library/notes.txt"
+            }),
+            args: json!({}),
+            risk_level: RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+        let src_action = Action {
+            domain: "files".to_string(),
+            operation: "read_text".to_string(),
+            resource: json!({
+                "src": "/mnt/library/notes.txt"
+            }),
+            args: json!({
+                "max_bytes": 2048
+            }),
+            risk_level: RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+
+        let source_result = executor
+            .execute(&source_action, "task-10", "step-1")
+            .expect("source alias");
+        let src_result = executor
+            .execute(&src_action, "task-10", "step-2")
+            .expect("src alias");
+
+        assert_eq!(
+            source_result.result_payload["context"]["preview_kind"],
+            "stat"
+        );
+        assert_eq!(
+            source_result.result_payload["context"]["normalized_path"],
+            "/mnt/library/notes.txt"
+        );
+        assert_eq!(
+            src_result.result_payload["context"]["preview_kind"],
+            "read_text"
+        );
+        assert_eq!(
+            src_result.result_payload["context"]["normalized_path"],
+            "/mnt/library/notes.txt"
+        );
+        assert_eq!(src_result.result_payload["context"]["max_bytes"], 2048);
     }
 }

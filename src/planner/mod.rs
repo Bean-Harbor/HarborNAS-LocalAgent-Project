@@ -71,6 +71,43 @@ mod tests {
     }
 
     #[test]
+    fn planner_keeps_read_only_files_on_harboros_routes() {
+        let steps = plan_task(PlannerIntent {
+            domain: "files".to_string(),
+            operation: "read_text".to_string(),
+            resource: serde_json::json!({"path": "/mnt/notes/brief.txt"}),
+            args: json!({"max_bytes": 4096}),
+        });
+
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].route_candidates,
+            vec![Route::MiddlewareApi, Route::Midcli]
+        );
+    }
+
+    #[test]
+    fn planner_keeps_browser_and_mcp_for_non_system_domains() {
+        let steps = plan_task(PlannerIntent {
+            domain: "device".to_string(),
+            operation: "inspect".to_string(),
+            resource: serde_json::json!({"device_id": "cam-1"}),
+            args: json!({}),
+        });
+
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].route_candidates,
+            vec![
+                Route::MiddlewareApi,
+                Route::Midcli,
+                Route::Browser,
+                Route::Mcp
+            ]
+        );
+    }
+
+    #[test]
     fn planner_marks_restart_as_high_risk() {
         let steps = plan_task(PlannerIntent {
             domain: "service".to_string(),

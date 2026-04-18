@@ -729,7 +729,7 @@ fn bridge_provider_status_from_gateway_response(
         ..Default::default()
     };
     let Some(selected) = selected else {
-        provider.status = "IM Gateway 未配置平台".to_string();
+        provider.status = "HarborGate 未配置平台".to_string();
         return provider;
     };
 
@@ -863,12 +863,12 @@ mod tests {
     #[test]
     fn build_mobile_setup_url_supports_static_and_session_variants() {
         assert_eq!(
-            build_mobile_setup_url("http://harbornas.local:4174", None),
-            "http://harbornas.local:4174/setup/mobile"
+            build_mobile_setup_url("http://harborbeacon.local:4174", None),
+            "http://harborbeacon.local:4174/setup/mobile"
         );
         assert_eq!(
-            build_mobile_setup_url("http://harbornas.local:4174/", Some("ABCD-1234")),
-            "http://harbornas.local:4174/setup/mobile?session=ABCD-1234"
+            build_mobile_setup_url("http://harborbeacon.local:4174/", Some("ABCD-1234")),
+            "http://harborbeacon.local:4174/setup/mobile?session=ABCD-1234"
         );
     }
 
@@ -919,7 +919,7 @@ mod tests {
                 platform: "feishu".to_string(),
                 enabled: true,
                 connected: true,
-                display_name: "HarborNAS Bot".to_string(),
+                display_name: "HarborBeacon Bot".to_string(),
                 capabilities: GatewayPlatformCapabilities {
                     reply: true,
                     update: false,
@@ -931,7 +931,7 @@ mod tests {
         assert!(provider.configured);
         assert!(provider.connected);
         assert_eq!(provider.platform, "feishu");
-        assert_eq!(provider.app_name, "HarborNAS Bot");
+        assert_eq!(provider.app_name, "HarborBeacon Bot");
         assert_eq!(provider.gateway_base_url, "http://gateway.local:4180");
         assert_eq!(provider.status, "已连接");
         assert!(provider.capabilities.reply);

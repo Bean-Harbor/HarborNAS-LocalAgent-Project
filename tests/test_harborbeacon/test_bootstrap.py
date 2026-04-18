@@ -56,7 +56,17 @@ def test_build_harborbeacon_app_wires_camera_domain_into_webhook_dispatch():
     assert response.status_code == 200
     assert app.registry.has_capability("camera.scan")
     assert len(sent_messages) == 1
-    assert any(tool.name == "camera.scan" for tool in app.mcp_adapter.list_tools())
+    tools = {tool.name for tool in app.mcp_adapter.list_tools()}
+    assert {
+        "camera.scan",
+        "camera.connect",
+        "camera.snapshot",
+        "camera.share_link",
+        "camera.live_view",
+        "camera.analyze",
+        "camera.ptz",
+    }.issubset(tools)
+    assert app.registry.has_capability("camera.share_link")
     assert "camera" == captured["payload"]["intent"]["domain"]
     assert "scan" == captured["payload"]["intent"]["action"]
     assert captured["payload"]["source"]["surface"] == "harborbeacon"

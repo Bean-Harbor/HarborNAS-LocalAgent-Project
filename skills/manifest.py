@@ -1,7 +1,7 @@
 """Skill manifest model and YAML loader.
 
 A manifest describes a skill's identity, capabilities, executor config,
-permissions, risk profile, and I/O schemas.  Follows HarborNAS-Skill-Spec-v1.
+permissions, risk profile, and I/O schemas.  Follows HarborBeacon-Skill-Spec-v1.
 """
 from __future__ import annotations
 

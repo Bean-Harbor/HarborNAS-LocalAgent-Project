@@ -1,4 +1,4 @@
-# HarborNAS Local Agent V2 快速参考
+# HarborBeacon Local Agent V2 快速参考
 
 ## 1. 一句话目标
 

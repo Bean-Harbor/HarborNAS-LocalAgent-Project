@@ -4,7 +4,15 @@ use thiserror::Error;
 use crate::orchestrator::contracts::{Action, RiskLevel};
 
 const SUPPORTED_SERVICE_OPS: [&str; 5] = ["status", "start", "stop", "restart", "enable"];
-const SUPPORTED_FILE_OPS: [&str; 4] = ["search", "copy", "move", "archive"];
+const SUPPORTED_FILE_OPS: [&str; 7] = [
+    "search",
+    "copy",
+    "move",
+    "archive",
+    "list",
+    "stat",
+    "read_text",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalContext {
@@ -170,7 +178,9 @@ fn default_risk_level(action: &Action) -> RiskLevel {
         ("service", "status") => RiskLevel::Low,
         ("service", "start") | ("service", "enable") => RiskLevel::Medium,
         ("service", "stop") | ("service", "restart") => RiskLevel::High,
-        ("files", "search") => RiskLevel::Low,
+        ("files", "search") | ("files", "list") | ("files", "stat") | ("files", "read_text") => {
+            RiskLevel::Low
+        }
         ("files", "copy") => {
             let overwrite = action
                 .args
@@ -271,5 +281,32 @@ mod tests {
 
         assert_eq!(action.risk_level, RiskLevel::High);
         assert!(action.requires_approval);
+    }
+
+    #[test]
+    fn read_only_file_ops_stay_low_risk() {
+        let list_action = Action {
+            domain: "files".to_string(),
+            operation: "list".to_string(),
+            resource: json!({"path": "/mnt/library"}),
+            args: json!({}),
+            risk_level: RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+        let read_action = Action {
+            domain: "files".to_string(),
+            operation: "read_text".to_string(),
+            resource: json!({"path": "/mnt/library/brief.txt"}),
+            args: json!({"max_bytes": 1024}),
+            risk_level: RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+
+        assert_eq!(effective_risk_level(&list_action), RiskLevel::Low);
+        assert_eq!(effective_risk_level(&read_action), RiskLevel::Low);
+        assert!(enforce(&list_action, None).is_ok());
+        assert!(enforce(&read_action, None).is_ok());
     }
 }

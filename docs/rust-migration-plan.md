@@ -1,4 +1,4 @@
-# Rust Migration Plan for HarborNAS Local Agent
+# Rust Migration Plan for HarborBeacon Local Agent
 
 ## Goal
 

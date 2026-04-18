@@ -1,4 +1,4 @@
-# HarborNAS Contract E2E Test Plan v1
+# HarborBeacon Contract E2E Test Plan v1
 
 ## Purpose
 This document defines end-to-end validation across three executable contracts:
@@ -9,9 +9,9 @@ This document defines end-to-end validation across three executable contracts:
 The goal is to ensure planning, routing, execution, fallback, and governance remain consistent under real operational conditions.
 
 ## Covered Contract Documents
-1. HarborNAS-Middleware-Endpoint-Contract-v1.md
-2. HarborNAS-Files-BatchOps-Contract-v1.md
-3. HarborNAS-Planner-TaskDecompose-Contract-v1.md
+1. HarborBeacon-Middleware-Endpoint-Contract-v1.md
+2. HarborBeacon-Files-BatchOps-Contract-v1.md
+3. HarborBeacon-Planner-TaskDecompose-Contract-v1.md
 
 ## E2E Pipeline Under Test
 1. User request ingestion
@@ -22,7 +22,7 @@ The goal is to ensure planning, routing, execution, fallback, and governance rem
 6. Policy checks and final response
 
 ## Test Environments
-- ENV-A: HarborNAS middleware available + midcli available
+- ENV-A: HarborBeacon middleware available + midcli available
 - ENV-B: middleware degraded + midcli available
 - ENV-C: middleware unavailable + midcli unavailable + constrained CLI available
 - ENV-D: all routes unavailable (negative path)
@@ -94,7 +94,7 @@ The goal is to ensure planning, routing, execution, fallback, and governance rem
 
 ## Compatibility and Drift Matrix
 
-| Scenario | HarborNAS ref | Upstream ref | Planner schema | Route compliance | Executor contract | Status |
+| Scenario | HarborBeacon ref | Upstream ref | Planner schema | Route compliance | Executor contract | Status |
 |---|---|---|---|---|---|---|
 | service enable/restart | develop | master | pass/fail | pass/fail | pass/fail | pending |
 | files copy/move | develop | master | pass/fail | pass/fail | pass/fail | pending |

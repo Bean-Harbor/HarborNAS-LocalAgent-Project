@@ -1,5 +1,6 @@
 //! Minimal Assistant Task API service for HarborBeacon integration.
 
+use std::env;
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,6 +29,7 @@ use crate::control_plane::tasks::{
     ArtifactKind, ArtifactRecord, ConversationSession, ExecutionRoute, TaskRun, TaskRunStatus,
     TaskStepRun, TaskStepRunStatus,
 };
+use crate::domains::knowledge::{DOMAIN as KNOWLEDGE_DOMAIN, OP_SEARCH as KNOWLEDGE_OP_SEARCH};
 use crate::domains::vision::OP_ANALYZE_CAMERA;
 use crate::orchestrator::approval::{ApprovalManager, AutonomyConfig, AutonomyLevel};
 use crate::orchestrator::contracts::{Action, RiskLevel, StepStatus};
@@ -44,6 +46,9 @@ use crate::runtime::hub::{
     looks_like_auth_error, CameraConnectRequest, CameraHubService, HubScanRequest,
     HubScanResultItem,
 };
+use crate::runtime::knowledge::{
+    KnowledgeSearchRequest, KnowledgeSearchResponse, KnowledgeSearchService,
+};
 use crate::runtime::media::SnapshotCaptureResult;
 use crate::runtime::registry::ResolvedCameraTarget;
 use crate::runtime::remote_view;
@@ -51,6 +56,12 @@ use crate::runtime::task_session::{
     session_state_value_from_conversation, PendingTaskCandidate, PendingTaskConnect,
     TaskConversationState, TaskConversationStore,
 };
+
+const LEGACY_IM_RECIPIENT_FALLBACK_ENV: &str = "HARBORBEACON_ENABLE_LEGACY_IM_RECIPIENT_FALLBACK";
+const LEGACY_IM_RECIPIENT_FALLBACK_ENV_ALIAS: &str =
+    "HARBORNAS_ENABLE_LEGACY_IM_RECIPIENT_FALLBACK";
+const KNOWLEDGE_NL_FALLBACK_ENV: &str = "HARBORBEACON_ENABLE_LEGACY_KNOWLEDGE_NL_FALLBACK";
+const KNOWLEDGE_NL_FALLBACK_ENV_ALIAS: &str = "HARBORNAS_ENABLE_LEGACY_KNOWLEDGE_NL_FALLBACK";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct TaskSource {
@@ -407,6 +418,16 @@ impl TaskApiService {
             request.intent.domain.trim().to_lowercase(),
             request.intent.action.trim().to_lowercase(),
         ) {
+            (domain, action) if domain == KNOWLEDGE_DOMAIN && action == KNOWLEDGE_OP_SEARCH => {
+                self.handle_knowledge_search(&request)
+            }
+            (domain, action)
+                if domain == "general"
+                    && action == "message"
+                    && should_route_general_message_to_knowledge(&request) =>
+            {
+                self.handle_knowledge_search(&request)
+            }
             (domain, action) if domain == "camera" && action == "scan" => {
                 self.handle_camera_scan(&request)
             }
@@ -416,7 +437,9 @@ impl TaskApiService {
             (domain, action) if domain == "camera" && action == "snapshot" => {
                 self.handle_camera_snapshot(&request)
             }
-            (domain, action) if domain == "camera" && action == "share_link" => {
+            (domain, action)
+                if domain == "camera" && (action == "share_link" || action == "live_view") =>
+            {
                 self.handle_camera_share_link(&request)
             }
             (domain, action) if domain == "camera" && action == "analyze" => {
@@ -1050,6 +1073,55 @@ impl TaskApiService {
         )
     }
 
+    fn handle_knowledge_search(&self, request: &TaskRequest) -> TaskResponse {
+        let action = apply_governance_defaults(Action {
+            domain: KNOWLEDGE_DOMAIN.to_string(),
+            operation: KNOWLEDGE_OP_SEARCH.to_string(),
+            resource: json!({
+                "roots": knowledge_search_roots(request),
+            }),
+            args: request.args.clone(),
+            risk_level: RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        });
+        if let Err(response) =
+            self.ensure_action_allowed(request, &action, "knowledge_search_service")
+        {
+            return response;
+        }
+
+        let Some(query) = knowledge_search_query(request) else {
+            return self.failed(
+                request,
+                "knowledge_search_service",
+                RiskLevel::Low,
+                "缺少可检索的主题，请提供 query 或更明确地说明要找什么内容。".to_string(),
+            );
+        };
+        let (include_documents, include_images) = knowledge_modalities(request);
+        let search_request = KnowledgeSearchRequest {
+            query,
+            roots: knowledge_search_roots(request),
+            include_documents,
+            include_images,
+            limit: knowledge_result_limit(request),
+        };
+
+        match KnowledgeSearchService::search(search_request) {
+            Ok(result) => self.completed(
+                request,
+                "knowledge_search_service",
+                RiskLevel::Low,
+                format_knowledge_search_message(&result),
+                serde_json::to_value(&result).unwrap_or_else(|_| json!({})),
+                build_knowledge_search_artifacts(&result),
+                knowledge_search_next_actions(&result),
+            ),
+            Err(error) => self.failed(request, "knowledge_search_service", RiskLevel::Low, error),
+        }
+    }
+
     fn resolve_camera_target(&self, request: &TaskRequest) -> Result<ResolvedCameraTarget, String> {
         let targets = self.admin_store.registry_store().load_camera_targets()?;
         if targets.is_empty() {
@@ -1477,15 +1549,7 @@ impl TaskApiService {
         };
         let explicit_recipient = notification_recipient_from_args(&request.args);
         let admin_state = self.admin_store.load_state().ok();
-        let fallback_recipient = explicit_recipient.or_else(|| {
-            if !route_key.is_empty() {
-                return None;
-            }
-            let destination = legacy_destination.as_deref().unwrap_or_default();
-            admin_state.as_ref().and_then(|state| {
-                resolve_notification_recipient(destination, state, request.source.user_id.as_str())
-            })
-        });
+        let allow_legacy_recipient_fallback = legacy_im_recipient_fallback_enabled();
         let destination = if matches!(platform_hint.as_deref(), Some("local_ui")) {
             NotificationDestination {
                 kind: NotificationDestinationKind::LocalUi,
@@ -1504,21 +1568,35 @@ impl TaskApiService {
                 platform: String::new(),
                 recipient: None,
             }
-        } else if let Some(recipient) = fallback_recipient {
-            NotificationDestination {
-                kind: NotificationDestinationKind::Recipient,
-                route_key: String::new(),
-                id: legacy_destination.clone().unwrap_or_default(),
-                platform: platform_hint.unwrap_or_default(),
-                recipient: Some(recipient),
-            }
-        } else if let Some(destination_id) = legacy_destination.clone() {
-            NotificationDestination {
-                kind: NotificationDestinationKind::Conversation,
-                route_key: String::new(),
-                id: destination_id,
-                platform: platform_hint.unwrap_or_default(),
-                recipient: None,
+        } else if allow_legacy_recipient_fallback {
+            let fallback_recipient = explicit_recipient.or_else(|| {
+                let destination = legacy_destination.as_deref().unwrap_or_default();
+                admin_state.as_ref().and_then(|state| {
+                    resolve_notification_recipient(
+                        destination,
+                        state,
+                        request.source.user_id.as_str(),
+                    )
+                })
+            });
+            if let Some(recipient) = fallback_recipient {
+                NotificationDestination {
+                    kind: NotificationDestinationKind::Recipient,
+                    route_key: String::new(),
+                    id: legacy_destination.clone().unwrap_or_default(),
+                    platform: platform_hint.unwrap_or_default(),
+                    recipient: Some(recipient),
+                }
+            } else if let Some(destination_id) = legacy_destination.clone() {
+                NotificationDestination {
+                    kind: NotificationDestinationKind::Conversation,
+                    route_key: String::new(),
+                    id: destination_id,
+                    platform: platform_hint.unwrap_or_default(),
+                    recipient: None,
+                }
+            } else {
+                return None;
             }
         } else {
             return None;
@@ -1528,7 +1606,7 @@ impl TaskApiService {
             notification_id: String::new(),
             trace_id: request.trace_id.clone(),
             source: NotificationSource {
-                service: "harbornas".to_string(),
+                service: "harborbeacon".to_string(),
                 module: "task_api".to_string(),
                 event_type: event_type.to_string(),
             },
@@ -1614,6 +1692,10 @@ impl TaskApiService {
             .pointer("/snapshot/source_storage")
             .cloned()
             .unwrap_or(Value::Null);
+        let snapshot_ingest_metadata = payload
+            .pointer("/snapshot/ingest_metadata")
+            .cloned()
+            .unwrap_or(Value::Null);
         let snapshot_byte_size = u64_at_paths(payload, &["/snapshot/byte_size"]);
         let detection_summary = string_at_paths(payload, &["/detection_summary"]);
         let summary = string_at_paths(payload, &["/summary"]);
@@ -1631,6 +1713,7 @@ impl TaskApiService {
                 &captured_at,
                 snapshot_byte_size,
                 source_storage.clone(),
+                snapshot_ingest_metadata.clone(),
                 detection_summary.as_deref(),
                 summary.as_deref(),
                 summary_source.as_deref(),
@@ -1654,6 +1737,7 @@ impl TaskApiService {
                 &captured_at,
                 None,
                 source_storage.clone(),
+                snapshot_ingest_metadata.clone(),
                 detection_summary.as_deref(),
                 summary.as_deref(),
                 summary_source.as_deref(),
@@ -2385,6 +2469,7 @@ fn build_snapshot_media_asset(
             "camera_display_name": target.display_name.clone(),
             "room_name": target.room_name.clone(),
             "storage_relative_path": snapshot.storage.relative_path.clone(),
+            "device_ingest_metadata": snapshot.ingest_metadata.clone(),
         }),
     }
 }
@@ -2400,6 +2485,7 @@ fn build_vision_image_media_asset(
     captured_at: &str,
     byte_size_override: Option<u64>,
     source_storage: Value,
+    ingest_metadata: Value,
     detection_summary: Option<&str>,
     summary: Option<&str>,
     summary_source: Option<&str>,
@@ -2448,6 +2534,7 @@ fn build_vision_image_media_asset(
             "summary_source": summary_source,
             "storage_path": image_path,
             "source_storage": source_storage,
+            "ingest_metadata": ingest_metadata,
         }),
     }
 }
@@ -2550,6 +2637,66 @@ fn build_share_link_artifact(share_link: &Value) -> TaskArtifact {
             "ttl_minutes": share_link.get("ttl_minutes").cloned().unwrap_or(Value::Null),
         }),
     }
+}
+
+fn build_knowledge_search_artifacts(response: &KnowledgeSearchResponse) -> Vec<TaskArtifact> {
+    response
+        .documents
+        .iter()
+        .chain(response.images.iter())
+        .take(6)
+        .map(|hit| TaskArtifact {
+            kind: if hit.modality.as_str() == "image" {
+                "image".to_string()
+            } else {
+                "text".to_string()
+            },
+            label: hit.title.clone(),
+            mime_type: mime_type_from_path(&hit.path).unwrap_or_else(|| {
+                if hit.modality.as_str() == "image" {
+                    "image/*".to_string()
+                } else {
+                    "text/plain".to_string()
+                }
+            }),
+            media_asset_id: None,
+            path: Some(hit.path.clone()),
+            url: None,
+            metadata: json!({
+                "modality": hit.modality.clone(),
+                "score": hit.score,
+                "citation": {
+                    "title": hit.title.clone(),
+                    "path": hit.path.clone(),
+                    "modality": hit.modality.clone(),
+                    "chunk_id": hit.chunk_id.clone(),
+                    "line_start": hit.line_start,
+                    "line_end": hit.line_end,
+                    "matched_terms": hit.matched_terms.clone(),
+                    "preview": hit.snippet.clone(),
+                    "score": hit.score,
+                },
+            }),
+        })
+        .collect()
+}
+
+fn format_knowledge_search_message(response: &KnowledgeSearchResponse) -> String {
+    response.reply_pack.summary.clone()
+}
+
+fn knowledge_search_next_actions(response: &KnowledgeSearchResponse) -> Vec<String> {
+    let mut actions = Vec::new();
+    if !response.documents.is_empty() {
+        actions.push("只看文档结果".to_string());
+    }
+    if !response.images.is_empty() {
+        actions.push("只看图片结果".to_string());
+    }
+    if actions.is_empty() {
+        actions.push("换个关键词再搜".to_string());
+    }
+    actions
 }
 
 fn build_share_media_session(
@@ -3016,9 +3163,20 @@ fn session_id_for_request(request: &TaskRequest) -> String {
 }
 
 fn step_id_for_request(request: &TaskRequest) -> String {
-    first_non_empty(&[request.step_id.as_str()])
+    let step_id = first_non_empty(&[request.step_id.as_str()])
         .map(|value| value.to_string())
-        .unwrap_or_else(|| format!("{}:s1", request.task_id))
+        .unwrap_or_else(|| "s1".to_string());
+    if looks_like_turn_local_step_id(&step_id) {
+        format!("{}:{step_id}", request.task_id)
+    } else {
+        step_id
+    }
+}
+
+fn looks_like_turn_local_step_id(step_id: &str) -> bool {
+    step_id
+        .strip_prefix("step_")
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()))
 }
 
 fn workspace_id_for_request(request: &TaskRequest) -> String {
@@ -3195,6 +3353,200 @@ fn normalize_command_text(text: &str) -> String {
             !ch.is_whitespace() && !matches!(ch, '，' | '。' | ',' | '.' | '？' | '?' | '！' | '!')
         })
         .collect()
+}
+
+fn should_route_general_message_to_knowledge(request: &TaskRequest) -> bool {
+    if !knowledge_nl_fallback_enabled() {
+        return false;
+    }
+    let raw_text = request.intent.raw_text.trim();
+    if raw_text.is_empty() {
+        return false;
+    }
+    let normalized = raw_text.to_lowercase();
+    let has_retrieval_verb = [
+        "找", "查", "搜", "检索", "search", "find", "lookup", "look up",
+    ]
+    .iter()
+    .any(|token| normalized.contains(token));
+    let has_target_noun = [
+        "文件", "文档", "图片", "照片", "资料", "内容", "file", "document", "image", "photo",
+        "picture", "content",
+    ]
+    .iter()
+    .any(|token| normalized.contains(token));
+    has_retrieval_verb && has_target_noun
+}
+
+fn knowledge_nl_fallback_enabled() -> bool {
+    env_var_with_legacy_alias(KNOWLEDGE_NL_FALLBACK_ENV, KNOWLEDGE_NL_FALLBACK_ENV_ALIAS)
+        .map(|value| env_flag_enabled(&value))
+        .unwrap_or(false)
+}
+
+fn knowledge_search_query(request: &TaskRequest) -> Option<String> {
+    first_string(
+        &[&request.args],
+        &[
+            "/query",
+            "/keyword",
+            "/keywords/0",
+            "/search/query",
+            "/knowledge/query",
+        ],
+    )
+    .or_else(|| infer_query_from_raw_text(&request.intent.raw_text))
+}
+
+fn infer_query_from_raw_text(raw_text: &str) -> Option<String> {
+    let trimmed = raw_text
+        .trim()
+        .trim_matches(|ch: char| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '，' | '。' | ',' | '.' | '？' | '?' | '！' | '!' | '：' | ':'
+                )
+        })
+        .to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut candidate = trimmed.clone();
+    for pattern in [
+        "请帮我",
+        "帮我",
+        "找到",
+        "找一下",
+        "找出",
+        "查一下",
+        "查找",
+        "搜索",
+        "搜一下",
+        "搜",
+        "检索",
+        "和",
+        "关于",
+        "有关的",
+        "相关的",
+        "有关",
+        "文件",
+        "文档",
+        "图片",
+        "照片",
+        "资料",
+        "内容",
+        "file",
+        "files",
+        "document",
+        "documents",
+        "image",
+        "images",
+        "photo",
+        "photos",
+        "picture",
+        "pictures",
+        "search for",
+        "search",
+        "find",
+        "lookup",
+        "look up",
+    ] {
+        candidate = candidate.replace(pattern, " ");
+    }
+
+    let candidate = candidate
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string();
+
+    if candidate.is_empty() {
+        Some(trimmed)
+    } else {
+        Some(candidate)
+    }
+}
+
+fn knowledge_search_roots(request: &TaskRequest) -> Vec<String> {
+    first_string_vec(
+        &[&request.args],
+        &["/roots", "/search/roots", "/knowledge/roots"],
+    )
+}
+
+fn knowledge_result_limit(request: &TaskRequest) -> usize {
+    usize_at_paths(
+        &request.args,
+        &["/limit", "/search/limit", "/knowledge/limit"],
+    )
+    .unwrap_or(5)
+    .clamp(1, 10)
+}
+
+fn knowledge_modalities(request: &TaskRequest) -> (bool, bool) {
+    let requested = first_string_vec(
+        &[&request.args],
+        &["/modalities", "/search/modalities", "/knowledge/modalities"],
+    )
+    .into_iter()
+    .map(|item| item.to_lowercase())
+    .collect::<Vec<_>>();
+    if !requested.is_empty() {
+        let include_documents = requested.iter().any(|item| {
+            matches!(
+                item.as_str(),
+                "document" | "documents" | "doc" | "docs" | "text"
+            )
+        });
+        let include_images = requested.iter().any(|item| {
+            matches!(
+                item.as_str(),
+                "image" | "images" | "photo" | "photos" | "picture" | "pictures"
+            )
+        });
+        return (include_documents, include_images);
+    }
+
+    if request
+        .intent
+        .domain
+        .trim()
+        .eq_ignore_ascii_case(KNOWLEDGE_DOMAIN)
+        && request
+            .intent
+            .action
+            .trim()
+            .eq_ignore_ascii_case(KNOWLEDGE_OP_SEARCH)
+    {
+        return (true, true);
+    }
+
+    let normalized = request.intent.raw_text.to_lowercase();
+    let asks_for_documents = [
+        "文档",
+        "文件",
+        "资料",
+        "document",
+        "documents",
+        "file",
+        "files",
+    ]
+    .iter()
+    .any(|token| normalized.contains(token));
+    let asks_for_images = [
+        "图片", "照片", "image", "images", "photo", "photos", "picture",
+    ]
+    .iter()
+    .any(|token| normalized.contains(token));
+
+    match (asks_for_documents, asks_for_images) {
+        (true, false) => (true, false),
+        (false, true) => (false, true),
+        _ => (true, true),
+    }
 }
 
 fn room_aliases<'a>(name: &'a str, room: &'a str) -> Vec<&'static str> {
@@ -3608,6 +3960,40 @@ fn notification_delivery_outcome(
     }
 }
 
+fn legacy_im_recipient_fallback_enabled() -> bool {
+    env_var_with_legacy_alias(
+        LEGACY_IM_RECIPIENT_FALLBACK_ENV,
+        LEGACY_IM_RECIPIENT_FALLBACK_ENV_ALIAS,
+    )
+    .map(|value| env_flag_enabled(&value))
+    .unwrap_or(false)
+}
+
+fn env_var_with_legacy_alias(primary: &str, legacy: &str) -> Option<String> {
+    if let Some(value) = env::var(primary)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(value);
+    }
+
+    env::var(legacy)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .inspect(|_| {
+            eprintln!("warning: {legacy} is deprecated; prefer {primary}");
+        })
+}
+
+fn env_flag_enabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 fn current_timestamp() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3659,6 +4045,7 @@ fn new_share_link_id() -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use base64::Engine as _;
@@ -3667,11 +4054,12 @@ mod tests {
     use super::{
         artifact_kind_from_name, build_artifact_records, conversation_key,
         effective_autonomy_level, effective_autonomy_level_for_task_run,
-        effective_requires_approval, format_pending_candidates, normalize_command_text,
-        notification_delivery_outcome, pending_candidates_from_results, protocol_string,
-        resolve_notification_recipient, room_aliases, PendingTaskCandidate, TaskApiService,
-        TaskArtifact, TaskIntent, TaskMessage, TaskRequest, TaskRequestAcceptance, TaskSource,
-        TaskStatus,
+        effective_requires_approval, env_flag_enabled, format_pending_candidates,
+        infer_query_from_raw_text, normalize_command_text, notification_delivery_outcome,
+        pending_candidates_from_results, protocol_string, resolve_notification_recipient,
+        room_aliases, should_route_general_message_to_knowledge, PendingTaskCandidate,
+        TaskApiService, TaskArtifact, TaskIntent, TaskMessage, TaskRequest, TaskRequestAcceptance,
+        TaskSource, TaskStatus, KNOWLEDGE_NL_FALLBACK_ENV,
     };
     use crate::connectors::notifications::{
         NotificationDelivery, NotificationDeliveryError, NotificationDeliveryMode,
@@ -3683,7 +4071,9 @@ mod tests {
     use crate::control_plane::approvals::ApprovalStatus;
     use crate::control_plane::auth::{AuthSource, IdentityBinding};
     use crate::control_plane::media::{MediaAssetKind, StorageTargetKind};
-    use crate::control_plane::tasks::{ArtifactKind, TaskRunStatus, TaskStepRunStatus};
+    use crate::control_plane::tasks::{
+        ArtifactKind, ConversationSession, TaskRunStatus, TaskStepRunStatus,
+    };
     use crate::runtime::admin_console::{
         AdminConsoleState, AdminConsoleStore, IdentityBindingRecord, RemoteViewConfig,
     };
@@ -3693,7 +4083,11 @@ mod tests {
         CameraCapabilities, CameraDevice, CameraStreamRef, DeviceRegistryStore, DeviceStatus,
         ResolvedCameraTarget, StreamTransport,
     };
-    use crate::runtime::task_session::TaskConversationStore;
+    use crate::runtime::task_session::{
+        PendingTaskConnect, TaskConversationState, TaskConversationStore,
+    };
+
+    static RETRIEVAL_GATE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn unique_path(prefix: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
@@ -3701,6 +4095,14 @@ mod tests {
             .expect("clock")
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{unique}.json"))
+    }
+
+    fn unique_dir(prefix: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{unique}"))
     }
 
     #[test]
@@ -3729,9 +4131,9 @@ mod tests {
 
     #[test]
     fn handle_task_persists_route_key_and_message_summary() {
-        let admin_path = unique_path("harbornas-admin-state");
-        let registry_path = unique_path("harbornas-device-registry");
-        let conversation_path = unique_path("harbornas-task-route-message");
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-route-message");
         let service = TaskApiService::new(
             AdminConsoleStore::new(
                 admin_path.clone(),
@@ -3745,7 +4147,7 @@ mod tests {
             step_id: "step-route-message".to_string(),
             source: TaskSource {
                 channel: "im_bridge".to_string(),
-                surface: "im_gateway".to_string(),
+                surface: "harborgate".to_string(),
                 conversation_id: "chat-route-message".to_string(),
                 user_id: "user-1".to_string(),
                 session_id: "sess-route-message".to_string(),
@@ -3848,9 +4250,9 @@ mod tests {
 
     #[test]
     fn accept_or_replay_task_returns_replayed_response_for_identical_task_id() {
-        let admin_path = unique_path("harbornas-admin-state");
-        let registry_path = unique_path("harbornas-device-registry");
-        let conversation_path = unique_path("harbornas-task-idempotent-replay");
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-idempotent-replay");
         let service = TaskApiService::new(
             AdminConsoleStore::new(
                 admin_path.clone(),
@@ -3864,7 +4266,7 @@ mod tests {
             step_id: "step-idempotent".to_string(),
             source: TaskSource {
                 channel: "im_bridge".to_string(),
-                surface: "im_gateway".to_string(),
+                surface: "harborgate".to_string(),
                 conversation_id: "chat-idempotent".to_string(),
                 user_id: "user-1".to_string(),
                 session_id: "sess-idempotent".to_string(),
@@ -3909,9 +4311,9 @@ mod tests {
 
     #[test]
     fn accept_or_replay_task_rejects_conflicting_task_identity() {
-        let admin_path = unique_path("harbornas-admin-state");
-        let registry_path = unique_path("harbornas-device-registry");
-        let conversation_path = unique_path("harbornas-task-idempotent-conflict");
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-idempotent-conflict");
         let service = TaskApiService::new(
             AdminConsoleStore::new(
                 admin_path.clone(),
@@ -3925,7 +4327,7 @@ mod tests {
             step_id: "step-idempotent-conflict".to_string(),
             source: TaskSource {
                 channel: "im_bridge".to_string(),
-                surface: "im_gateway".to_string(),
+                surface: "harborgate".to_string(),
                 conversation_id: "chat-idempotent-conflict".to_string(),
                 user_id: "user-1".to_string(),
                 session_id: "sess-idempotent-conflict".to_string(),
@@ -3966,6 +4368,116 @@ mod tests {
                 assert!(message.contains("different request identity"));
             }
             other => panic!("expected conflict, got {other:?}"),
+        }
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn accept_or_replay_task_preserves_original_response_when_turn_local_step_id_is_reused() {
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-idempotent-step-scope");
+        let service = TaskApiService::new(
+            AdminConsoleStore::new(
+                admin_path.clone(),
+                DeviceRegistryStore::new(registry_path.clone()),
+            ),
+            TaskConversationStore::new(conversation_path.clone()),
+        );
+        let first = TaskRequest {
+            task_id: "task-step-scope-a".to_string(),
+            trace_id: "trace-step-scope-a".to_string(),
+            step_id: "step_01".to_string(),
+            source: TaskSource {
+                channel: "im_bridge".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-step-scope".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-step-scope".to_string(),
+                route_key: "gw_route_step_scope".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "system".to_string(),
+                action: "ping".to_string(),
+                raw_text: "ping".to_string(),
+            },
+            entity_refs: json!({}),
+            args: json!({}),
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_step_scope_a".to_string(),
+                chat_type: "group".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+        let second = TaskRequest {
+            task_id: "task-step-scope-b".to_string(),
+            trace_id: "trace-step-scope-b".to_string(),
+            step_id: "step_01".to_string(),
+            source: TaskSource {
+                channel: "im_bridge".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-step-scope".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-step-scope".to_string(),
+                route_key: "gw_route_step_scope".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "system".to_string(),
+                action: "status".to_string(),
+                raw_text: "status".to_string(),
+            },
+            entity_refs: json!({}),
+            args: json!({}),
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_step_scope_b".to_string(),
+                chat_type: "group".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+
+        let first_response = service.handle_task(first.clone());
+        assert_eq!(first_response.status, TaskStatus::Failed);
+        assert!(first_response.result.message.contains("system.ping"));
+
+        let second_response = service.handle_task(second);
+        assert_eq!(second_response.status, TaskStatus::Failed);
+        assert!(second_response.result.message.contains("system.status"));
+
+        assert!(service
+            .conversation_store()
+            .load_task_step("step_01")
+            .expect("load raw step id")
+            .is_none());
+        let first_step = service
+            .conversation_store()
+            .load_task_step("task-step-scope-a:step_01")
+            .expect("load first scoped step")
+            .expect("first scoped step");
+        let second_step = service
+            .conversation_store()
+            .load_task_step("task-step-scope-b:step_01")
+            .expect("load second scoped step")
+            .expect("second scoped step");
+        assert_eq!(first_step.task_id, "task-step-scope-a");
+        assert_eq!(second_step.task_id, "task-step-scope-b");
+
+        let replay = service
+            .accept_or_replay_task(&first)
+            .expect("idempotency decision");
+        match replay {
+            TaskRequestAcceptance::Replay(response) => {
+                assert_eq!(response.status, TaskStatus::Failed);
+                assert!(response.result.message.contains("system.ping"));
+                assert!(!response.result.message.contains("system.status"));
+            }
+            other => panic!("expected replay, got {other:?}"),
         }
 
         let _ = fs::remove_file(admin_path);
@@ -4065,6 +4577,14 @@ mod tests {
         assert_eq!(
             normalize_command_text("分析 客厅摄像头！"),
             "分析客厅摄像头"
+        );
+    }
+
+    #[test]
+    fn infer_query_from_raw_text_keeps_search_subject() {
+        assert_eq!(
+            infer_query_from_raw_text("帮我找到和樱花有关的文件"),
+            Some("樱花".to_string())
         );
     }
 
@@ -4201,6 +4721,20 @@ mod tests {
                 .and_then(Value::as_str),
             Some("task-snapshot")
         );
+        assert_eq!(
+            media_asset
+                .metadata
+                .pointer("/device_ingest_metadata/provenance")
+                .and_then(Value::as_str),
+            Some("media")
+        );
+        assert_eq!(
+            media_asset
+                .metadata
+                .pointer("/device_ingest_metadata/ingest_disposition")
+                .and_then(Value::as_str),
+            Some("knowledge_index_candidate")
+        );
 
         let payload = super::build_snapshot_payload(&target, &snapshot, &media_asset);
         assert_eq!(
@@ -4232,11 +4766,11 @@ mod tests {
 
     #[test]
     fn persist_vision_media_assets_creates_snapshot_and_derived_records() {
-        let admin_path = unique_path("harbornas-admin-state");
-        let registry_path = unique_path("harbornas-device-registry");
-        let conversation_path = unique_path("harbornas-task-runtime");
-        let snapshot_path = unique_path("harbornas-vision-snapshot").with_extension("jpg");
-        let annotated_path = unique_path("harbornas-vision-annotated").with_extension("jpg");
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
+        let snapshot_path = unique_path("harborbeacon-vision-snapshot").with_extension("jpg");
+        let annotated_path = unique_path("harborbeacon-vision-annotated").with_extension("jpg");
         fs::write(&snapshot_path, b"snapshot-bytes").expect("write snapshot image");
         fs::write(&annotated_path, b"annotated-bytes").expect("write annotated image");
 
@@ -4394,9 +4928,9 @@ mod tests {
 
     #[test]
     fn build_notification_request_prefers_route_key_contract_shape() {
-        let admin_path = unique_path("harbornas-admin-state");
-        let registry_path = unique_path("harbornas-device-registry");
-        let conversation_path = unique_path("harbornas-task-runtime");
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
         let admin_store = AdminConsoleStore::new(
             admin_path.clone(),
             DeviceRegistryStore::new(registry_path.clone()),
@@ -4465,6 +4999,8 @@ mod tests {
                     "summary": "检测到门口有人活动",
                     "notification_channel": "im_bridge",
                     "notification_format": "lark_card",
+                    "notification/destination/recipient/recipient_id": "ou_platform_should_not_be_needed",
+                    "notification/destination/recipient/recipient_type": "open_id",
                     "notification_card": {
                         "header": {"title": {"content": "Front Door AI 分析"}}
                     }
@@ -4515,9 +5051,10 @@ mod tests {
         );
         assert_eq!(notification.destination.route_key, "gw_route_notify");
         assert_eq!(notification.destination.platform, "");
+        assert!(notification.destination.recipient.is_none());
         assert_eq!(notification.content.attachments.len(), 1);
         assert_eq!(notification.content.title, "Front Door AI 分析");
-        assert_eq!(notification.source.service, "harbornas");
+        assert_eq!(notification.source.service, "harborbeacon");
         assert_eq!(notification.source.module, "task_api");
         assert_eq!(notification.source.event_type, "task.completed");
         assert_eq!(notification.delivery.mode, NotificationDeliveryMode::Send);
@@ -4537,10 +5074,321 @@ mod tests {
     }
 
     #[test]
+    fn build_notification_request_ignores_legacy_recipient_hints_when_route_key_exists() {
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        let conversation_store = TaskConversationStore::new(conversation_path);
+        let service = TaskApiService::new(admin_store, conversation_store);
+        let request = TaskRequest {
+            task_id: "task-route-opaque".to_string(),
+            trace_id: "trace-route-opaque".to_string(),
+            step_id: "step-route-opaque".to_string(),
+            source: TaskSource {
+                channel: "im_bridge".to_string(),
+                surface: "harborbeacon".to_string(),
+                conversation_id: "chat-opaque".to_string(),
+                user_id: "user-opaque".to_string(),
+                session_id: "sess-opaque".to_string(),
+                route_key: "gw_route_opaque".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "camera".to_string(),
+                action: "analyze".to_string(),
+                raw_text: "分析门口摄像头".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "notification/destination/recipient/recipient_id": "ou_should_be_ignored",
+                "notification/destination/recipient/recipient_type": "open_id",
+                "notification_channel": "im_bridge",
+            }),
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_route_opaque".to_string(),
+                chat_type: "group".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+        let target = ResolvedCameraTarget {
+            device_id: "cam-opaque".to_string(),
+            display_name: "Front Door".to_string(),
+            status: DeviceStatus::Online,
+            room_name: Some("Entry".to_string()),
+            vendor: None,
+            model: None,
+            ip_address: Some("192.168.1.10".to_string()),
+            mac_address: None,
+            discovery_source: "onvif".to_string(),
+            primary_stream: CameraStreamRef {
+                transport: StreamTransport::Rtsp,
+                url: "rtsp://192.168.1.10/live".to_string(),
+                requires_auth: false,
+            },
+            onvif_device_service_url: None,
+            ezviz_device_serial: None,
+            ezviz_camera_no: None,
+            capabilities: CameraCapabilities {
+                snapshot: true,
+                stream: true,
+                ptz: false,
+                audio: false,
+            },
+            last_seen_at: None,
+        };
+
+        let notification = service
+            .build_notification_request(
+                &request,
+                "task.completed",
+                &target,
+                &json!({
+                    "summary": "检测到门口有人活动",
+                    "notification_channel": "im_bridge",
+                }),
+                &[],
+            )
+            .expect("notification request");
+
+        assert_eq!(
+            notification.destination.kind,
+            NotificationDestinationKind::Conversation
+        );
+        assert_eq!(notification.destination.route_key, "gw_route_opaque");
+        assert!(notification.destination.recipient.is_none());
+        assert_eq!(notification.destination.platform, "");
+        assert!(notification.destination.id.is_empty());
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn build_notification_request_retires_legacy_platform_fallback_without_route_key() {
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        let conversation_store = TaskConversationStore::new(conversation_path);
+        let service = TaskApiService::new(admin_store, conversation_store);
+        let request = TaskRequest {
+            task_id: "task-legacy-fallback".to_string(),
+            trace_id: "trace-legacy-fallback".to_string(),
+            step_id: "step-legacy-fallback".to_string(),
+            source: TaskSource {
+                channel: "im_bridge".to_string(),
+                surface: "harborbeacon".to_string(),
+                conversation_id: "chat-legacy".to_string(),
+                user_id: "user-legacy".to_string(),
+                session_id: "sess-legacy".to_string(),
+                route_key: String::new(),
+            },
+            intent: TaskIntent {
+                domain: "camera".to_string(),
+                action: "analyze".to_string(),
+                raw_text: "分析门口摄像头".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "notification/destination/recipient/recipient_id": "ou_legacy_should_not_send",
+                "notification/destination/recipient/recipient_type": "open_id",
+                "notification_channel": "im_bridge",
+            }),
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_legacy".to_string(),
+                chat_type: "group".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+        let target = ResolvedCameraTarget {
+            device_id: "cam-legacy".to_string(),
+            display_name: "Front Door".to_string(),
+            status: DeviceStatus::Online,
+            room_name: Some("Entry".to_string()),
+            vendor: None,
+            model: None,
+            ip_address: Some("192.168.1.10".to_string()),
+            mac_address: None,
+            discovery_source: "onvif".to_string(),
+            primary_stream: CameraStreamRef {
+                transport: StreamTransport::Rtsp,
+                url: "rtsp://192.168.1.10/live".to_string(),
+                requires_auth: false,
+            },
+            onvif_device_service_url: None,
+            ezviz_device_serial: None,
+            ezviz_camera_no: None,
+            capabilities: CameraCapabilities {
+                snapshot: true,
+                stream: true,
+                ptz: false,
+                audio: false,
+            },
+            last_seen_at: None,
+        };
+
+        assert!(service
+            .build_notification_request(
+                &request,
+                "task.completed",
+                &target,
+                &json!({
+                    "summary": "检测到门口有人活动",
+                    "notification_channel": "im_bridge",
+                }),
+                &[],
+            )
+            .is_none());
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn general_message_retrieval_fallback_is_disabled_by_default() {
+        let _guard = RETRIEVAL_GATE_TEST_LOCK.lock().expect("lock");
+        std::env::remove_var(KNOWLEDGE_NL_FALLBACK_ENV);
+
+        let request = TaskRequest {
+            intent: TaskIntent {
+                raw_text: "帮我找到和樱花有关的文件".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(!should_route_general_message_to_knowledge(&request));
+    }
+
+    #[test]
+    fn env_flag_enabled_accepts_common_truthy_strings() {
+        assert!(env_flag_enabled("1"));
+        assert!(env_flag_enabled("true"));
+        assert!(env_flag_enabled("YES"));
+        assert!(env_flag_enabled(" on "));
+        assert!(!env_flag_enabled("0"));
+        assert!(!env_flag_enabled("false"));
+        assert!(!env_flag_enabled(""));
+    }
+
+    #[test]
+    fn handle_camera_connect_resume_token_routes_into_resume_flow_without_platform_identity() {
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let service = TaskApiService::new(admin_store, conversation_store.clone());
+
+        let session = ConversationSession {
+            session_id: "sess-resume".to_string(),
+            workspace_id: "home-1".to_string(),
+            channel: "feishu".to_string(),
+            surface: "harborbeacon".to_string(),
+            conversation_id: "chat-resume".to_string(),
+            user_id: "user-1".to_string(),
+            route_key: "gw_route_resume_opaque".to_string(),
+            last_message_id: "om_resume".to_string(),
+            chat_type: "p2p".to_string(),
+            state: Value::Null,
+            resume_token: None,
+            expires_at: None,
+        };
+        let mut conversation = TaskConversationState {
+            key: "chat-resume".to_string(),
+            ..Default::default()
+        };
+        conversation.set_camera_pending_connect(Some(PendingTaskConnect {
+            resume_token: "resume-opaque-1".to_string(),
+            name: "Gate Cam".to_string(),
+            ip: "192.168.1.20".to_string(),
+            room: Some("Entry".to_string()),
+            port: 554,
+            rtsp_paths: vec!["/live".to_string()],
+            requires_auth: true,
+            vendor: Some("Demo".to_string()),
+            model: Some("X1".to_string()),
+        }));
+        conversation_store
+            .save_for_session(&session, &conversation)
+            .expect("save conversation");
+
+        let request = TaskRequest {
+            task_id: "task-resume-opaque".to_string(),
+            trace_id: "trace-resume-opaque".to_string(),
+            step_id: "step-resume-opaque".to_string(),
+            source: TaskSource {
+                channel: "feishu".to_string(),
+                surface: "harborbeacon".to_string(),
+                conversation_id: "chat-resume".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-resume".to_string(),
+                route_key: "gw_route_resume_opaque".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "camera".to_string(),
+                action: "connect".to_string(),
+                raw_text: "密码 xxxxxx".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "resume_token": "resume-opaque-1",
+                "approval": {
+                    "token": "approval-opaque-1",
+                    "approver_id": "user-1"
+                }
+            }),
+            autonomy: super::TaskAutonomy {
+                level: "full".to_string(),
+            },
+            message: Some(TaskMessage {
+                message_id: "om_resume_followup".to_string(),
+                chat_type: "p2p".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Failed);
+        assert_eq!(response.result.message, "缺少 password，无法继续接入流程。");
+
+        let loaded = conversation_store
+            .load_for_session("sess-resume", Some("chat-resume"))
+            .expect("load conversation")
+            .expect("conversation");
+        assert_eq!(
+            loaded
+                .camera_pending_connect()
+                .map(|pending| pending.resume_token),
+            Some("resume-opaque-1".to_string())
+        );
+        assert_eq!(loaded.key, "chat-resume");
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
     fn handle_camera_share_link_returns_link_artifact() {
-        let admin_path = unique_path("harbornas-admin-state");
-        let registry_path = unique_path("harbornas-device-registry");
-        let conversation_path = unique_path("harbornas-task-runtime");
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
         let registry_store = DeviceRegistryStore::new(registry_path.clone());
         let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store.clone());
         let conversation_store = TaskConversationStore::new(conversation_path.clone());
@@ -4644,6 +5492,75 @@ mod tests {
     }
 
     #[test]
+    fn handle_camera_live_view_alias_returns_link_artifact() {
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
+        let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store.clone());
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let service = TaskApiService::new(admin_store, conversation_store);
+
+        let mut device = CameraDevice::new("cam-share", "Front Door", "rtsp://192.168.1.10/live");
+        device.status = DeviceStatus::Online;
+        device.room = Some("Entry".to_string());
+        device.discovery_source = "manual_entry".to_string();
+        device.capabilities.snapshot = true;
+        device.capabilities.stream = true;
+        registry_store
+            .save_devices(&[device])
+            .expect("save registry device");
+        service
+            .clone()
+            .admin_store
+            .save_remote_view_config(RemoteViewConfig {
+                share_secret: "platform-share-secret".to_string(),
+                share_link_ttl_minutes: 45,
+            })
+            .expect("save remote view config");
+
+        let response = service.handle_task(TaskRequest {
+            task_id: "task-live-view".to_string(),
+            trace_id: "trace-live-view".to_string(),
+            step_id: "step-live-view".to_string(),
+            source: TaskSource {
+                channel: "admin_api".to_string(),
+                surface: "agent_hub_admin_api".to_string(),
+                conversation_id: "admin-console".to_string(),
+                user_id: "local-admin".to_string(),
+                session_id: "admin-session".to_string(),
+                route_key: String::new(),
+            },
+            intent: TaskIntent {
+                domain: "camera".to_string(),
+                action: "live_view".to_string(),
+                raw_text: "生成共享观看链接".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "device_id": "cam-share"
+            }),
+            autonomy: Default::default(),
+            message: None,
+        });
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.executor_used, "camera_hub_service");
+        assert_eq!(response.result.data["camera_target"]["device_id"], "cam-share");
+        assert_eq!(response.result.data["share_link"]["device_id"], "cam-share");
+        assert_eq!(response.result.artifacts.len(), 1);
+        assert_eq!(response.result.artifacts[0].kind, "link");
+        assert_eq!(
+            response.result.events[0]["event_type"],
+            "task.share_link_issued"
+        );
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
     fn resolve_notification_recipient_prefers_bound_chat_id() {
         let state = AdminConsoleState {
             identity_bindings: vec![IdentityBindingRecord {
@@ -4698,7 +5615,7 @@ mod tests {
             notification_id: "notif_01JABC".to_string(),
             trace_id: "trace_01JABC".to_string(),
             source: NotificationSource {
-                service: "harbornas".to_string(),
+                service: "harborbeacon".to_string(),
                 module: "task_api".to_string(),
                 event_type: "task.completed".to_string(),
             },
@@ -4846,9 +5763,9 @@ mod tests {
 
     #[test]
     fn handle_camera_connect_blocks_by_default_until_approved() {
-        let admin_path = unique_path("harbornas-admin-state");
-        let registry_path = unique_path("harbornas-device-registry");
-        let conversation_path = unique_path("harbornas-task-runtime");
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
         let admin_store = AdminConsoleStore::new(
             admin_path.clone(),
             DeviceRegistryStore::new(registry_path.clone()),
@@ -4908,9 +5825,9 @@ mod tests {
 
     #[test]
     fn handle_camera_connect_fails_under_readonly_autonomy_before_approval() {
-        let admin_path = unique_path("harbornas-admin-state");
-        let registry_path = unique_path("harbornas-device-registry");
-        let conversation_path = unique_path("harbornas-task-runtime");
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
         let admin_store = AdminConsoleStore::new(
             admin_path.clone(),
             DeviceRegistryStore::new(registry_path.clone()),
@@ -4975,9 +5892,9 @@ mod tests {
 
     #[test]
     fn handle_camera_connect_with_full_autonomy_and_token_skips_approval_prompt() {
-        let admin_path = unique_path("harbornas-admin-state");
-        let registry_path = unique_path("harbornas-device-registry");
-        let conversation_path = unique_path("harbornas-task-runtime");
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
         let admin_store = AdminConsoleStore::new(
             admin_path.clone(),
             DeviceRegistryStore::new(registry_path.clone()),
@@ -5052,9 +5969,9 @@ mod tests {
 
     #[test]
     fn approve_pending_approval_replays_task_request() {
-        let admin_path = unique_path("harbornas-admin-state");
-        let registry_path = unique_path("harbornas-device-registry");
-        let conversation_path = unique_path("harbornas-task-runtime");
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
         let admin_store = AdminConsoleStore::new(
             admin_path.clone(),
             DeviceRegistryStore::new(registry_path.clone()),
@@ -5126,9 +6043,9 @@ mod tests {
 
     #[test]
     fn reject_pending_approval_closes_task() {
-        let admin_path = unique_path("harbornas-admin-state");
-        let registry_path = unique_path("harbornas-device-registry");
-        let conversation_path = unique_path("harbornas-task-reject");
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-reject");
         let admin_store = AdminConsoleStore::new(
             admin_path.clone(),
             DeviceRegistryStore::new(registry_path.clone()),
@@ -5201,9 +6118,9 @@ mod tests {
 
     #[test]
     fn handle_task_blocks_when_approval_required_without_token() {
-        let admin_path = unique_path("harbornas-admin-state");
-        let registry_path = unique_path("harbornas-device-registry");
-        let conversation_path = unique_path("harbornas-task-runtime");
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
         let admin_store = AdminConsoleStore::new(
             admin_path.clone(),
             DeviceRegistryStore::new(registry_path.clone()),
@@ -5278,9 +6195,9 @@ mod tests {
 
     #[test]
     fn handle_task_persists_runtime_records_for_failures() {
-        let admin_path = unique_path("harbornas-admin-state");
-        let registry_path = unique_path("harbornas-device-registry");
-        let conversation_path = unique_path("harbornas-task-runtime");
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
         let admin_store = AdminConsoleStore::new(
             admin_path.clone(),
             DeviceRegistryStore::new(registry_path.clone()),
@@ -5341,5 +6258,369 @@ mod tests {
         let _ = fs::remove_file(admin_path);
         let _ = fs::remove_file(registry_path);
         let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn handle_knowledge_search_returns_document_and_image_hits() {
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
+        let knowledge_root = unique_dir("harborbeacon-knowledge-runtime");
+        fs::create_dir_all(knowledge_root.join("docs")).expect("create docs");
+        fs::create_dir_all(knowledge_root.join("images")).expect("create images");
+        fs::write(
+            knowledge_root.join("docs").join("sakura-notes.md"),
+            "樱花季整理计划，记录花园图片和说明。",
+        )
+        .expect("write doc");
+        fs::write(
+            knowledge_root.join("images").join("spring-garden.jpg"),
+            b"not-an-image",
+        )
+        .expect("write image");
+        fs::write(
+            knowledge_root.join("images").join("spring-garden.json"),
+            r#"{"caption":"春天盛开的樱花树"}"#,
+        )
+        .expect("write sidecar");
+
+        let service = TaskApiService::new(
+            AdminConsoleStore::new(
+                admin_path.clone(),
+                DeviceRegistryStore::new(registry_path.clone()),
+            ),
+            TaskConversationStore::new(conversation_path.clone()),
+        );
+        let request = TaskRequest {
+            task_id: "task-knowledge-search".to_string(),
+            trace_id: "trace-knowledge-search".to_string(),
+            step_id: "step-knowledge-search".to_string(),
+            source: TaskSource::default(),
+            intent: TaskIntent {
+                domain: "knowledge".to_string(),
+                action: "search".to_string(),
+                raw_text: "搜索樱花文件".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "query": "樱花",
+                "roots": [knowledge_root.to_string_lossy().to_string()]
+            }),
+            autonomy: Default::default(),
+            message: None,
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.executor_used, "knowledge_search_service");
+        assert_eq!(
+            response.result.message,
+            response.result.data["reply_pack"]["summary"]
+        );
+        assert_eq!(
+            response.result.data["documents"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            response.result.data["images"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            response.result.data["reply_pack"]["citations"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            response.result.data["reply_pack"]["citations"][0]["title"],
+            "sakura-notes.md"
+        );
+        assert!(
+            response.result.data["reply_pack"]["citations"][0]["preview"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("樱花")
+        );
+        assert_eq!(response.result.artifacts.len(), 2);
+        assert_eq!(response.result.artifacts[0].kind, "text");
+        assert_eq!(response.result.artifacts[1].kind, "image");
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+        let _ = fs::remove_dir_all(knowledge_root);
+    }
+
+    #[test]
+    fn general_message_routes_retrieval_query_to_knowledge_search() {
+        let _guard = RETRIEVAL_GATE_TEST_LOCK.lock().expect("lock");
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
+        let knowledge_root = unique_dir("harborbeacon-knowledge-general-message");
+        fs::create_dir_all(knowledge_root.join("docs")).expect("create docs");
+        fs::write(
+            knowledge_root.join("docs").join("sakura-journal.md"),
+            "我把樱花相关的文档放在这里，方便后续整理。",
+        )
+        .expect("write doc");
+
+        std::env::set_var(KNOWLEDGE_NL_FALLBACK_ENV, "1");
+
+        let service = TaskApiService::new(
+            AdminConsoleStore::new(
+                admin_path.clone(),
+                DeviceRegistryStore::new(registry_path.clone()),
+            ),
+            TaskConversationStore::new(conversation_path.clone()),
+        );
+        let request = TaskRequest {
+            task_id: "task-general-message-search".to_string(),
+            trace_id: "trace-general-message-search".to_string(),
+            step_id: "step-general-message-search".to_string(),
+            source: TaskSource {
+                channel: "wechat".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-search".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "session-search".to_string(),
+                route_key: "gw_route_search".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "general".to_string(),
+                action: "message".to_string(),
+                raw_text: "帮我找到和樱花有关的文件".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "roots": [knowledge_root.to_string_lossy().to_string()]
+            }),
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_knowledge_01".to_string(),
+                chat_type: "p2p".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.executor_used, "knowledge_search_service");
+        assert_eq!(response.result.data["query"], "樱花");
+        assert_eq!(
+            response.result.message,
+            response.result.data["reply_pack"]["summary"]
+        );
+        assert_eq!(
+            response.result.data["documents"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            response.result.data["reply_pack"]["citations"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert!(
+            response.result.data["reply_pack"]["citations"][0]["preview"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("樱花")
+        );
+
+        std::env::remove_var(KNOWLEDGE_NL_FALLBACK_ENV);
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+        let _ = fs::remove_dir_all(knowledge_root);
+    }
+
+    #[test]
+    fn retrieval_round_trip_launch_pack_covers_explicit_enabled_and_disabled_paths() {
+        let _guard = RETRIEVAL_GATE_TEST_LOCK.lock().expect("lock");
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
+        let knowledge_root = unique_dir("harborbeacon-knowledge-launch-pack");
+        let index_root = unique_dir("harborbeacon-knowledge-index-launch-pack");
+        fs::create_dir_all(knowledge_root.join("docs")).expect("create docs");
+        fs::create_dir_all(knowledge_root.join("images")).expect("create images");
+        fs::create_dir_all(&index_root).expect("create index root");
+        fs::write(
+            knowledge_root.join("docs").join("sakura-notes.md"),
+            "今年花园里的樱花开得很盛，适合做春季归档。",
+        )
+        .expect("write doc");
+        fs::write(
+            knowledge_root.join("images").join("spring-garden.jpg"),
+            b"fake-image",
+        )
+        .expect("write image");
+        fs::write(
+            knowledge_root.join("images").join("spring-garden.json"),
+            r#"{"caption":"春天盛开的樱花树","labels":["sakura","spring"]}"#,
+        )
+        .expect("write sidecar");
+
+        std::env::set_var("HARBOR_KNOWLEDGE_INDEX_ROOT", &index_root);
+        let service = TaskApiService::new(
+            AdminConsoleStore::new(
+                admin_path.clone(),
+                DeviceRegistryStore::new(registry_path.clone()),
+            ),
+            TaskConversationStore::new(conversation_path.clone()),
+        );
+
+        let explicit_request = TaskRequest {
+            task_id: "task-launch-explicit".to_string(),
+            trace_id: "trace-launch-explicit".to_string(),
+            step_id: "step-launch-explicit".to_string(),
+            source: TaskSource::default(),
+            intent: TaskIntent {
+                domain: "knowledge".to_string(),
+                action: "search".to_string(),
+                raw_text: "搜索樱花文件".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "query": "樱花",
+                "roots": [knowledge_root.to_string_lossy().to_string()]
+            }),
+            autonomy: Default::default(),
+            message: None,
+        };
+        let explicit_response = service.handle_task(explicit_request);
+        assert_eq!(explicit_response.status, TaskStatus::Completed);
+        assert_eq!(explicit_response.executor_used, "knowledge_search_service");
+        assert_eq!(
+            explicit_response.result.message,
+            explicit_response.result.data["reply_pack"]["summary"]
+        );
+        assert_eq!(
+            explicit_response.result.data["reply_pack"]["citations"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            explicit_response.result.data["reply_pack"]["citations"][0]["line_start"],
+            1
+        );
+        assert_eq!(explicit_response.result.artifacts.len(), 2);
+        assert_eq!(
+            explicit_response.result.artifacts[0].metadata["citation"]["title"],
+            "sakura-notes.md"
+        );
+        assert_eq!(
+            explicit_response.result.artifacts[0].metadata["citation"]["line_start"],
+            1
+        );
+
+        std::env::set_var(KNOWLEDGE_NL_FALLBACK_ENV, "1");
+        let enabled_request = TaskRequest {
+            task_id: "task-launch-enabled".to_string(),
+            trace_id: "trace-launch-enabled".to_string(),
+            step_id: "step-launch-enabled".to_string(),
+            source: TaskSource {
+                channel: "wechat".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-launch".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "session-launch".to_string(),
+                route_key: "gw_route_launch".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "general".to_string(),
+                action: "message".to_string(),
+                raw_text: "帮我找到和樱花有关的文件".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "roots": [knowledge_root.to_string_lossy().to_string()]
+            }),
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_launch_01".to_string(),
+                chat_type: "p2p".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+        assert!(should_route_general_message_to_knowledge(&enabled_request));
+        let enabled_response = service.handle_task(enabled_request);
+        assert_eq!(enabled_response.status, TaskStatus::Completed);
+        assert_eq!(enabled_response.executor_used, "knowledge_search_service");
+        assert_eq!(
+            enabled_response.result.message,
+            enabled_response.result.data["reply_pack"]["summary"]
+        );
+        assert_eq!(
+            enabled_response.result.data["reply_pack"]["citations"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            enabled_response.result.data["reply_pack"]["citations"][0]["line_start"],
+            1
+        );
+        assert_eq!(
+            enabled_response.result.artifacts[0].metadata["citation"]["preview"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("樱花"),
+            true
+        );
+
+        std::env::remove_var(KNOWLEDGE_NL_FALLBACK_ENV);
+        let disabled_request = TaskRequest {
+            task_id: "task-launch-disabled".to_string(),
+            trace_id: "trace-launch-disabled".to_string(),
+            step_id: "step-launch-disabled".to_string(),
+            source: TaskSource {
+                channel: "wechat".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-launch".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "session-launch".to_string(),
+                route_key: "gw_route_launch".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "general".to_string(),
+                action: "message".to_string(),
+                raw_text: "帮我找到和樱花有关的文件".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "roots": [knowledge_root.to_string_lossy().to_string()]
+            }),
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_launch_02".to_string(),
+                chat_type: "p2p".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+        assert!(!should_route_general_message_to_knowledge(
+            &disabled_request
+        ));
+        let disabled_response = service.handle_task(disabled_request);
+        assert_eq!(disabled_response.status, TaskStatus::Failed);
+        assert_eq!(disabled_response.executor_used, "task_api");
+        assert!(disabled_response
+            .result
+            .message
+            .contains("unsupported task action"));
+
+        std::env::remove_var("HARBOR_KNOWLEDGE_INDEX_ROOT");
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+        let _ = fs::remove_dir_all(knowledge_root);
+        let _ = fs::remove_dir_all(index_root);
     }
 }

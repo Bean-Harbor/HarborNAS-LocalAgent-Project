@@ -2,71 +2,138 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{Cursor, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::thread;
 
-use clap::Parser;
 use qrcodegen::{QrCode, QrCodeEcc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, ResponseBox, Server, StatusCode};
 
-use harbornas_local_agent::control_plane::media::{MediaSession, MediaSessionStatus, ShareLink};
-use harbornas_local_agent::control_plane::users::{MembershipStatus, RoleKind};
-use harbornas_local_agent::runtime::access_control::{
+use harborbeacon_local_agent::control_plane::media::{MediaSession, MediaSessionStatus, ShareLink};
+use harborbeacon_local_agent::control_plane::users::{MembershipStatus, RoleKind};
+use harborbeacon_local_agent::runtime::access_control::{
     authorize_access, AccessAction, AccessIdentityHints, AccessPrincipal,
 };
-use harbornas_local_agent::runtime::admin_console::{
+use harborbeacon_local_agent::runtime::admin_console::{
     AdminConsoleState, AdminConsoleStore, AdminDefaults, BridgeProviderConfig,
     IdentityBindingRecord,
 };
-use harbornas_local_agent::runtime::hub::{
+use harborbeacon_local_agent::runtime::hub::{
     build_mobile_setup_url, CameraHubService, HubManualAddSummary, HubScanRequest, HubScanSummary,
     HubStateSnapshot,
 };
-use harbornas_local_agent::runtime::registry::{CameraDevice, DeviceRegistryStore};
-use harbornas_local_agent::runtime::remote_view;
-use harbornas_local_agent::runtime::task_api::{
+use harborbeacon_local_agent::runtime::registry::{CameraDevice, DeviceRegistryStore};
+use harborbeacon_local_agent::runtime::remote_view;
+use harborbeacon_local_agent::runtime::task_api::{
     TaskApiService, TaskApprovalSummary, TaskIntent, TaskRequest, TaskResponse, TaskSource,
     TaskStatus,
 };
-use harbornas_local_agent::runtime::task_session::TaskConversationStore;
+use harborbeacon_local_agent::runtime::task_session::TaskConversationStore;
 
-#[derive(Debug, Parser)]
-#[command(name = "agent-hub-admin-api")]
-#[command(about = "Local admin API for HarborNAS Agent Hub demo console")]
+#[derive(Debug, Clone)]
 struct Cli {
-    #[arg(long, default_value = "127.0.0.1:4174", help = "Bind address")]
     bind: String,
-
-    #[arg(
-        long,
-        default_value = ".harbornas/admin-console.json",
-        help = "Admin console state file"
-    )]
     admin_state: PathBuf,
-
-    #[arg(
-        long,
-        default_value = ".harbornas/device-registry.json",
-        help = "Device registry file"
-    )]
     device_registry: PathBuf,
-
-    #[arg(
-        long,
-        default_value = ".harbornas/task-api-conversations.json",
-        help = "Task API conversation state file"
-    )]
     conversations: PathBuf,
-
-    #[arg(
-        long,
-        default_value = "http://harbornas.local:4174",
-        help = "Public origin used in QR setup URL"
-    )]
     public_origin: String,
+}
+
+fn take_value(args: &[String], index: &mut usize, flag: &str) -> String {
+    *index += 1;
+    if *index >= args.len() {
+        fail(&format!("missing value for {flag}"));
+    }
+    args[*index].clone()
+}
+
+fn fail(message: &str) -> ! {
+    eprintln!("{message}");
+    std::process::exit(2);
+}
+
+fn print_usage() {
+    eprintln!(
+        "Usage: agent-hub-admin-api [--bind ADDR] [--admin-state PATH] [--device-registry PATH] [--conversations PATH] [--public-origin URL]"
+    );
+}
+
+impl Default for Cli {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1:4174".to_string(),
+            admin_state: PathBuf::from(".harborbeacon/admin-console.json"),
+            device_registry: PathBuf::from(".harborbeacon/device-registry.json"),
+            conversations: PathBuf::from(".harborbeacon/task-api-conversations.json"),
+            public_origin: "http://harborbeacon.local:4174".to_string(),
+        }
+    }
+}
+
+impl Cli {
+    fn parse() -> Self {
+        let args = std::env::args().skip(1).collect::<Vec<_>>();
+        if matches!(args.first().map(String::as_str), Some("--help" | "-h")) {
+            print_usage();
+            std::process::exit(0);
+        }
+
+        let mut cli = Self::default();
+        let mut index = 0;
+        while index < args.len() {
+            let arg = &args[index];
+            match arg.as_str() {
+                "--bind" => cli.bind = take_value(&args, &mut index, "--bind"),
+                value if value.starts_with("--bind=") => {
+                    cli.bind = value["--bind=".len()..].to_string();
+                }
+                "--admin-state" => {
+                    cli.admin_state = PathBuf::from(take_value(&args, &mut index, "--admin-state"))
+                }
+                value if value.starts_with("--admin-state=") => {
+                    cli.admin_state = PathBuf::from(value["--admin-state=".len()..].to_string())
+                }
+                "--device-registry" => {
+                    cli.device_registry =
+                        PathBuf::from(take_value(&args, &mut index, "--device-registry"))
+                }
+                value if value.starts_with("--device-registry=") => {
+                    cli.device_registry =
+                        PathBuf::from(value["--device-registry=".len()..].to_string())
+                }
+                "--conversations" => {
+                    cli.conversations =
+                        PathBuf::from(take_value(&args, &mut index, "--conversations"))
+                }
+                value if value.starts_with("--conversations=") => {
+                    cli.conversations =
+                        PathBuf::from(value["--conversations=".len()..].to_string())
+                }
+                "--public-origin" => {
+                    cli.public_origin =
+                        take_value(&args, &mut index, "--public-origin")
+                }
+                value if value.starts_with("--public-origin=") => {
+                    cli.public_origin = value["--public-origin=".len()..].to_string();
+                }
+                "--help" | "-h" => {
+                    print_usage();
+                    std::process::exit(0);
+                }
+                value if value.starts_with('-') => {
+                    fail(&format!("unknown flag: {value}"));
+                }
+                value => {
+                    fail(&format!("unexpected positional argument: {value}"));
+                }
+            }
+            index += 1;
+        }
+
+        cli
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1226,7 +1293,7 @@ impl AdminApi {
     fn load_camera_device(
         &self,
         device_id: &str,
-    ) -> Result<harbornas_local_agent::runtime::registry::CameraDevice, String> {
+    ) -> Result<harborbeacon_local_agent::runtime::registry::CameraDevice, String> {
         self.hub()
             .load_registered_cameras()?
             .into_iter()
@@ -1373,9 +1440,12 @@ impl AdminApi {
 
 fn main() {
     let cli = Cli::parse();
-    let registry_store = DeviceRegistryStore::new(cli.device_registry);
-    let admin_store = AdminConsoleStore::new(cli.admin_state, registry_store);
-    let conversation_store = TaskConversationStore::new(cli.conversations);
+    let device_registry_path = resolve_state_path(&cli.device_registry);
+    let admin_state_path = resolve_state_path(&cli.admin_state);
+    let conversation_path = resolve_state_path(&cli.conversations);
+    let registry_store = DeviceRegistryStore::new(device_registry_path);
+    let admin_store = AdminConsoleStore::new(admin_state_path, registry_store);
+    let conversation_store = TaskConversationStore::new(conversation_path);
     let task_service = TaskApiService::new(admin_store.clone(), conversation_store);
     let api = AdminApi::new(admin_store, task_service, cli.public_origin);
 
@@ -1384,16 +1454,42 @@ fn main() {
         std::process::exit(1);
     });
 
-    println!(
-        "HarborNAS Agent Hub admin API listening on http://{}",
-        cli.bind
-    );
+    println!("HarborBeacon admin API listening on http://{}", cli.bind);
     for request in server.incoming_requests() {
         let api = api.clone();
         thread::spawn(move || {
             api.handle(request);
         });
     }
+}
+
+fn resolve_state_path(preferred: &Path) -> PathBuf {
+    if preferred.exists() || !is_harborbeacon_state_path(preferred) {
+        return preferred.to_path_buf();
+    }
+
+    let legacy = legacy_state_path(preferred);
+    if legacy.exists() {
+        eprintln!(
+            "warning: legacy .harbornas state path {} is deprecated; prefer {}",
+            legacy.display(),
+            preferred.display()
+        );
+        legacy
+    } else {
+        preferred.to_path_buf()
+    }
+}
+
+fn is_harborbeacon_state_path(path: &Path) -> bool {
+    path.to_string_lossy().contains(".harborbeacon")
+}
+
+fn legacy_state_path(path: &Path) -> PathBuf {
+    PathBuf::from(
+        path.to_string_lossy()
+            .replace(".harborbeacon", ".harbornas"),
+    )
 }
 
 fn parse_query_param(url: &str, key: &str) -> Option<String> {
@@ -1596,7 +1692,7 @@ fn render_mobile_setup_page(
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>HarborNAS IM Gateway 状态</title>
+  <title>HarborBeacon HarborGate 状态</title>
   <style>
     body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #f4efe7; color: #1e1b18; margin: 0; }}
     .wrap {{ max-width: 560px; margin: 0 auto; padding: 24px 18px 40px; }}
@@ -1616,9 +1712,9 @@ fn render_mobile_setup_page(
 <body>
   <div class="wrap">
     <div class="card">
-      <div class="meta">HarborNAS Agent Hub · 手机配置页</div>
-      <h1>查看 IM Gateway 状态</h1>
-      <p>HarborNAS 不再保存平台侧 <code>app_id</code> / <code>app_secret</code>。这个页面只会让 HarborNAS 后端去读取 IM Gateway 的脱敏状态，并同步显示连接结果。</p>
+      <div class="meta">HarborBeacon · 手机配置页</div>
+      <h1>查看 HarborGate 状态</h1>
+      <p>HarborBeacon 不再保存平台侧 <code>app_id</code> / <code>app_secret</code>。这个页面只会让 HarborBeacon 后端去读取 HarborGate 的脱敏状态，并同步显示连接结果。</p>
       <div class="status">
         <div><strong>当前状态：</strong><span id="status-text">{status}</span></div>
         <div><strong>当前会话：</strong>{session_code}</div>
@@ -1629,8 +1725,8 @@ fn render_mobile_setup_page(
       </div>
       <p class="hint">当前打开的是本地配置入口：<code>{setup_url}</code></p>
       <button id="submit-btn">刷新 Gateway 状态</button>
-      <p class="hint">点击后，HarborNAS 会使用服务端配置的 IM Gateway 地址与服务 token 访问 <code>GET /api/gateway/status</code>。返回结果必须是脱敏状态，不会把原始平台凭据写进 HarborNAS。</p>
-      <p class="hint">如果这里刷新失败，请检查 HarborNAS 机器上的 <code>HARBOR_IM_GATEWAY_BASE_URL</code> 和 <code>HARBOR_IM_GATEWAY_BEARER_TOKEN</code>，以及 IM Gateway 是否已实现推荐的状态接口。静态配置页仍然可以固定在 <code>{static_setup_url}</code>。</p>
+      <p class="hint">点击后，HarborBeacon 会使用服务端配置的 HarborGate 地址与服务 token 访问 <code>GET /api/gateway/status</code>。返回结果必须是脱敏状态，不会把原始平台凭据写进 HarborBeacon。</p>
+      <p class="hint">如果这里刷新失败，请检查 HarborBeacon 机器上的 <code>HARBORGATE_BASE_URL</code> 和 <code>HARBORGATE_BEARER_TOKEN</code>，以及 HarborGate 是否已实现推荐的状态接口。静态配置页仍然可以固定在 <code>{static_setup_url}</code>。</p>
       <p id="result" class="hint"></p>
     </div>
   </div>
@@ -1638,7 +1734,7 @@ fn render_mobile_setup_page(
     document.getElementById('submit-btn').addEventListener('click', async () => {{
       const result = document.getElementById('result');
       result.className = 'hint';
-      result.textContent = '正在刷新 IM Gateway 状态...';
+      result.textContent = '正在刷新 HarborGate 状态...';
       try {{
         const response = await fetch('/api/bridge/configure', {{
           method: 'POST',
@@ -1656,7 +1752,7 @@ fn render_mobile_setup_page(
         const caps = payload.bridge_provider?.capabilities || {{}};
         document.getElementById('capabilities').textContent = `reply=${{caps.reply ? 'yes' : 'no'}} / update=${{caps.update ? 'yes' : 'no'}} / attachments=${{caps.attachments ? 'yes' : 'no'}}`;
         result.className = 'hint ok';
-        result.textContent = 'IM Gateway 状态已刷新，HarborNAS 只保存了脱敏状态。';
+        result.textContent = 'HarborGate 状态已刷新，HarborBeacon 只保存了脱敏状态。';
       }} catch (error) {{
         result.className = 'hint err';
         result.textContent = error.message;
@@ -1670,7 +1766,7 @@ fn render_mobile_setup_page(
 
 fn render_live_view_page(
     public_origin: &str,
-    device: &harbornas_local_agent::runtime::registry::CameraDevice,
+    device: &harborbeacon_local_agent::runtime::registry::CameraDevice,
     identity_query: &str,
 ) -> String {
     let device_label = device.room.as_deref().unwrap_or(device.name.as_str());
@@ -1845,7 +1941,7 @@ fn render_live_view_page(
       </div>
 
       <div class="hint">
-        如果画面没有出来，先确认手机和 HarborNAS Agent Hub 在同一个局域网，再点击“重连画面”。
+        如果画面没有出来，先确认手机和 HarborBeacon 在同一个局域网，再点击“重连画面”。
         这个页面只负责看实时视频；拍照、录像、云台控制仍然建议继续在统一 IM 入口里完成。
       </div>
     </div>
@@ -1887,7 +1983,7 @@ fn render_live_view_page(
 
 fn render_shared_live_view_page(
     share_token: &str,
-    device: &harbornas_local_agent::runtime::registry::CameraDevice,
+    device: &harborbeacon_local_agent::runtime::registry::CameraDevice,
 ) -> String {
     let device_label = html_escape(device.room.as_deref().unwrap_or(device.name.as_str()));
     let device_name = html_escape(&device.name);
@@ -2384,7 +2480,7 @@ fn task_error_message(response: &TaskResponse) -> String {
 
 fn parse_scan_results(
     data: &Value,
-) -> Result<Vec<harbornas_local_agent::runtime::hub::HubScanResultItem>, String> {
+) -> Result<Vec<harborbeacon_local_agent::runtime::hub::HubScanResultItem>, String> {
     let value = data
         .pointer("/candidates")
         .cloned()
@@ -2609,15 +2705,15 @@ mod tests {
         percent_decode_path_segment, redact_bridge_provider_config, request_identity_hints,
         url_encode_path_segment, AdminApi,
     };
-    use harbornas_local_agent::control_plane::media::{
+    use harborbeacon_local_agent::control_plane::media::{
         MediaDeliveryMode, MediaSession, MediaSessionKind, MediaSessionStatus, ShareAccessScope,
         ShareLink,
     };
-    use harbornas_local_agent::runtime::admin_console::{AdminConsoleStore, RemoteViewConfig};
-    use harbornas_local_agent::runtime::registry::DeviceRegistryStore;
-    use harbornas_local_agent::runtime::remote_view;
-    use harbornas_local_agent::runtime::task_api::TaskApiService;
-    use harbornas_local_agent::runtime::task_session::TaskConversationStore;
+    use harborbeacon_local_agent::runtime::admin_console::{AdminConsoleStore, RemoteViewConfig};
+    use harborbeacon_local_agent::runtime::registry::DeviceRegistryStore;
+    use harborbeacon_local_agent::runtime::remote_view;
+    use harborbeacon_local_agent::runtime::task_api::TaskApiService;
+    use harborbeacon_local_agent::runtime::task_session::TaskConversationStore;
     use serde_json::json;
     use std::fs;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -2709,19 +2805,19 @@ mod tests {
     #[test]
     fn bridge_provider_config_redacts_secret() {
         let redacted = redact_bridge_provider_config(
-            harbornas_local_agent::runtime::admin_console::BridgeProviderConfig {
+            harborbeacon_local_agent::runtime::admin_console::BridgeProviderConfig {
                 configured: true,
                 connected: true,
                 platform: "feishu".to_string(),
                 gateway_base_url: "http://gateway.local:4180".to_string(),
                 app_id: "cli_xxx".to_string(),
                 app_secret: "super-secret".to_string(),
-                app_name: "HarborNAS Bot".to_string(),
+                app_name: "HarborBeacon Bot".to_string(),
                 bot_open_id: "ou_xxx".to_string(),
                 status: "已连接".to_string(),
                 last_checked_at: "2026-04-18T10:00:00Z".to_string(),
                 capabilities:
-                    harbornas_local_agent::runtime::admin_console::BridgeProviderCapabilities {
+                    harborbeacon_local_agent::runtime::admin_console::BridgeProviderCapabilities {
                         reply: true,
                         update: true,
                         attachments: true,
@@ -2809,9 +2905,9 @@ mod tests {
 
     #[test]
     fn verify_shared_camera_token_requires_persisted_active_share_link() {
-        let admin_path = unique_store_path("harbornas-admin-state");
-        let registry_path = unique_store_path("harbornas-device-registry");
-        let conversation_path = unique_store_path("harbornas-task-runtime");
+        let admin_path = unique_store_path("harborbeacon-admin-state");
+        let registry_path = unique_store_path("harborbeacon-device-registry");
+        let conversation_path = unique_store_path("harborbeacon-task-runtime");
         let registry_store = DeviceRegistryStore::new(registry_path.clone());
         let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
         admin_store
@@ -2825,7 +2921,7 @@ mod tests {
         let api = AdminApi::new(
             admin_store,
             task_service,
-            "http://harbornas.local:4174".to_string(),
+            "http://harborbeacon.local:4174".to_string(),
         );
 
         let issued = remote_view::issue_camera_share_token("platform-share-secret", "cam-1", 15)
@@ -2877,9 +2973,9 @@ mod tests {
 
     #[test]
     fn list_share_links_surfaces_registered_status() {
-        let admin_path = unique_store_path("harbornas-admin-state");
-        let registry_path = unique_store_path("harbornas-device-registry");
-        let conversation_path = unique_store_path("harbornas-task-runtime");
+        let admin_path = unique_store_path("harborbeacon-admin-state");
+        let registry_path = unique_store_path("harborbeacon-device-registry");
+        let conversation_path = unique_store_path("harborbeacon-task-runtime");
         let registry_store = DeviceRegistryStore::new(registry_path.clone());
         let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
         let conversation_store = TaskConversationStore::new(conversation_path.clone());
@@ -2887,7 +2983,7 @@ mod tests {
         let api = AdminApi::new(
             admin_store,
             task_service,
-            "http://harbornas.local:4174".to_string(),
+            "http://harborbeacon.local:4174".to_string(),
         );
 
         conversation_store

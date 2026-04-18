@@ -4,7 +4,7 @@
 
 ## 目标
 
-- 在 Debian 13 机器上长期运行 HarborNAS Agent Hub
+- 在 Debian 13 机器上长期运行 HarborBeacon
 - 设备通过网线接入局域网
 - 使用静态二维码把手机带到本机后台配置页
 - 在手机上填写飞书机器人的 `app_id` / `app_secret`
@@ -14,11 +14,11 @@
 
 推荐把设备的固定二维码做成：
 
-- `http://harbornas.local:4174/setup/mobile`
+- `http://harborbeacon.local:4174/setup/mobile`
 
 这要求设备在局域网内：
 
-- 主机名固定为 `harbornas`
+- 主机名固定为 `harborbeacon`
 - 运行 `avahi-daemon`
 - 广播 `_http._tcp` 服务
 
@@ -29,19 +29,19 @@
 
 运行方式：
 
-- `sudo ./tools/setup_debian13_local_discovery.sh harbornas`
+- `sudo ./tools/setup_debian13_local_discovery.sh harborbeacon`
 - `sudo ./tools/install_debian13_services.sh`
 
 安装后建议直接把下面这个静态二维码地址做成机身贴纸：
 
-- `http://harbornas.local:4174/api/binding/static-qr.svg`
+- `http://harborbeacon.local:4174/api/binding/static-qr.svg`
 
 ## 模型依赖（YOLO）
 
 仓库不会提交 `yolov8n.pt` 这类权重文件；Debian 安装脚本会默认下载并校验 YOLO 模型到本机：
 
-- 默认路径：`/var/lib/harbornas/models/yolov8n.pt`
-- 默认环境变量：`HARBOR_YOLO_MODEL=/var/lib/harbornas/models/yolov8n.pt`
+- 默认路径：`/var/lib/harborbeacon/models/yolov8n.pt`
+- 默认环境变量：`HARBOR_YOLO_MODEL=/var/lib/harborbeacon/models/yolov8n.pt`
 
 如需跳过模型下载：
 
@@ -117,14 +117,14 @@
 - 回复 `接入 1`
 - 回复 `忽略 2`
 - 回复 `密码 xxxxxx`
-- 这些会话状态持久化到 `.harbornas/task-api-conversations.json`，本机 Task API 重启后不会直接丢失
+- 这些会话状态持久化到 `.harborbeacon/task-api-conversations.json`，本机 Task API 重启后不会直接丢失
 
 不建议长期保留偏调试风格的原始 ffmpeg / RTSP 错误全文回显。
 
 ## 明天部署优先级
 
 1. Debian 13 上启用固定主机名与 Avahi
-2. 用静态二维码访问 `harbornas.local`
+2. 用静态二维码访问 `harborbeacon.local`
 3. 在手机页填写并保存飞书 Bot 凭证
 4. 启动 `assistant-task-api` 与 `agent-hub-admin-api`，确认本机服务正常
 5. 部署外部 HarborBeacon / IM bridge，并把它指向 `http://<Debian 机器>:4175`

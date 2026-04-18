@@ -1,4 +1,4 @@
-# HarborNAS GitHub Actions Workflow Draft v1
+# HarborBeacon GitHub Actions Workflow Draft v1
 
 ## Purpose
 This document translates the CI contract pipeline checklist into an initial GitHub Actions workflow design that engineering can implement with minimal interpretation.
@@ -94,7 +94,7 @@ Suggested steps:
 
 #### job: e2e_matrix
 Purpose:
-- run mandatory scenarios from HarborNAS-Contract-E2E-Test-Plan-v1.md
+- run mandatory scenarios from HarborBeacon-Contract-E2E-Test-Plan-v1.md
 
 Suggested strategy:
 ```yaml
@@ -128,7 +128,7 @@ Suggested steps:
 
 #### job: drift_compatibility
 Purpose:
-- compare HarborNAS refs against upstream refs
+- compare HarborBeacon refs against upstream refs
 - run compatibility matrix validation
 
 Suggested steps:

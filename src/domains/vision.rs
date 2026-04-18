@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::connectors::storage::StorageObjectRef;
+use crate::runtime::media::DeviceArtifactMetadata;
 use crate::runtime::registry::ResolvedCameraTarget;
 
 pub const DOMAIN: &str = "vision";
@@ -31,9 +32,17 @@ pub struct VisionDetection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct VisionImageArtifact {
+pub struct VisionImageIndexSidecar {
+    pub artifact_role: String,
     pub image_path: String,
+    #[serde(default)]
+    pub source_image_path: Option<String>,
+    #[serde(default)]
     pub annotated_image_path: Option<String>,
+    #[serde(default)]
+    pub caption: Option<String>,
+    #[serde(default)]
+    pub derived_text: Option<String>,
     pub mime_type: String,
     #[serde(default)]
     pub source_storage: Option<StorageObjectRef>,
@@ -41,6 +50,39 @@ pub struct VisionImageArtifact {
     pub byte_size: Option<u64>,
     #[serde(default)]
     pub captured_at_epoch_ms: Option<u128>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub ingest_metadata: Option<DeviceArtifactMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VisionImageArtifact {
+    pub image_path: String,
+    #[serde(default)]
+    pub source_image_path: Option<String>,
+    pub annotated_image_path: Option<String>,
+    #[serde(default)]
+    pub caption: Option<String>,
+    #[serde(default)]
+    pub derived_text: Option<String>,
+    pub mime_type: String,
+    #[serde(default)]
+    pub source_storage: Option<StorageObjectRef>,
+    #[serde(default)]
+    pub byte_size: Option<u64>,
+    #[serde(default)]
+    pub captured_at_epoch_ms: Option<u128>,
+    #[serde(default)]
+    pub index_sidecar_path: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub ingest_metadata: Option<DeviceArtifactMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -81,7 +123,11 @@ fn default_notification_format() -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{VisionAnalyzeCameraArgs, VisionAnalyzeCameraPayload, OP_ANALYZE_CAMERA};
+    use super::{
+        VisionAnalyzeCameraArgs, VisionAnalyzeCameraPayload, VisionImageArtifact, OP_ANALYZE_CAMERA,
+    };
+    use crate::connectors::storage::{StorageObjectRef, StorageTarget};
+    use crate::runtime::media::DeviceArtifactMetadata;
 
     #[test]
     fn analyze_camera_args_use_person_defaults() {
@@ -128,11 +174,18 @@ mod tests {
             "detections": [],
             "snapshot": {
                 "image_path": "snap.jpg",
+                "source_image_path": "snap.jpg",
                 "annotated_image_path": null,
+                "caption": null,
+                "derived_text": null,
                 "mime_type": "image/jpeg",
                 "source_storage": null,
                 "byte_size": null,
-                "captured_at_epoch_ms": null
+                "captured_at_epoch_ms": null,
+                "tags": [],
+                "labels": [],
+                "index_sidecar_path": null,
+                "ingest_metadata": null
             },
             "detection_summary": "检测到 1 个 person，最高置信度 88%。",
             "feishu_card": {"header": {"title": {"content": "Front Door AI 分析"}}}
@@ -146,8 +199,71 @@ mod tests {
         assert_eq!(payload.snapshot.byte_size, None);
         assert_eq!(payload.snapshot.captured_at_epoch_ms, None);
         assert_eq!(
+            payload.snapshot.source_image_path.as_deref(),
+            Some("snap.jpg")
+        );
+        assert_eq!(payload.snapshot.caption, None);
+        assert_eq!(payload.snapshot.derived_text, None);
+        assert!(payload.snapshot.tags.is_empty());
+        assert!(payload.snapshot.labels.is_empty());
+        assert_eq!(payload.snapshot.index_sidecar_path, None);
+        assert_eq!(payload.snapshot.ingest_metadata, None);
+        assert_eq!(
             payload.notification_card["header"]["title"]["content"],
             "Front Door AI 分析"
+        );
+    }
+
+    #[test]
+    fn image_artifact_accepts_ingest_metadata_for_future_indexing() {
+        let artifact = VisionImageArtifact {
+            image_path: "snapshot.jpg".to_string(),
+            annotated_image_path: Some("snapshot-annotated.jpg".to_string()),
+            mime_type: "image/jpeg".to_string(),
+            source_storage: Some(StorageObjectRef {
+                target: StorageTarget::LocalDisk,
+                relative_path: "snapshots/cam-1/123.jpg".to_string(),
+            }),
+            byte_size: Some(123),
+            captured_at_epoch_ms: Some(1710000000000),
+            source_image_path: Some("snapshots/cam-1/123.jpg".to_string()),
+            index_sidecar_path: Some("snapshots/cam-1/123.json".to_string()),
+            caption: Some("Front Door AI snapshot".to_string()),
+            derived_text: Some("检测到 person; labels: person".to_string()),
+            tags: vec!["camera".to_string(), "snapshot".to_string()],
+            labels: vec!["person".to_string()],
+            ingest_metadata: Some(
+                DeviceArtifactMetadata::knowledge_index_candidate("cam-1", 1710000000000)
+                    .with_device_context(
+                        Some("Front Door".to_string()),
+                        Some("Entry".to_string()),
+                        Some("DemoCam".to_string()),
+                        Some("C1".to_string()),
+                        Some("manual_entry".to_string()),
+                        Some("rtsp".to_string()),
+                        Some(false),
+                    ),
+            ),
+        };
+
+        let encoded = serde_json::to_value(&artifact).expect("serialize");
+        assert_eq!(encoded["ingest_metadata"]["device_id"], "cam-1");
+        assert_eq!(encoded["ingest_metadata"]["provenance"], "media");
+        assert_eq!(encoded["source_image_path"], "snapshots/cam-1/123.jpg");
+        assert_eq!(encoded["caption"], "Front Door AI snapshot");
+        assert_eq!(encoded["derived_text"], "检测到 person; labels: person");
+        assert_eq!(encoded["tags"], json!(["camera", "snapshot"]));
+        assert_eq!(encoded["labels"], json!(["person"]));
+        assert_eq!(encoded["index_sidecar_path"], "snapshots/cam-1/123.json");
+        assert_eq!(
+            encoded["ingest_metadata"]["ingest_disposition"],
+            "knowledge_index_candidate"
+        );
+
+        let decoded: VisionImageArtifact = serde_json::from_value(encoded).expect("decode");
+        assert_eq!(
+            decoded.ingest_metadata.expect("metadata").room.as_deref(),
+            Some("Entry")
         );
     }
 }

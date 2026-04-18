@@ -9,6 +9,100 @@ use crate::connectors::storage::{StorageObjectRef, StorageTarget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ArtifactProvenance {
+    Media,
+    Control,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactIngestDisposition {
+    KnowledgeIndexCandidate,
+    RuntimeOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceArtifactMetadata {
+    pub device_id: String,
+    #[serde(default)]
+    pub device_name: Option<String>,
+    #[serde(default)]
+    pub room: Option<String>,
+    #[serde(default)]
+    pub vendor: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub discovery_source: Option<String>,
+    #[serde(default)]
+    pub captured_at_epoch_ms: Option<u128>,
+    #[serde(default)]
+    pub stream_transport: Option<String>,
+    #[serde(default)]
+    pub source_requires_auth: Option<bool>,
+    pub provenance: ArtifactProvenance,
+    pub ingest_disposition: ArtifactIngestDisposition,
+}
+
+impl DeviceArtifactMetadata {
+    pub fn knowledge_index_candidate(
+        device_id: impl Into<String>,
+        captured_at_epoch_ms: u128,
+    ) -> Self {
+        Self {
+            device_id: device_id.into(),
+            device_name: None,
+            room: None,
+            vendor: None,
+            model: None,
+            discovery_source: None,
+            captured_at_epoch_ms: Some(captured_at_epoch_ms),
+            stream_transport: None,
+            source_requires_auth: None,
+            provenance: ArtifactProvenance::Media,
+            ingest_disposition: ArtifactIngestDisposition::KnowledgeIndexCandidate,
+        }
+    }
+
+    pub fn runtime_only(device_id: impl Into<String>, captured_at_epoch_ms: u128) -> Self {
+        Self {
+            device_id: device_id.into(),
+            device_name: None,
+            room: None,
+            vendor: None,
+            model: None,
+            discovery_source: None,
+            captured_at_epoch_ms: Some(captured_at_epoch_ms),
+            stream_transport: None,
+            source_requires_auth: None,
+            provenance: ArtifactProvenance::Control,
+            ingest_disposition: ArtifactIngestDisposition::RuntimeOnly,
+        }
+    }
+
+    pub fn with_device_context(
+        mut self,
+        device_name: Option<String>,
+        room: Option<String>,
+        vendor: Option<String>,
+        model: Option<String>,
+        discovery_source: Option<String>,
+        stream_transport: Option<String>,
+        source_requires_auth: Option<bool>,
+    ) -> Self {
+        self.device_name = device_name;
+        self.room = room;
+        self.vendor = vendor;
+        self.model = model;
+        self.discovery_source = discovery_source;
+        self.stream_transport = stream_transport;
+        self.source_requires_auth = source_requires_auth;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MediaAssetKind {
     Snapshot,
     Clip,
@@ -82,6 +176,10 @@ pub struct SnapshotCaptureResult {
     pub storage: StorageObjectRef,
     #[serde(default)]
     pub captured_at_epoch_ms: u128,
+    #[serde(default)]
+    pub index_sidecar_relative_path: String,
+    #[serde(default)]
+    pub ingest_metadata: Option<DeviceArtifactMetadata>,
 }
 
 impl SnapshotCaptureResult {
@@ -97,12 +195,17 @@ impl SnapshotCaptureResult {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis())
             .unwrap_or_default();
+        let ingest_metadata = Some(DeviceArtifactMetadata::knowledge_index_candidate(
+            device_id.clone(),
+            captured_at_epoch_ms,
+        ));
         let relative_path = format!(
             "snapshots/{}/{}.{}",
             sanitize_path_segment(&device_id),
             captured_at_epoch_ms,
             format.file_extension()
         );
+        let index_sidecar_relative_path = derive_index_sidecar_relative_path(&relative_path);
 
         Self {
             device_id,
@@ -116,7 +219,33 @@ impl SnapshotCaptureResult {
                 relative_path,
             },
             captured_at_epoch_ms,
+            index_sidecar_relative_path,
+            ingest_metadata,
         }
+    }
+
+    pub fn with_device_context(
+        mut self,
+        device_name: Option<String>,
+        room: Option<String>,
+        vendor: Option<String>,
+        model: Option<String>,
+        discovery_source: Option<String>,
+        stream_transport: Option<String>,
+        source_requires_auth: Option<bool>,
+    ) -> Self {
+        self.ingest_metadata = self.ingest_metadata.take().map(|metadata| {
+            metadata.with_device_context(
+                device_name,
+                room,
+                vendor,
+                model,
+                discovery_source,
+                stream_transport,
+                source_requires_auth,
+            )
+        });
+        self
     }
 }
 
@@ -150,6 +279,10 @@ pub struct StreamOpenResult {
     pub player: String,
     pub player_path: PathBuf,
     pub process_id: u32,
+    #[serde(default)]
+    pub opened_at_epoch_ms: Option<u128>,
+    #[serde(default)]
+    pub ingest_metadata: Option<DeviceArtifactMetadata>,
 }
 
 impl StreamOpenResult {
@@ -160,14 +293,48 @@ impl StreamOpenResult {
         player_path: PathBuf,
         process_id: u32,
     ) -> Self {
+        let device_id = device_id.into();
+        let opened_at_epoch_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default();
         Self {
-            device_id: device_id.into(),
+            device_id: device_id.clone(),
             asset_kind: MediaAssetKind::Stream,
             stream_url: stream_url.into(),
             player: player.into(),
             player_path,
             process_id,
+            opened_at_epoch_ms: Some(opened_at_epoch_ms),
+            ingest_metadata: Some(DeviceArtifactMetadata::runtime_only(
+                device_id,
+                opened_at_epoch_ms,
+            )),
         }
+    }
+
+    pub fn with_device_context(
+        mut self,
+        device_name: Option<String>,
+        room: Option<String>,
+        vendor: Option<String>,
+        model: Option<String>,
+        discovery_source: Option<String>,
+        stream_transport: Option<String>,
+        source_requires_auth: Option<bool>,
+    ) -> Self {
+        self.ingest_metadata = self.ingest_metadata.take().map(|metadata| {
+            metadata.with_device_context(
+                device_name,
+                room,
+                vendor,
+                model,
+                discovery_source,
+                stream_transport,
+                source_requires_auth,
+            )
+        });
+        self
     }
 }
 
@@ -184,11 +351,23 @@ fn sanitize_path_segment(value: &str) -> String {
         .collect()
 }
 
+fn derive_index_sidecar_relative_path(relative_path: &str) -> String {
+    let path = PathBuf::from(relative_path);
+    let mut sidecar = path;
+    sidecar.set_extension("json");
+    sidecar.to_string_lossy().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use super::{SnapshotCaptureResult, SnapshotFormat, StreamOpenRequest, StreamOpenResult};
+    use serde_json::json;
+
+    use super::{
+        ArtifactIngestDisposition, ArtifactProvenance, SnapshotCaptureResult, SnapshotFormat,
+        StreamOpenRequest, StreamOpenResult,
+    };
     use crate::connectors::storage::StorageTarget;
 
     #[test]
@@ -207,6 +386,26 @@ mod tests {
             .relative_path
             .starts_with("snapshots/front_door_cam/"));
         assert!(result.storage.relative_path.ends_with(".jpg"));
+        assert!(result.index_sidecar_relative_path.ends_with(".json"));
+        assert!(result
+            .index_sidecar_relative_path
+            .starts_with("snapshots/front_door_cam/"));
+        assert_eq!(
+            result
+                .ingest_metadata
+                .as_ref()
+                .expect("metadata")
+                .provenance,
+            ArtifactProvenance::Media
+        );
+        assert_eq!(
+            result
+                .ingest_metadata
+                .as_ref()
+                .expect("metadata")
+                .ingest_disposition,
+            ArtifactIngestDisposition::KnowledgeIndexCandidate
+        );
     }
 
     #[test]
@@ -234,5 +433,59 @@ mod tests {
         assert_eq!(result.asset_kind, super::MediaAssetKind::Stream);
         assert_eq!(result.player, "ffplay");
         assert_eq!(result.process_id, 1234);
+        assert_eq!(
+            result
+                .ingest_metadata
+                .as_ref()
+                .expect("metadata")
+                .provenance,
+            ArtifactProvenance::Control
+        );
+        assert_eq!(
+            result
+                .ingest_metadata
+                .as_ref()
+                .expect("metadata")
+                .ingest_disposition,
+            ArtifactIngestDisposition::RuntimeOnly
+        );
+    }
+
+    #[test]
+    fn snapshot_metadata_round_trips_with_device_context() {
+        let result = SnapshotCaptureResult::new(
+            "cam-1",
+            SnapshotFormat::Png,
+            "ZmFrZQ==",
+            4,
+            StorageTarget::LocalDisk,
+        )
+        .with_device_context(
+            Some("Front Door".to_string()),
+            Some("Entry".to_string()),
+            Some("DemoCam".to_string()),
+            Some("C1".to_string()),
+            Some("manual_entry".to_string()),
+            Some("rtsp".to_string()),
+            Some(false),
+        );
+
+        let encoded = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(encoded["ingest_metadata"]["device_id"], json!("cam-1"));
+        assert_eq!(
+            encoded["ingest_metadata"]["device_name"],
+            json!("Front Door")
+        );
+        assert_eq!(encoded["ingest_metadata"]["provenance"], json!("media"));
+        assert_eq!(
+            encoded["ingest_metadata"]["ingest_disposition"],
+            json!("knowledge_index_candidate")
+        );
+
+        let decoded: SnapshotCaptureResult = serde_json::from_value(encoded).expect("decode");
+        assert_eq!(
+            decoded.ingest_metadata.expect("metadata").room.as_deref(),
+            Some("Entry")
+        );
     }
 }

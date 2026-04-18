@@ -1,4 +1,4 @@
-//! IM Gateway status client for HarborNAS admin surfaces.
+//! HarborGate status client for HarborBeacon admin surfaces.
 
 use std::env;
 use std::time::Duration;
@@ -7,8 +7,10 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 
 pub const CONTRACT_VERSION: &str = "1.5";
-pub const IM_GATEWAY_BASE_URL_ENV: &str = "HARBOR_IM_GATEWAY_BASE_URL";
-pub const IM_GATEWAY_BEARER_TOKEN_ENV: &str = "HARBOR_IM_GATEWAY_BEARER_TOKEN";
+pub const IM_GATEWAY_BASE_URL_ENV: &str = "HARBORGATE_BASE_URL";
+pub const IM_GATEWAY_BEARER_TOKEN_ENV: &str = "HARBORGATE_BEARER_TOKEN";
+pub const LEGACY_IM_GATEWAY_BASE_URL_ENV: &str = "HARBOR_IM_GATEWAY_BASE_URL";
+pub const LEGACY_IM_GATEWAY_BEARER_TOKEN_ENV: &str = "HARBOR_IM_GATEWAY_BEARER_TOKEN";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct GatewayPlatformCapabilities {
@@ -37,6 +39,7 @@ pub struct GatewayPlatformStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct GatewayStatusResponse {
     #[serde(default)]
+    #[serde(alias = "channels")]
     pub platforms: Vec<GatewayPlatformStatus>,
 }
 
@@ -48,10 +51,14 @@ pub struct GatewayClientConfig {
 
 impl GatewayClientConfig {
     pub fn from_env() -> Result<Self, String> {
-        let base_url = env::var(IM_GATEWAY_BASE_URL_ENV)
-            .map_err(|_| format!("missing required env var {IM_GATEWAY_BASE_URL_ENV}"))?;
-        let bearer_token = env::var(IM_GATEWAY_BEARER_TOKEN_ENV)
-            .map_err(|_| format!("missing required env var {IM_GATEWAY_BEARER_TOKEN_ENV}"))?;
+        let base_url =
+            env_var_with_legacy_alias(IM_GATEWAY_BASE_URL_ENV, LEGACY_IM_GATEWAY_BASE_URL_ENV)
+                .ok_or_else(|| format!("missing required env var {IM_GATEWAY_BASE_URL_ENV}"))?;
+        let bearer_token = env_var_with_legacy_alias(
+            IM_GATEWAY_BEARER_TOKEN_ENV,
+            LEGACY_IM_GATEWAY_BEARER_TOKEN_ENV,
+        )
+        .ok_or_else(|| format!("missing required env var {IM_GATEWAY_BEARER_TOKEN_ENV}"))?;
         Self::new(base_url, bearer_token)
     }
 
@@ -61,17 +68,35 @@ impl GatewayClientConfig {
     ) -> Result<Self, String> {
         let base_url = base_url.into().trim().to_string();
         if base_url.is_empty() {
-            return Err("IM Gateway base URL cannot be empty".to_string());
+            return Err("HarborGate base URL cannot be empty".to_string());
         }
         let bearer_token = bearer_token.into().trim().to_string();
         if bearer_token.is_empty() {
-            return Err("IM Gateway bearer token cannot be empty".to_string());
+            return Err("HarborGate bearer token cannot be empty".to_string());
         }
         Ok(Self {
             base_url,
             bearer_token,
         })
     }
+}
+
+fn env_var_with_legacy_alias(primary: &str, legacy: &str) -> Option<String> {
+    if let Some(value) = env::var(primary)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(value);
+    }
+
+    env::var(legacy)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .inspect(|_| {
+            eprintln!("warning: {legacy} is deprecated; prefer {primary}");
+        })
 }
 
 pub struct GatewayStatusClient {
@@ -89,7 +114,7 @@ impl GatewayStatusClient {
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
-            .map_err(|error| format!("failed to build IM Gateway status client: {error}"))?;
+            .map_err(|error| format!("failed to build HarborGate status client: {error}"))?;
         Ok(Self { client, config })
     }
 
@@ -107,20 +132,20 @@ impl GatewayStatusClient {
             )
             .header("X-Contract-Version", CONTRACT_VERSION)
             .send()
-            .map_err(|error| format!("IM Gateway status request failed: {error}"))?;
+            .map_err(|error| format!("HarborGate status request failed: {error}"))?;
         let status = response.status();
         let body = response
             .text()
-            .map_err(|error| format!("failed to read IM Gateway status response: {error}"))?;
+            .map_err(|error| format!("failed to read HarborGate status response: {error}"))?;
         if !status.is_success() {
             return Err(format!(
-                "IM Gateway status request failed with HTTP {}: {}",
+                "HarborGate status request failed with HTTP {}: {}",
                 status.as_u16(),
                 body
             ));
         }
         serde_json::from_str(&body)
-            .map_err(|error| format!("failed to parse IM Gateway status response: {error}"))
+            .map_err(|error| format!("failed to parse HarborGate status response: {error}"))
     }
 }
 
@@ -150,7 +175,7 @@ mod tests {
         let server = thread::spawn(move || -> String {
             let (mut stream, _) = listener.accept().expect("accept request");
             let request = read_http_request(&mut stream);
-            let body = r#"{"platforms":[{"platform":"feishu","enabled":true,"connected":true,"display_name":"HarborNAS Bot","capabilities":{"reply":true,"update":true,"attachments":true}}]}"#;
+            let body = r#"{"platforms":[{"platform":"feishu","enabled":true,"connected":true,"display_name":"HarborBeacon Bot","capabilities":{"reply":true,"update":true,"attachments":true}}]}"#;
             write_http_response(&mut stream, 200, "OK", body);
             request
         });
@@ -176,11 +201,48 @@ mod tests {
                     platform: "feishu".to_string(),
                     enabled: true,
                     connected: true,
-                    display_name: "HarborNAS Bot".to_string(),
+                    display_name: "HarborBeacon Bot".to_string(),
                     capabilities: super::GatewayPlatformCapabilities {
                         reply: true,
                         update: true,
                         attachments: true,
+                    },
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn fetch_status_accepts_redacted_channels_shape() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let _request = read_http_request(&mut stream);
+            let body = r#"{"ok":true,"gateway_version":"0.1.0","channels":[{"platform":"feishu","enabled":true,"connected":false,"display_name":"HarborBeacon Bot","capabilities":{"reply":true,"update":false,"attachments":false}}]}"#;
+            write_http_response(&mut stream, 200, "OK", body);
+        });
+
+        let client = GatewayStatusClient::from_config(
+            GatewayClientConfig::new(format!("http://{address}"), "test-token").expect("config"),
+        )
+        .expect("client");
+
+        let response = client.fetch_status().expect("status");
+        server.join().expect("server thread");
+
+        assert_eq!(
+            response,
+            GatewayStatusResponse {
+                platforms: vec![super::GatewayPlatformStatus {
+                    platform: "feishu".to_string(),
+                    enabled: true,
+                    connected: false,
+                    display_name: "HarborBeacon Bot".to_string(),
+                    capabilities: super::GatewayPlatformCapabilities {
+                        reply: true,
+                        update: false,
+                        attachments: false,
                     },
                 }],
             }

@@ -1,12 +1,12 @@
-# HarborNAS Local Agent Planning Package
+# HarborBeacon Local Agent Planning Package
 
-This repository contains the completed planning deliverables for a HarborNAS local-first AI agent project, including architecture, roadmap, quick reference, meeting guide, launch checklist, and document index.
+This repository contains the completed planning deliverables for a HarborBeacon local-first AI agent project, including architecture, roadmap, quick reference, meeting guide, launch checklist, and document index.
 
 ## Rust Runtime (New)
 
 The project now includes a Rust runtime that compiles into a standalone binary for easier HarborOS integration.
 
-- Binary name: `harbornas-agent`
+- Binary name: `harborbeacon-agent`
 - Entry point: `src/main.rs`
 - Core modules: `src/orchestrator/` and `src/skills/`
 - Planner module: `src/planner/`
@@ -16,7 +16,7 @@ The project now includes a Rust runtime that compiles into a standalone binary f
 Build and run:
 
 - `cargo build --release`
-- `./target/release/harbornas-agent --plan examples/plan_service_status.json`
+- `./target/release/harborbeacon-agent --plan examples/plan_service_status.json`
 
 Additional migrated script binaries:
 
@@ -34,31 +34,31 @@ Useful flags:
 - `--force-dry-run`: force all actions into dry-run mode
 
 ## Documents
-- HarborNAS-LocalAgent-Plan.md
-- HarborNAS-LocalAgent-Roadmap.md
-- HarborNAS-LocalAgent-QuickRef.md
-- HarborNAS-LocalAgent-MeetingGuide.md
-- HarborNAS-LocalAgent-LaunchChecklist.md
-- HarborNAS-LocalAgent-DocumentIndex.md
-- HarborNAS-LocalAgent-V2-Assistant-Skills-Roadmap.md
-- HarborNAS-Skill-Spec-v1.md
-- HarborNAS-Middleware-Endpoint-Contract-v1.md
-- HarborNAS-Files-BatchOps-Contract-v1.md
-- HarborNAS-Planner-TaskDecompose-Contract-v1.md
-- HarborNAS-Contract-E2E-Test-Plan-v1.md
-- HarborNAS-CI-Contract-Pipeline-Checklist-v1.md
-- HarborNAS-GitHub-Actions-Workflow-Draft-v1.md
+- HarborBeacon-LocalAgent-Plan.md
+- HarborBeacon-LocalAgent-Roadmap.md
+- HarborBeacon-LocalAgent-QuickRef.md
+- HarborBeacon-LocalAgent-MeetingGuide.md
+- HarborBeacon-LocalAgent-LaunchChecklist.md
+- HarborBeacon-LocalAgent-DocumentIndex.md
+- HarborBeacon-LocalAgent-V2-Assistant-Skills-Roadmap.md
+- HarborBeacon-Skill-Spec-v1.md
+- HarborBeacon-Middleware-Endpoint-Contract-v1.md
+- HarborBeacon-Files-BatchOps-Contract-v1.md
+- HarborBeacon-Planner-TaskDecompose-Contract-v1.md
+- HarborBeacon-Contract-E2E-Test-Plan-v1.md
+- HarborBeacon-CI-Contract-Pipeline-Checklist-v1.md
+- HarborBeacon-GitHub-Actions-Workflow-Draft-v1.md
 
 ## V2 Additions
 
-- `HarborNAS-LocalAgent-V2-Assistant-Skills-Roadmap.md`: assistant + skills integration roadmap with HarborOS control-plane-first policy (`middleware API > midcli > browser > MCP`).
-- `HarborNAS-Skill-Spec-v1.md`: standard skill contract (manifest schema, runtime envelope, routing, risk and test requirements), including HarborOS `middleware` API binding and `midcli` fallback rules.
-- `HarborNAS-Middleware-Endpoint-Contract-v1.md`: executable endpoint contract for `system.harbor_ops`, including action normalization, API/CLI mapping, error model, and compatibility matrix template.
-- `HarborNAS-Files-BatchOps-Contract-v1.md`: executable endpoint contract for `files.batch_ops`, including path policy, route fallback chain, CLI template constraints, and compatibility matrix template.
-- `HarborNAS-Planner-TaskDecompose-Contract-v1.md`: executable planner contract for `planner.task_decompose`, including step schema, dependency rules, route-candidate policy, and release gates.
-- `HarborNAS-Contract-E2E-Test-Plan-v1.md`: end-to-end validation plan across planner + execution contracts, including environment matrix, fallback checks, drift checks, and release exit criteria.
-- `HarborNAS-CI-Contract-Pipeline-Checklist-v1.md`: CI job checklist that maps all contract governance to merge, nightly, and pre-release pipeline stages.
-- `HarborNAS-GitHub-Actions-Workflow-Draft-v1.md`: initial GitHub Actions workflow draft mapping contract governance into concrete PR, nightly, and release workflows.
+- `HarborBeacon-LocalAgent-V2-Assistant-Skills-Roadmap.md`: assistant + skills integration roadmap with HarborOS control-plane-first policy (`middleware API > midcli > browser > MCP`).
+- `HarborBeacon-Skill-Spec-v1.md`: standard skill contract (manifest schema, runtime envelope, routing, risk and test requirements), including HarborOS `middleware` API binding and `midcli` fallback rules.
+- `HarborBeacon-Middleware-Endpoint-Contract-v1.md`: executable endpoint contract for `system.harbor_ops`, including action normalization, API/CLI mapping, error model, and compatibility matrix template.
+- `HarborBeacon-Files-BatchOps-Contract-v1.md`: executable endpoint contract for `files.batch_ops`, including path policy, route fallback chain, CLI template constraints, and compatibility matrix template.
+- `HarborBeacon-Planner-TaskDecompose-Contract-v1.md`: executable planner contract for `planner.task_decompose`, including step schema, dependency rules, route-candidate policy, and release gates.
+- `HarborBeacon-Contract-E2E-Test-Plan-v1.md`: end-to-end validation plan across planner + execution contracts, including environment matrix, fallback checks, drift checks, and release exit criteria.
+- `HarborBeacon-CI-Contract-Pipeline-Checklist-v1.md`: CI job checklist that maps all contract governance to merge, nightly, and pre-release pipeline stages.
+- `HarborBeacon-GitHub-Actions-Workflow-Draft-v1.md`: initial GitHub Actions workflow draft mapping contract governance into concrete PR, nightly, and release workflows.
 
 ## HarborBeacon — IM 接入与用户交互层
 
@@ -112,11 +112,11 @@ HarborBeacon 是基于 [ZeroClaw](https://github.com/punkpeye/zeroclaw) 二次�
 - `target/release/evaluate-release-gate`: converts drift output into a blocking/non-blocking release decision.
 - `tests/contracts`, `tests/fallback`, `tests/policy`: minimal pytest suites that keep the documented routing, fallback, and governance rules from regressing.
 
-Current scope note: the default CI path runs Rust binaries in documentation-only mode, and the same binaries can switch into live HarborNAS integration mode when `midclt` and/or `cli` are available.
+Current scope note: the default CI path runs Rust binaries in documentation-only mode, and the same binaries can switch into live HarborBeacon integration mode when `midclt` and/or `cli` are available.
 
 ## Live Integration Mode
 
-The four Rust binaries now support live HarborNAS probing through `middleware` and `midcli`.
+The four Rust binaries now support live HarborBeacon probing through `middleware` and `midcli`.
 
 - Middleware transport: local `midclt call ...`
 - MidCLI transport: non-interactive `cli -m csv -c ...`

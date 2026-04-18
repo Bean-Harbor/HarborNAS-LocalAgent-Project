@@ -10,7 +10,7 @@ const state = {
     boundUser: "未配置",
     channel: "Harbor IM Bridge",
     qrToken: "http://127.0.0.1:4174/setup/mobile?session=PENDING",
-    staticQrToken: "http://harbornas.local:4174/setup/mobile",
+    staticQrToken: "http://harborbeacon.local:4174/setup/mobile",
   },
   bridgeProvider: {
     configured: false,
@@ -831,7 +831,7 @@ function mapBinding(binding) {
     boundUser: binding?.bound_user || "未配置",
     channel: binding?.channel || "Harbor IM Bridge",
     qrToken: binding?.setup_url || binding?.qr_token || "http://127.0.0.1:4174/setup/mobile?session=PENDING",
-    staticQrToken: binding?.static_setup_url || binding?.setup_url || "http://harbornas.local:4174/setup/mobile",
+    staticQrToken: binding?.static_setup_url || binding?.setup_url || "http://harborbeacon.local:4174/setup/mobile",
   };
 }
 
@@ -2236,7 +2236,7 @@ async function boot() {
       type: "normal",
       title: "本地管理 API 已连接",
       body:
-        `已经读取到 ${state.cameras.length} 台真实设备，当前成员 ${state.accessMembers.length} 项，已登记共享链路 ${state.shareLinks.length} 条，默认策略来自 .harbornas 下的本地状态文件。` +
+        `已经读取到 ${state.cameras.length} 台真实设备，当前成员 ${state.accessMembers.length} 项，已登记共享链路 ${state.shareLinks.length} 条，默认策略来自 .harborbeacon 下的本地状态文件。` +
         (state.approvalsError ? "审批队列当前暂不可用。" : `当前待审批 ${state.approvals.length} 项。`) +
         (state.shareLinksError ? "共享链接列表当前暂不可用。" : "") +
         (state.accessMembersError ? "成员角色列表当前暂不可用。" : ""),

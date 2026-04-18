@@ -38,10 +38,10 @@ else:
 
 ROOT = Path(__file__).resolve().parent.parent
 REQUIRED_DOCS = [
-    ROOT / "HarborNAS-Contract-E2E-Test-Plan-v1.md",
-    ROOT / "HarborNAS-Middleware-Endpoint-Contract-v1.md",
-    ROOT / "HarborNAS-Files-BatchOps-Contract-v1.md",
-    ROOT / "HarborNAS-Planner-TaskDecompose-Contract-v1.md",
+    ROOT / "HarborBeacon-Contract-E2E-Test-Plan-v1.md",
+    ROOT / "HarborBeacon-Middleware-Endpoint-Contract-v1.md",
+    ROOT / "HarborBeacon-Files-BatchOps-Contract-v1.md",
+    ROOT / "HarborBeacon-Planner-TaskDecompose-Contract-v1.md",
 ]
 
 

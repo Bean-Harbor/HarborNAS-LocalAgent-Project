@@ -27,13 +27,13 @@ else:
 ROOT = Path(__file__).resolve().parent.parent
 
 REQUIRED_FILES = [
-    "HarborNAS-LocalAgent-V2-Assistant-Skills-Roadmap.md",
-    "HarborNAS-Middleware-Endpoint-Contract-v1.md",
-    "HarborNAS-Files-BatchOps-Contract-v1.md",
-    "HarborNAS-Planner-TaskDecompose-Contract-v1.md",
-    "HarborNAS-Contract-E2E-Test-Plan-v1.md",
-    "HarborNAS-CI-Contract-Pipeline-Checklist-v1.md",
-    "HarborNAS-GitHub-Actions-Workflow-Draft-v1.md",
+    "HarborBeacon-LocalAgent-V2-Assistant-Skills-Roadmap.md",
+    "HarborBeacon-Middleware-Endpoint-Contract-v1.md",
+    "HarborBeacon-Files-BatchOps-Contract-v1.md",
+    "HarborBeacon-Planner-TaskDecompose-Contract-v1.md",
+    "HarborBeacon-Contract-E2E-Test-Plan-v1.md",
+    "HarborBeacon-CI-Contract-Pipeline-Checklist-v1.md",
+    "HarborBeacon-GitHub-Actions-Workflow-Draft-v1.md",
 ]
 
 REQUIRED_MIDDLEWARE_METHODS = [
@@ -58,9 +58,9 @@ def build_checks() -> list[dict[str, object]]:
             }
         )
 
-    v2_doc = (ROOT / "HarborNAS-LocalAgent-V2-Assistant-Skills-Roadmap.md").read_text(encoding="utf-8")
-    files_doc = (ROOT / "HarborNAS-Files-BatchOps-Contract-v1.md").read_text(encoding="utf-8")
-    planner_doc = (ROOT / "HarborNAS-Planner-TaskDecompose-Contract-v1.md").read_text(encoding="utf-8")
+    v2_doc = (ROOT / "HarborBeacon-LocalAgent-V2-Assistant-Skills-Roadmap.md").read_text(encoding="utf-8")
+    files_doc = (ROOT / "HarborBeacon-Files-BatchOps-Contract-v1.md").read_text(encoding="utf-8")
+    planner_doc = (ROOT / "HarborBeacon-Planner-TaskDecompose-Contract-v1.md").read_text(encoding="utf-8")
 
     checks.extend(
         [

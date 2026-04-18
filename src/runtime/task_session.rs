@@ -897,7 +897,7 @@ mod tests {
 
     #[test]
     fn conversation_store_round_trips_state() {
-        let path = unique_store_path("harbornas-task-conversations");
+        let path = unique_store_path("harborbeacon-task-conversations");
         let store = TaskConversationStore::new(&path);
         let pending_candidate = PendingTaskCandidate {
             candidate_id: "cand-1".to_string(),
@@ -940,7 +940,7 @@ mod tests {
 
     #[test]
     fn runtime_records_round_trip() {
-        let path = unique_store_path("harbornas-task-runtime");
+        let path = unique_store_path("harborbeacon-task-runtime");
         let store = TaskConversationStore::new(&path);
 
         let session = ConversationSession {
@@ -1039,7 +1039,7 @@ mod tests {
 
     #[test]
     fn load_for_session_prefers_session_state_and_backfills_key() {
-        let path = unique_store_path("harbornas-task-session-state");
+        let path = unique_store_path("harborbeacon-task-session-state");
         let store = TaskConversationStore::new(&path);
         let session = ConversationSession {
             session_id: "sess-1".to_string(),
@@ -1080,7 +1080,7 @@ mod tests {
 
     #[test]
     fn load_for_session_reads_envelope_state() {
-        let path = unique_store_path("harbornas-task-session-envelope");
+        let path = unique_store_path("harborbeacon-task-session-envelope");
         let store = TaskConversationStore::new(&path);
         let session = ConversationSession {
             session_id: "sess-1".to_string(),
@@ -1127,7 +1127,7 @@ mod tests {
 
     #[test]
     fn load_for_session_backfills_pending_resume_from_legacy_connect_state() {
-        let path = unique_store_path("harbornas-task-session-resume");
+        let path = unique_store_path("harborbeacon-task-session-resume");
         let store = TaskConversationStore::new(&path);
         let session = ConversationSession {
             session_id: "sess-1".to_string(),
@@ -1179,8 +1179,69 @@ mod tests {
     }
 
     #[test]
+    fn save_for_session_preserves_resume_token_for_camera_connect_continuation() {
+        let path = unique_store_path("harborbeacon-task-session-resume-token");
+        let store = TaskConversationStore::new(&path);
+        let session = ConversationSession {
+            session_id: "sess-resume".to_string(),
+            workspace_id: "home-1".to_string(),
+            channel: "feishu".to_string(),
+            surface: "harborbeacon".to_string(),
+            conversation_id: "chat-resume".to_string(),
+            user_id: "user-1".to_string(),
+            route_key: "gw_route_resume".to_string(),
+            last_message_id: "om_resume".to_string(),
+            chat_type: "p2p".to_string(),
+            state: Value::Null,
+            resume_token: None,
+            expires_at: None,
+        };
+        let mut state = TaskConversationState {
+            key: "chat-resume".to_string(),
+            ..Default::default()
+        };
+        state.set_camera_pending_connect(Some(PendingTaskConnect {
+            resume_token: "resume-opaque-1".to_string(),
+            name: "Gate Cam".to_string(),
+            ip: "192.168.1.20".to_string(),
+            room: Some("Entry".to_string()),
+            port: 554,
+            rtsp_paths: vec!["/live".to_string()],
+            requires_auth: true,
+            vendor: Some("Demo".to_string()),
+            model: Some("X1".to_string()),
+        }));
+
+        store
+            .save_for_session(&session, &state)
+            .expect("save for session");
+
+        let loaded = store
+            .load_for_session("sess-resume", Some("chat-resume"))
+            .expect("load")
+            .expect("state");
+
+        assert_eq!(
+            loaded.camera_pending_connect(),
+            Some(PendingTaskConnect {
+                resume_token: "resume-opaque-1".to_string(),
+                name: "Gate Cam".to_string(),
+                ip: "192.168.1.20".to_string(),
+                room: Some("Entry".to_string()),
+                port: 554,
+                rtsp_paths: vec!["/live".to_string()],
+                requires_auth: true,
+                vendor: Some("Demo".to_string()),
+                model: Some("X1".to_string()),
+            })
+        );
+        assert_eq!(loaded.key, "chat-resume");
+        let _ = fs::remove_file(store.path());
+    }
+
+    #[test]
     fn save_for_session_updates_session_state_and_legacy_map() {
-        let path = unique_store_path("harbornas-task-session-save");
+        let path = unique_store_path("harborbeacon-task-session-save");
         let store = TaskConversationStore::new(&path);
         let session = ConversationSession {
             session_id: "sess-1".to_string(),
@@ -1240,7 +1301,7 @@ mod tests {
 
     #[test]
     fn approval_and_event_records_round_trip() {
-        let path = unique_store_path("harbornas-task-governance");
+        let path = unique_store_path("harborbeacon-task-governance");
         let store = TaskConversationStore::new(&path);
         let approval = ApprovalTicket {
             approval_id: "approval-1".to_string(),
@@ -1300,7 +1361,7 @@ mod tests {
 
     #[test]
     fn media_assets_round_trip() {
-        let path = unique_store_path("harbornas-media-assets");
+        let path = unique_store_path("harborbeacon-media-assets");
         let store = TaskConversationStore::new(&path);
         let media_asset = MediaAsset {
             asset_id: "asset-1".to_string(),
@@ -1340,7 +1401,7 @@ mod tests {
 
     #[test]
     fn share_link_records_round_trip_and_can_be_revoked() {
-        let path = unique_store_path("harbornas-share-links");
+        let path = unique_store_path("harborbeacon-share-links");
         let store = TaskConversationStore::new(&path);
         let media_session = MediaSession {
             media_session_id: "media-session-1".to_string(),

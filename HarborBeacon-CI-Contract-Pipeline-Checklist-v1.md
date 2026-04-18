@@ -1,13 +1,13 @@
-# HarborNAS CI Contract Pipeline Checklist v1
+# HarborBeacon CI Contract Pipeline Checklist v1
 
 ## Purpose
 This checklist maps contract documents to executable CI stages so governance can be enforced automatically on every merge and release.
 
 ## Covered Contracts
-1. HarborNAS-Middleware-Endpoint-Contract-v1.md
-2. HarborNAS-Files-BatchOps-Contract-v1.md
-3. HarborNAS-Planner-TaskDecompose-Contract-v1.md
-4. HarborNAS-Contract-E2E-Test-Plan-v1.md
+1. HarborBeacon-Middleware-Endpoint-Contract-v1.md
+2. HarborBeacon-Files-BatchOps-Contract-v1.md
+3. HarborBeacon-Planner-TaskDecompose-Contract-v1.md
+4. HarborBeacon-Contract-E2E-Test-Plan-v1.md
 
 ## Pipeline Stages
 
@@ -48,7 +48,7 @@ Exit criteria:
 - 0 policy bypass
 
 ### Stage 5: E2E Scenarios (Nightly)
-- Execute scenario set defined in HarborNAS-Contract-E2E-Test-Plan-v1.md
+- Execute scenario set defined in HarborBeacon-Contract-E2E-Test-Plan-v1.md
 - Run in ENV-A and ENV-B daily
 
 Exit criteria:
@@ -56,7 +56,7 @@ Exit criteria:
 - P95 pre-execution orchestration latency <= 2s
 
 ### Stage 6: Drift and Compatibility Matrix (Pre-release)
-- Run HarborNAS ref vs upstream ref compatibility matrix
+- Run HarborBeacon ref vs upstream ref compatibility matrix
 - Compare endpoint/method/field changes
 
 Exit criteria:

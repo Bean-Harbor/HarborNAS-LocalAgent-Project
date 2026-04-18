@@ -23,8 +23,8 @@ use crate::control_plane::users::{
 };
 use crate::runtime::registry::{CameraDevice, DeviceRegistryStore};
 
-const DEFAULT_BINDING_CHANNEL_LABEL: &str = "Harbor IM Gateway";
-const DEFAULT_PROVIDER_ACCOUNT_DISPLAY_NAME: &str = "Harbor IM Gateway";
+const DEFAULT_BINDING_CHANNEL_LABEL: &str = "Harbor HarborGate";
+const DEFAULT_PROVIDER_ACCOUNT_DISPLAY_NAME: &str = "Harbor HarborGate";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AdminBindingState {
@@ -1737,7 +1737,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        std::env::temp_dir().join(format!("harbornas-{name}-{unique}.json"))
+        std::env::temp_dir().join(format!("harborbeacon-{name}-{unique}.json"))
     }
 
     #[test]
@@ -2003,7 +2003,7 @@ mod tests {
                 connected: true,
                 platform: "feishu".to_string(),
                 gateway_base_url: "http://gateway.local:4180".to_string(),
-                app_name: "HarborNAS Bot".to_string(),
+                app_name: "HarborBeacon Bot".to_string(),
                 status: "已连接".to_string(),
                 last_checked_at: "2026-04-18T10:00:00Z".to_string(),
                 capabilities: BridgeProviderCapabilities {
@@ -2016,16 +2016,19 @@ mod tests {
             .expect("save bridge provider status");
 
         assert_eq!(updated.binding.metric, "Gateway 在线");
-        assert_eq!(updated.binding.bound_user.as_deref(), Some("HarborNAS Bot"));
+        assert_eq!(
+            updated.binding.bound_user.as_deref(),
+            Some("HarborBeacon Bot")
+        );
         assert!(updated.platform.provider_accounts.iter().any(|provider| {
             provider.provider_account_id == BRIDGE_PROVIDER_ACCOUNT_ID
                 && provider.metadata["platform"] == json!("feishu")
-                && provider.metadata["display_name"] == json!("HarborNAS Bot")
+                && provider.metadata["display_name"] == json!("HarborBeacon Bot")
         }));
         assert!(updated.platform.credentials.is_empty());
 
         let reloaded = store.load_or_create_state().expect("reload");
-        assert_eq!(reloaded.bridge_provider.app_name, "HarborNAS Bot");
+        assert_eq!(reloaded.bridge_provider.app_name, "HarborBeacon Bot");
         assert_eq!(
             reloaded.bridge_provider.gateway_base_url,
             "http://gateway.local:4180"
@@ -2044,13 +2047,13 @@ mod tests {
             connected: false,
             platform: "   ".to_string(),
             gateway_base_url: "  http://gateway.local:4180  ".to_string(),
-            app_name: "  HarborNAS Bot  ".to_string(),
+            app_name: "  HarborBeacon Bot  ".to_string(),
             ..Default::default()
         });
 
         assert_eq!(sanitized.platform, "");
         assert_eq!(sanitized.gateway_base_url, "http://gateway.local:4180");
-        assert_eq!(sanitized.app_name, "HarborNAS Bot");
+        assert_eq!(sanitized.app_name, "HarborBeacon Bot");
         assert_eq!(sanitized.status, "未配置");
     }
 
@@ -2062,7 +2065,7 @@ mod tests {
             connected: true,
             platform: "feishu".to_string(),
             gateway_base_url: "http://gateway.local:4180".to_string(),
-            app_name: "HarborNAS Bot".to_string(),
+            app_name: "HarborBeacon Bot".to_string(),
             status: "已连接".to_string(),
             last_checked_at: "2026-04-18T10:00:00Z".to_string(),
             capabilities: BridgeProviderCapabilities {
@@ -2091,7 +2094,7 @@ mod tests {
         assert_eq!(platform.provider_accounts[1].provider_key, "im_bridge");
         assert_eq!(
             platform.provider_accounts[1].metadata["display_name"],
-            json!("HarborNAS Bot")
+            json!("HarborBeacon Bot")
         );
         assert_eq!(
             platform.provider_accounts[1].capabilities["reply"],

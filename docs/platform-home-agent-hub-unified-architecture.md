@@ -4,7 +4,7 @@
 
 ## 1. 结论
 
-HarborNAS 后续长期框架不再采用“两条并行主链路”：
+HarborBeacon 后续长期框架不再采用“两条并行主链路”：
 
 - 一条是原始 `Local Agent V2` 的通用助手 / 编排 / skills 主链路
 - 一条是 `Home Agent Hub` 的摄像头 MVP 产品链路

@@ -7,14 +7,18 @@ use crate::scripts::integration::{
     default_midcli_service_query, IntegrationConfig, MidcliClient, MiddlewareClient,
 };
 
-const REQUIRED_FILES: [&str; 7] = [
-    "HarborNAS-LocalAgent-V2-Assistant-Skills-Roadmap.md",
-    "HarborNAS-Middleware-Endpoint-Contract-v1.md",
-    "HarborNAS-Files-BatchOps-Contract-v1.md",
-    "HarborNAS-Planner-TaskDecompose-Contract-v1.md",
-    "HarborNAS-Contract-E2E-Test-Plan-v1.md",
-    "HarborNAS-CI-Contract-Pipeline-Checklist-v1.md",
-    "HarborNAS-GitHub-Actions-Workflow-Draft-v1.md",
+const REQUIRED_FILES: [&str; 11] = [
+    "HarborBeacon-LocalAgent-V2-Assistant-Skills-Roadmap.md",
+    "HarborBeacon-Middleware-Endpoint-Contract-v1.md",
+    "HarborBeacon-Files-BatchOps-Contract-v1.md",
+    "HarborBeacon-Planner-TaskDecompose-Contract-v1.md",
+    "HarborBeacon-Contract-E2E-Test-Plan-v1.md",
+    "HarborBeacon-CI-Contract-Pipeline-Checklist-v1.md",
+    "HarborBeacon-GitHub-Actions-Workflow-Draft-v1.md",
+    "HarborBeacon-HarborGate-v1.5-Cutover-Evidence.md",
+    "docs/hos-system-domain-cutover-smoke.md",
+    "docs/retrieval-roundtrip-launch-pack.md",
+    "docs/document-rag-mvp.md",
 ];
 
 const REQUIRED_MIDDLEWARE_METHODS: [&str; 5] = [
@@ -56,12 +60,28 @@ pub fn build_checks(root: &Path) -> Vec<CheckResult> {
     }
 
     let v2_doc =
-        fs::read_to_string(root.join("HarborNAS-LocalAgent-V2-Assistant-Skills-Roadmap.md"))
+        fs::read_to_string(root.join("HarborBeacon-LocalAgent-V2-Assistant-Skills-Roadmap.md"))
             .unwrap_or_default();
-    let files_doc = fs::read_to_string(root.join("HarborNAS-Files-BatchOps-Contract-v1.md"))
+    let files_doc = fs::read_to_string(root.join("HarborBeacon-Files-BatchOps-Contract-v1.md"))
         .unwrap_or_default();
     let planner_doc =
-        fs::read_to_string(root.join("HarborNAS-Planner-TaskDecompose-Contract-v1.md"))
+        fs::read_to_string(root.join("HarborBeacon-Planner-TaskDecompose-Contract-v1.md"))
+            .unwrap_or_default();
+    let cutover_doc =
+        fs::read_to_string(root.join("HarborBeacon-HarborGate-v1.5-Cutover-Evidence.md"))
+            .unwrap_or_default();
+    let rollback_doc =
+        fs::read_to_string(root.join("docs/im-v1.5-cutover-rollback-observability-gates.md"))
+            .unwrap_or_default();
+    let hos_smoke_doc = fs::read_to_string(root.join("docs/hos-system-domain-cutover-smoke.md"))
+        .unwrap_or_default();
+    let retrieval_launch_doc =
+        fs::read_to_string(root.join("docs/retrieval-roundtrip-launch-pack.md"))
+            .unwrap_or_default();
+    let document_rag_doc =
+        fs::read_to_string(root.join("docs/document-rag-mvp.md")).unwrap_or_default();
+    let launch_checklist =
+        fs::read_to_string(root.join("HarborBeacon-LocalAgent-LaunchChecklist.md"))
             .unwrap_or_default();
 
     checks.push(CheckResult {
@@ -97,6 +117,98 @@ pub fn build_checks(root: &Path) -> Vec<CheckResult> {
         passed: planner_doc
             .contains("\"route_priority\": [\"middleware_api\", \"midcli\", \"browser\", \"mcp\"]"),
         details: "Planner contract must preserve the approved route priority order.".to_string(),
+        skipped: None,
+    });
+
+    checks.push(CheckResult {
+        name: "cutover-evidence:frozen-seam-coverage".to_string(),
+        passed: [
+            "POST /api/tasks",
+            "POST /api/notifications/deliveries",
+            "GET /api/gateway/status",
+            "X-Contract-Version: 1.5",
+            "resume_token",
+            "accepted-request delivery failures remain `HTTP 200` with `ok=false`",
+            "direct platform delivery count is `0`",
+            "HARBORBEACON_ENABLE_LEGACY_IM_RECIPIENT_FALLBACK=1",
+            "Rollback must preserve the frozen boundary",
+            "external IM repo",
+        ]
+        .iter()
+        .all(|item| cutover_doc.contains(item)),
+        details: "HarborBeacon cutover evidence must cover the frozen endpoints, rollback constraints, and remaining external dependencies.".to_string(),
+        skipped: None,
+    });
+
+    checks.push(CheckResult {
+        name: "rollback-doc:legacy-fallback-switch".to_string(),
+        passed: [
+            "legacy recipient fallback may only be re-enabled via",
+            "rollback notes must say whether legacy recipient fallback is disabled or explicitly re-enabled",
+        ]
+        .iter()
+        .all(|item| rollback_doc.contains(item)),
+        details: "Rollback gate doc must describe the explicit legacy fallback switch and note requirement.".to_string(),
+        skipped: None,
+    });
+
+    checks.push(CheckResult {
+        name: "hos-system-domain-cutover-smoke:boundary-and-fallback".to_string(),
+        passed: [
+            "Middleware API -> MidCLI -> Browser/MCP fallback",
+            "Browser and MCP remain fallback-only for non-system domains",
+            "HarborOS executors do not claim device-native domains",
+            "keep `Browser/MCP` as fallback only for non-system domains",
+            "do not route IM or notification concerns back into HarborOS system control",
+        ]
+        .iter()
+        .all(|item| hos_smoke_doc.contains(item)),
+        details: "HarborOS smoke pack must document the frozen system-domain route order, fallback-only Browser/MCP behavior, and rollback boundary limits.".to_string(),
+        skipped: None,
+    });
+
+    checks.push(CheckResult {
+        name: "retrieval-launch-pack:operator-handoff".to_string(),
+        passed: [
+            "Retrieval Round-Trip Launch Pack",
+            "HARBORBEACON_ENABLE_LEGACY_KNOWLEDGE_NL_FALLBACK=1",
+            "explicit `knowledge.search`",
+            "returns `failed` from `task_api`",
+            "Rollback",
+        ]
+        .iter()
+        .all(|item| retrieval_launch_doc.contains(item)),
+        details: "Retrieval launch pack must show explicit search, enabled fallback, disabled rollback, and operator-facing recovery notes.".to_string(),
+        skipped: None,
+    });
+
+    checks.push(CheckResult {
+        name: "launch-checklist:retrieval-handoff-section".to_string(),
+        passed: [
+            "Retrieval Round-Trip Launch / Handoff Pack",
+            "explicit `knowledge.search` 仍然可用",
+            "HARBORBEACON_ENABLE_LEGACY_KNOWLEDGE_NL_FALLBACK=1",
+            "operator note 能在一页里说明输入、输出、canary flag 状态和 rollback 行为",
+        ]
+        .iter()
+        .all(|item| launch_checklist.contains(item)),
+        details: "Main launch checklist must point operators at the retrieval handoff pack and its canary/rollback story.".to_string(),
+        skipped: None,
+    });
+
+    checks.push(CheckResult {
+        name: "document-rag-mvp:grounding-and-boundary".to_string(),
+        passed: [
+            "Document RAG MVP",
+            "chunk/snippet level",
+            "chunk_id",
+            "No OCR.",
+            "No vector search.",
+            "No audio or video semantics.",
+        ]
+        .iter()
+        .all(|item| document_rag_doc.contains(item)),
+        details: "Document RAG note must describe chunk grounding and explicitly state the remaining out-of-scope semantics.".to_string(),
         skipped: None,
     });
 

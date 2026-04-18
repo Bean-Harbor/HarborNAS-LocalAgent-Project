@@ -1,57 +1,105 @@
 use std::env;
 use std::io::{Cursor, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
-use harbornas_local_agent::runtime::admin_console::AdminConsoleStore;
-use harbornas_local_agent::runtime::registry::DeviceRegistryStore;
-use harbornas_local_agent::runtime::task_api::{
+use harborbeacon_local_agent::runtime::admin_console::AdminConsoleStore;
+use harborbeacon_local_agent::runtime::registry::DeviceRegistryStore;
+use harborbeacon_local_agent::runtime::task_api::{
     TaskApiService, TaskRequest, TaskRequestAcceptance,
 };
-use harbornas_local_agent::runtime::task_session::TaskConversationStore;
+use harborbeacon_local_agent::runtime::task_session::TaskConversationStore;
 
 const CONTRACT_VERSION: &str = "1.5";
 const SERVICE_TOKEN_ENV: &str = "HARBOR_TASK_API_BEARER_TOKEN";
 const HEADER_AUTHORIZATION: &str = "Authorization";
 const HEADER_CONTRACT_VERSION: &str = "X-Contract-Version";
 
-#[derive(Debug, Parser)]
-#[command(name = "assistant-task-api")]
-#[command(about = "Local Assistant Task API for HarborNAS <-> IM Gateway bridging")]
+#[derive(Debug, Clone)]
 struct Cli {
-    #[arg(long, default_value = "127.0.0.1:4175", help = "Bind address")]
     bind: String,
-
-    #[arg(
-        long,
-        default_value = ".harbornas/admin-console.json",
-        help = "Admin console state file"
-    )]
     admin_state: PathBuf,
-
-    #[arg(
-        long,
-        default_value = ".harbornas/device-registry.json",
-        help = "Device registry file"
-    )]
     device_registry: PathBuf,
-
-    #[arg(
-        long,
-        default_value = ".harbornas/task-api-conversations.json",
-        help = "Task conversation state file"
-    )]
     conversations: PathBuf,
-
-    #[arg(
-        long,
-        help = "Bearer token required from IM Gateway callers; falls back to HARBOR_TASK_API_BEARER_TOKEN"
-    )]
     service_token: Option<String>,
+}
+
+impl Default for Cli {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1:4175".to_string(),
+            admin_state: PathBuf::from(".harborbeacon/admin-console.json"),
+            device_registry: PathBuf::from(".harborbeacon/device-registry.json"),
+            conversations: PathBuf::from(".harborbeacon/task-api-conversations.json"),
+            service_token: None,
+        }
+    }
+}
+
+impl Cli {
+    fn parse() -> Self {
+        let args = env::args().skip(1).collect::<Vec<_>>();
+        if matches!(args.first().map(String::as_str), Some("--help" | "-h")) {
+            print_usage();
+            std::process::exit(0);
+        }
+
+        let mut cli = Self::default();
+        let mut index = 0;
+        while index < args.len() {
+            let arg = &args[index];
+            match arg.as_str() {
+                "--bind" => cli.bind = take_value(&args, &mut index, "--bind"),
+                value if value.starts_with("--bind=") => {
+                    cli.bind = value["--bind=".len()..].to_string();
+                }
+                "--admin-state" => {
+                    cli.admin_state = PathBuf::from(take_value(&args, &mut index, "--admin-state"))
+                }
+                value if value.starts_with("--admin-state=") => {
+                    cli.admin_state = PathBuf::from(value["--admin-state=".len()..].to_string())
+                }
+                "--device-registry" => {
+                    cli.device_registry =
+                        PathBuf::from(take_value(&args, &mut index, "--device-registry"))
+                }
+                value if value.starts_with("--device-registry=") => {
+                    cli.device_registry =
+                        PathBuf::from(value["--device-registry=".len()..].to_string())
+                }
+                "--conversations" => {
+                    cli.conversations =
+                        PathBuf::from(take_value(&args, &mut index, "--conversations"))
+                }
+                value if value.starts_with("--conversations=") => {
+                    cli.conversations =
+                        PathBuf::from(value["--conversations=".len()..].to_string())
+                }
+                "--service-token" => {
+                    cli.service_token = Some(take_value(&args, &mut index, "--service-token"))
+                }
+                value if value.starts_with("--service-token=") => {
+                    cli.service_token = Some(value["--service-token=".len()..].to_string())
+                }
+                "--help" | "-h" => {
+                    print_usage();
+                    std::process::exit(0);
+                }
+                value if value.starts_with('-') => {
+                    fail(&format!("unknown flag: {value}"));
+                }
+                value => {
+                    fail(&format!("unexpected positional argument: {value}"));
+                }
+            }
+            index += 1;
+        }
+
+        cli
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -182,10 +230,13 @@ impl TaskApiHttpServer {
 fn main() {
     let cli = Cli::parse();
     let service_token = resolve_service_token(cli.service_token);
+    let device_registry_path = resolve_state_path(&cli.device_registry);
+    let admin_state_path = resolve_state_path(&cli.admin_state);
+    let conversation_path = resolve_state_path(&cli.conversations);
 
-    let registry_store = DeviceRegistryStore::new(cli.device_registry.clone());
-    let admin_store = AdminConsoleStore::new(cli.admin_state.clone(), registry_store);
-    let conversation_store = TaskConversationStore::new(cli.conversations.clone());
+    let registry_store = DeviceRegistryStore::new(device_registry_path);
+    let admin_store = AdminConsoleStore::new(admin_state_path, registry_store);
+    let conversation_store = TaskConversationStore::new(conversation_path);
     let service = TaskApiService::new(admin_store, conversation_store);
     let api = TaskApiHttpServer::new(service, service_token);
 
@@ -259,12 +310,7 @@ fn parse_bearer_token(value: &str) -> Option<String> {
 }
 
 fn validate_task_request_contract(request: &TaskRequest) -> Result<(), String> {
-    if !request
-        .source
-        .surface
-        .trim()
-        .eq_ignore_ascii_case("im_gateway")
-    {
+    if !is_harborgate_surface(request.source.surface.trim()) {
         return Ok(());
     }
 
@@ -284,22 +330,75 @@ fn validate_task_request_contract(request: &TaskRequest) -> Result<(), String> {
     ] {
         if value.is_empty() {
             return Err(format!(
-                "missing required field for IM Gateway caller: {field}"
+                "missing required field for HarborGate caller: {field}"
             ));
         }
     }
 
     let Some(message) = request.message.as_ref() else {
-        return Err("missing required field for IM Gateway caller: message".to_string());
+        return Err("missing required field for HarborGate caller: message".to_string());
     };
 
     match message.chat_type.trim() {
         "p2p" | "group" | "channel" | "unknown" => Ok(()),
-        "" => Err("missing required field for IM Gateway caller: message.chat_type".to_string()),
+        "" => Err("missing required field for HarborGate caller: message.chat_type".to_string()),
         other => Err(format!(
-            "invalid message.chat_type for IM Gateway caller: {other}"
+            "invalid message.chat_type for HarborGate caller: {other}"
         )),
     }
+}
+
+fn is_harborgate_surface(surface: &str) -> bool {
+    let normalized = surface.trim();
+    normalized.eq_ignore_ascii_case("harborgate") || normalized.eq_ignore_ascii_case("im_gateway")
+}
+
+fn resolve_state_path(preferred: &Path) -> PathBuf {
+    if preferred.exists() || !is_harborbeacon_state_path(preferred) {
+        return preferred.to_path_buf();
+    }
+
+    let legacy = legacy_state_path(preferred);
+    if legacy.exists() {
+        eprintln!(
+            "warning: legacy .harbornas state path {} is deprecated; prefer {}",
+            legacy.display(),
+            preferred.display()
+        );
+        legacy
+    } else {
+        preferred.to_path_buf()
+    }
+}
+
+fn take_value(args: &[String], index: &mut usize, flag: &str) -> String {
+    *index += 1;
+    if *index >= args.len() {
+        fail(&format!("missing value for {flag}"));
+    }
+    args[*index].clone()
+}
+
+fn fail(message: &str) -> ! {
+    eprintln!("{message}");
+    std::process::exit(2);
+}
+
+fn print_usage() {
+    eprintln!(
+        "Usage: assistant-task-api [--bind ADDR] [--admin-state PATH] [--device-registry PATH] [--conversations PATH] [--service-token TOKEN]"
+    );
+}
+
+fn is_harborbeacon_state_path(path: &Path) -> bool {
+    path.to_string_lossy().contains(".harborbeacon")
+}
+
+fn legacy_state_path(path: &Path) -> PathBuf {
+    PathBuf::from(
+        path.to_string_lossy()
+            .replace(".harborbeacon", ".harbornas"),
+    )
 }
 
 fn ok_json(payload: &impl Serialize) -> Response<Cursor<Vec<u8>>> {
@@ -398,10 +497,10 @@ mod tests {
         header_value, parse_bearer_token, TaskApiHttpServer, HEADER_AUTHORIZATION,
         HEADER_CONTRACT_VERSION,
     };
-    use harbornas_local_agent::runtime::admin_console::AdminConsoleStore;
-    use harbornas_local_agent::runtime::registry::DeviceRegistryStore;
-    use harbornas_local_agent::runtime::task_api::TaskApiService;
-    use harbornas_local_agent::runtime::task_session::TaskConversationStore;
+    use harborbeacon_local_agent::runtime::admin_console::AdminConsoleStore;
+    use harborbeacon_local_agent::runtime::registry::DeviceRegistryStore;
+    use harborbeacon_local_agent::runtime::task_api::TaskApiService;
+    use harborbeacon_local_agent::runtime::task_session::TaskConversationStore;
 
     fn unique_path(prefix: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
@@ -519,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn task_endpoint_rejects_im_gateway_request_without_message_block() {
+    fn task_endpoint_rejects_harborgate_request_without_message_block() {
         let (server, paths) = build_server("shared-token");
         let headers = [
             header(HEADER_AUTHORIZATION, "Bearer shared-token"),
@@ -531,7 +630,7 @@ mod tests {
             "step_id": "step-http-no-message",
             "source": {
                 "channel": "im_bridge",
-                "surface": "im_gateway",
+                "surface": "harborgate",
                 "conversation_id": "chat-http-no-message",
                 "user_id": "user-1",
                 "session_id": "sess-http-no-message",
@@ -572,7 +671,7 @@ mod tests {
             "step_id": "step-http-ok",
             "source": {
                 "channel": "im_bridge",
-                "surface": "im_gateway",
+                "surface": "harborgate",
                 "conversation_id": "chat-http-ok",
                 "user_id": "user-1",
                 "session_id": "sess-http-ok",
@@ -611,6 +710,69 @@ mod tests {
     }
 
     #[test]
+    fn task_endpoint_accepts_legacy_im_gateway_surface_for_compatibility_window() {
+        let (server, paths) = build_server("shared-token");
+        let headers = [
+            header(HEADER_AUTHORIZATION, "Bearer shared-token"),
+            header(HEADER_CONTRACT_VERSION, "1.5"),
+        ];
+        let body = json!({
+            "task_id": "task-http-legacy-surface",
+            "trace_id": "trace-http-legacy-surface",
+            "step_id": "step-http-legacy-surface",
+            "source": {
+                "channel": "im_bridge",
+                "surface": "im_gateway",
+                "conversation_id": "chat-http-legacy-surface",
+                "user_id": "user-1",
+                "session_id": "sess-http-legacy-surface",
+                "route_key": "gw_route_http_legacy_surface"
+            },
+            "intent": {
+                "domain": "system",
+                "action": "ping",
+                "raw_text": "ping"
+            },
+            "entity_refs": {},
+            "args": {},
+            "autonomy": {
+                "level": "supervised"
+            },
+            "message": {
+                "message_id": "om_http_legacy_surface",
+                "chat_type": "group",
+                "mentions": [],
+                "attachments": []
+            }
+        });
+        let encoded = serde_json::to_vec(&body).expect("encode request");
+        let (status, payload, _) = response_json(server.handle_task_payload(&headers, &encoded));
+
+        assert_eq!(status.0, 200);
+        assert_eq!(payload["task_id"], "task-http-legacy-surface");
+        cleanup(paths);
+    }
+
+    #[test]
+    fn resolve_state_path_prefers_legacy_harbornas_state_when_new_path_is_absent() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("harborbeacon-state-fallback-{unique}"));
+        let preferred = root.join(".harborbeacon").join("admin-console.json");
+        let legacy = root.join(".harbornas").join("admin-console.json");
+        fs::create_dir_all(legacy.parent().expect("legacy parent")).expect("create legacy dir");
+        fs::write(&legacy, "{}").expect("write legacy file");
+
+        let resolved = super::resolve_state_path(&preferred);
+
+        assert_eq!(resolved, legacy);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn task_endpoint_rejects_conflicting_reuse_of_task_id() {
         let (server, paths) = build_server("shared-token");
         let headers = [
@@ -623,7 +785,7 @@ mod tests {
             "step_id": "step-http-conflict",
             "source": {
                 "channel": "im_bridge",
-                "surface": "im_gateway",
+                "surface": "harborgate",
                 "conversation_id": "chat-http-conflict",
                 "user_id": "user-1",
                 "session_id": "sess-http-conflict",
@@ -653,7 +815,7 @@ mod tests {
             "step_id": "step-http-conflict",
             "source": {
                 "channel": "im_bridge",
-                "surface": "im_gateway",
+                "surface": "harborgate",
                 "conversation_id": "chat-http-conflict",
                 "user_id": "user-1",
                 "session_id": "sess-http-conflict",
@@ -685,6 +847,104 @@ mod tests {
             response_json(server.handle_task_payload(&headers, &conflicting));
         assert_eq!(status.0, 409);
         assert_eq!(payload["error"]["code"], "IDEMPOTENCY_CONFLICT");
+
+        cleanup(paths);
+    }
+
+    #[test]
+    fn task_endpoint_replays_original_response_after_later_turn_reuses_turn_local_step_id() {
+        let (server, paths) = build_server("shared-token");
+        let headers = [
+            header(HEADER_AUTHORIZATION, "Bearer shared-token"),
+            header(HEADER_CONTRACT_VERSION, "1.5"),
+        ];
+        let first = serde_json::to_vec(&json!({
+            "task_id": "task-http-step-a",
+            "trace_id": "trace-http-step-a",
+            "step_id": "step_01",
+            "source": {
+                "channel": "im_bridge",
+                "surface": "harborgate",
+                "conversation_id": "chat-http-step",
+                "user_id": "user-1",
+                "session_id": "sess-http-step",
+                "route_key": "gw_route_http_step"
+            },
+            "intent": {
+                "domain": "system",
+                "action": "ping",
+                "raw_text": "ping"
+            },
+            "entity_refs": {},
+            "args": {},
+            "autonomy": {
+                "level": "supervised"
+            },
+            "message": {
+                "message_id": "om_http_step_a",
+                "chat_type": "group",
+                "mentions": [],
+                "attachments": []
+            }
+        }))
+        .expect("encode first request");
+        let second = serde_json::to_vec(&json!({
+            "task_id": "task-http-step-b",
+            "trace_id": "trace-http-step-b",
+            "step_id": "step_01",
+            "source": {
+                "channel": "im_bridge",
+                "surface": "harborgate",
+                "conversation_id": "chat-http-step",
+                "user_id": "user-1",
+                "session_id": "sess-http-step",
+                "route_key": "gw_route_http_step"
+            },
+            "intent": {
+                "domain": "system",
+                "action": "status",
+                "raw_text": "status"
+            },
+            "entity_refs": {},
+            "args": {},
+            "autonomy": {
+                "level": "supervised"
+            },
+            "message": {
+                "message_id": "om_http_step_b",
+                "chat_type": "group",
+                "mentions": [],
+                "attachments": []
+            }
+        }))
+        .expect("encode second request");
+
+        let first_response = response_json(server.handle_task_payload(&headers, &first));
+        assert_eq!(first_response.0 .0, 200);
+        assert_eq!(first_response.1["status"], "failed");
+        assert!(first_response.1["result"]["message"]
+            .as_str()
+            .is_some_and(|value| value.contains("system.ping")));
+
+        let second_response = response_json(server.handle_task_payload(&headers, &second));
+        assert_eq!(second_response.0 .0, 200);
+        assert_eq!(second_response.1["status"], "failed");
+        assert!(second_response.1["result"]["message"]
+            .as_str()
+            .is_some_and(|value| value.contains("system.status")));
+
+        let replay_response = response_json(server.handle_task_payload(&headers, &first));
+        assert_eq!(replay_response.0 .0, 200);
+        assert_eq!(replay_response.1["status"], "failed");
+        assert!(replay_response.1["result"]["message"]
+            .as_str()
+            .is_some_and(|value| value.contains("system.ping")));
+        assert!(server
+            .service
+            .conversation_store()
+            .load_task_step("step_01")
+            .expect("load raw step id")
+            .is_none());
 
         cleanup(paths);
     }

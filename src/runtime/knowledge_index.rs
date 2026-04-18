@@ -1,0 +1,850 @@
+//! Local knowledge index and manifest storage for HarborBeacon search.
+
+use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+pub const KNOWLEDGE_INDEX_ROOT_ENV: &str = "HARBOR_KNOWLEDGE_INDEX_ROOT";
+
+const DEFAULT_INDEX_DIR: &str = ".harborbeacon/knowledge-index";
+const MAX_INDEX_TEXT_BYTES: u64 = 512 * 1024;
+const MAX_CHUNK_LINES: usize = 4;
+const MAX_CHUNK_CHARS: usize = 320;
+const INDEX_SCHEMA_VERSION: u32 = 1;
+const DOCUMENT_EXTENSIONS: &[&str] = &[
+    "txt", "md", "markdown", "json", "csv", "html", "htm", "yaml", "yml", "log",
+];
+const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp"];
+const SIDECAR_EXTENSIONS: &[&str] = &["txt", "md", "markdown", "json", "csv", "yaml", "yml"];
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeModality {
+    Document,
+    Image,
+}
+
+impl KnowledgeModality {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Document => "document",
+            Self::Image => "image",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct KnowledgeFileSignature {
+    pub modified_unix_millis: u128,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct KnowledgeIndexChunk {
+    pub chunk_id: String,
+    pub line_start: usize,
+    pub line_end: usize,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KnowledgeIndexEntry {
+    pub modality: KnowledgeModality,
+    pub path: String,
+    pub title: String,
+    pub searchable_text: String,
+    #[serde(default)]
+    pub chunks: Vec<KnowledgeIndexChunk>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_path: Option<String>,
+    pub file_signature: KnowledgeFileSignature,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_signature: Option<KnowledgeFileSignature>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KnowledgeIndexDirectory {
+    pub path: String,
+    pub signature: KnowledgeFileSignature,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KnowledgeIndexManifest {
+    pub schema_version: u32,
+    pub root: String,
+    pub root_signature: KnowledgeFileSignature,
+    pub generated_at: String,
+    #[serde(default)]
+    pub directories: Vec<KnowledgeIndexDirectory>,
+    #[serde(default)]
+    pub entries: Vec<KnowledgeIndexEntry>,
+}
+
+impl Default for KnowledgeIndexManifest {
+    fn default() -> Self {
+        Self {
+            schema_version: INDEX_SCHEMA_VERSION,
+            root: String::new(),
+            root_signature: KnowledgeFileSignature::default(),
+            generated_at: current_timestamp(),
+            directories: Vec::new(),
+            entries: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct KnowledgeIndexRefreshStats {
+    pub added: usize,
+    pub updated: usize,
+    pub removed: usize,
+    pub reused: usize,
+    pub skipped_directories: usize,
+    pub rebuilt: bool,
+    pub persisted: bool,
+    pub persist_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct KnowledgeIndexSnapshot {
+    pub root: PathBuf,
+    pub manifest_path: PathBuf,
+    pub manifest: KnowledgeIndexManifest,
+    pub stats: KnowledgeIndexRefreshStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnowledgeIndexConfig {
+    pub index_root: PathBuf,
+}
+
+impl KnowledgeIndexConfig {
+    pub fn from_env() -> Result<Self, String> {
+        let index_root = env::var(KNOWLEDGE_INDEX_ROOT_ENV)
+            .ok()
+            .map(PathBuf::from)
+            .unwrap_or_else(default_index_root);
+        Self::new(index_root)
+    }
+
+    pub fn new(index_root: impl Into<PathBuf>) -> Result<Self, String> {
+        let index_root = index_root.into();
+        if index_root.as_os_str().is_empty() {
+            return Err("knowledge index root cannot be empty".to_string());
+        }
+        Ok(Self { index_root })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct KnowledgeIndexService {
+    config: KnowledgeIndexConfig,
+}
+
+impl KnowledgeIndexService {
+    pub fn new() -> Result<Self, String> {
+        let config = KnowledgeIndexConfig::from_env()?;
+        Self::from_config(config)
+    }
+
+    pub fn from_config(config: KnowledgeIndexConfig) -> Result<Self, String> {
+        fs::create_dir_all(&config.index_root).map_err(|error| {
+            format!(
+                "failed to create knowledge index root {}: {error}",
+                config.index_root.display()
+            )
+        })?;
+        Ok(Self { config })
+    }
+
+    pub fn load_or_refresh(&self, root: &Path) -> Result<KnowledgeIndexSnapshot, String> {
+        if !root.exists() {
+            return Err(format!("knowledge root not found: {}", root.display()));
+        }
+
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let manifest_path = self.manifest_path_for_root(&root);
+        let current_root_signature = directory_signature(&root)?;
+        let mut old_state = load_manifest_state(&manifest_path).unwrap_or_default();
+
+        if old_state.manifest.entries.is_empty() && old_state.manifest.directories.is_empty() {
+            old_state.manifest.root = root.to_string_lossy().into_owned();
+            old_state.manifest.root_signature = current_root_signature.clone();
+        }
+
+        let mut stats = KnowledgeIndexRefreshStats::default();
+        stats.rebuilt =
+            old_state.manifest.entries.is_empty() && old_state.manifest.directories.is_empty();
+        let mut new_state = KnowledgeIndexState::new(
+            root.clone(),
+            manifest_path.clone(),
+            current_root_signature.clone(),
+        );
+        refresh_directory(&root, true, &old_state, &mut new_state, &mut stats)?;
+
+        new_state.manifest.generated_at = current_timestamp();
+        new_state.manifest.root = root.to_string_lossy().into_owned();
+        new_state.manifest.root_signature = current_root_signature;
+        new_state.manifest.entries.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then(left.modality.as_str().cmp(right.modality.as_str()))
+        });
+        new_state
+            .manifest
+            .directories
+            .sort_by(|left, right| left.path.cmp(&right.path));
+
+        if let Err(error) = save_manifest(&new_state.manifest_path, &new_state.manifest) {
+            stats.persist_error = Some(error);
+        } else {
+            stats.persisted = true;
+        }
+
+        let manifest = new_state.manifest;
+        stats.removed = old_state
+            .manifest
+            .entries
+            .len()
+            .saturating_sub(stats.reused + stats.updated);
+
+        Ok(KnowledgeIndexSnapshot {
+            root,
+            manifest_path,
+            manifest,
+            stats,
+        })
+    }
+
+    fn manifest_path_for_root(&self, root: &Path) -> PathBuf {
+        self.config
+            .index_root
+            .join(format!("{}.json", root_hash(root)))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct KnowledgeIndexState {
+    manifest_path: PathBuf,
+    manifest: KnowledgeIndexManifest,
+}
+
+impl KnowledgeIndexState {
+    fn new(root: PathBuf, manifest_path: PathBuf, root_signature: KnowledgeFileSignature) -> Self {
+        Self {
+            manifest_path,
+            manifest: KnowledgeIndexManifest {
+                schema_version: INDEX_SCHEMA_VERSION,
+                root: root.to_string_lossy().into_owned(),
+                root_signature,
+                generated_at: current_timestamp(),
+                directories: Vec::new(),
+                entries: Vec::new(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct LoadedManifestState {
+    manifest: KnowledgeIndexManifest,
+    directories: HashMap<String, KnowledgeFileSignature>,
+    entries: HashMap<String, KnowledgeIndexEntry>,
+}
+
+fn load_manifest_state(path: &Path) -> Result<LoadedManifestState, String> {
+    if !path.exists() {
+        return Ok(LoadedManifestState::default());
+    }
+
+    let text = fs::read_to_string(path).map_err(|error| {
+        format!(
+            "failed to read knowledge index manifest {}: {error}",
+            path.display()
+        )
+    })?;
+    let manifest = serde_json::from_str::<KnowledgeIndexManifest>(&text).map_err(|error| {
+        format!(
+            "failed to parse knowledge index manifest {}: {error}",
+            path.display()
+        )
+    })?;
+    if manifest.schema_version != INDEX_SCHEMA_VERSION {
+        return Ok(LoadedManifestState::default());
+    }
+
+    let directories = manifest
+        .directories
+        .iter()
+        .map(|directory| (directory.path.clone(), directory.signature.clone()))
+        .collect::<HashMap<_, _>>();
+    let entries = manifest
+        .entries
+        .iter()
+        .map(|entry| (entry.path.clone(), entry.clone()))
+        .collect::<HashMap<_, _>>();
+    Ok(LoadedManifestState {
+        manifest,
+        directories,
+        entries,
+    })
+}
+
+fn save_manifest(path: &Path, manifest: &KnowledgeIndexManifest) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create knowledge index directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let payload = serde_json::to_string_pretty(manifest).map_err(|error| {
+        format!(
+            "failed to serialize knowledge index manifest {}: {error}",
+            path.display()
+        )
+    })?;
+    fs::write(path, payload).map_err(|error| {
+        format!(
+            "failed to write knowledge index manifest {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn refresh_directory(
+    path: &Path,
+    is_root: bool,
+    old_state: &LoadedManifestState,
+    new_state: &mut KnowledgeIndexState,
+    stats: &mut KnowledgeIndexRefreshStats,
+) -> Result<(), String> {
+    let current_signature = directory_signature(path)?;
+    let path_key = path.to_string_lossy().into_owned();
+    new_state
+        .manifest
+        .directories
+        .push(KnowledgeIndexDirectory {
+            path: path_key.clone(),
+            signature: current_signature.clone(),
+        });
+
+    if !is_root {
+        if old_state
+            .directories
+            .get(&path_key)
+            .is_some_and(|signature| signature == &current_signature)
+        {
+            reuse_directory(path, old_state, new_state, stats);
+            stats.skipped_directories += 1;
+            return Ok(());
+        }
+    }
+
+    let entries = fs::read_dir(path).map_err(|error| {
+        format!(
+            "failed to read knowledge directory {}: {error}",
+            path.display()
+        )
+    })?;
+    for entry in entries.flatten() {
+        let child = entry.path();
+        if child.is_dir() {
+            if should_skip_directory(&child) {
+                continue;
+            }
+            refresh_directory(&child, false, old_state, new_state, stats)?;
+            continue;
+        }
+
+        let Some(modality) = classify_path(&child) else {
+            continue;
+        };
+        let Some(index_entry) = refresh_entry(&child, modality, old_state, stats)? else {
+            continue;
+        };
+        new_state.manifest.entries.push(index_entry);
+    }
+
+    Ok(())
+}
+
+fn reuse_directory(
+    path: &Path,
+    old_state: &LoadedManifestState,
+    new_state: &mut KnowledgeIndexState,
+    stats: &mut KnowledgeIndexRefreshStats,
+) {
+    let prefix = path.to_path_buf();
+    for directory in &old_state.manifest.directories {
+        let directory_path = PathBuf::from(&directory.path);
+        if directory_path.starts_with(&prefix) && directory_path != prefix {
+            new_state.manifest.directories.push(directory.clone());
+        }
+    }
+
+    for entry in old_state.manifest.entries.iter() {
+        let entry_path = PathBuf::from(&entry.path);
+        if entry_path.starts_with(&prefix) {
+            new_state.manifest.entries.push(entry.clone());
+            stats.reused += 1;
+        }
+    }
+}
+
+fn refresh_entry(
+    path: &Path,
+    modality: KnowledgeModality,
+    old_state: &LoadedManifestState,
+    stats: &mut KnowledgeIndexRefreshStats,
+) -> Result<Option<KnowledgeIndexEntry>, String> {
+    let path_key = path.to_string_lossy().into_owned();
+    let title = path
+        .file_name()
+        .and_then(|item| item.to_str())
+        .unwrap_or(path_key.as_str())
+        .to_string();
+    let file_signature = file_signature(path)?;
+
+    match modality {
+        KnowledgeModality::Document => {
+            if let Some(old_entry) = old_state.entries.get(&path_key) {
+                if old_entry.file_signature == file_signature {
+                    stats.reused += 1;
+                    return Ok(Some(old_entry.clone()));
+                }
+            }
+            let Some(text) = load_text_file(path) else {
+                return Ok(None);
+            };
+            let chunks = build_text_chunks(&text);
+            if old_state.entries.contains_key(&path_key) {
+                stats.updated += 1;
+            } else {
+                stats.added += 1;
+            }
+            Ok(Some(KnowledgeIndexEntry {
+                modality,
+                path: path_key,
+                title,
+                searchable_text: text,
+                chunks,
+                sidecar_path: None,
+                file_signature,
+                sidecar_signature: None,
+            }))
+        }
+        KnowledgeModality::Image => {
+            let (sidecar_path, sidecar_signature, searchable_text) = image_sidecar_state(path)?;
+            let chunks = build_text_chunks(&searchable_text);
+            if let Some(old_entry) = old_state.entries.get(&path_key) {
+                if old_entry.file_signature == file_signature
+                    && old_entry.sidecar_signature == sidecar_signature
+                {
+                    stats.reused += 1;
+                    return Ok(Some(old_entry.clone()));
+                }
+            }
+            if old_state.entries.contains_key(&path_key) {
+                stats.updated += 1;
+            } else {
+                stats.added += 1;
+            }
+            Ok(Some(KnowledgeIndexEntry {
+                modality,
+                path: path_key,
+                title,
+                searchable_text,
+                chunks,
+                sidecar_path,
+                file_signature,
+                sidecar_signature,
+            }))
+        }
+    }
+}
+
+fn image_sidecar_state(
+    image_path: &Path,
+) -> Result<(Option<String>, Option<KnowledgeFileSignature>, String), String> {
+    let Some(stem) = image_path.file_stem().and_then(|item| item.to_str()) else {
+        return Ok((None, None, String::new()));
+    };
+    let Some(parent) = image_path.parent() else {
+        return Ok((None, None, String::new()));
+    };
+
+    for extension in SIDECAR_EXTENSIONS {
+        let candidate = parent.join(format!("{stem}.{extension}"));
+        if !candidate.exists() {
+            continue;
+        }
+        let Some(text) = load_text_file(&candidate) else {
+            return Ok((
+                Some(candidate.to_string_lossy().into_owned()),
+                Some(file_signature(&candidate)?),
+                String::new(),
+            ));
+        };
+        return Ok((
+            Some(candidate.to_string_lossy().into_owned()),
+            Some(file_signature(&candidate)?),
+            text,
+        ));
+    }
+
+    Ok((None, None, String::new()))
+}
+
+fn load_text_file(path: &Path) -> Option<String> {
+    let metadata = fs::metadata(path).ok()?;
+    if metadata.len() > MAX_INDEX_TEXT_BYTES {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&bytes).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+fn build_text_chunks(text: &str) -> Vec<KnowledgeIndexChunk> {
+    let mut chunks = Vec::new();
+    let mut current_lines: Vec<String> = Vec::new();
+    let mut current_start_line = 1usize;
+    let mut current_end_line = 0usize;
+    let mut current_chars = 0usize;
+
+    for (index, raw_line) in text.lines().enumerate() {
+        let line_number = index + 1;
+        let line = raw_line.trim_end();
+        let line_chars = line.chars().count();
+        let projected_chars =
+            current_chars + line_chars + if current_lines.is_empty() { 0 } else { 1 };
+        if !current_lines.is_empty()
+            && (current_lines.len() >= MAX_CHUNK_LINES || projected_chars > MAX_CHUNK_CHARS)
+        {
+            push_chunk(
+                &mut chunks,
+                &current_lines,
+                current_start_line,
+                current_end_line,
+            );
+            current_lines.clear();
+            current_chars = 0;
+            current_start_line = line_number;
+        }
+
+        current_end_line = line_number;
+        current_chars = current_chars + line_chars + if current_lines.is_empty() { 0 } else { 1 };
+        current_lines.push(line.to_string());
+    }
+
+    if !current_lines.is_empty() {
+        push_chunk(
+            &mut chunks,
+            &current_lines,
+            current_start_line,
+            current_end_line,
+        );
+    } else if !text.trim().is_empty() {
+        chunks.push(KnowledgeIndexChunk {
+            chunk_id: "chunk-0001".to_string(),
+            line_start: 1,
+            line_end: 1,
+            text: text.trim().to_string(),
+        });
+    }
+
+    if chunks.is_empty() {
+        chunks.push(KnowledgeIndexChunk {
+            chunk_id: "chunk-0001".to_string(),
+            line_start: 1,
+            line_end: 1,
+            text: text.trim().to_string(),
+        });
+    }
+
+    chunks
+}
+
+fn push_chunk(
+    chunks: &mut Vec<KnowledgeIndexChunk>,
+    lines: &[String],
+    line_start: usize,
+    line_end: usize,
+) {
+    let text = lines
+        .iter()
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        return;
+    }
+    let chunk_id = format!("chunk-{:04}", chunks.len() + 1);
+    chunks.push(KnowledgeIndexChunk {
+        chunk_id,
+        line_start,
+        line_end,
+        text,
+    });
+}
+
+fn file_signature(path: &Path) -> Result<KnowledgeFileSignature, String> {
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("failed to read metadata for {}: {error}", path.display()))?;
+    Ok(KnowledgeFileSignature {
+        modified_unix_millis: metadata
+            .modified()
+            .ok()
+            .and_then(system_time_to_millis)
+            .unwrap_or_default(),
+        size_bytes: metadata.len(),
+    })
+}
+
+fn directory_signature(path: &Path) -> Result<KnowledgeFileSignature, String> {
+    file_signature(path)
+}
+
+fn classify_path(path: &Path) -> Option<KnowledgeModality> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    if DOCUMENT_EXTENSIONS.contains(&extension.as_str()) && !is_image_sidecar(path) {
+        return Some(KnowledgeModality::Document);
+    }
+    if IMAGE_EXTENSIONS.contains(&extension.as_str()) {
+        return Some(KnowledgeModality::Image);
+    }
+    None
+}
+
+fn is_image_sidecar(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|item| item.to_str()) else {
+        return false;
+    };
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    IMAGE_EXTENSIONS
+        .iter()
+        .any(|extension| parent.join(format!("{stem}.{extension}")).exists())
+}
+
+fn should_skip_directory(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|item| item.to_str()) else {
+        return false;
+    };
+    matches!(name, ".git" | ".svn" | "node_modules" | "target")
+}
+
+fn default_index_root() -> PathBuf {
+    PathBuf::from(DEFAULT_INDEX_DIR)
+}
+
+fn root_hash(root: &Path) -> String {
+    let canonical = root
+        .canonicalize()
+        .ok()
+        .unwrap_or_else(|| root.to_path_buf());
+    let normalized = canonical.to_string_lossy().to_string();
+    let digest = Sha256::digest(normalized.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn current_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string()
+}
+
+fn system_time_to_millis(value: SystemTime) -> Option<u128> {
+    value
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{KnowledgeIndexConfig, KnowledgeIndexService, KnowledgeModality};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_dir(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{unique}"))
+    }
+
+    fn cleanup_dir(path: &Path) {
+        if path.exists() {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+
+    #[test]
+    fn incremental_refresh_updates_changed_files_and_reuses_unchanged_entries() {
+        let knowledge_root = unique_dir("harborbeacon-knowledge-index-root");
+        let index_root = unique_dir("harborbeacon-knowledge-index-store");
+        fs::create_dir_all(knowledge_root.join("docs")).expect("create docs");
+        fs::create_dir_all(knowledge_root.join("images")).expect("create images");
+        fs::create_dir_all(&index_root).expect("create index root");
+        fs::write(
+            knowledge_root.join("docs").join("sakura-notes.md"),
+            "今年花园里的樱花开得很盛，适合做春季归档。",
+        )
+        .expect("write doc");
+        fs::write(
+            knowledge_root.join("images").join("garden.jpg"),
+            b"fake-image",
+        )
+        .expect("write image");
+        fs::write(
+            knowledge_root.join("images").join("garden.json"),
+            r#"{"caption":"花园里的樱花树","tags":["spring","sakura"]}"#,
+        )
+        .expect("write sidecar");
+
+        let service = KnowledgeIndexService::from_config(
+            KnowledgeIndexConfig::new(index_root.clone()).expect("config"),
+        )
+        .expect("service");
+        let first = service
+            .load_or_refresh(&knowledge_root)
+            .expect("first index build");
+        assert_eq!(first.stats.added, 2);
+        assert!(first.stats.persisted);
+        assert_eq!(first.manifest.entries.len(), 2);
+        assert!(first
+            .manifest
+            .entries
+            .iter()
+            .any(|entry| entry.modality == KnowledgeModality::Image
+                && entry.searchable_text.contains("樱花树")));
+        assert!(
+            first
+                .manifest
+                .entries
+                .iter()
+                .any(|entry| entry.modality == KnowledgeModality::Document
+                    && !entry.chunks.is_empty())
+        );
+        assert!(first
+            .manifest
+            .entries
+            .iter()
+            .any(|entry| entry.modality == KnowledgeModality::Image && !entry.chunks.is_empty()));
+
+        fs::write(
+            knowledge_root.join("docs").join("sakura-notes.md"),
+            "今年花园里的樱花开得更盛，适合做春季归档和分享。",
+        )
+        .expect("update doc");
+        fs::write(
+            knowledge_root.join("docs").join("spring-guide.md"),
+            "春季知识索引补充笔记。",
+        )
+        .expect("add doc");
+
+        let second = service
+            .load_or_refresh(&knowledge_root)
+            .expect("second index refresh");
+        assert!(second.stats.updated >= 1);
+        assert!(second.stats.added >= 1);
+        assert!(second.stats.reused >= 1);
+        assert!(second
+            .manifest
+            .entries
+            .iter()
+            .any(|entry| entry.path.ends_with("spring-guide.md")));
+
+        cleanup_dir(&knowledge_root);
+        cleanup_dir(&index_root);
+    }
+
+    #[test]
+    fn sidecar_metadata_is_persisted_for_image_entries() {
+        let knowledge_root = unique_dir("harborbeacon-knowledge-index-sidecar");
+        let index_root = unique_dir("harborbeacon-knowledge-index-store");
+        fs::create_dir_all(knowledge_root.join("images")).expect("create images");
+        fs::create_dir_all(&index_root).expect("create index root");
+        fs::write(
+            knowledge_root.join("images").join("gate.jpg"),
+            b"fake-image",
+        )
+        .expect("write image");
+        fs::write(
+            knowledge_root.join("images").join("gate.yaml"),
+            "caption: front gate\nlabels:\n  - entry\n  - camera\n",
+        )
+        .expect("write sidecar");
+
+        let service = KnowledgeIndexService::from_config(
+            KnowledgeIndexConfig::new(index_root.clone()).expect("config"),
+        )
+        .expect("service");
+        let snapshot = service
+            .load_or_refresh(&knowledge_root)
+            .expect("index refresh");
+        let image = snapshot
+            .manifest
+            .entries
+            .iter()
+            .find(|entry| entry.modality == KnowledgeModality::Image)
+            .expect("image entry");
+        let expected_sidecar = knowledge_root
+            .join("images")
+            .join("gate.yaml")
+            .canonicalize()
+            .unwrap_or_else(|_| knowledge_root.join("images").join("gate.yaml"));
+        let expected_sidecar = expected_sidecar.to_string_lossy().into_owned();
+
+        assert_eq!(
+            image.sidecar_path.as_deref(),
+            Some(expected_sidecar.as_str())
+        );
+        assert!(image.searchable_text.contains("front gate"));
+        assert!(image.searchable_text.contains("entry"));
+
+        cleanup_dir(&knowledge_root);
+        cleanup_dir(&index_root);
+    }
+
+    #[test]
+    fn repeated_refreshes_keep_manifest_path_stable() {
+        let knowledge_root = unique_dir("harborbeacon-knowledge-index-stable");
+        let index_root = unique_dir("harborbeacon-knowledge-index-store");
+        fs::create_dir_all(knowledge_root.join("docs")).expect("create docs");
+        fs::create_dir_all(&index_root).expect("create index root");
+        fs::write(
+            knowledge_root.join("docs").join("one.md"),
+            "稳定排序测试内容。",
+        )
+        .expect("write doc");
+
+        let service = KnowledgeIndexService::from_config(
+            KnowledgeIndexConfig::new(index_root.clone()).expect("config"),
+        )
+        .expect("service");
+        let first = service.load_or_refresh(&knowledge_root).expect("first");
+        let second = service.load_or_refresh(&knowledge_root).expect("second");
+        assert_eq!(first.manifest_path, second.manifest_path);
+        assert_eq!(first.manifest.entries, second.manifest.entries);
+        assert!(second.stats.reused >= 1);
+
+        cleanup_dir(&knowledge_root);
+        cleanup_dir(&index_root);
+    }
+}

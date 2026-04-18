@@ -1,4 +1,4 @@
-# HarborNAS Files BatchOps Contract v1
+# HarborBeacon Files BatchOps Contract v1
 
 ## Purpose
 This document defines the executable contract for `files.batch_ops` with route priority:
@@ -47,7 +47,7 @@ This document defines the executable contract for `files.batch_ops` with route p
 | search | `filesystem.search` | `filesystem search ...` | `find` template | LOW |
 
 Notes:
-- If middleware method is missing in current HarborNAS build, fallback to `midcli`.
+- If middleware method is missing in current HarborBeacon build, fallback to `midcli`.
 - If both middleware and `midcli` are unavailable for a capability, use constrained CLI templates only when path policy passes.
 
 ## Request Contract
@@ -137,7 +137,7 @@ Hard rules:
 
 ## Compatibility Matrix Template
 
-| Capability | HarborNAS middleware ref | Upstream middleware ref | API test | midcli test | CLI-template test | Decision |
+| Capability | HarborBeacon middleware ref | Upstream middleware ref | API test | midcli test | CLI-template test | Decision |
 |---|---|---|---|---|---|---|
 | files.copy | develop | master | pass/fail | pass/fail | pass/fail | keep/block |
 | files.move | develop | master | pass/fail | pass/fail | pass/fail | keep/block |

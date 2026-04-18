@@ -153,6 +153,35 @@ def normalize_path(path: str) -> str:
     return str(Path(path).resolve(strict=False))
 
 
+def normalize_contract_path(path: str) -> str:
+    """Normalize a Harbor contract path without leaking host OS semantics."""
+    trimmed = path.strip()
+    if not trimmed:
+        raise PathPolicyError("path is required")
+
+    contract_path = trimmed.replace("\\", "/")
+    if re.match(r"^[A-Za-z]:", contract_path):
+        contract_path = contract_path[2:]
+
+    if not contract_path.startswith("/"):
+        raise PathPolicyError(f"path must be absolute: {trimmed!r}")
+
+    parts: list[str] = []
+    for segment in contract_path.split("/"):
+        if not segment or segment == ".":
+            continue
+        if segment == "..":
+            if not parts:
+                raise PathPolicyError(f"path escapes root: {trimmed!r}")
+            parts.pop()
+            continue
+        parts.append(segment)
+
+    if not parts:
+        return "/"
+    return "/" + "/".join(parts)
+
+
 def ensure_service_name(service_name: str) -> None:
     if not SERVICE_NAME_RE.match(service_name):
         raise IntegrationError(f"invalid service name: {service_name!r}")
@@ -168,8 +197,8 @@ def ensure_approved(risk_level: str, config: IntegrationConfig, *, approval_toke
 
 
 def validate_path_policy(*, read_paths: list[str] | None = None, write_paths: list[str] | None = None) -> dict[str, list[str]]:
-    normalized_reads = [normalize_path(path) for path in (read_paths or [])]
-    normalized_writes = [normalize_path(path) for path in (write_paths or [])]
+    normalized_reads = [normalize_contract_path(path) for path in (read_paths or [])]
+    normalized_writes = [normalize_contract_path(path) for path in (write_paths or [])]
 
     for path in normalized_reads + normalized_writes:
         if path in DENIED_ROOTS or any(path == denied or path.startswith(f"{denied}/") for denied in DENIED_ROOTS if denied != "/"):

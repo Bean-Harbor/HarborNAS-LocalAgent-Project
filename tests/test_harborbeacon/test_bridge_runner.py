@@ -74,7 +74,7 @@ def test_load_channel_configs_from_admin_state_reads_saved_bridge_provider(tmp_p
                     "configured": True,
                     "app_id": "cli_saved",
                     "app_secret": "saved-secret",
-                    "app_name": "HarborNAS Bot",
+                    "app_name": "HarborBeacon Bot",
                     "bot_open_id": "ou_bot",
                 }
             },
@@ -90,7 +90,7 @@ def test_load_channel_configs_from_admin_state_reads_saved_bridge_provider(tmp_p
     assert configs[0].app_id == "cli_saved"
     assert configs[0].transport_mode == "websocket"
     assert configs[0].extra["receive_id_type"] == "open_id"
-    assert configs[0].extra["app_name"] == "HarborNAS Bot"
+    assert configs[0].extra["app_name"] == "HarborBeacon Bot"
 
 
 def test_resolve_channel_configs_prefers_yaml_then_admin_state_then_env(tmp_path, monkeypatch):
