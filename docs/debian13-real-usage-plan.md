@@ -1,6 +1,6 @@
 # Debian 13 Real Usage Plan
 
-更新时间：2026-04-12
+更新时间：2026-04-17
 
 ## 目标
 
@@ -61,6 +61,26 @@
 - `assistant-task-api` 负责 HarborBeacon 的 camera domain task 请求、补参续执行和会话状态持久化
 - `agent-hub-admin-api` 负责二维码、手机配置页、默认策略和设备库
 
+外部 HarborBeacon / IM bridge 现在需要单独部署，并把它的 Task API 基地址指向：
+
+- `http://127.0.0.1:4175`
+
+本仓库的 Debian 安装脚本不再额外安装旧 `feishu-harbor-bot` systemd 服务。
+
+当前仓库提供了一个最小 bridge 参考启动器：
+
+- `python3 tools/run_harborbeacon_bridge.py --channels-config /etc/harborbeacon/channels.yaml --task-api-url http://127.0.0.1:4175`
+
+这个 runner 现在已经内置：
+
+- Feishu 真实出站发送
+- Telegram 真实出站发送
+- 其他平台暂时仍以日志 sender 兜底，适合外部 bridge 项目继续补自己的 sender
+
+配置文件示例可参考：
+
+- `examples/harborbeacon.channels.example.yaml`
+
 ## 摄像头发现建议
 
 建议分三层：
@@ -97,7 +117,7 @@
 - 回复 `接入 1`
 - 回复 `忽略 2`
 - 回复 `密码 xxxxxx`
-- 这些会话状态持久化到 `.harbornas/feishu-conversations.json`，Bot 重启后不会直接丢失
+- 这些会话状态持久化到 `.harbornas/task-api-conversations.json`，本机 Task API 重启后不会直接丢失
 
 不建议长期保留偏调试风格的原始 ffmpeg / RTSP 错误全文回显。
 
@@ -106,6 +126,6 @@
 1. Debian 13 上启用固定主机名与 Avahi
 2. 用静态二维码访问 `harbornas.local`
 3. 在手机页填写并保存飞书 Bot 凭证
-4. 启动系统服务，并确认 Bot 自动连上飞书
-5. 从飞书里执行 `扫描摄像头`
-6. 用 `接入 1` / `密码 xxxxxx` 完成首台摄像头接入
+4. 启动 `assistant-task-api` 与 `agent-hub-admin-api`，确认本机服务正常
+5. 部署外部 HarborBeacon / IM bridge，并把它指向 `http://<Debian 机器>:4175`
+6. 从 IM 中执行 `扫描摄像头`，再用 `接入 1` / `密码 xxxxxx` 完成首台摄像头接入

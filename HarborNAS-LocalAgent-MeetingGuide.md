@@ -103,7 +103,7 @@ MQTT                   autonomy.py (自主级别)      executors → HarborOS
 
 **关键说明**:
 - HarborBeacon 是基于 ZeroClaw 的二次开发，预装在 HarborOS 中（同一台机器）
-- 开机后一键配置 IM 通道（飞书/企微/Telegram/Discord/钉钉/Slack/MQTT）
+- 开机后手动填写并校验 IM 通道凭证（飞书/企微/Telegram/Discord/钉钉/Slack/MQTT）
 - 自主级别: ReadOnly（只读安全）/ Supervised（需审批）/ Full（完全自主）
 
 **讨论问题**:

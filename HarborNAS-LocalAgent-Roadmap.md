@@ -49,7 +49,7 @@
 交付物:
 
 - 多终端统一会话入口（Web/Mobile API + IM 通道）
-- HarborBeacon IM 接入：飞书 / 企微 / Telegram / Discord / 钉钉 / Slack / MQTT 一键配置
+- HarborBeacon IM 接入：飞书 / 企微 / Telegram / Discord / 钉钉 / Slack / MQTT 手动填凭证并校验
 - 任务状态机：`queued -> planned -> executing -> completed/failed`
 - 第一条端到端链路：IM → HarborBeacon → Planner → MiddlewareExecutor → Result
 

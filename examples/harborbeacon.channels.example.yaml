@@ -1,0 +1,16 @@
+channels:
+  feishu:
+    enabled: true
+    app_id: "cli_xxx"
+    app_secret: "secret_xxx"
+    transport_mode: "websocket"
+    extra:
+      domain: "https://open.feishu.cn"
+      receive_id_type: "open_id"
+
+  telegram:
+    enabled: false
+    bot_token: "123456:ABCDEF"
+    transport_mode: "long_poll"
+    extra:
+      poll_timeout: 30
