@@ -19,7 +19,12 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$desktopRoot = Join-Path $repoRoot "harborbeacon-desktop"
+$workspaceRoot = Split-Path -Parent $repoRoot
+$desktopRoot = if (-not [string]::IsNullOrWhiteSpace($env:HARBOR_DESKTOP_ROOT)) {
+    $env:HARBOR_DESKTOP_ROOT
+} else {
+    Join-Path $workspaceRoot "harborbeacon-desktop"
+}
 
 function Resolve-PreferredTargetDir {
     param(
