@@ -9,6 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::runtime::model_center;
+
 pub const KNOWLEDGE_INDEX_ROOT_ENV: &str = "HARBOR_KNOWLEDGE_INDEX_ROOT";
 
 const DEFAULT_INDEX_DIR: &str = ".harborbeacon/knowledge-index";
@@ -50,6 +52,20 @@ pub struct KnowledgeIndexChunk {
     pub line_start: usize,
     pub line_end: usize,
     pub text: String,
+    #[serde(default)]
+    pub source_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct KnowledgeIndexTextSource {
+    pub source_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_key: Option<String>,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,6 +76,8 @@ pub struct KnowledgeIndexEntry {
     pub searchable_text: String,
     #[serde(default)]
     pub chunks: Vec<KnowledgeIndexChunk>,
+    #[serde(default)]
+    pub text_sources: Vec<KnowledgeIndexTextSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidecar_path: Option<String>,
     pub file_signature: KnowledgeFileSignature,
@@ -423,7 +441,13 @@ fn refresh_entry(
             let Some(text) = load_text_file(path) else {
                 return Ok(None);
             };
-            let chunks = build_text_chunks(&text);
+            let text_sources = vec![KnowledgeIndexTextSource {
+                source_kind: "document".to_string(),
+                source_path: Some(path_key.clone()),
+                provider_key: None,
+                text: text.clone(),
+            }];
+            let chunks = build_text_chunks(&text_sources);
             if old_state.entries.contains_key(&path_key) {
                 stats.updated += 1;
             } else {
@@ -435,17 +459,20 @@ fn refresh_entry(
                 title,
                 searchable_text: text,
                 chunks,
+                text_sources,
                 sidecar_path: None,
                 file_signature,
                 sidecar_signature: None,
             }))
         }
         KnowledgeModality::Image => {
-            let (sidecar_path, sidecar_signature, searchable_text) = image_sidecar_state(path)?;
-            let chunks = build_text_chunks(&searchable_text);
+            let (sidecar_path, sidecar_signature, text_sources) = image_text_sources(path)?;
+            let searchable_text = join_text_sources(&text_sources);
+            let chunks = build_text_chunks(&text_sources);
             if let Some(old_entry) = old_state.entries.get(&path_key) {
                 if old_entry.file_signature == file_signature
                     && old_entry.sidecar_signature == sidecar_signature
+                    && old_entry.text_sources == text_sources
                 {
                     stats.reused += 1;
                     return Ok(Some(old_entry.clone()));
@@ -462,12 +489,57 @@ fn refresh_entry(
                 title,
                 searchable_text,
                 chunks,
+                text_sources,
                 sidecar_path,
                 file_signature,
                 sidecar_signature,
             }))
         }
     }
+}
+
+fn image_text_sources(
+    image_path: &Path,
+) -> Result<
+    (
+        Option<String>,
+        Option<KnowledgeFileSignature>,
+        Vec<KnowledgeIndexTextSource>,
+    ),
+    String,
+> {
+    let (sidecar_path, sidecar_signature, sidecar_text) = image_sidecar_state(image_path)?;
+    let mut text_sources = Vec::new();
+    if !sidecar_text.is_empty() {
+        text_sources.push(KnowledgeIndexTextSource {
+            source_kind: "sidecar".to_string(),
+            source_path: sidecar_path.clone(),
+            provider_key: None,
+            text: sidecar_text,
+        });
+    }
+
+    let ocr = model_center::run_ocr(image_path);
+    if ocr.available && !ocr.text.trim().is_empty() {
+        text_sources.push(KnowledgeIndexTextSource {
+            source_kind: "ocr".to_string(),
+            source_path: None,
+            provider_key: Some(ocr.provider_key),
+            text: ocr.text,
+        });
+    }
+
+    let vlm = model_center::run_vlm_summary(image_path);
+    if vlm.available && !vlm.text.trim().is_empty() {
+        text_sources.push(KnowledgeIndexTextSource {
+            source_kind: "vlm".to_string(),
+            source_path: None,
+            provider_key: Some(vlm.provider_key),
+            text: vlm.text,
+        });
+    }
+
+    Ok((sidecar_path, sidecar_signature, text_sources))
 }
 
 fn image_sidecar_state(
@@ -512,7 +584,25 @@ fn load_text_file(path: &Path) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-fn build_text_chunks(text: &str) -> Vec<KnowledgeIndexChunk> {
+fn join_text_sources(text_sources: &[KnowledgeIndexTextSource]) -> String {
+    text_sources
+        .iter()
+        .map(|source| source.text.as_str())
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn build_text_chunks(text_sources: &[KnowledgeIndexTextSource]) -> Vec<KnowledgeIndexChunk> {
+    let mut chunks = Vec::new();
+    for source in text_sources {
+        chunks.extend(build_chunks_for_source(source));
+    }
+    chunks
+}
+
+fn build_chunks_for_source(source: &KnowledgeIndexTextSource) -> Vec<KnowledgeIndexChunk> {
+    let text = source.text.as_str();
     let mut chunks = Vec::new();
     let mut current_lines: Vec<String> = Vec::new();
     let mut current_start_line = 1usize;
@@ -530,6 +620,7 @@ fn build_text_chunks(text: &str) -> Vec<KnowledgeIndexChunk> {
         {
             push_chunk(
                 &mut chunks,
+                source,
                 &current_lines,
                 current_start_line,
                 current_end_line,
@@ -547,6 +638,7 @@ fn build_text_chunks(text: &str) -> Vec<KnowledgeIndexChunk> {
     if !current_lines.is_empty() {
         push_chunk(
             &mut chunks,
+            source,
             &current_lines,
             current_start_line,
             current_end_line,
@@ -557,6 +649,8 @@ fn build_text_chunks(text: &str) -> Vec<KnowledgeIndexChunk> {
             line_start: 1,
             line_end: 1,
             text: text.trim().to_string(),
+            source_kind: source.source_kind.clone(),
+            source_path: source.source_path.clone(),
         });
     }
 
@@ -566,6 +660,8 @@ fn build_text_chunks(text: &str) -> Vec<KnowledgeIndexChunk> {
             line_start: 1,
             line_end: 1,
             text: text.trim().to_string(),
+            source_kind: source.source_kind.clone(),
+            source_path: source.source_path.clone(),
         });
     }
 
@@ -574,6 +670,7 @@ fn build_text_chunks(text: &str) -> Vec<KnowledgeIndexChunk> {
 
 fn push_chunk(
     chunks: &mut Vec<KnowledgeIndexChunk>,
+    source: &KnowledgeIndexTextSource,
     lines: &[String],
     line_start: usize,
     line_end: usize,
@@ -594,6 +691,8 @@ fn push_chunk(
         line_start,
         line_end,
         text,
+        source_kind: source.source_kind.clone(),
+        source_path: source.source_path.clone(),
     });
 }
 

@@ -5,7 +5,9 @@ target/
 *.rust.json
 .venv/
 .harborbeacon/
-.harbornas/
 .cache/
 yolov8n.pt
 *.pt
+dist/release-bundles/
+.tmp-live/
+tmp-hos*-snapshot.jpg

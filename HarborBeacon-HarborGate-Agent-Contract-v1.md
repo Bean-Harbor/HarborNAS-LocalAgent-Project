@@ -1,30 +1,30 @@
-# HarborNAS IM Gateway Agent Contract v1
+# HarborBeacon IM Gateway Agent Contract v1
 
 ## Purpose
 This document freezes the v1 boundary between:
 - external IM Gateway
-- HarborNAS backend
+- HarborBeacon backend
 
 The design goal is:
 - IM Gateway owns all IM-platform concerns
-- HarborNAS owns all business/task concerns
+- HarborBeacon owns all business/task concerns
 - both sides communicate only through HTTP/JSON contracts
 
 ## Frozen Interfaces
 v1 freezes exactly two cross-repo interfaces:
 1. inbound task interface
-   - IM Gateway -> HarborNAS
+   - IM Gateway -> HarborBeacon
    - based on existing `POST /api/tasks`
 2. outbound notification delivery interface
-   - HarborNAS -> IM Gateway
+   - HarborBeacon -> IM Gateway
    - new interface for all platform-facing notifications
 
 ## Hard Boundary Rules
-- IM Gateway must not import `harborbeacon.*`, `orchestrator.*`, or any HarborNAS runtime code.
-- HarborNAS must not import IM Gateway adapter/runtime code.
-- Repos must not share `.harbornas/*.json` or any other runtime state files.
+- IM Gateway must not import `harborbeacon.*`, `orchestrator.*`, or any HarborBeacon runtime code.
+- HarborBeacon must not import IM Gateway adapter/runtime code.
+- Repos must not share `.harborbeacon/*.json` or any other runtime state files.
 - IM platform credentials such as `app_id`, `app_secret`, bot token, websocket ticket, webhook secret must live only in IM Gateway.
-- HarborNAS remains the source of truth for:
+- HarborBeacon remains the source of truth for:
   - business session state
   - resumable workflow state
   - approval state
@@ -45,7 +45,7 @@ v1 freezes exactly two cross-repo interfaces:
   - reply delivery
   - platform payload formatting
   - platform credential storage
-- HarborNAS owns:
+- HarborBeacon owns:
   - `assistant_task_api`
   - task execution
   - business state
@@ -104,7 +104,7 @@ Before freezing v1, add one explicit top-level `message` block so IM-specific me
     "mentions": [
       {
         "id": "ou_bot_xxx",
-        "name": "HarborNAS Bot"
+        "name": "HarborBeacon Bot"
       }
     ],
     "attachments": []
@@ -159,7 +159,7 @@ Before freezing v1, add one explicit top-level `message` block so IM-specific me
 
 ### Backward Compatibility
 - legacy non-IM callers may omit `message`
-- HarborNAS may initially treat `message` as optional during rollout
+- HarborBeacon may initially treat `message` as optional during rollout
 - once IM Gateway is the primary caller, `message` should be treated as required for IM surfaces
 
 ### Response Contract
@@ -197,25 +197,25 @@ IM Gateway should map `TaskResponse` to user-visible replies as follows:
 - `result.next_actions`
   - optional suggestion chips or appended text
 - `status=needs_input` with `prompt` and `resume_token`
-  - continue the same HarborNAS-owned business flow
+  - continue the same HarborBeacon-owned business flow
 - `status=failed`
-  - render failure message without reinterpreting HarborNAS business semantics
+  - render failure message without reinterpreting HarborBeacon business semantics
 
-### Why HarborNAS Keeps Business Session State
-HarborNAS already persists business conversation state in `.harbornas/task-api-conversations.json`.
+### Why HarborBeacon Keeps Business Session State
+HarborBeacon already persists business conversation state in `.harborbeacon/task-api-conversations.json`.
 That means:
-- resumable workflow truth stays in HarborNAS
+- resumable workflow truth stays in HarborBeacon
 - IM Gateway may keep only transport session helpers
 - IM Gateway must not become the source of truth for workflow/business state
 
 ## Interface 2: Outbound Notification Delivery Interface
 
 ### Why This Interface Exists
-HarborNAS currently still contains direct IM delivery logic in:
-- [src/connectors/notifications.rs](/C:/Users/beanw/HarborNAS-LocalAgent-Project-git/src/connectors/notifications.rs:128)
-- [src/runtime/task_api.rs](/C:/Users/beanw/HarborNAS-LocalAgent-Project-git/src/runtime/task_api.rs:1272)
+HarborBeacon currently still contains direct IM delivery logic in:
+- [src/connectors/notifications.rs](/C:/Users/beanw/HarborBeacon-LocalAgent-Project-git/src/connectors/notifications.rs:128)
+- [src/runtime/task_api.rs](/C:/Users/beanw/HarborBeacon-LocalAgent-Project-git/src/runtime/task_api.rs:1272)
 
-If IM Gateway is meant to fully replace the current IM layer, HarborNAS core must stop sending directly to Feishu/Telegram/other IM platforms.
+If IM Gateway is meant to fully replace the current IM layer, HarborBeacon core must stop sending directly to Feishu/Telegram/other IM platforms.
 
 ### Endpoint
 `POST /api/notifications/deliveries`
@@ -229,7 +229,7 @@ This endpoint is hosted by IM Gateway.
   "notification_id": "notif_01JABC...",
   "trace_id": "trace_01JABC...",
   "source": {
-    "service": "harbornas",
+    "service": "harborbeacon",
     "module": "task_api",
     "event_type": "task.completed"
   },
@@ -262,9 +262,9 @@ This endpoint is hosted by IM Gateway.
 ```
 
 ### Notification Rules
-- HarborNAS produces notification intent only.
+- HarborBeacon produces notification intent only.
 - IM Gateway performs actual platform delivery.
-- HarborNAS must not attach platform credentials to this request.
+- HarborBeacon must not attach platform credentials to this request.
 - `destination.platform` is optional if IM Gateway can resolve destination routing from its own mapping.
 - `destination.recipient` is optional when `kind` and `id` are enough for IM Gateway resolution.
 - `delivery.mode` must be one of:
@@ -308,27 +308,27 @@ Failure response:
 ```
 
 ## Cross-Interface Idempotency Rules
-- IM Gateway -> HarborNAS:
+- IM Gateway -> HarborBeacon:
   - `trace_id` must stay stable for retried delivery of the same inbound user message
-  - `message.message_id` should be used by HarborNAS for dedup where possible
-- HarborNAS -> IM Gateway:
+  - `message.message_id` should be used by HarborBeacon for dedup where possible
+- HarborBeacon -> IM Gateway:
   - `delivery.idempotency_key` must stay stable for notification retries
   - IM Gateway must avoid duplicate user-visible sends when the same idempotency key is retried
 
 ## Risk List
 ### Risk 1
-New IM project accidentally depends on HarborNAS runtime modules.
+New IM project accidentally depends on HarborBeacon runtime modules.
 
 Mitigation:
 - only communicate via HTTP/JSON
 - private gateway models stay private to the IM repo
 
 ### Risk 2
-HarborNAS keeps platform-level credentials and continues direct delivery.
+HarborBeacon keeps platform-level credentials and continues direct delivery.
 
 Mitigation:
 - platform credentials live only in IM Gateway
-- HarborNAS direct IM delivery code is transitional and must be removed after notification interface rollout
+- HarborBeacon direct IM delivery code is transitional and must be removed after notification interface rollout
 
 ## Recommended Private Models
 These are private implementation details, not shared cross-repo contracts.
@@ -337,7 +337,7 @@ These are private implementation details, not shared cross-repo contracts.
   - internal `InboundMessage`
   - internal `OutboundMessage`
   - adapter runtime/session state
-- HarborNAS private models:
+- HarborBeacon private models:
   - `TaskRequest`
   - `TaskResponse`
   - `NotificationRequest`
@@ -352,7 +352,7 @@ These are private implementation details, not shared cross-repo contracts.
   - platform delivery
   - platform credential/config management
   - message normalization and reply formatting
-- Engineer B: HarborNAS repo
+- Engineer B: HarborBeacon repo
   - `assistant_task_api`
   - business/task state machine
   - approval flow
@@ -362,20 +362,20 @@ These are private implementation details, not shared cross-repo contracts.
 
 ## Rollout Order
 1. First, make IM Gateway call `POST /api/tasks` and map `TaskResponse` back to user replies.
-2. Then, extract HarborNAS notification delivery behind the new HTTP notification interface.
-3. Finally, remove HarborNAS direct IM platform delivery code so IM Gateway fully owns the IM layer.
+2. Then, extract HarborBeacon notification delivery behind the new HTTP notification interface.
+3. Finally, remove HarborBeacon direct IM platform delivery code so IM Gateway fully owns the IM layer.
 
 ## Minimum Test Cases
 1. IM Gateway -> `POST /api/tasks` happy path with `message.message_id`, `chat_type`, `mentions`, `attachments`.
-2. HarborNAS task resume path with `status=needs_input`, `prompt`, and `resume_token`.
+2. HarborBeacon task resume path with `status=needs_input`, `prompt`, and `resume_token`.
 3. Duplicate inbound retry with stable `trace_id` does not create duplicate business state transitions.
-4. HarborNAS -> IM Gateway notification send happy path returns `provider_message_id`.
+4. HarborBeacon -> IM Gateway notification send happy path returns `provider_message_id`.
 5. Notification retry with same `idempotency_key` does not duplicate end-user delivery.
-6. HarborNAS build fails if direct platform credential usage remains in notification delivery path after full cutover.
+6. HarborBeacon build fails if direct platform credential usage remains in notification delivery path after full cutover.
 
 ## Release Gate
 A release is allowed only when:
 - both frozen interfaces have contract tests
 - one real IM round-trip passes through `IM Gateway -> /api/tasks -> TaskResponse -> user reply`
-- one real notification round-trip passes through `HarborNAS -> IM Gateway -> platform delivery`
-- HarborNAS no longer depends on platform credentials for IM notification delivery
+- one real notification round-trip passes through `HarborBeacon -> IM Gateway -> platform delivery`
+- HarborBeacon no longer depends on platform credentials for IM notification delivery

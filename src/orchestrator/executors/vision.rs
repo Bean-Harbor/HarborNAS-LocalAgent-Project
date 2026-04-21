@@ -179,12 +179,15 @@ impl VisionExecutor {
         &self,
         device: &ResolvedCameraTarget,
     ) -> Result<SnapshotCaptureResult, String> {
-        self.rtsp.capture_snapshot(&SnapshotCaptureRequest::new(
-            device.device_id.clone(),
-            device.primary_stream.url.clone(),
-            SnapshotFormat::Jpeg,
-            StorageTarget::LocalDisk,
-        ))
+        self.rtsp.capture_snapshot(
+            &SnapshotCaptureRequest::new(
+                device.device_id.clone(),
+                device.primary_stream.url.clone(),
+                SnapshotFormat::Jpeg,
+                StorageTarget::LocalDisk,
+            )
+            .with_snapshot_url(device.snapshot_url.clone()),
+        )
     }
 
     fn persist_snapshot(
@@ -727,6 +730,7 @@ mod tests {
                 url: "rtsp://192.168.1.10/live".to_string(),
                 requires_auth: false,
             },
+            snapshot_url: None,
             onvif_device_service_url: None,
             ezviz_device_serial: None,
             ezviz_camera_no: None,

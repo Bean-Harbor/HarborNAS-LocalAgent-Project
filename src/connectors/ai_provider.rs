@@ -42,8 +42,21 @@ pub struct VisionSummaryRequest {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct TextCompletionRequest {
+    pub system_prompt: Option<String>,
+    pub user_prompt: String,
+    pub temperature: Option<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct VisionSummaryResponse {
     pub summary: String,
+    pub raw_response: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextCompletionResponse {
+    pub text: String,
     pub raw_response: serde_json::Value,
 }
 
@@ -137,6 +150,11 @@ pub struct OpenAiCompatibleVisionClient {
     config: OpenAiCompatibleConfig,
 }
 
+pub struct OpenAiCompatibleTextClient {
+    client: Client,
+    config: OpenAiCompatibleConfig,
+}
+
 impl OpenAiCompatibleVisionClient {
     pub fn new(config: OpenAiCompatibleConfig) -> Result<Self, String> {
         let client = Client::builder()
@@ -211,15 +229,82 @@ impl OpenAiCompatibleVisionClient {
     }
 
     fn headers(&self) -> Result<HeaderMap, String> {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", self.config.api_key))
-                .map_err(|e| format!("invalid OpenAI-compatible auth header: {e}"))?,
-        );
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        Ok(headers)
+        openai_compatible_headers(&self.config.api_key)
     }
+}
+
+impl OpenAiCompatibleTextClient {
+    pub fn new(config: OpenAiCompatibleConfig) -> Result<Self, String> {
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(45))
+            .build()
+            .map_err(|e| format!("failed to build OpenAI-compatible text client: {e}"))?;
+        Ok(Self { client, config })
+    }
+
+    pub fn complete_text(
+        &self,
+        request: &TextCompletionRequest,
+    ) -> Result<TextCompletionResponse, String> {
+        let mut messages = Vec::new();
+        if let Some(system_prompt) = request
+            .system_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            messages.push(json!({
+                "role": "system",
+                "content": system_prompt,
+            }));
+        }
+        messages.push(json!({
+            "role": "user",
+            "content": request.user_prompt,
+        }));
+
+        let payload = json!({
+            "model": self.config.model,
+            "temperature": request.temperature.unwrap_or(0.1),
+            "messages": messages,
+        });
+
+        let response = self
+            .client
+            .post(format!("{}/chat/completions", self.config.base_url))
+            .headers(openai_compatible_headers(&self.config.api_key)?)
+            .json(&payload)
+            .send()
+            .map_err(|e| format!("OpenAI-compatible text request failed: {e}"))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .unwrap_or_else(|_| "<body unavailable>".to_string());
+            return Err(format!("OpenAI-compatible API error {status}: {body}"));
+        }
+
+        let raw_response: serde_json::Value = response
+            .json()
+            .map_err(|e| format!("failed to parse OpenAI-compatible response: {e}"))?;
+        let text = extract_message_text(&raw_response).ok_or_else(|| {
+            "OpenAI-compatible response did not contain assistant text".to_string()
+        })?;
+
+        Ok(TextCompletionResponse { text, raw_response })
+    }
+}
+
+fn openai_compatible_headers(api_key: &str) -> Result<HeaderMap, String> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {api_key}"))
+            .map_err(|e| format!("invalid OpenAI-compatible auth header: {e}"))?,
+    );
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(headers)
 }
 
 fn extract_message_text(value: &serde_json::Value) -> Option<String> {

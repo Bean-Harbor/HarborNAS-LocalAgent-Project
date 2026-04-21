@@ -7,9 +7,11 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
+import harbor_integration  # noqa: E402
 from harbor_integration import (  # noqa: E402
     ApprovalRequiredError,
     IntegrationConfig,
+    IntegrationError,
     MiddlewareClient,
     MidcliClient,
     PathPolicyError,
@@ -130,7 +132,7 @@ def test_execute_file_action_blocks_denied_path(monkeypatch) -> None:
             config=config,
             operation="copy",
             src="/etc/passwd",
-            dst="/mnt/agent-ci/out.txt",
+            dst="/mnt/software/harborbeacon-agent-ci/out.txt",
             dry_run=True,
         )
     except PathPolicyError:
@@ -141,12 +143,12 @@ def test_execute_file_action_blocks_denied_path(monkeypatch) -> None:
 
 def test_validate_path_policy_keeps_contract_paths_on_allowlist() -> None:
     policy = validate_path_policy(
-        read_paths=[r"C:\mnt\agent-ci\copy-source.txt"],
-        write_paths=[r"C:\mnt\agent-ci\copy-destination.txt"],
+        read_paths=[r"C:\mnt\software\harborbeacon-agent-ci\copy-source.txt"],
+        write_paths=[r"C:\mnt\software\harborbeacon-agent-ci\copy-destination.txt"],
     )
 
-    assert policy["read_paths"] == ["/mnt/agent-ci/copy-source.txt"]
-    assert policy["write_paths"] == ["/mnt/agent-ci/copy-destination.txt"]
+    assert policy["read_paths"] == ["/mnt/software/harborbeacon-agent-ci/copy-source.txt"]
+    assert policy["write_paths"] == ["/mnt/software/harborbeacon-agent-ci/copy-destination.txt"]
 
 
 def test_execute_file_action_dry_run_returns_preview(monkeypatch) -> None:
@@ -160,9 +162,160 @@ def test_execute_file_action_dry_run_returns_preview(monkeypatch) -> None:
         midcli=midcli,
         config=config,
         operation="move",
-        src="/mnt/agent-ci/source.txt",
-        dst="/mnt/agent-ci/dst",
+        src="/mnt/software/harborbeacon-agent-ci/source.txt",
+        dst="/mnt/software/harborbeacon-agent-ci/dst",
         dry_run=True,
     )
     assert payload["preview"] is True
     assert payload["risk_level"] == "HIGH"
+
+
+def test_execute_service_action_falls_back_to_midcli_when_middleware_errors(monkeypatch) -> None:
+    config = IntegrationConfig()
+    middleware = MiddlewareClient(config)
+    midcli = MidcliClient(config)
+
+    monkeypatch.setattr(middleware, "is_available", lambda: True)
+    monkeypatch.setattr(midcli, "is_available", lambda: True)
+    monkeypatch.setattr(
+        middleware,
+        "service_control",
+        lambda operation, service_name: (_ for _ in ()).throw(
+            IntegrationError("middleware exploded")
+        ),
+    )
+    monkeypatch.setattr(
+        midcli,
+        "service_control",
+        lambda operation, service_name: type(
+            "Result",
+            (),
+            {"stdout": "true\n", "duration_ms": 7},
+        )(),
+    )
+
+    payload = execute_service_action(
+        middleware=middleware,
+        midcli=midcli,
+        config=config,
+        operation="restart",
+        service_name="ssh",
+        dry_run=False,
+        approval_token="approved",
+    )
+
+    assert payload["executor"] == "midcli"
+    assert payload["route_fallback_used"] is True
+
+
+def test_execute_file_action_falls_back_to_midcli_when_middleware_errors(monkeypatch) -> None:
+    config = IntegrationConfig()
+    middleware = MiddlewareClient(config)
+    midcli = MidcliClient(config)
+
+    monkeypatch.setattr(middleware, "is_available", lambda: True)
+    monkeypatch.setattr(midcli, "is_available", lambda: True)
+    monkeypatch.setattr(
+        middleware,
+        "filesystem_copy",
+        lambda src, dst, recursive=False: (_ for _ in ()).throw(
+            IntegrationError("filesystem.copy failed")
+        ),
+    )
+    monkeypatch.setattr(
+        midcli,
+        "filesystem_copy",
+        lambda src, dst, recursive=False: type(
+            "Result",
+            (),
+            {"stdout": "true\n", "duration_ms": 8},
+        )(),
+    )
+
+    payload = execute_file_action(
+        middleware=middleware,
+        midcli=midcli,
+        config=config,
+        operation="copy",
+        src="/mnt/software/harborbeacon-agent-ci/copy-source.txt",
+        dst="/mnt/software/harborbeacon-agent-ci/copy-destination.txt",
+        dry_run=False,
+    )
+
+    assert payload["executor"] == "midcli"
+    assert payload["route_fallback_used"] is True
+
+
+def test_integration_config_defaults_to_live_verified_mutation_root() -> None:
+    config = IntegrationConfig()
+    assert config.mutation_root == "/mnt/software/harborbeacon-agent-ci"
+
+
+def test_normalize_path_preserves_harbor_posix_path() -> None:
+    assert (
+        harbor_integration.normalize_path(
+            "/mnt/software/harborbeacon-agent-ci/../harborbeacon-agent-ci/copy-source.txt"
+        )
+        == "/mnt/software/harborbeacon-agent-ci/copy-source.txt"
+    )
+
+
+def test_windows_remote_mutation_roots_skip_local_fixture_staging(monkeypatch) -> None:
+    monkeypatch.setattr(harbor_integration.os, "name", "nt")
+    monkeypatch.setattr(
+        harbor_integration.Path,
+        "mkdir",
+        lambda self, *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("mkdir should not run for remote POSIX roots on Windows")
+        ),
+    )
+    monkeypatch.setattr(
+        harbor_integration.Path,
+        "write_text",
+        lambda self, *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("write_text should not run for remote POSIX roots on Windows")
+        ),
+    )
+    root = "/mnt/software/harborbeacon-agent-ci"
+
+    created_dir = harbor_integration.ensure_directory(root)
+    created_file = harbor_integration.ensure_mutation_fixture(
+        root,
+        filename="copy-source.txt",
+        content="payload\n",
+    )
+
+    assert created_dir == root
+    assert created_file == f"{root}/copy-source.txt"
+
+
+def test_remote_posix_mutation_roots_skip_local_fixture_staging_for_linux_verifier(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(harbor_integration.os, "name", "posix")
+    monkeypatch.setenv("HARBOR_MIDCLI_URL", "ws://192.168.3.169/websocket")
+    monkeypatch.setattr(
+        harbor_integration.Path,
+        "mkdir",
+        lambda self, *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("mkdir should not run for remote HarborOS POSIX roots")
+        ),
+    )
+    monkeypatch.setattr(
+        harbor_integration.Path,
+        "write_text",
+        lambda self, *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("write_text should not run for remote HarborOS POSIX roots")
+        ),
+    )
+    root = "/mnt/software/harborbeacon-agent-ci"
+
+    created_dir = harbor_integration.ensure_directory(root)
+    created_file = harbor_integration.ensure_mutation_fixture(
+        root,
+        filename="copy-source.txt",
+        content="payload\n",
+    )
+
+    assert created_dir == root
+    assert created_file == f"{root}/copy-source.txt"

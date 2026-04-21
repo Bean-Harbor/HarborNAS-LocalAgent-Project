@@ -24,35 +24,19 @@ This is the repeatable HarborBeacon-side demo note for document/image retrieval.
   - `reply_pack.citations` includes the document and image
   - `artifacts` mirrors the same citation set
 
-### 2. NL Retrieval Fallback Enabled
+### 2. General Message Stays Outside Retrieval
 
 - Input:
   - domain: `general`
   - action: `message`
   - raw text: `帮我找到和樱花有关的文件`
-- Canary flag state:
-  - `HARBORBEACON_ENABLE_LEGACY_KNOWLEDGE_NL_FALLBACK=1`
-- Expected HarborBeacon reply:
-  - routes to `knowledge_search_service`
-  - same citation-ready reply pack as explicit search
-  - same summary / artifacts coherence
-
-### 3. NL Retrieval Fallback Disabled
-
-- Input:
-  - domain: `general`
-  - action: `message`
-  - raw text: `帮我找到和樱花有关的文件`
-- Canary flag state:
-  - `HARBORBEACON_ENABLE_LEGACY_KNOWLEDGE_NL_FALLBACK` unset
 - Expected HarborBeacon reply:
   - does not opportunistically route into knowledge retrieval
   - returns `failed` from `task_api`
-  - explicit `knowledge.search` remains available for rollback-safe access
+  - explicit `knowledge.search` remains available for retrieval access
 
 ## Rollback
 
-- Turn off `HARBORBEACON_ENABLE_LEGACY_KNOWLEDGE_NL_FALLBACK`.
+- No legacy retrieval fallback exists to toggle during rollback.
 - No IM contract changes are required.
 - No retrieval semantics move to HarborGate or HarborOS.
-

@@ -9,6 +9,8 @@ pub mod hub;
 pub mod knowledge;
 pub mod knowledge_index;
 pub mod media;
+pub mod media_tools;
+pub mod model_center;
 pub mod node_runtime;
 pub mod registry;
 pub mod remote_view;

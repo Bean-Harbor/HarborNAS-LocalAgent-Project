@@ -5,6 +5,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use glob::glob;
+use if_addrs::get_if_addrs;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -83,7 +84,7 @@ impl Default for IntegrationConfig {
             approval_token: None,
             required_approval_token: None,
             approver_id: None,
-            mutation_root: "/mnt/agent-ci".to_string(),
+            mutation_root: "/mnt/software/harborbeacon-agent-ci".to_string(),
             rollback_on_failure: true,
         }
     }
@@ -206,11 +207,110 @@ pub fn run_command(argv: &[String], timeout_ms: u64) -> Result<CommandResult, In
 }
 
 pub fn normalize_path(path: &str) -> String {
+    if looks_like_absolute_posix_path(path) {
+        return normalize_posix_path(path);
+    }
+
     let p = Path::new(path);
     p.canonicalize()
         .unwrap_or_else(|_| PathBuf::from(path))
         .to_string_lossy()
         .to_string()
+}
+
+fn looks_like_absolute_posix_path(path: &str) -> bool {
+    let trimmed = path.trim();
+    trimmed.starts_with('/') && !trimmed.starts_with("\\\\")
+}
+
+fn normalize_posix_path(path: &str) -> String {
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in path.trim().split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            value => segments.push(value),
+        }
+    }
+
+    if segments.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", segments.join("/"))
+    }
+}
+
+fn extract_url_host(url: &str) -> Option<String> {
+    let authority = url
+        .split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .rsplit('@')
+        .next()
+        .unwrap_or("")
+        .trim();
+
+    if authority.is_empty() {
+        return None;
+    }
+
+    if authority.starts_with('[') {
+        return authority
+            .split(']')
+            .next()
+            .map(|host| host.trim_start_matches('[').to_string())
+            .filter(|host| !host.is_empty());
+    }
+
+    authority
+        .split(':')
+        .next()
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(|host| host.to_string())
+}
+
+fn harbor_target_is_remote(midcli_url: Option<&str>) -> bool {
+    let Some(host) = midcli_url.and_then(extract_url_host) else {
+        return false;
+    };
+
+    if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1") {
+        return false;
+    }
+
+    let local_hostnames = [
+        std::env::var("HOSTNAME").ok(),
+        std::env::var("COMPUTERNAME").ok(),
+    ];
+    if local_hostnames
+        .iter()
+        .flatten()
+        .any(|local| host.eq_ignore_ascii_case(local))
+    {
+        return false;
+    }
+
+    if let Ok(ifaces) = get_if_addrs() {
+        if ifaces.iter().any(|iface| iface.ip().to_string() == host) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn should_skip_local_fixture_staging_for_url(
+    normalized_path: &str,
+    midcli_url: Option<&str>,
+) -> bool {
+    looks_like_absolute_posix_path(normalized_path)
+        && (cfg!(windows) || harbor_target_is_remote(midcli_url))
 }
 
 fn ensure_service_name(service_name: &str) -> Result<(), IntegrationError> {
@@ -383,7 +483,16 @@ pub fn ensure_mutation_fixture(
     filename: &str,
     content: &str,
 ) -> Result<String, IntegrationError> {
-    let root_path = PathBuf::from(normalize_path(root));
+    let normalized_root = normalize_path(root);
+    if should_skip_local_fixture_staging(&normalized_root) {
+        return Ok(format!(
+            "{}/{}",
+            normalized_root.trim_end_matches('/'),
+            filename
+        ));
+    }
+
+    let root_path = PathBuf::from(&normalized_root);
     fs::create_dir_all(&root_path).map_err(|e| IntegrationError::Generic(e.to_string()))?;
     let file_path = root_path.join(filename);
     fs::write(&file_path, content).map_err(|e| IntegrationError::Generic(e.to_string()))?;
@@ -392,8 +501,21 @@ pub fn ensure_mutation_fixture(
 
 pub fn ensure_directory(path: &str) -> Result<String, IntegrationError> {
     let normalized = normalize_path(path);
+    if should_skip_local_fixture_staging(&normalized) {
+        return Ok(normalized);
+    }
     fs::create_dir_all(&normalized).map_err(|e| IntegrationError::Generic(e.to_string()))?;
     Ok(normalized)
+}
+
+pub fn should_skip_local_fixture_staging(normalized_path: &str) -> bool {
+    let midcli_url = std::env::var("HARBOR_MIDCLI_URL").ok();
+    should_skip_local_fixture_staging_for_url(normalized_path, midcli_url.as_deref())
+}
+
+pub fn should_use_remote_mutation_seed(config: &IntegrationConfig, mutation_root: &str) -> bool {
+    config.allow_mutations
+        && should_skip_local_fixture_staging_for_url(mutation_root, config.midcli_url.as_deref())
 }
 
 pub fn discover_source_capabilities(repo_path: Option<&str>) -> HashMap<String, bool> {
@@ -721,7 +843,7 @@ pub fn execute_service_action(
 ) -> Result<Value, IntegrationError> {
     ensure_service_name(service_name)?;
     let risk_level = service_operation_risk(operation)?;
-    let executor = if prefer_midcli {
+    let preferred_executor = if prefer_midcli {
         "midcli"
     } else {
         "middleware_api"
@@ -731,7 +853,7 @@ pub fn execute_service_action(
         return Ok(build_service_preview(
             operation,
             service_name,
-            executor,
+            preferred_executor,
             risk_level,
         ));
     }
@@ -743,18 +865,24 @@ pub fn execute_service_action(
         &format!("service.{operation}"),
     )?;
 
+    let mut middleware_error: Option<String> = None;
     if !prefer_midcli && middleware.is_available() {
-        let (payload, result) = middleware.service_control(operation, service_name)?;
-        return Ok(json!({
-            "preview": false,
-            "executor": "middleware_api",
-            "operation": operation,
-            "service_name": service_name,
-            "risk_level": risk_level,
-            "duration_ms": result.duration_ms,
-            "result": payload,
-            "approver_id": config.approver_id,
-        }));
+        match middleware.service_control(operation, service_name) {
+            Ok((payload, result)) => {
+                return Ok(json!({
+                    "preview": false,
+                    "executor": "middleware_api",
+                    "operation": operation,
+                    "service_name": service_name,
+                    "risk_level": risk_level,
+                    "duration_ms": result.duration_ms,
+                    "result": payload,
+                    "approver_id": config.approver_id,
+                    "route_fallback_used": false,
+                }));
+            }
+            Err(err) => middleware_error = Some(err.to_string()),
+        }
     }
 
     if midcli.is_available() {
@@ -768,7 +896,14 @@ pub fn execute_service_action(
             "duration_ms": result.duration_ms,
             "result": parse_loose_value(&result.stdout),
             "approver_id": config.approver_id,
+            "route_fallback_used": middleware_error.is_some(),
         }));
+    }
+
+    if let Some(error) = middleware_error {
+        return Err(IntegrationError::CapabilityUnavailable(format!(
+            "middleware failed and midcli is unavailable for service control: {error}"
+        )));
     }
 
     Err(IntegrationError::CapabilityUnavailable(
@@ -793,7 +928,7 @@ pub fn execute_file_action(
     let src_normalized = policy.read_paths[0].clone();
     let dst_normalized = policy.write_paths[0].clone();
     let risk_level = file_operation_risk(operation, overwrite)?;
-    let executor = if prefer_midcli {
+    let preferred_executor = if prefer_midcli {
         "midcli"
     } else {
         "middleware_api"
@@ -804,7 +939,7 @@ pub fn execute_file_action(
             operation,
             &src_normalized,
             &dst_normalized,
-            executor,
+            preferred_executor,
             risk_level,
             overwrite,
         ));
@@ -817,26 +952,28 @@ pub fn execute_file_action(
         &format!("files.{operation}"),
     )?;
 
+    let mut middleware_error: Option<String> = None;
     match operation {
         "copy" => {
             if !prefer_midcli && middleware.is_available() {
-                let (payload, result) = middleware.filesystem_copy(
-                    &src_normalized,
-                    &dst_normalized,
-                    recursive,
-                    false,
-                )?;
-                return Ok(json!({
-                    "preview": false,
-                    "executor": "middleware_api",
-                    "operation": operation,
-                    "src": src_normalized,
-                    "dst": dst_normalized,
-                    "risk_level": risk_level,
-                    "duration_ms": result.duration_ms,
-                    "result": payload,
-                    "approver_id": config.approver_id,
-                }));
+                match middleware.filesystem_copy(&src_normalized, &dst_normalized, recursive, false)
+                {
+                    Ok((payload, result)) => {
+                        return Ok(json!({
+                            "preview": false,
+                            "executor": "middleware_api",
+                            "operation": operation,
+                            "src": src_normalized,
+                            "dst": dst_normalized,
+                            "risk_level": risk_level,
+                            "duration_ms": result.duration_ms,
+                            "result": payload,
+                            "approver_id": config.approver_id,
+                            "route_fallback_used": false,
+                        }));
+                    }
+                    Err(err) => middleware_error = Some(err.to_string()),
+                }
             }
             if midcli.is_available() {
                 let result = midcli.filesystem_copy(&src_normalized, &dst_normalized, recursive)?;
@@ -850,24 +987,29 @@ pub fn execute_file_action(
                     "duration_ms": result.duration_ms,
                     "result": parse_loose_value(&result.stdout),
                     "approver_id": config.approver_id,
+                    "route_fallback_used": middleware_error.is_some(),
                 }));
             }
         }
         "move" => {
             if !prefer_midcli && middleware.is_available() {
-                let (payload, result) =
-                    middleware.filesystem_move(&src_normalized, &dst_normalized, recursive)?;
-                return Ok(json!({
-                    "preview": false,
-                    "executor": "middleware_api",
-                    "operation": operation,
-                    "src": src_normalized,
-                    "dst": dst_normalized,
-                    "risk_level": risk_level,
-                    "duration_ms": result.duration_ms,
-                    "result": payload,
-                    "approver_id": config.approver_id,
-                }));
+                match middleware.filesystem_move(&src_normalized, &dst_normalized, recursive) {
+                    Ok((payload, result)) => {
+                        return Ok(json!({
+                            "preview": false,
+                            "executor": "middleware_api",
+                            "operation": operation,
+                            "src": src_normalized,
+                            "dst": dst_normalized,
+                            "risk_level": risk_level,
+                            "duration_ms": result.duration_ms,
+                            "result": payload,
+                            "approver_id": config.approver_id,
+                            "route_fallback_used": false,
+                        }));
+                    }
+                    Err(err) => middleware_error = Some(err.to_string()),
+                }
             }
             if midcli.is_available() {
                 let result = midcli.filesystem_move(&src_normalized, &dst_normalized, recursive)?;
@@ -881,6 +1023,7 @@ pub fn execute_file_action(
                     "duration_ms": result.duration_ms,
                     "result": parse_loose_value(&result.stdout),
                     "approver_id": config.approver_id,
+                    "route_fallback_used": middleware_error.is_some(),
                 }));
             }
         }
@@ -889,6 +1032,12 @@ pub fn execute_file_action(
                 "unsupported file operation: {operation}"
             )));
         }
+    }
+
+    if let Some(error) = middleware_error {
+        return Err(IntegrationError::CapabilityUnavailable(format!(
+            "middleware failed and midcli is unavailable for files.{operation}: {error}"
+        )));
     }
 
     Err(IntegrationError::CapabilityUnavailable(format!(
@@ -902,8 +1051,10 @@ mod tests {
     use std::fs;
 
     use super::{
-        discover_source_capabilities, execute_file_action, execute_service_action, parse_csv_rows,
-        IntegrationConfig, MidcliClient, MiddlewareClient,
+        discover_source_capabilities, ensure_directory, ensure_mutation_fixture,
+        execute_file_action, execute_service_action, normalize_path, parse_csv_rows,
+        should_skip_local_fixture_staging_for_url, validate_path_policy, IntegrationConfig,
+        MidcliClient, MiddlewareClient,
     };
 
     #[test]
@@ -1066,5 +1217,73 @@ mod tests {
 
         assert_eq!(result["preview"], true);
         assert_eq!(result["risk_level"], "HIGH");
+    }
+
+    #[test]
+    fn normalize_path_keeps_harbor_posix_paths_stable() {
+        assert_eq!(
+            normalize_path(
+                "/mnt/software/harborbeacon-agent-ci/../harborbeacon-agent-ci/copy-source.txt"
+            ),
+            "/mnt/software/harborbeacon-agent-ci/copy-source.txt"
+        );
+        assert_eq!(
+            normalize_path("/data//sandbox/./move"),
+            "/data/sandbox/move"
+        );
+    }
+
+    #[test]
+    fn validate_path_policy_accepts_virtual_harbor_posix_paths() {
+        let policy = validate_path_policy(
+            &["/mnt/software/harborbeacon-agent-ci/source.txt".to_string()],
+            &["/mnt/software/harborbeacon-agent-ci/destination.txt".to_string()],
+        )
+        .expect("policy");
+
+        assert_eq!(
+            policy.read_paths,
+            vec!["/mnt/software/harborbeacon-agent-ci/source.txt"]
+        );
+        assert_eq!(
+            policy.write_paths,
+            vec!["/mnt/software/harborbeacon-agent-ci/destination.txt"]
+        );
+    }
+
+    #[test]
+    fn remote_posix_mutation_paths_skip_local_fixture_staging_for_remote_harbor() {
+        assert!(should_skip_local_fixture_staging_for_url(
+            "/mnt/software/harborbeacon-agent-ci",
+            Some("ws://192.168.3.169/websocket")
+        ));
+        if !cfg!(windows) {
+            assert!(!should_skip_local_fixture_staging_for_url(
+                "/mnt/software/harborbeacon-agent-ci",
+                Some("ws://127.0.0.1/websocket")
+            ));
+        }
+    }
+
+    #[test]
+    fn windows_remote_mutation_paths_skip_local_fixture_staging() {
+        if !cfg!(windows) {
+            return;
+        }
+
+        assert_eq!(
+            ensure_directory("/mnt/software/harborbeacon-agent-ci")
+                .expect("virtual remote directory"),
+            "/mnt/software/harborbeacon-agent-ci"
+        );
+        assert_eq!(
+            ensure_mutation_fixture(
+                "/mnt/software/harborbeacon-agent-ci",
+                "copy-source.txt",
+                "payload\n"
+            )
+            .expect("virtual remote fixture"),
+            "/mnt/software/harborbeacon-agent-ci/copy-source.txt"
+        );
     }
 }

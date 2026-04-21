@@ -6,9 +6,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::control_plane::models::{ModelEndpointStatus, ModelKind};
 use crate::runtime::knowledge_index::{
     KnowledgeIndexChunk, KnowledgeIndexEntry, KnowledgeIndexService, KnowledgeModality,
 };
+use crate::runtime::model_center;
 
 pub const KNOWLEDGE_ROOTS_ENV: &str = "HARBOR_KNOWLEDGE_ROOTS";
 
@@ -52,6 +54,10 @@ pub struct KnowledgeSearchHit {
     pub snippet: Option<String>,
     #[serde(default)]
     pub matched_terms: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -70,6 +76,10 @@ pub struct KnowledgeSearchCitation {
     #[serde(default)]
     pub preview: Option<String>,
     pub score: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -159,6 +169,7 @@ impl KnowledgeSearchService {
         documents.truncate(limit);
         images.truncate(limit);
         let reply_pack = build_reply_pack(&query, total_matches, &documents, &images);
+        let (supported_modalities, pending_modalities) = modality_support_matrix();
 
         Ok(KnowledgeSearchResponse {
             query,
@@ -170,10 +181,31 @@ impl KnowledgeSearchService {
             documents,
             images,
             reply_pack,
-            supported_modalities: vec!["document".to_string(), "image".to_string()],
-            pending_modalities: vec!["audio".to_string(), "video".to_string()],
+            supported_modalities,
+            pending_modalities,
         })
     }
+}
+
+fn modality_support_matrix() -> (Vec<String>, Vec<String>) {
+    let mut supported = vec![
+        "document".to_string(),
+        "image".to_string(),
+        "ocr".to_string(),
+    ];
+    let mut pending = vec!["audio".to_string(), "video".to_string()];
+
+    let model_center_state = model_center::load_model_center_state();
+    let vlm_ready = model_center_state.endpoints.iter().any(|endpoint| {
+        endpoint.model_kind == ModelKind::Vlm && endpoint.status != ModelEndpointStatus::Disabled
+    });
+    if vlm_ready {
+        supported.push("vlm".to_string());
+    } else {
+        pending.push("vlm".to_string());
+    }
+
+    (supported, pending)
 }
 
 fn resolve_roots(request_roots: &[String]) -> Result<Vec<PathBuf>, String> {
@@ -238,6 +270,8 @@ fn build_hit_from_index_entry(
             line_start: 1,
             line_end: entry.searchable_text.lines().count().max(1),
             text: entry.searchable_text.clone(),
+            source_kind: entry.modality.as_str().to_string(),
+            source_path: entry.sidecar_path.clone(),
         }]
     } else {
         entry.chunks.clone()
@@ -276,6 +310,8 @@ fn build_reply_pack(
             matched_terms: hit.matched_terms.clone(),
             preview: hit.snippet.clone(),
             score: hit.score,
+            provenance: hit.provenance.clone(),
+            source_path: hit.source_path.clone(),
         })
         .collect::<Vec<_>>();
     let summary = build_reply_summary(query, total_matches, documents, images);
@@ -290,7 +326,7 @@ fn build_reply_summary(
 ) -> String {
     if total_matches == 0 {
         return format!(
-            "已检索知识库，但暂时没有找到与“{}”相关的文档或图片。",
+            "已检索知识库，但暂时没有找到与“{}”相关的文档、图片或 OCR 线索。",
             query
         );
     }
@@ -374,6 +410,10 @@ fn build_hit(
         line_end: chunk.map(|item| item.line_end),
         snippet: searchable_text.and_then(|text| build_snippet(text, &matched_terms)),
         matched_terms,
+        provenance: chunk
+            .map(|item| item.source_kind.clone())
+            .filter(|value| !value.trim().is_empty()),
+        source_path: chunk.and_then(|item| item.source_path.clone()),
     })
 }
 
@@ -527,6 +567,14 @@ mod tests {
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use serde_json::json;
+
+    use crate::control_plane::models::{
+        ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, ModelRoutePolicy,
+        PrivacyLevel,
+    };
+    use crate::runtime::admin_console::{AdminConsoleState, AdminModelCenterState};
+
     use super::{KnowledgeSearchRequest, KnowledgeSearchService};
 
     static INDEX_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -543,6 +591,81 @@ mod tests {
         if path.exists() {
             let _ = fs::remove_dir_all(path);
         }
+    }
+
+    fn write_mock_model_center_state(
+        path: &Path,
+        mock_ocr_text: &str,
+        mock_vlm_text: Option<&str>,
+    ) {
+        let mut endpoints = vec![ModelEndpoint {
+            model_endpoint_id: "ocr-mock".to_string(),
+            workspace_id: Some("home-1".to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Ocr,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "tesseract".to_string(),
+            model_name: "mock-ocr".to_string(),
+            capability_tags: vec!["ocr".to_string()],
+            cost_policy: json!({}),
+            status: ModelEndpointStatus::Active,
+            metadata: json!({
+                "mock_text": mock_ocr_text,
+            }),
+        }];
+        let mut route_policies = vec![ModelRoutePolicy {
+            route_policy_id: "retrieval.ocr".to_string(),
+            workspace_id: "home-1".to_string(),
+            domain_scope: "retrieval".to_string(),
+            modality: "image".to_string(),
+            privacy_level: PrivacyLevel::StrictLocal,
+            local_preferred: true,
+            max_cost_per_run: None,
+            fallback_order: vec!["local".to_string(), "cloud".to_string()],
+            status: "active".to_string(),
+            metadata: json!({}),
+        }];
+        if let Some(mock_vlm_text) = mock_vlm_text {
+            endpoints.push(ModelEndpoint {
+                model_endpoint_id: "vlm-mock".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Vlm,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "mock-vlm".to_string(),
+                capability_tags: vec!["vlm".to_string(), "multimodal".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "mock_text": mock_vlm_text,
+                }),
+            });
+            route_policies.push(ModelRoutePolicy {
+                route_policy_id: "retrieval.vision_summary".to_string(),
+                workspace_id: "home-1".to_string(),
+                domain_scope: "retrieval".to_string(),
+                modality: "multimodal".to_string(),
+                privacy_level: PrivacyLevel::AllowRedactedCloud,
+                local_preferred: true,
+                max_cost_per_run: None,
+                fallback_order: vec!["local".to_string(), "cloud".to_string()],
+                status: "active".to_string(),
+                metadata: json!({}),
+            });
+        }
+        let state = AdminConsoleState {
+            models: AdminModelCenterState {
+                endpoints,
+                route_policies,
+            },
+            ..AdminConsoleState::default()
+        };
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&state).expect("serialize admin state"),
+        )
+        .expect("write admin state");
     }
 
     #[test]
@@ -704,5 +827,145 @@ mod tests {
 
         cleanup_dir(&root);
         cleanup_dir(&index_root);
+    }
+
+    #[test]
+    fn search_surfaces_sidecar_and_ocr_provenance_for_image_hits() {
+        let _guard = INDEX_TEST_LOCK.lock().expect("lock");
+        let root = unique_dir("harborbeacon-knowledge-image-provenance");
+        let index_root = unique_dir("harborbeacon-knowledge-index-store");
+        let admin_state_path = unique_dir("harborbeacon-admin-model-center").join("state.json");
+        fs::create_dir_all(root.join("images")).expect("create images");
+        fs::create_dir_all(&index_root).expect("create index root");
+        fs::create_dir_all(
+            admin_state_path
+                .parent()
+                .expect("admin state path parent directory"),
+        )
+        .expect("create admin state dir");
+        fs::write(root.join("images").join("gate.jpg"), b"fake-image").expect("write image");
+        fs::write(
+            root.join("images").join("gate.txt"),
+            "front gate camera overview",
+        )
+        .expect("write sidecar");
+        write_mock_model_center_state(&admin_state_path, "plate ABC123 from OCR", None);
+
+        std::env::set_var("HARBOR_KNOWLEDGE_INDEX_ROOT", &index_root);
+        std::env::set_var("HARBOR_ADMIN_STATE_PATH", &admin_state_path);
+        let sidecar_response = KnowledgeSearchService::search(KnowledgeSearchRequest {
+            query: "front".to_string(),
+            roots: vec![root.to_string_lossy().into_owned()],
+            include_documents: false,
+            include_images: true,
+            limit: 5,
+        })
+        .expect("sidecar search");
+        let ocr_response = KnowledgeSearchService::search(KnowledgeSearchRequest {
+            query: "ABC123".to_string(),
+            roots: vec![root.to_string_lossy().into_owned()],
+            include_documents: false,
+            include_images: true,
+            limit: 5,
+        })
+        .expect("ocr search");
+        std::env::remove_var("HARBOR_KNOWLEDGE_INDEX_ROOT");
+        std::env::remove_var("HARBOR_ADMIN_STATE_PATH");
+
+        assert_eq!(sidecar_response.images.len(), 1);
+        assert_eq!(
+            sidecar_response.images[0].provenance.as_deref(),
+            Some("sidecar")
+        );
+        assert!(sidecar_response.images[0]
+            .source_path
+            .as_deref()
+            .unwrap_or_default()
+            .ends_with("gate.txt"));
+        assert_eq!(
+            sidecar_response.reply_pack.citations[0]
+                .provenance
+                .as_deref(),
+            Some("sidecar")
+        );
+        assert!(sidecar_response
+            .supported_modalities
+            .iter()
+            .any(|item| item == "ocr"));
+
+        assert_eq!(ocr_response.images.len(), 1);
+        assert_eq!(ocr_response.images[0].provenance.as_deref(), Some("ocr"));
+        assert!(ocr_response.images[0].source_path.is_none());
+        assert_eq!(
+            ocr_response.reply_pack.citations[0].provenance.as_deref(),
+            Some("ocr")
+        );
+        assert!(ocr_response
+            .pending_modalities
+            .iter()
+            .any(|item| item == "vlm"));
+
+        cleanup_dir(&root);
+        cleanup_dir(&index_root);
+        cleanup_dir(
+            admin_state_path
+                .parent()
+                .expect("admin state path parent directory"),
+        );
+    }
+
+    #[test]
+    fn search_surfaces_vlm_provenance_for_image_hits() {
+        let _guard = INDEX_TEST_LOCK.lock().expect("lock");
+        let root = unique_dir("harborbeacon-knowledge-vlm");
+        let index_root = unique_dir("harborbeacon-knowledge-index-store");
+        let admin_state_path = unique_dir("harborbeacon-admin-model-center-vlm").join("state.json");
+        fs::create_dir_all(root.join("images")).expect("create images");
+        fs::create_dir_all(&index_root).expect("create index root");
+        fs::create_dir_all(
+            admin_state_path
+                .parent()
+                .expect("admin state path parent directory"),
+        )
+        .expect("create admin state dir");
+        fs::write(root.join("images").join("porch.jpg"), b"fake-image").expect("write image");
+        write_mock_model_center_state(
+            &admin_state_path,
+            "",
+            Some("门口地面有一个快递箱和一把折叠雨伞"),
+        );
+
+        std::env::set_var("HARBOR_KNOWLEDGE_INDEX_ROOT", &index_root);
+        std::env::set_var("HARBOR_ADMIN_STATE_PATH", &admin_state_path);
+        let response = KnowledgeSearchService::search(KnowledgeSearchRequest {
+            query: "快递箱".to_string(),
+            roots: vec![root.to_string_lossy().into_owned()],
+            include_documents: false,
+            include_images: true,
+            limit: 5,
+        })
+        .expect("vlm search");
+        std::env::remove_var("HARBOR_KNOWLEDGE_INDEX_ROOT");
+        std::env::remove_var("HARBOR_ADMIN_STATE_PATH");
+
+        assert_eq!(response.images.len(), 1);
+        assert_eq!(response.images[0].provenance.as_deref(), Some("vlm"));
+        assert_eq!(
+            response.reply_pack.citations[0].provenance.as_deref(),
+            Some("vlm")
+        );
+        assert!(response
+            .supported_modalities
+            .iter()
+            .any(|item| item == "vlm"));
+        assert!(!response.pending_modalities.iter().any(|item| item == "vlm"));
+
+        cleanup_dir(&root);
+        cleanup_dir(&index_root);
+        cleanup_dir(
+            admin_state_path
+                .parent()
+                .expect("admin state path parent directory"),
+        );
     }
 }

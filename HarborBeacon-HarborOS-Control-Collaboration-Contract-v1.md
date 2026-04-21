@@ -25,7 +25,7 @@ Gateway contract.
 
 The authoritative IM boundary remains the external file:
 
-- `C:\Users\beanw\OpenSource\IM\HarborNAS-IM-Gateway-Agent-Contract-v1.5.md`
+- `C:\Users\beanw\OpenSource\IM\HarborBeacon-HarborGate-Agent-Contract-v1.5.md`
 
 Rules:
 
@@ -139,7 +139,7 @@ Meaning:
 ## Hard Boundary Rules
 
 - HarborOS control work MUST NOT modify
-  `C:\Users\beanw\OpenSource\IM\HarborNAS-IM-Gateway-Agent-Contract-v1.5.md`.
+  `C:\Users\beanw\OpenSource\IM\HarborBeacon-HarborGate-Agent-Contract-v1.5.md`.
 - HarborOS control work MUST NOT redefine or silently widen the meaning of:
   - `task_id`
   - `trace_id`
@@ -149,7 +149,7 @@ Meaning:
   - `TaskResponse.status`
   - notification request or response fields
 - HarborOS control work MUST NOT introduce IM-platform credentials into
-  HarborNAS control code.
+  HarborBeacon control code.
 - HarborOS control work MUST NOT directly deliver IM platform messages.
 - HarborOS control work MUST NOT import IM Gateway repo code, adapter code, or
   platform SDK-specific runtime code as part of HarborOS execution.

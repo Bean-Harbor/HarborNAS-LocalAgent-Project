@@ -146,7 +146,8 @@
   "room": "客厅",
   "ip": "192.168.3.73",
   "port": 554,
-  "path_candidates": ["/Streaming/Channels/101"],
+  "path_candidates": ["/stream1", "/stream2", "/Streaming/Channels/101"],
+  "snapshot_url": "http://192.168.3.73/snapshot.jpg",
   "username": "optional",
   "password": "optional"
 }

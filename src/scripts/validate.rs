@@ -130,7 +130,7 @@ pub fn build_checks(root: &Path) -> Vec<CheckResult> {
             "resume_token",
             "accepted-request delivery failures remain `HTTP 200` with `ok=false`",
             "direct platform delivery count is `0`",
-            "HARBORBEACON_ENABLE_LEGACY_IM_RECIPIENT_FALLBACK=1",
+            "must not reintroduce legacy recipient fallback",
             "Rollback must preserve the frozen boundary",
             "external IM repo",
         ]
@@ -141,14 +141,14 @@ pub fn build_checks(root: &Path) -> Vec<CheckResult> {
     });
 
     checks.push(CheckResult {
-        name: "rollback-doc:legacy-fallback-switch".to_string(),
+        name: "rollback-doc:legacy-fallback-removed".to_string(),
         passed: [
-            "legacy recipient fallback may only be re-enabled via",
-            "rollback notes must say whether legacy recipient fallback is disabled or explicitly re-enabled",
+            "legacy recipient fallback remains removed during rollback",
+            "rollback notes must say that legacy recipient fallback stayed disabled",
         ]
         .iter()
         .all(|item| rollback_doc.contains(item)),
-        details: "Rollback gate doc must describe the explicit legacy fallback switch and note requirement.".to_string(),
+        details: "Rollback gate doc must keep legacy recipient fallback removed and document that clearly.".to_string(),
         skipped: None,
     });
 
@@ -158,6 +158,11 @@ pub fn build_checks(root: &Path) -> Vec<CheckResult> {
             "Middleware API -> MidCLI -> Browser/MCP fallback",
             "Browser and MCP remain fallback-only for non-system domains",
             "HarborOS executors do not claim device-native domains",
+            "discover",
+            "snapshot",
+            "share_link",
+            "inspect",
+            "control",
             "keep `Browser/MCP` as fallback only for non-system domains",
             "do not route IM or notification concerns back into HarborOS system control",
         ]
@@ -171,14 +176,14 @@ pub fn build_checks(root: &Path) -> Vec<CheckResult> {
         name: "retrieval-launch-pack:operator-handoff".to_string(),
         passed: [
             "Retrieval Round-Trip Launch Pack",
-            "HARBORBEACON_ENABLE_LEGACY_KNOWLEDGE_NL_FALLBACK=1",
             "explicit `knowledge.search`",
             "returns `failed` from `task_api`",
+            "No legacy retrieval fallback exists to toggle during rollback.",
             "Rollback",
         ]
         .iter()
         .all(|item| retrieval_launch_doc.contains(item)),
-        details: "Retrieval launch pack must show explicit search, enabled fallback, disabled rollback, and operator-facing recovery notes.".to_string(),
+        details: "Retrieval launch pack must show explicit search, non-opportunistic general messages, and operator-facing rollback notes.".to_string(),
         skipped: None,
     });
 
@@ -187,12 +192,12 @@ pub fn build_checks(root: &Path) -> Vec<CheckResult> {
         passed: [
             "Retrieval Round-Trip Launch / Handoff Pack",
             "explicit `knowledge.search` 仍然可用",
-            "HARBORBEACON_ENABLE_LEGACY_KNOWLEDGE_NL_FALLBACK=1",
-            "operator note 能在一页里说明输入、输出、canary flag 状态和 rollback 行为",
+            "`general.message` 不再机会路由到 retrieval",
+            "operator note 能在一页里说明输入、输出和 rollback 行为",
         ]
         .iter()
         .all(|item| launch_checklist.contains(item)),
-        details: "Main launch checklist must point operators at the retrieval handoff pack and its canary/rollback story.".to_string(),
+        details: "Main launch checklist must point operators at the explicit-only retrieval handoff story.".to_string(),
         skipped: None,
     });
 

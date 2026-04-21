@@ -8,7 +8,7 @@ use harborbeacon_local_agent::adapters::rtsp::CommandRtspAdapter;
 use harborbeacon_local_agent::orchestrator::approval::{AutonomyConfig, AutonomyLevel};
 use harborbeacon_local_agent::orchestrator::executors::device_discovery::DeviceDiscoveryExecutor;
 use harborbeacon_local_agent::orchestrator::executors::harbor_ops::{
-    MidcliExecutor, MiddlewareExecutor, MiddlewareHttpExecutor, MiddlewareWsExecutor,
+    register_harbor_executors, HarborExecutorConfig,
 };
 use harborbeacon_local_agent::orchestrator::executors::vision::VisionExecutor;
 use harborbeacon_local_agent::orchestrator::tool_loop::{
@@ -150,7 +150,8 @@ impl Cli {
                     cli.autonomy = parse_autonomy(&value["--autonomy=".len()..]);
                 }
                 "--max-iterations" => {
-                    cli.max_iterations = take_usize(&take_value(&args, &mut index, "--max-iterations"))
+                    cli.max_iterations =
+                        take_usize(&take_value(&args, &mut index, "--max-iterations"))
                 }
                 value if value.starts_with("--max-iterations=") => {
                     cli.max_iterations = take_usize(&value["--max-iterations=".len()..]);
@@ -314,36 +315,18 @@ fn run_rtsp_open_mode(cli: &Cli, stream_url: &str) {
 fn run_plan_mode(cli: &Cli, plan: TaskPlan) {
     let mut router = Router::new();
     let device_registry_path = PathBuf::from(".harborbeacon/device-registry.json");
-
-    // If --harbor-url is provided, use WS executor (user+pass) or HTTP executor (api-key);
-    // otherwise fall back to local preview/passthrough executors.
-    if let Some(ref url) = cli.harbor_url {
-        if let Some(ref api_key) = cli.harbor_api_key {
-            // API key → HTTP REST executor
-            match MiddlewareHttpExecutor::with_api_key(url, api_key) {
-                Ok(exec) => router.register(Box::new(exec)),
-                Err(e) => {
-                    eprintln!("failed to create HTTP executor: {e}");
-                    std::process::exit(1);
-                }
-            }
-        } else if let (Some(ref user), Some(ref pass)) = (&cli.harbor_user, &cli.harbor_password) {
-            // Username + password → WebSocket middleware executor
-            router.register(Box::new(MiddlewareWsExecutor::new(url, user, pass)));
-        } else {
-            eprintln!("--harbor-url requires --harbor-api-key or --harbor-user/--harbor-password");
-            std::process::exit(1);
-        }
-    } else if !cli.disable_middleware {
-        router.register(Box::new(MiddlewareExecutor::new(true)));
-    }
-
-    if !cli.disable_midcli {
-        router.register(Box::new(MidcliExecutor::new(
-            true,
-            "midcli".to_string(),
-            cli.midcli_passthrough,
-        )));
+    let harbor_config = HarborExecutorConfig::from_cli(
+        cli.harbor_url.clone(),
+        cli.harbor_api_key.clone(),
+        cli.harbor_user.clone(),
+        cli.harbor_password.clone(),
+        cli.disable_middleware,
+        cli.disable_midcli,
+        cli.midcli_passthrough,
+    );
+    if let Err(error) = register_harbor_executors(&mut router, &harbor_config) {
+        eprintln!("failed to configure HarborOS executors: {error}");
+        std::process::exit(1);
     }
 
     let device_executor = match DeviceDiscoveryExecutor::new(

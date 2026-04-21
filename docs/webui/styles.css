@@ -100,6 +100,13 @@ body {
   letter-spacing: 0.08em;
 }
 
+.sidebar-copy {
+  margin: 0;
+  color: rgba(242, 235, 223, 0.78);
+  line-height: 1.6;
+  font-size: 13px;
+}
+
 .brand h1,
 .hero h2,
 .panel-header h3,
@@ -210,6 +217,15 @@ body {
   padding: 30px 32px 58px;
 }
 
+.workspace-section {
+  display: grid;
+  gap: 22px;
+}
+
+.workspace-section[hidden] {
+  display: none !important;
+}
+
 .hero,
 .metric-card,
 .panel {
@@ -281,10 +297,147 @@ body {
 .bind-grid,
 .intake-grid,
 .policy-grid,
+.account-summary-grid,
+.account-signal-grid,
+.gateway-status-grid,
+.task-signal-grid,
+.overview-signal-grid,
 .device-grid,
 .bottom-grid {
   display: grid;
   gap: 18px;
+}
+
+.page-state {
+  display: grid;
+  gap: 12px;
+  margin-top: 18px;
+  padding: 16px 18px;
+  border-radius: 22px;
+  background: rgba(248, 244, 236, 0.92);
+  border: 1px solid rgba(53, 64, 58, 0.08);
+}
+
+.page-state-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  align-items: center;
+}
+
+.page-state-title {
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+}
+
+.page-state-note {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.55;
+  font-size: 13px;
+}
+
+.page-state-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.state-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(53, 64, 58, 0.1);
+  background: rgba(255, 255, 255, 0.62);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.state-chip.active.loading {
+  color: var(--amber);
+  background: var(--amber-soft);
+}
+
+.state-chip.active.empty {
+  color: var(--muted);
+  background: rgba(105, 117, 109, 0.12);
+}
+
+.state-chip.active.blocker {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.state-chip.active.success {
+  color: var(--teal);
+  background: var(--teal-soft);
+}
+
+.model-endpoint-card,
+.model-policy-card,
+.legacy-model-card {
+  overflow: hidden;
+}
+
+.model-row-fields,
+.model-route-fields {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.model-row-fields {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.model-route-fields {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.model-row-inline,
+.model-route-inline {
+  display: grid;
+  gap: 10px;
+}
+
+.model-row-meta,
+.model-route-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.model-row-actions,
+.model-route-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+.model-result-chip {
+  color: var(--ink);
+  background: rgba(245, 239, 225, 0.9);
+}
+
+.model-result-chip.ok {
+  color: var(--teal);
+  background: var(--teal-soft);
+}
+
+.model-result-chip.failed {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.model-result-chip.unknown {
+  color: var(--muted);
+  background: rgba(105, 117, 109, 0.12);
 }
 
 .metric-grid {
@@ -354,9 +507,35 @@ body {
   margin-top: 18px;
 }
 
+.model-center-grid {
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1.1fr) minmax(0, 0.95fr);
+}
+
+.legacy-policy-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.account-summary-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 18px;
+}
+
+.account-signal-grid,
+.gateway-status-grid,
+.task-signal-grid,
+.overview-signal-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 18px;
+}
+
 .device-grid,
 .bottom-grid {
   grid-template-columns: 1.22fr 0.94fr;
+}
+
+.section-panel,
+.overview-panel {
+  overflow: hidden;
 }
 
 .subpanel,
@@ -1034,7 +1213,13 @@ select:focus {
 
 @media (max-width: 1200px) {
   .metric-grid,
-  .policy-grid {
+  .policy-grid,
+  .model-center-grid,
+  .account-summary-grid,
+  .account-signal-grid,
+  .gateway-status-grid,
+  .task-signal-grid,
+  .overview-signal-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -1072,6 +1257,12 @@ select:focus {
 
   .metric-grid,
   .policy-grid,
+  .model-center-grid,
+  .account-summary-grid,
+  .account-signal-grid,
+  .gateway-status-grid,
+  .task-signal-grid,
+  .overview-signal-grid,
   .scan-toolbar {
     grid-template-columns: 1fr;
   }
@@ -1091,5 +1282,11 @@ select:focus {
 
   .surface-copy h4 {
     font-size: 34px;
+  }
+
+  .model-row-fields,
+  .model-route-fields,
+  .legacy-policy-grid {
+    grid-template-columns: 1fr;
   }
 }

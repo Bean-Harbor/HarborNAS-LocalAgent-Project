@@ -1,7 +1,7 @@
 # HarborBeacon 本地智能体规划文档
 
 > 当前执行更新（2026-04-18）  
-> 当前落地重点不是继续扩张单仓 IM 能力，而是按 `HarborBeacon-IM-Gateway-Agent-Contract-v1.5` 完成双仓边界。  
+> 当前落地重点不是继续扩张单仓 IM 能力，而是按 `HarborBeacon-HarborGate-Agent-Contract-v1.5` 完成双仓边界。
 > IM 仓库负责 `adapter/gateway/route/平台凭据`；HarborBeacon 负责 `task/business state/approval/artifact/audit`。  
 > 两边只通过 HTTP/JSON contract 通信，不互相 import，也不共享 `.harborbeacon/*.json`。  
 > 本文档以下实施阶段与近期行动，均以 HarborBeacon 侧可执行工作为准。  

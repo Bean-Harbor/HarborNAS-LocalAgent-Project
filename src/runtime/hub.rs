@@ -15,11 +15,13 @@ use crate::adapters::ssdp::UdpSsdpAdapter;
 use crate::connectors::im_gateway::{GatewayPlatformStatus, GatewayStatusClient};
 use crate::connectors::storage::StorageTarget;
 use crate::runtime::admin_console::{
-    sanitize_defaults, AdminBindingState, AdminConsoleState, AdminConsoleStore, AdminDefaults,
-    BridgeProviderCapabilities, BridgeProviderConfig,
+    delivery_policy_summary, harboros_current_user_display_name, harboros_current_user_id,
+    harboros_writable_root, sanitize_defaults, AdminBindingState, AdminConsoleState,
+    AdminConsoleStore, AdminDefaults, BridgeProviderCapabilities, BridgeProviderConfig,
+    DeliveryPolicySummary,
 };
 use crate::runtime::discovery::{
-    DiscoveryProtocol, DiscoveryRequest, DiscoveryService, RtspProbeRequest,
+    default_rtsp_paths, DiscoveryProtocol, DiscoveryRequest, DiscoveryService, RtspProbeRequest,
 };
 use crate::runtime::media::{SnapshotCaptureRequest, SnapshotCaptureResult, SnapshotFormat};
 use crate::runtime::registry::{CameraDevice, DeviceRegistryStore, DeviceStatus, StreamTransport};
@@ -29,6 +31,10 @@ pub struct HubStateSnapshot {
     pub binding: AdminBindingState,
     pub defaults: AdminDefaults,
     pub bridge_provider: BridgeProviderConfig,
+    pub delivery_policy: DeliveryPolicySummary,
+    pub writable_root: String,
+    pub current_principal_user_id: String,
+    pub current_principal_display_name: String,
     pub devices: Vec<CameraDevice>,
 }
 
@@ -86,6 +92,8 @@ pub struct CameraConnectRequest {
     #[serde(default)]
     pub port: Option<u16>,
     #[serde(default)]
+    pub snapshot_url: Option<String>,
+    #[serde(default)]
     pub discovery_source: String,
     #[serde(default)]
     pub vendor: Option<String>,
@@ -131,6 +139,10 @@ impl CameraHubService {
             binding: enrich_binding_urls(state.binding, public_origin),
             defaults: state.defaults,
             bridge_provider: state.bridge_provider,
+            delivery_policy: delivery_policy_summary(),
+            writable_root: harboros_writable_root(),
+            current_principal_user_id: harboros_current_user_id(),
+            current_principal_display_name: harboros_current_user_display_name(),
             devices,
         })
     }
@@ -213,9 +225,15 @@ impl CameraHubService {
         let path_candidates = if request.path_candidates.is_empty() {
             state.defaults.rtsp_paths.clone()
         } else {
-            request.path_candidates
+            let mut paths = request.path_candidates.clone();
+            paths.extend(state.defaults.rtsp_paths.clone());
+            paths
         };
-        let path_candidates = crate::runtime::admin_console::dedupe_rtsp_paths(path_candidates);
+        let path_candidates = effective_rtsp_path_candidates(
+            &path_candidates,
+            request.vendor.as_deref(),
+            request.model.as_deref(),
+        );
         let username = request
             .username
             .and_then(|value| non_empty_opt(&value))
@@ -252,6 +270,7 @@ impl CameraHubService {
         device.vendor = request.vendor.filter(|value| !value.trim().is_empty());
         device.model = request.model.filter(|value| !value.trim().is_empty());
         device.ip_address = Some(ip.to_string());
+        device.snapshot_url = request.snapshot_url.and_then(|value| non_empty_opt(&value));
         device.discovery_source = if request.discovery_source.trim().is_empty() {
             "manual_entry".to_string()
         } else {
@@ -260,6 +279,8 @@ impl CameraHubService {
         device.primary_stream.transport = StreamTransport::Rtsp;
         device.primary_stream.requires_auth = probe.requires_auth;
         device.capabilities = probe.capabilities;
+        device.capabilities.snapshot =
+            device.snapshot_url.is_some() || device.capabilities.snapshot;
 
         let devices = upsert_devices(self.admin_store.registry_store(), &[device.clone()])?;
         let saved = devices
@@ -288,12 +309,15 @@ impl CameraHubService {
             .ok_or_else(|| format!("device not found: {device_id}"))?;
 
         let adapter = CommandRtspAdapter::default();
-        adapter.capture_snapshot(&SnapshotCaptureRequest::new(
-            device.device_id,
-            device.primary_stream.url,
-            SnapshotFormat::Jpeg,
-            StorageTarget::LocalDisk,
-        ))
+        adapter.capture_snapshot(
+            &SnapshotCaptureRequest::new(
+                device.device_id,
+                device.primary_stream.url,
+                SnapshotFormat::Jpeg,
+                StorageTarget::LocalDisk,
+            )
+            .with_snapshot_url(device.snapshot_url),
+        )
     }
 
     pub fn capture_camera_snapshot(&self, device_id: &str) -> Result<Vec<u8>, String> {
@@ -320,19 +344,24 @@ impl CameraHubService {
         let mut results = Vec::new();
 
         for ip in &candidate_ips {
+            let existing = existing_devices
+                .iter()
+                .find(|device| device.ip_address.as_deref() == Some(ip.as_str()))
+                .cloned();
+            let path_candidates = effective_rtsp_path_candidates(
+                &state.defaults.rtsp_paths,
+                existing.as_ref().and_then(|device| device.vendor.as_deref()),
+                existing.as_ref().and_then(|device| device.model.as_deref()),
+            );
             let probe_request = RtspProbeRequest {
                 candidate_id: format!("rtsp-{}", ip.replace('.', "-")),
                 ip_address: ip.clone(),
                 port: state.defaults.rtsp_port,
                 username: non_empty_opt(&state.defaults.rtsp_username),
                 password: non_empty_opt(&state.defaults.rtsp_password),
-                path_candidates: state.defaults.rtsp_paths.clone(),
+                path_candidates: path_candidates.clone(),
             };
             let probe = adapter.probe(&probe_request)?;
-            let existing = existing_devices
-                .iter()
-                .find(|device| device.ip_address.as_deref() == Some(ip.as_str()))
-                .cloned();
             let requires_auth = probe.requires_auth
                 || probe
                     .error_message
@@ -380,7 +409,7 @@ impl CameraHubService {
                     requires_auth,
                     vendor: device.vendor.clone(),
                     model: device.model.clone(),
-                    rtsp_paths: state.defaults.rtsp_paths.clone(),
+                    rtsp_paths: path_candidates.clone(),
                 });
             } else {
                 results.push(HubScanResultItem {
@@ -411,7 +440,7 @@ impl CameraHubService {
                     requires_auth,
                     vendor: existing.as_ref().and_then(|device| device.vendor.clone()),
                     model: existing.as_ref().and_then(|device| device.model.clone()),
-                    rtsp_paths: state.defaults.rtsp_paths.clone(),
+                    rtsp_paths: path_candidates,
                 });
             }
         }
@@ -472,11 +501,18 @@ impl CameraHubService {
                         .is_some_and(looks_like_auth_error)
             });
             let port = candidate.port.unwrap_or(state.defaults.rtsp_port);
-            let rtsp_paths = if candidate.rtsp_paths.is_empty() {
-                state.defaults.rtsp_paths.clone()
-            } else {
-                candidate.rtsp_paths.clone()
-            };
+            let vendor = candidate
+                .vendor
+                .clone()
+                .or_else(|| device.and_then(|item| item.vendor.clone()));
+            let model = candidate
+                .model
+                .clone()
+                .or_else(|| device.and_then(|item| item.model.clone()));
+            let mut candidate_paths = candidate.rtsp_paths.clone();
+            candidate_paths.extend(state.defaults.rtsp_paths.iter().cloned());
+            let rtsp_paths =
+                effective_rtsp_path_candidates(&candidate_paths, vendor.as_deref(), model.as_deref());
 
             let base = match candidate.protocol {
                 DiscoveryProtocol::Onvif => "ONVIF",
@@ -519,8 +555,8 @@ impl CameraHubService {
                 reachable,
                 registered: device.is_some(),
                 requires_auth,
-                vendor: candidate.vendor.clone().or_else(|| device.and_then(|item| item.vendor.clone())),
-                model: candidate.model.clone().or_else(|| device.and_then(|item| item.model.clone())),
+                vendor,
+                model,
                 rtsp_paths,
             });
         }
@@ -547,12 +583,10 @@ pub fn build_mobile_setup_url(public_origin: &str, session_code: Option<&str>) -
 
 pub fn enrich_binding_urls(
     mut binding: AdminBindingState,
-    public_origin: Option<&str>,
+    _public_origin: Option<&str>,
 ) -> AdminBindingState {
-    if let Some(public_origin) = public_origin {
-        binding.setup_url = build_mobile_setup_url(public_origin, Some(&binding.session_code));
-        binding.static_setup_url = build_mobile_setup_url(public_origin, None);
-    }
+    binding.setup_url.clear();
+    binding.static_setup_url.clear();
     binding
 }
 
@@ -574,6 +608,29 @@ pub fn resolve_discovery_protocols(discovery: &str) -> Vec<DiscoveryProtocol> {
     }
     protocols.push(DiscoveryProtocol::RtspProbe);
     protocols
+}
+
+fn effective_rtsp_path_candidates(
+    base_paths: &[String],
+    vendor: Option<&str>,
+    model: Option<&str>,
+) -> Vec<String> {
+    let mut paths = base_paths.to_vec();
+    if is_tp_link_tapo_vendor(vendor, model) {
+        paths.push("/stream1".to_string());
+        paths.push("/stream2".to_string());
+    }
+    paths.extend(default_rtsp_paths());
+    crate::runtime::admin_console::dedupe_rtsp_paths(paths)
+}
+
+fn is_tp_link_tapo_vendor(vendor: Option<&str>, model: Option<&str>) -> bool {
+    let vendor = vendor.unwrap_or_default().to_ascii_lowercase();
+    let model = model.unwrap_or_default().to_ascii_lowercase();
+    vendor.contains("tapo")
+        || vendor.contains("tp-link")
+        || vendor.contains("tplink")
+        || model.contains("tapo")
 }
 
 pub fn non_empty_opt(value: &str) -> Option<String> {
@@ -642,6 +699,7 @@ pub fn merge_camera(existing: CameraDevice, incoming: CameraDevice) -> CameraDev
             incoming.discovery_source
         },
         primary_stream: incoming.primary_stream,
+        snapshot_url: incoming.snapshot_url.or(existing.snapshot_url),
         onvif_device_service_url: incoming
             .onvif_device_service_url
             .or(existing.onvif_device_service_url),
@@ -853,8 +911,9 @@ fn normalize_network(network: Ipv4Addr, prefix: u8) -> Ipv4Addr {
 #[cfg(test)]
 mod tests {
     use super::{
-        bridge_provider_status_from_gateway_response, build_mobile_setup_url, humanize_probe_error,
-        looks_like_auth_error, merge_camera, normalize_camera_metadata,
+        bridge_provider_status_from_gateway_response, build_mobile_setup_url,
+        effective_rtsp_path_candidates, humanize_probe_error, looks_like_auth_error, merge_camera,
+        normalize_camera_metadata,
         resolve_discovery_protocols,
     };
     use crate::connectors::im_gateway::{GatewayPlatformCapabilities, GatewayPlatformStatus};
@@ -878,6 +937,24 @@ mod tests {
         assert_eq!(
             humanize_probe_error("rtsp://demo: 401 Unauthorized"),
             "RTSP 返回 401，说明摄像头需要密码。"
+        );
+    }
+
+    #[test]
+    fn effective_rtsp_path_candidates_keep_existing_entries_and_add_tapo_fallbacks() {
+        let paths = effective_rtsp_path_candidates(
+            &["/Streaming/Channels/101".to_string()],
+            Some("TP-Link"),
+            Some("Tapo C200"),
+        );
+
+        assert_eq!(paths[0], "/Streaming/Channels/101");
+        assert!(paths.contains(&"/stream1".to_string()));
+        assert!(paths.contains(&"/stream2".to_string()));
+        assert!(paths.contains(&"/live".to_string()));
+        assert_eq!(
+            paths.iter().filter(|path| path.as_str() == "/stream1").count(),
+            1
         );
     }
 

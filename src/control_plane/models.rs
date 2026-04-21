@@ -15,6 +15,19 @@ pub enum ModelKind {
     Embedder,
 }
 
+impl ModelKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Llm => "llm",
+            Self::Vlm => "vlm",
+            Self::Ocr => "ocr",
+            Self::Asr => "asr",
+            Self::Detector => "detector",
+            Self::Embedder => "embedder",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelEndpointKind {
@@ -24,6 +37,16 @@ pub enum ModelEndpointKind {
     Cloud,
 }
 
+impl ModelEndpointKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Sidecar => "sidecar",
+            Self::Cloud => "cloud",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelEndpointStatus {
@@ -31,6 +54,16 @@ pub enum ModelEndpointStatus {
     Active,
     Degraded,
     Disabled,
+}
+
+impl ModelEndpointStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Degraded => "degraded",
+            Self::Disabled => "disabled",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

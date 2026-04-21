@@ -20,7 +20,19 @@ Cutover is allowed only when all of the following are true:
 - non-200 errors remain reserved for request rejection, while accepted delivery failures remain `HTTP 200`
 - HarborBeacon does not directly deliver platform messages after cutover
 - HarborBeacon does not own raw platform credentials, credential validation, or platform-provider auth state
-- legacy recipient fallback may only be re-enabled via `HARBORBEACON_ENABLE_LEGACY_IM_RECIPIENT_FALLBACK=1` during rollback
+- legacy recipient fallback remains removed during rollback; replay only the
+  HarborGate-owned `route_key` delivery path
+
+## Migration Switches
+
+These are the only closeout switches that matter for HarborBeacon-side docs:
+
+- `HARBORBEACON_ENABLE_LEGACY_IM_RECIPIENT_FALLBACK`: decommissioned on the
+  HarborBeacon side and not part of the steady-state rollback shape
+- direct platform delivery path: decommissioned in HarborBeacon; rollback must
+  keep delivery on HarborGate
+- raw platform credential ownership/validation: decommissioned in HarborBeacon;
+  status should come from redacted HarborGate views only
 
 ## Rollback Gates
 
@@ -32,7 +44,18 @@ Rollback is acceptable only if it keeps HarborBeacon inside the same frozen boun
 - rollback must not broaden HarborOS into IM transport ownership
 - rollback must preserve existing HarborOS system-domain fallback order:
   - `Middleware API -> MidCLI -> Browser/MCP fallback`
-- rollback notes must say whether legacy recipient fallback is disabled or explicitly re-enabled
+- rollback notes must say that legacy recipient fallback stayed disabled
+
+## Old-Path Decommissioning Checklist
+
+The HarborBeacon side is considered decommissioned only when all of the following
+are true:
+
+- no direct platform delivery path remains in HarborBeacon docs or runbooks
+- no HarborBeacon-owned raw credential storage or validation remains in scope
+- no legacy recipient fallback is available as a HarborBeacon rollback shape
+- HarborBeacon rollback references the HarborGate-owned delivery path only
+- the HarborOS fallback order remains unchanged and separate from IM transport
 
 If cutover fails, rollback should revert to the previous approved interface path
 without moving platform ownership back into HarborBeacon.

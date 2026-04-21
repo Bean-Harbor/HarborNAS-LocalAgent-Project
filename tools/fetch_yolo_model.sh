@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_DIR="${MODEL_DIR:-/var/lib/harbornas/models}"
+MODEL_DIR="${MODEL_DIR:-/var/lib/harborbeacon/models}"
 MODEL_NAME="${MODEL_NAME:-yolov8n.pt}"
 MODEL_URL="${MODEL_URL:-https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8n.pt}"
 

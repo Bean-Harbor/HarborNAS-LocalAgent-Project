@@ -1,29 +1,31 @@
 //! Minimal Assistant Task API service for HarborBeacon integration.
 
-use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::adapters::rtsp::CommandRtspAdapter;
 use crate::connectors::notifications::{
     NotificationAttachment, NotificationAttachmentKind, NotificationContent, NotificationDelivery,
     NotificationDeliveryError, NotificationDeliveryMode, NotificationDeliveryService,
     NotificationDestination, NotificationDestinationKind, NotificationMetadata,
-    NotificationPayloadFormat, NotificationRecipient, NotificationRecipientIdType,
-    NotificationRequest, NotificationSource,
+    NotificationPayloadFormat, NotificationRequest, NotificationSource,
 };
+#[cfg(test)]
+use crate::connectors::notifications::{NotificationRecipient, NotificationRecipientIdType};
 use crate::connectors::storage::StorageTarget;
 use crate::control_plane::approvals::{ApprovalStatus, ApprovalTicket};
 use crate::control_plane::events::{EventRecord, EventSeverity, EventSourceKind};
 use crate::control_plane::media::{
     MediaAsset, MediaAssetKind, MediaDeliveryMode, MediaSession, MediaSessionKind,
-    MediaSessionStatus, ShareAccessScope, ShareLink, StorageTargetKind,
+    MediaSessionStatus, RecordingPolicy, ShareAccessScope, ShareLink, StorageTargetKind,
 };
 use crate::control_plane::tasks::{
     ArtifactKind, ArtifactRecord, ConversationSession, ExecutionRoute, TaskRun, TaskRunStatus,
@@ -32,16 +34,19 @@ use crate::control_plane::tasks::{
 use crate::domains::knowledge::{DOMAIN as KNOWLEDGE_DOMAIN, OP_SEARCH as KNOWLEDGE_OP_SEARCH};
 use crate::domains::vision::OP_ANALYZE_CAMERA;
 use crate::orchestrator::approval::{ApprovalManager, AutonomyConfig, AutonomyLevel};
-use crate::orchestrator::contracts::{Action, RiskLevel, StepStatus};
+use crate::orchestrator::contracts::{Action, ExecutionResult, RiskLevel, StepStatus};
+use crate::orchestrator::executors::harbor_ops::{register_harbor_executors, HarborExecutorConfig};
 use crate::orchestrator::executors::vision::VisionExecutor;
 use crate::orchestrator::policy::{
     action_requires_approval, apply_governance_defaults, effective_risk_level, enforce,
     ApprovalContext,
 };
-use crate::orchestrator::router::Executor;
+use crate::orchestrator::router::{Executor, Router};
 use crate::runtime::admin_console::{
-    resolved_identity_binding_records, AdminConsoleState, AdminConsoleStore, IdentityBindingRecord,
+    harboros_writable_root, AdminConsoleState, AdminConsoleStore, NotificationTargetRecord,
 };
+#[cfg(test)]
+use crate::runtime::admin_console::{resolved_identity_binding_records, IdentityBindingRecord};
 use crate::runtime::hub::{
     looks_like_auth_error, CameraConnectRequest, CameraHubService, HubScanRequest,
     HubScanResultItem,
@@ -49,7 +54,10 @@ use crate::runtime::hub::{
 use crate::runtime::knowledge::{
     KnowledgeSearchRequest, KnowledgeSearchResponse, KnowledgeSearchService,
 };
-use crate::runtime::media::SnapshotCaptureResult;
+use crate::runtime::media::{ClipCaptureRequest, ClipCaptureResult, SnapshotCaptureResult};
+use crate::runtime::model_center::{
+    run_llm_text_with_state, run_ocr_with_state, run_vlm_summary_with_state,
+};
 use crate::runtime::registry::ResolvedCameraTarget;
 use crate::runtime::remote_view;
 use crate::runtime::task_session::{
@@ -57,11 +65,7 @@ use crate::runtime::task_session::{
     TaskConversationState, TaskConversationStore,
 };
 
-const LEGACY_IM_RECIPIENT_FALLBACK_ENV: &str = "HARBORBEACON_ENABLE_LEGACY_IM_RECIPIENT_FALLBACK";
-const LEGACY_IM_RECIPIENT_FALLBACK_ENV_ALIAS: &str =
-    "HARBORNAS_ENABLE_LEGACY_IM_RECIPIENT_FALLBACK";
-const KNOWLEDGE_NL_FALLBACK_ENV: &str = "HARBORBEACON_ENABLE_LEGACY_KNOWLEDGE_NL_FALLBACK";
-const KNOWLEDGE_NL_FALLBACK_ENV_ALIAS: &str = "HARBORNAS_ENABLE_LEGACY_KNOWLEDGE_NL_FALLBACK";
+const ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV: &str = "HARBOR_ALLOW_NON_HARBOROS_CAPTURE_ROOT";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct TaskSource {
@@ -266,6 +270,34 @@ pub enum TaskRequestAcceptance {
     Conflict(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GeneralMessagePlanKind {
+    CameraSnapshot,
+    CameraRecordClip,
+    KnowledgeSearch,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GeneralMessagePlan {
+    kind: GeneralMessagePlanKind,
+    camera_hint: Option<String>,
+    query: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+struct GeneralMessagePlanPayload {
+    #[serde(default)]
+    action: String,
+    #[serde(default)]
+    camera_hint: Option<String>,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskApiService {
     admin_store: AdminConsoleStore,
@@ -412,6 +444,11 @@ impl TaskApiService {
         if request.trace_id.trim().is_empty() {
             request.trace_id = request.task_id.clone();
         }
+        let _ = self.admin_store.record_member_interactive_surface(
+            &request.source.user_id,
+            &request.source.channel,
+            Some(&request.source.route_key),
+        );
         let tracking = self.begin_task_tracking(&request);
 
         let mut response = match (
@@ -421,12 +458,11 @@ impl TaskApiService {
             (domain, action) if domain == KNOWLEDGE_DOMAIN && action == KNOWLEDGE_OP_SEARCH => {
                 self.handle_knowledge_search(&request)
             }
-            (domain, action)
-                if domain == "general"
-                    && action == "message"
-                    && should_route_general_message_to_knowledge(&request) =>
-            {
-                self.handle_knowledge_search(&request)
+            (domain, action) if domain == "general" && action == "message" => {
+                self.handle_general_message(&request)
+            }
+            (domain, action) if is_supported_harbor_task(&domain, &action) => {
+                self.handle_harbor_system_action(&request)
             }
             (domain, action) if domain == "camera" && action == "scan" => {
                 self.handle_camera_scan(&request)
@@ -527,6 +563,131 @@ impl TaskApiService {
             prompt: string_at_paths(&output_payload, &["/prompt"]),
             resume_token: string_at_paths(&output_payload, &["/resume_token"]),
         })
+    }
+
+    fn handle_harbor_system_action(&self, request: &TaskRequest) -> TaskResponse {
+        let action = match build_harbor_action_from_request(request) {
+            Ok(action) => action,
+            Err(error) => {
+                return self.failed(
+                    request,
+                    "harboros_router",
+                    expected_risk_level(request),
+                    error,
+                );
+            }
+        };
+
+        if let Err(response) = self.ensure_action_allowed(request, &action, "harboros_router") {
+            return response;
+        }
+
+        let mut router = Router::new();
+        if let Err(error) =
+            register_harbor_executors(&mut router, &HarborExecutorConfig::from_env())
+        {
+            let error_message = error.clone();
+            let data = json!({
+                "domain": action.domain.clone(),
+                "operation": action.operation.clone(),
+                "resource": action.resource.clone(),
+                "executor_used": "harboros_router",
+                "route_fallback_used": false,
+                "error_code": "EXECUTOR_CONFIG_ERROR",
+                "error_message": error_message,
+            });
+            let event = self.serialize_event_record(&build_task_event_record(
+                request,
+                &step_id_for_request(request),
+                "task.harboros_failed",
+                EventSeverity::Error,
+                data.clone(),
+            ));
+            return self.failed_with_context(
+                request,
+                "harboros_router",
+                action.risk_level,
+                format!("HarborOS executor configuration error: {error}"),
+                data,
+                vec![event],
+            );
+        }
+
+        let execution = router.execute(&action, &request.task_id, &step_id_for_request(request));
+        self.harbor_response_from_execution(request, &action, execution)
+    }
+
+    fn harbor_response_from_execution(
+        &self,
+        request: &TaskRequest,
+        action: &Action,
+        execution: ExecutionResult,
+    ) -> TaskResponse {
+        let preview = harbor_execution_is_preview(&execution.result_payload);
+        let data = json!({
+            "domain": action.domain.clone(),
+            "operation": action.operation.clone(),
+            "resource": action.resource.clone(),
+            "executor_used": execution.executor_used.clone(),
+            "route_fallback_used": execution.fallback_used,
+            "duration_ms": execution.duration_ms,
+            "preview": preview,
+            "result": execution.result_payload.clone(),
+            "error_code": execution.error_code.clone(),
+            "error_message": execution.error_message.clone(),
+        });
+        let (status, event_type, severity, message) = if execution.ok() {
+            (
+                TaskStatus::Completed,
+                "task.harboros_dispatched",
+                EventSeverity::Info,
+                format!(
+                    "HarborOS {}.{} 已通过 {} 执行",
+                    action.domain, action.operation, execution.executor_used
+                ),
+            )
+        } else {
+            (
+                TaskStatus::Failed,
+                "task.harboros_failed",
+                EventSeverity::Error,
+                format!(
+                    "HarborOS {}.{} 执行失败: {}",
+                    action.domain,
+                    action.operation,
+                    execution
+                        .error_message
+                        .clone()
+                        .unwrap_or_else(|| "unknown error".to_string())
+                ),
+            )
+        };
+        let event = self.serialize_event_record(&build_task_event_record(
+            request,
+            &step_id_for_request(request),
+            event_type,
+            severity,
+            data.clone(),
+        ));
+
+        TaskResponse {
+            task_id: request.task_id.clone(),
+            trace_id: request.trace_id.clone(),
+            status,
+            executor_used: execution.executor_used.clone(),
+            risk_level: action.risk_level,
+            result: TaskResultEnvelope {
+                message,
+                data,
+                artifacts: Vec::new(),
+                events: vec![event],
+                next_actions: Vec::new(),
+            },
+            audit_ref: non_empty_audit_ref(&execution.audit_ref),
+            missing_fields: Vec::new(),
+            prompt: None,
+            resume_token: None,
+        }
     }
 
     fn handle_camera_scan(&self, request: &TaskRequest) -> TaskResponse {
@@ -683,6 +844,7 @@ impl TaskApiService {
                     ip: candidate.ip.clone(),
                     room: candidate.room.clone(),
                     port: candidate.port,
+                    snapshot_url: None,
                     rtsp_paths: candidate.rtsp_paths.clone(),
                     requires_auth: true,
                     vendor: candidate.vendor.clone(),
@@ -719,6 +881,7 @@ impl TaskApiService {
             ip: ip.clone(),
             room: first_string(&[&request.entity_refs, &request.args], &["/room"]),
             port: first_u16(&[&request.entity_refs, &request.args], &["/port"]).unwrap_or(554),
+            snapshot_url: first_string(&[&request.entity_refs, &request.args], &["/snapshot_url"]),
             rtsp_paths: first_string_vec(
                 &[&request.entity_refs, &request.args],
                 &["/path_candidates", "/rtsp_paths"],
@@ -913,6 +1076,23 @@ impl TaskApiService {
                             "notification_delivery".to_string(),
                             delivery_outcome.payload.clone(),
                         );
+                        if notification_request.destination.kind
+                            == NotificationDestinationKind::Conversation
+                        {
+                            object.insert(
+                                "interaction_reply".to_string(),
+                                delivery_outcome.payload.clone(),
+                            );
+                        }
+                        if notification_request.destination.kind
+                            == NotificationDestinationKind::Recipient
+                            && delivery_outcome.event_type == "task.proactive_delivery_failed"
+                        {
+                            object.insert(
+                                "proactive_delivery_failure".to_string(),
+                                delivery_outcome.payload.clone(),
+                            );
+                        }
                     }
                     events.push(self.serialize_event_record(&build_task_event_record(
                         request,
@@ -949,6 +1129,210 @@ impl TaskApiService {
         }
     }
 
+    fn handle_general_message(&self, request: &TaskRequest) -> TaskResponse {
+        let plan = match self.general_message_plan(request) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return self.failed(request, "agentic_interpreter", RiskLevel::Low, error);
+            }
+        };
+
+        match plan.kind {
+            GeneralMessagePlanKind::CameraSnapshot => {
+                let mut routed = request.clone();
+                routed.intent.domain = "camera".to_string();
+                routed.intent.action = "snapshot".to_string();
+                if let Some(camera_hint) = plan.camera_hint {
+                    upsert_json_string(&mut routed.args, "/device_hint", &camera_hint);
+                }
+                self.handle_camera_snapshot(&routed)
+            }
+            GeneralMessagePlanKind::CameraRecordClip => {
+                let mut routed = request.clone();
+                routed.intent.domain = "camera".to_string();
+                routed.intent.action = "record_clip".to_string();
+                if let Some(camera_hint) = plan.camera_hint {
+                    upsert_json_string(&mut routed.args, "/device_hint", &camera_hint);
+                }
+                self.handle_camera_record_clip(&routed)
+            }
+            GeneralMessagePlanKind::KnowledgeSearch => {
+                let mut routed = request.clone();
+                routed.intent.domain = KNOWLEDGE_DOMAIN.to_string();
+                routed.intent.action = KNOWLEDGE_OP_SEARCH.to_string();
+                if let Some(query) = plan.query {
+                    upsert_json_string(&mut routed.args, "/query", &query);
+                }
+                if routed.args.pointer("/roots").is_none() {
+                    if let Some(root) = self.default_capture_search_root() {
+                        upsert_json_string_vec(&mut routed.args, "/roots", &[root]);
+                    }
+                }
+                self.handle_knowledge_search(&routed)
+            }
+            GeneralMessagePlanKind::Unsupported => self.failed(
+                request,
+                "agentic_interpreter",
+                RiskLevel::Low,
+                plan.reason.unwrap_or_else(|| {
+                    "当前自然语义没有被解释成可执行的抓拍、短视频或检索任务。".to_string()
+                }),
+            ),
+        }
+    }
+
+    fn general_message_plan(&self, request: &TaskRequest) -> Result<GeneralMessagePlan, String> {
+        let admin_state = self.admin_store.load_or_create_state()?;
+        let camera_targets = self
+            .admin_store
+            .registry_store()
+            .load_camera_targets()
+            .unwrap_or_default();
+        let selected_camera = admin_state.defaults.selected_camera_device_id.clone();
+        let writable_root = harboros_writable_root();
+        let capture_subdirectory = admin_state.defaults.capture_subdirectory.clone();
+        let clip_length_seconds = admin_state.defaults.clip_length_seconds;
+        let llm_prompt = build_general_message_planner_prompt(
+            request,
+            &camera_targets,
+            selected_camera.as_deref(),
+            writable_root.as_str(),
+            capture_subdirectory.as_str(),
+            clip_length_seconds,
+        );
+
+        let llm_plan = run_llm_text_with_state(&llm_prompt, &admin_state.models);
+        if llm_plan.available && !llm_plan.text.trim().is_empty() {
+            if let Some(plan) = parse_general_message_plan(&llm_plan.text) {
+                return Ok(plan);
+            }
+        }
+
+        fallback_general_message_plan(
+            request.intent.raw_text.as_str(),
+            selected_camera.as_deref(),
+        )
+        .ok_or_else(|| {
+            if llm_plan.summary.trim().is_empty() {
+                "当前没有可用的自然语义解释器，请先在 Model Center 配置可用的 LLM endpoint。"
+                    .to_string()
+            } else {
+                format!("自然语义解释失败：{}", llm_plan.summary)
+            }
+        })
+    }
+
+    fn handle_camera_record_clip(&self, request: &TaskRequest) -> TaskResponse {
+        let target = match self.resolve_camera_target(request) {
+            Ok(target) => target,
+            Err(error) => {
+                return self.failed(request, "camera_hub_service", RiskLevel::Low, error);
+            }
+        };
+
+        let action = apply_governance_defaults(Action {
+            domain: "camera".to_string(),
+            operation: "record_clip".to_string(),
+            resource: json!({ "device_id": target.device_id.clone() }),
+            args: json!({ "device_id": target.device_id.clone() }),
+            risk_level: RiskLevel::Low,
+            requires_approval: request_requires_approval(request),
+            dry_run: false,
+        });
+        if let Err(response) = self.ensure_action_allowed(request, &action, "camera_hub_service") {
+            return response;
+        }
+
+        let admin_state = match self.admin_store.load_or_create_state() {
+            Ok(state) => state,
+            Err(error) => {
+                return self.failed(request, "camera_hub_service", RiskLevel::Low, error);
+            }
+        };
+        let recording_policy = resolved_recording_policy(&admin_state, Some(&target));
+        let capture_root = match resolved_capture_directory(&admin_state, recording_policy.as_ref()) {
+            Ok(path) => path,
+            Err(error) => {
+                return self.failed(request, "camera_hub_service", RiskLevel::Low, error);
+            }
+        };
+        let clip_length_seconds = recording_policy
+            .as_ref()
+            .and_then(RecordingPolicy::clip_length_seconds_hint)
+            .unwrap_or_else(|| admin_state.defaults.clip_length_seconds)
+            .clamp(3, 300);
+        let keyframe_count = recording_policy
+            .as_ref()
+            .and_then(RecordingPolicy::keyframe_count_hint)
+            .or(Some(admin_state.defaults.keyframe_count));
+        let keyframe_interval_seconds = recording_policy
+            .as_ref()
+            .and_then(RecordingPolicy::keyframe_interval_seconds_hint)
+            .or(Some(admin_state.defaults.keyframe_interval_seconds));
+
+        let clip_path = build_clip_output_path(&capture_root, &target, current_epoch_ms());
+        let adapter = CommandRtspAdapter::default();
+        let clip_request = ClipCaptureRequest::new(
+            target.device_id.clone(),
+            target.primary_stream.url.clone(),
+            clip_length_seconds,
+            StorageTarget::HarborOsPool,
+        )
+        .with_keyframe_hints(keyframe_count, keyframe_interval_seconds);
+
+        let clip = match adapter.capture_clip_to_path(&clip_request, &clip_path) {
+            Ok(result) => result,
+            Err(error) => {
+                return self.failed(request, "camera_hub_service", RiskLevel::Low, error);
+            }
+        };
+        let keyframes_dir = build_keyframe_directory(&capture_root, &clip_path);
+        let keyframes = match adapter.extract_keyframes(
+            &clip_path,
+            &keyframes_dir,
+            keyframe_count,
+            keyframe_interval_seconds,
+        ) {
+            Ok(paths) => paths,
+            Err(error) => {
+                return self.failed(
+                    request,
+                    "camera_hub_service",
+                    RiskLevel::Low,
+                    format!("短视频已保存，但关键帧抽取失败: {error}"),
+                );
+            }
+        };
+        if let Err(error) = self.persist_clip_ingest(&admin_state, &target, &clip, &keyframes) {
+            return self.failed(
+                request,
+                "camera_hub_service",
+                RiskLevel::Low,
+                format!("短视频已保存，但写入索引副产物失败: {error}"),
+            );
+        }
+
+        let media_asset = build_clip_media_asset(request, &target, &clip);
+        if let Err(error) = self.conversation_store.save_media_asset(&media_asset) {
+            return self.failed(
+                request,
+                "camera_hub_service",
+                RiskLevel::Low,
+                format!("短视频已保存，但保存媒体记录失败: {error}"),
+            );
+        }
+
+        self.completed(
+            request,
+            "camera_hub_service",
+            RiskLevel::Low,
+            format!("已录制 {} 的短视频片段。", target.display_name),
+            build_clip_payload(&target, &clip, &keyframes, &media_asset),
+            build_clip_artifacts(&clip, &keyframes, &media_asset),
+            vec!["检索这段视频".to_string()],
+        )
+    }
+
     fn handle_camera_snapshot(&self, request: &TaskRequest) -> TaskResponse {
         let target = match self.resolve_camera_target(request) {
             Ok(target) => target,
@@ -972,6 +1356,29 @@ impl TaskApiService {
 
         match self.hub().capture_camera_snapshot_result(&target.device_id) {
             Ok(snapshot) => {
+                let admin_state = match self.admin_store.load_or_create_state() {
+                    Ok(state) => state,
+                    Err(error) => {
+                        return self.failed(request, "camera_hub_service", RiskLevel::Low, error);
+                    }
+                };
+                let recording_policy = resolved_recording_policy(&admin_state, Some(&target));
+                let snapshot = match self.persist_snapshot_capture(
+                    &admin_state,
+                    recording_policy.as_ref(),
+                    &target,
+                    snapshot,
+                ) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        return self.failed(
+                            request,
+                            "camera_hub_service",
+                            RiskLevel::Low,
+                            format!("抓拍已完成，但保存图片失败: {error}"),
+                        );
+                    }
+                };
                 let media_asset = build_snapshot_media_asset(request, &target, &snapshot);
                 if let Err(error) = self.conversation_store.save_media_asset(&media_asset) {
                     return self.failed(
@@ -1162,10 +1569,110 @@ impl TaskApiService {
             }
         }
 
+        if let Ok(state) = self.admin_store.load_or_create_state() {
+            if let Some(selected) = state.defaults.selected_camera_device_id.as_deref() {
+                if let Some(target) = targets.iter().find(|target| target.device_id == selected) {
+                    return Ok(target.clone());
+                }
+            }
+        }
+
         targets
             .first()
             .cloned()
             .ok_or_else(|| "未找到可分析的摄像头设备。".to_string())
+    }
+
+    fn default_capture_search_root(&self) -> Option<String> {
+        let state = self.admin_store.load_or_create_state().ok()?;
+        resolved_capture_directory(&state, resolved_recording_policy(&state, None).as_ref())
+            .ok()
+            .map(|path| path.to_string_lossy().to_string())
+    }
+
+    fn persist_snapshot_capture(
+        &self,
+        state: &AdminConsoleState,
+        recording_policy: Option<&RecordingPolicy>,
+        target: &ResolvedCameraTarget,
+        snapshot: SnapshotCaptureResult,
+    ) -> Result<SnapshotCaptureResult, String> {
+        let capture_root = resolved_capture_directory(state, recording_policy)?;
+        let image_bytes = BASE64_STANDARD
+            .decode(snapshot.bytes_base64.as_bytes())
+            .map_err(|error| format!("failed to decode snapshot bytes: {error}"))?;
+        let output_path = build_snapshot_output_path(
+            &capture_root,
+            target,
+            snapshot.captured_at_epoch_ms,
+            snapshot.format.file_extension(),
+        );
+        fs::write(&output_path, &image_bytes)
+            .map_err(|error| format!("failed to write snapshot {}: {error}", output_path.display()))?;
+
+        let mut persisted = snapshot;
+        persisted.storage.target = StorageTarget::HarborOsPool;
+        persisted.storage.relative_path = output_path.to_string_lossy().to_string();
+        persisted.index_sidecar_relative_path = output_path
+            .with_extension("json")
+            .to_string_lossy()
+            .to_string();
+
+        let ocr = run_ocr_with_state(&output_path, &state.models);
+        let vlm = run_vlm_summary_with_state(&output_path, &state.models);
+        let snapshot_tags = vec!["camera".to_string(), "snapshot".to_string()];
+        write_media_index_sidecar(
+            &output_path.with_extension("json"),
+            &persisted.storage.relative_path,
+            None,
+            target,
+            &ocr.text,
+            &vlm.text,
+            &snapshot_tags,
+        )?;
+
+        Ok(persisted)
+    }
+
+    fn persist_clip_ingest(
+        &self,
+        state: &AdminConsoleState,
+        target: &ResolvedCameraTarget,
+        clip: &ClipCaptureResult,
+        keyframes: &[PathBuf],
+    ) -> Result<(), String> {
+        let clip_path = PathBuf::from(&clip.storage.relative_path);
+        let clip_tags = vec!["video".to_string(), "clip".to_string()];
+        write_media_index_sidecar(
+            &clip_path.with_extension("json"),
+            &clip.storage.relative_path,
+            None,
+            target,
+            "",
+            &format!(
+                "短视频片段，时长 {} 秒，共提取 {} 张关键帧。",
+                clip.clip_length_seconds,
+                keyframes.len()
+            ),
+            &clip_tags,
+        )?;
+
+        for keyframe in keyframes {
+            let ocr = run_ocr_with_state(keyframe, &state.models);
+            let vlm = run_vlm_summary_with_state(keyframe, &state.models);
+            let keyframe_tags = vec!["video".to_string(), "keyframe".to_string()];
+            write_media_index_sidecar(
+                &keyframe.with_extension("json"),
+                keyframe.to_string_lossy().as_ref(),
+                Some(&clip.storage.relative_path),
+                target,
+                &ocr.text,
+                &vlm.text,
+                &keyframe_tags,
+            )?;
+        }
+
+        Ok(())
     }
 
     fn completed(
@@ -1547,9 +2054,6 @@ impl TaskApiService {
             ),
             _ => (NotificationDeliveryMode::Send, String::new(), String::new()),
         };
-        let explicit_recipient = notification_recipient_from_args(&request.args);
-        let admin_state = self.admin_store.load_state().ok();
-        let allow_legacy_recipient_fallback = legacy_im_recipient_fallback_enabled();
         let destination = if matches!(platform_hint.as_deref(), Some("local_ui")) {
             NotificationDestination {
                 kind: NotificationDestinationKind::LocalUi,
@@ -1568,38 +2072,9 @@ impl TaskApiService {
                 platform: String::new(),
                 recipient: None,
             }
-        } else if allow_legacy_recipient_fallback {
-            let fallback_recipient = explicit_recipient.or_else(|| {
-                let destination = legacy_destination.as_deref().unwrap_or_default();
-                admin_state.as_ref().and_then(|state| {
-                    resolve_notification_recipient(
-                        destination,
-                        state,
-                        request.source.user_id.as_str(),
-                    )
-                })
-            });
-            if let Some(recipient) = fallback_recipient {
-                NotificationDestination {
-                    kind: NotificationDestinationKind::Recipient,
-                    route_key: String::new(),
-                    id: legacy_destination.clone().unwrap_or_default(),
-                    platform: platform_hint.unwrap_or_default(),
-                    recipient: Some(recipient),
-                }
-            } else if let Some(destination_id) = legacy_destination.clone() {
-                NotificationDestination {
-                    kind: NotificationDestinationKind::Conversation,
-                    route_key: String::new(),
-                    id: destination_id,
-                    platform: platform_hint.unwrap_or_default(),
-                    recipient: None,
-                }
-            } else {
-                return None;
-            }
         } else {
-            return None;
+            let state = self.admin_store.load_or_create_state().ok()?;
+            proactive_notification_destination(request, &state)?
         };
 
         let mut notification_request = NotificationRequest {
@@ -1912,6 +2387,7 @@ impl TaskApiService {
         self.conversation_store.save_task_run(&task_run)?;
 
         let (step_domain, step_operation) = step_identity(request, response);
+        let execution_route = execution_route_for_executor(&response.executor_used);
         let mut task_step = self
             .conversation_store
             .load_task_step(&tracking.step_id)?
@@ -1922,7 +2398,7 @@ impl TaskApiService {
                 route_key: request.source.route_key.clone(),
                 domain: step_domain.clone(),
                 operation: step_operation.clone(),
-                route: ExecutionRoute::Local,
+                route: execution_route,
                 executor_used: response.executor_used.clone(),
                 status: TaskStepRunStatus::Pending,
                 input_payload: build_step_input_payload(request),
@@ -1938,13 +2414,14 @@ impl TaskApiService {
         task_step.route_key = request.source.route_key.clone();
         task_step.domain = step_domain;
         task_step.operation = step_operation;
-        task_step.route = ExecutionRoute::Local;
+        task_step.route = execution_route;
         task_step.executor_used = response.executor_used.clone();
         task_step.status = task_step_status_from_response(response.status);
         task_step.input_payload = build_step_input_payload(request);
         task_step.output_payload = build_step_output_payload(response);
         task_step.error_code = match response.status {
-            TaskStatus::Failed => Some(format!("{}_failed", response.executor_used)),
+            TaskStatus::Failed => response_error_code(response)
+                .or_else(|| Some(format!("{}_failed", response.executor_used))),
             _ => None,
         };
         task_step.error_message = match response.status {
@@ -2281,6 +2758,7 @@ fn candidate_to_connect_request(
         username: None,
         password,
         port: Some(candidate.port),
+        snapshot_url: None,
         discovery_source: "task_api_candidate_confirm".to_string(),
         vendor: candidate.vendor.clone(),
         model: candidate.model.clone(),
@@ -2299,6 +2777,7 @@ fn pending_connect_to_request(
         username: None,
         password,
         port: Some(pending.port),
+        snapshot_url: pending.snapshot_url.clone(),
         discovery_source: "task_api_password_retry".to_string(),
         vendor: pending.vendor.clone(),
         model: pending.model.clone(),
@@ -2474,6 +2953,294 @@ fn build_snapshot_media_asset(
     }
 }
 
+fn build_clip_media_asset(
+    request: &TaskRequest,
+    target: &ResolvedCameraTarget,
+    clip: &ClipCaptureResult,
+) -> MediaAsset {
+    MediaAsset {
+        asset_id: new_media_asset_id(),
+        workspace_id: workspace_id_for_request(request),
+        device_id: Some(target.device_id.clone()),
+        asset_kind: MediaAssetKind::Clip,
+        storage_target: storage_target_kind_from_snapshot(clip.storage.target),
+        storage_uri: clip.storage.relative_path.clone(),
+        mime_type: clip.mime_type.clone(),
+        byte_size: clip.byte_size as u64,
+        checksum: file_checksum(&clip.storage.relative_path),
+        captured_at: Some(clip.captured_at_epoch_ms.to_string()),
+        started_at: Some(clip.started_at_epoch_ms.to_string()),
+        ended_at: Some(clip.ended_at_epoch_ms.to_string()),
+        derived_from_asset_id: None,
+        tags: vec!["clip".to_string(), "camera".to_string()],
+        metadata: json!({
+            "task_id": request.task_id.clone(),
+            "step_id": step_id_for_request(request),
+            "trace_id": request.trace_id.clone(),
+            "source_channel": request.source.channel.clone(),
+            "source_surface": request.source.surface.clone(),
+            "camera_display_name": target.display_name.clone(),
+            "room_name": target.room_name.clone(),
+            "storage_relative_path": clip.storage.relative_path.clone(),
+            "clip_length_seconds": clip.clip_length_seconds,
+            "keyframe_count": clip.keyframe_count,
+            "keyframe_interval_seconds": clip.keyframe_interval_seconds,
+            "device_ingest_metadata": clip.ingest_metadata.clone(),
+        }),
+    }
+}
+
+fn build_clip_payload(
+    target: &ResolvedCameraTarget,
+    clip: &ClipCaptureResult,
+    keyframes: &[PathBuf],
+    media_asset: &MediaAsset,
+) -> Value {
+    json!({
+        "camera_target": target,
+        "clip": {
+            "media_asset_id": media_asset.asset_id.clone(),
+            "mime_type": clip.mime_type.clone(),
+            "byte_size": clip.byte_size,
+            "captured_at_epoch_ms": clip.captured_at_epoch_ms,
+            "started_at_epoch_ms": clip.started_at_epoch_ms,
+            "ended_at_epoch_ms": clip.ended_at_epoch_ms,
+            "clip_length_seconds": clip.clip_length_seconds,
+            "storage": clip.storage.clone(),
+            "keyframe_count": keyframes.len(),
+            "keyframes": keyframes
+                .iter()
+                .map(|path| path.to_string_lossy().to_string())
+                .collect::<Vec<_>>(),
+        }
+    })
+}
+
+fn build_clip_artifacts(
+    clip: &ClipCaptureResult,
+    keyframes: &[PathBuf],
+    media_asset: &MediaAsset,
+) -> Vec<TaskArtifact> {
+    let mut artifacts = vec![TaskArtifact {
+        kind: "video".to_string(),
+        label: "短视频".to_string(),
+        mime_type: clip.mime_type.clone(),
+        media_asset_id: Some(media_asset.asset_id.clone()),
+        path: Some(clip.storage.relative_path.clone()),
+        url: None,
+        metadata: json!({
+            "media_asset_id": media_asset.asset_id.clone(),
+            "storage_target": clip.storage.target,
+            "captured_at_epoch_ms": clip.captured_at_epoch_ms,
+            "byte_size": clip.byte_size,
+            "keyframe_count": keyframes.len(),
+        }),
+    }];
+    artifacts.extend(keyframes.iter().take(3).map(|path| TaskArtifact {
+        kind: "image".to_string(),
+        label: "视频关键帧".to_string(),
+        mime_type: "image/jpeg".to_string(),
+        media_asset_id: None,
+        path: Some(path.to_string_lossy().to_string()),
+        url: None,
+        metadata: json!({
+            "artifact_role": "video_keyframe",
+            "source_video_path": clip.storage.relative_path.clone(),
+        }),
+    }));
+    artifacts
+}
+
+fn resolved_recording_policy(
+    state: &AdminConsoleState,
+    target: Option<&ResolvedCameraTarget>,
+) -> Option<RecordingPolicy> {
+    state
+        .platform
+        .recording_policies
+        .iter()
+        .find(|policy| {
+            target
+                .and_then(|target| {
+                    policy
+                        .device_id
+                        .as_deref()
+                        .map(|device_id| device_id == target.device_id.as_str())
+                })
+                .unwrap_or(false)
+        })
+        .cloned()
+        .or_else(|| {
+            state
+                .platform
+                .recording_policies
+                .first()
+                .cloned()
+        })
+}
+
+fn resolved_capture_directory(
+    state: &AdminConsoleState,
+    recording_policy: Option<&RecordingPolicy>,
+) -> Result<PathBuf, String> {
+    let root = PathBuf::from(harboros_writable_root());
+    ensure_safe_capture_root(&root)?;
+    let subdirectory = recording_policy
+        .and_then(RecordingPolicy::capture_subdirectory)
+        .unwrap_or(state.defaults.capture_subdirectory.as_str());
+    let subdirectory = sanitize_relative_subdirectory(subdirectory)
+        .ok_or_else(|| "capture 子目录不合法，必须是 writable root 下的相对路径。".to_string())?;
+    let capture_root = root.join(subdirectory);
+    fs::create_dir_all(&capture_root).map_err(|error| {
+        format!(
+            "failed to create capture directory {}: {error}",
+            capture_root.display()
+        )
+    })?;
+    Ok(capture_root)
+}
+
+fn ensure_safe_capture_root(root: &Path) -> Result<(), String> {
+    let normalized = root.to_string_lossy().replace('\\', "/");
+    if normalized.starts_with("/mnt/software/harborbeacon-agent-ci") {
+        Ok(())
+    } else if std::env::var(ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV)
+        .ok()
+        .is_some_and(|value| env_flag_enabled(&value))
+        && root.is_absolute()
+        && normalized.ends_with("/harborbeacon-agent-ci")
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "capture writable root {} is outside the approved HarborOS root",
+            root.display()
+        ))
+    }
+}
+
+fn sanitize_relative_subdirectory(value: &str) -> Option<PathBuf> {
+    let trimmed = value.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let candidate = Path::new(trimmed);
+    if candidate.is_absolute() {
+        return None;
+    }
+    let mut sanitized = PathBuf::new();
+    for component in candidate.components() {
+        match component {
+            std::path::Component::Normal(segment) => sanitized.push(segment),
+            _ => return None,
+        }
+    }
+    (!sanitized.as_os_str().is_empty()).then_some(sanitized)
+}
+
+fn build_snapshot_output_path(
+    capture_root: &Path,
+    target: &ResolvedCameraTarget,
+    captured_at_epoch_ms: u128,
+    extension: &str,
+) -> PathBuf {
+    capture_root.join(format!(
+        "{}-{}.{}",
+        sanitize_path_segment(&target.device_id),
+        captured_at_epoch_ms,
+        extension
+    ))
+}
+
+fn build_clip_output_path(
+    capture_root: &Path,
+    target: &ResolvedCameraTarget,
+    captured_at_epoch_ms: u128,
+) -> PathBuf {
+    capture_root.join(format!(
+        "{}-{}.mp4",
+        sanitize_path_segment(&target.device_id),
+        captured_at_epoch_ms
+    ))
+}
+
+fn build_keyframe_directory(capture_root: &Path, clip_path: &Path) -> PathBuf {
+    let stem = clip_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("clip");
+    capture_root.join("keyframes").join(stem)
+}
+
+fn current_epoch_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+fn sanitize_path_segment(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn write_media_index_sidecar(
+    sidecar_path: &Path,
+    media_path: &str,
+    source_video_path: Option<&str>,
+    target: &ResolvedCameraTarget,
+    ocr_text: &str,
+    vlm_summary: &str,
+    tags: &[String],
+) -> Result<(), String> {
+    if let Some(parent) = sidecar_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create sidecar directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let searchable = [ocr_text.trim(), vlm_summary.trim()]
+        .iter()
+        .filter(|value| !value.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = serde_json::to_string_pretty(&json!({
+        "caption": vlm_summary.trim(),
+        "derived_text": searchable,
+        "ocr_text": ocr_text.trim(),
+        "source_video_path": source_video_path,
+        "camera": {
+            "device_id": target.device_id,
+            "display_name": target.display_name,
+            "room_name": target.room_name,
+            "vendor": target.vendor,
+            "model": target.model,
+        },
+        "source_path": media_path,
+        "labels": tags,
+    }))
+    .map_err(|error| format!("failed to serialize media sidecar: {error}"))?;
+    fs::write(sidecar_path, content).map_err(|error| {
+        format!(
+            "failed to write media sidecar {}: {error}",
+            sidecar_path.display()
+        )
+    })
+}
+
 fn build_vision_image_media_asset(
     request: &TaskRequest,
     target: &ResolvedCameraTarget,
@@ -2585,6 +3352,7 @@ fn mime_type_from_path(path: &str) -> Option<String> {
         "jpg" | "jpeg" => Some("image/jpeg".to_string()),
         "png" => Some("image/png".to_string()),
         "webp" => Some("image/webp".to_string()),
+        "mp4" => Some("video/mp4".to_string()),
         _ => None,
     }
 }
@@ -2645,40 +3413,79 @@ fn build_knowledge_search_artifacts(response: &KnowledgeSearchResponse) -> Vec<T
         .iter()
         .chain(response.images.iter())
         .take(6)
-        .map(|hit| TaskArtifact {
-            kind: if hit.modality.as_str() == "image" {
-                "image".to_string()
-            } else {
-                "text".to_string()
-            },
-            label: hit.title.clone(),
-            mime_type: mime_type_from_path(&hit.path).unwrap_or_else(|| {
-                if hit.modality.as_str() == "image" {
-                    "image/*".to_string()
+        .map(|hit| {
+            let proxied_video_path = resolved_video_proxy_path(hit);
+            let is_video_proxy = proxied_video_path.is_some();
+            let path = proxied_video_path.unwrap_or_else(|| hit.path.clone());
+            TaskArtifact {
+                kind: if is_video_proxy {
+                    "video".to_string()
+                } else if hit.modality.as_str() == "image" {
+                    "image".to_string()
                 } else {
-                    "text/plain".to_string()
-                }
-            }),
-            media_asset_id: None,
-            path: Some(hit.path.clone()),
-            url: None,
-            metadata: json!({
-                "modality": hit.modality.clone(),
-                "score": hit.score,
-                "citation": {
-                    "title": hit.title.clone(),
-                    "path": hit.path.clone(),
-                    "modality": hit.modality.clone(),
-                    "chunk_id": hit.chunk_id.clone(),
-                    "line_start": hit.line_start,
-                    "line_end": hit.line_end,
-                    "matched_terms": hit.matched_terms.clone(),
-                    "preview": hit.snippet.clone(),
-                    "score": hit.score,
+                    "text".to_string()
                 },
-            }),
+                label: hit.title.clone(),
+                mime_type: mime_type_from_path(&path).unwrap_or_else(|| {
+                    if is_video_proxy {
+                        "video/mp4".to_string()
+                    } else if hit.modality.as_str() == "image" {
+                        "image/*".to_string()
+                    } else {
+                        "text/plain".to_string()
+                    }
+                }),
+                media_asset_id: None,
+                path: Some(path),
+                url: None,
+                metadata: json!({
+                    "modality": if is_video_proxy { "video" } else { hit.modality.as_str() },
+                    "score": hit.score,
+                    "source_image_path": if is_video_proxy { Some(hit.path.clone()) } else { None::<String> },
+                    "citation": {
+                        "title": hit.title.clone(),
+                        "path": hit.path.clone(),
+                        "modality": hit.modality.clone(),
+                        "chunk_id": hit.chunk_id.clone(),
+                        "line_start": hit.line_start,
+                        "line_end": hit.line_end,
+                        "matched_terms": hit.matched_terms.clone(),
+                        "preview": hit.snippet.clone(),
+                        "score": hit.score,
+                        "source_path": hit.source_path.clone(),
+                    },
+                }),
+            }
         })
         .collect()
+}
+
+fn resolved_video_proxy_path(hit: &crate::runtime::knowledge::KnowledgeSearchHit) -> Option<String> {
+    let sidecar_path = hit
+        .source_path
+        .as_deref()
+        .and_then(|path| {
+            Path::new(path)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .filter(|extension| {
+                    matches!(
+                        extension.to_ascii_lowercase().as_str(),
+                        "json" | "yaml" | "yml" | "txt" | "md" | "markdown" | "csv"
+                    )
+                })
+                .map(|_| PathBuf::from(path))
+        })
+        .or_else(|| {
+            let candidate = Path::new(&hit.path).with_extension("json");
+            candidate.exists().then_some(candidate)
+        })?;
+    let value = fs::read_to_string(sidecar_path).ok()?;
+    let json = serde_json::from_str::<Value>(&value).ok()?;
+    json.get("source_video_path")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn format_knowledge_search_message(response: &KnowledgeSearchResponse) -> String {
@@ -2871,6 +3678,200 @@ fn build_step_output_payload(response: &TaskResponse) -> Value {
     })
 }
 
+fn is_supported_harbor_task(domain: &str, action: &str) -> bool {
+    (domain == "service" && matches!(action, "status" | "start" | "stop" | "restart" | "enable"))
+        || (domain == "files" && matches!(action, "list" | "copy" | "move"))
+}
+
+fn build_harbor_action_from_request(request: &TaskRequest) -> Result<Action, String> {
+    let domain = request.intent.domain.trim().to_lowercase();
+    let operation = request.intent.action.trim().to_lowercase();
+
+    match (domain.as_str(), operation.as_str()) {
+        ("service", _) => build_harbor_service_action(request, &operation),
+        ("files", _) => build_harbor_files_action(request, &operation),
+        _ => Err(format!(
+            "unsupported HarborOS task action: {domain}.{operation}"
+        )),
+    }
+}
+
+fn build_harbor_service_action(request: &TaskRequest, operation: &str) -> Result<Action, String> {
+    let service_name = first_string(
+        &[&request.args, &request.entity_refs],
+        &[
+            "/service_name",
+            "/resource/service_name",
+            "/service/name",
+            "/service/id_or_name",
+            "/service",
+            "/resource/id_or_name",
+            "/resource/name",
+            "/id_or_name",
+            "/name",
+        ],
+    )
+    .ok_or_else(|| "service action requires service_name or resource.id_or_name".to_string())?;
+
+    let mut args = serde_json::Map::new();
+    if operation == "enable" {
+        args.insert(
+            "enable".to_string(),
+            json!(
+                bool_at_paths(&request.args, &["/enable", "/resource/enable"])
+                    .or_else(|| {
+                        bool_at_paths(&request.entity_refs, &["/enable", "/resource/enable"])
+                    })
+                    .unwrap_or(true)
+            ),
+        );
+    }
+
+    Ok(apply_governance_defaults(Action {
+        domain: "service".to_string(),
+        operation: operation.to_string(),
+        resource: json!({
+            "service_name": service_name,
+        }),
+        args: Value::Object(args),
+        risk_level: RiskLevel::Low,
+        requires_approval: request_requires_approval(request),
+        dry_run: request_preview_flag(request),
+    }))
+}
+
+fn build_harbor_files_action(request: &TaskRequest, operation: &str) -> Result<Action, String> {
+    let recursive = bool_at_paths(&request.args, &["/recursive", "/resource/recursive"])
+        .or_else(|| bool_at_paths(&request.entity_refs, &["/recursive", "/resource/recursive"]))
+        .unwrap_or(false);
+    let overwrite = bool_at_paths(&request.args, &["/overwrite", "/resource/overwrite"])
+        .or_else(|| bool_at_paths(&request.entity_refs, &["/overwrite", "/resource/overwrite"]))
+        .unwrap_or(false);
+    let max_bytes = u64_at_paths(&request.args, &["/max_bytes", "/resource/max_bytes"])
+        .or_else(|| u64_at_paths(&request.entity_refs, &["/max_bytes", "/resource/max_bytes"]));
+
+    let mut args = serde_json::Map::new();
+    if recursive {
+        args.insert("recursive".to_string(), json!(true));
+    }
+    if overwrite {
+        args.insert("overwrite".to_string(), json!(true));
+    }
+    if let Some(max_bytes) = max_bytes {
+        args.insert("max_bytes".to_string(), json!(max_bytes));
+    }
+
+    let resource = match operation {
+        "list" => {
+            let path = first_string(
+                &[&request.args, &request.entity_refs],
+                &[
+                    "/path",
+                    "/resource/path",
+                    "/paths/0",
+                    "/resource/paths/0",
+                    "/source",
+                    "/resource/source",
+                    "/src",
+                    "/resource/src",
+                ],
+            )
+            .ok_or_else(|| "files.list requires path or resource.path".to_string())?;
+            json!({
+                "path": path.clone(),
+                "paths": [path],
+            })
+        }
+        "copy" | "move" => {
+            let source = first_string(
+                &[&request.args, &request.entity_refs],
+                &[
+                    "/source",
+                    "/resource/source",
+                    "/src",
+                    "/resource/src",
+                    "/paths/0",
+                    "/resource/paths/0",
+                    "/path",
+                    "/resource/path",
+                ],
+            )
+            .ok_or_else(|| "files action requires source or resource.paths[0]".to_string())?;
+            let target = first_string(
+                &[&request.args, &request.entity_refs],
+                &[
+                    "/target",
+                    "/resource/target",
+                    "/destination",
+                    "/resource/destination",
+                    "/dst",
+                    "/resource/dst",
+                    "/paths/1",
+                    "/resource/paths/1",
+                ],
+            )
+            .ok_or_else(|| "files action requires target or resource.destination".to_string())?;
+            json!({
+                "source": source.clone(),
+                "target": target,
+                "paths": [source],
+            })
+        }
+        _ => return Err(format!("unsupported HarborOS files operation: {operation}")),
+    };
+
+    Ok(apply_governance_defaults(Action {
+        domain: "files".to_string(),
+        operation: operation.to_string(),
+        resource,
+        args: Value::Object(args),
+        risk_level: RiskLevel::Low,
+        requires_approval: request_requires_approval(request),
+        dry_run: request_preview_flag(request),
+    }))
+}
+
+fn request_preview_flag(request: &TaskRequest) -> bool {
+    bool_at_paths(
+        &request.args,
+        &[
+            "/dry_run",
+            "/preview",
+            "/resource/dry_run",
+            "/resource/preview",
+        ],
+    )
+    .or_else(|| {
+        bool_at_paths(
+            &request.entity_refs,
+            &[
+                "/dry_run",
+                "/preview",
+                "/resource/dry_run",
+                "/resource/preview",
+            ],
+        )
+    })
+    .unwrap_or(false)
+}
+
+fn harbor_execution_is_preview(payload: &Value) -> bool {
+    bool_at_paths(payload, &["/dry_run"]).unwrap_or(false)
+        || matches!(payload.pointer("/passthrough"), Some(&Value::Bool(false)))
+        || string_at_paths(payload, &["/note"])
+            .map(|value| value.to_ascii_lowercase().contains("preview"))
+            .unwrap_or(false)
+}
+
+fn non_empty_audit_ref(audit_ref: &str) -> String {
+    let trimmed = audit_ref.trim();
+    if trimmed.is_empty() {
+        new_audit_ref()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn build_artifact_records(
     request: &TaskRequest,
     step_id: &str,
@@ -3044,6 +4045,53 @@ fn normalized_contract_value(value: &Value) -> Value {
         Value::String(value) => Value::String(value.trim().to_string()),
         _ => value.clone(),
     }
+}
+
+fn upsert_json_string(target: &mut Value, pointer: &str, value: &str) {
+    ensure_json_pointer_parent(target, pointer);
+    if let Some((parent_pointer, leaf)) = split_json_pointer(pointer) {
+        if let Some(parent) = target.pointer_mut(parent_pointer) {
+            if let Some(map) = parent.as_object_mut() {
+                map.insert(leaf.to_string(), Value::String(value.to_string()));
+            }
+        }
+    }
+}
+
+fn upsert_json_string_vec(target: &mut Value, pointer: &str, values: &[String]) {
+    ensure_json_pointer_parent(target, pointer);
+    if let Some((parent_pointer, leaf)) = split_json_pointer(pointer) {
+        if let Some(parent) = target.pointer_mut(parent_pointer) {
+            if let Some(map) = parent.as_object_mut() {
+                map.insert(
+                    leaf.to_string(),
+                    Value::Array(values.iter().cloned().map(Value::String).collect()),
+                );
+            }
+        }
+    }
+}
+
+fn ensure_json_pointer_parent(target: &mut Value, pointer: &str) {
+    if !target.is_object() {
+        *target = json!({});
+    }
+    let Some((parent_pointer, _)) = split_json_pointer(pointer) else {
+        return;
+    };
+    let mut current = target;
+    for segment in parent_pointer.split('/').filter(|segment| !segment.is_empty()) {
+        let segment = segment.replace("~1", "/").replace("~0", "~");
+        if !current.is_object() {
+            *current = json!({});
+        }
+        let map = current.as_object_mut().expect("object");
+        current = map.entry(segment).or_insert_with(|| json!({}));
+    }
+}
+
+fn split_json_pointer(pointer: &str) -> Option<(&str, &str)> {
+    pointer.rsplit_once('/')
 }
 
 fn task_message_id(request: &TaskRequest) -> String {
@@ -3306,6 +4354,28 @@ fn task_step_status_from_response(status: TaskStatus) -> TaskStepRunStatus {
     }
 }
 
+fn execution_route_for_executor(executor_used: &str) -> ExecutionRoute {
+    match executor_used.trim().to_lowercase().as_str() {
+        "middleware_api" => ExecutionRoute::MiddlewareApi,
+        "midcli" => ExecutionRoute::Midcli,
+        "browser" => ExecutionRoute::Browser,
+        "mcp" => ExecutionRoute::Mcp,
+        _ => ExecutionRoute::Local,
+    }
+}
+
+fn response_error_code(response: &TaskResponse) -> Option<String> {
+    string_at_paths(
+        &response.result.data,
+        &[
+            "/error_code",
+            "/error/code",
+            "/result/error_code",
+            "/result/error/code",
+        ],
+    )
+}
+
 fn task_run_completed_at(status: TaskStatus, finished_at: &str) -> Option<String> {
     match status {
         TaskStatus::Completed | TaskStatus::Failed => Some(finished_at.to_string()),
@@ -3355,33 +4425,13 @@ fn normalize_command_text(text: &str) -> String {
         .collect()
 }
 
+#[cfg(test)]
 fn should_route_general_message_to_knowledge(request: &TaskRequest) -> bool {
-    if !knowledge_nl_fallback_enabled() {
-        return false;
-    }
-    let raw_text = request.intent.raw_text.trim();
-    if raw_text.is_empty() {
-        return false;
-    }
-    let normalized = raw_text.to_lowercase();
-    let has_retrieval_verb = [
-        "找", "查", "搜", "检索", "search", "find", "lookup", "look up",
-    ]
-    .iter()
-    .any(|token| normalized.contains(token));
-    let has_target_noun = [
-        "文件", "文档", "图片", "照片", "资料", "内容", "file", "document", "image", "photo",
-        "picture", "content",
-    ]
-    .iter()
-    .any(|token| normalized.contains(token));
-    has_retrieval_verb && has_target_noun
-}
-
-fn knowledge_nl_fallback_enabled() -> bool {
-    env_var_with_legacy_alias(KNOWLEDGE_NL_FALLBACK_ENV, KNOWLEDGE_NL_FALLBACK_ENV_ALIAS)
-        .map(|value| env_flag_enabled(&value))
-        .unwrap_or(false)
+    fallback_general_message_plan(
+        request.intent.raw_text.as_str(),
+        first_string(&[&request.args], &["/device_hint"]).as_deref(),
+    )
+    .is_some_and(|plan| matches!(plan.kind, GeneralMessagePlanKind::KnowledgeSearch))
 }
 
 fn knowledge_search_query(request: &TaskRequest) -> Option<String> {
@@ -3468,6 +4518,138 @@ fn infer_query_from_raw_text(raw_text: &str) -> Option<String> {
     } else {
         Some(candidate)
     }
+}
+
+fn parse_general_message_plan(text: &str) -> Option<GeneralMessagePlan> {
+    let payload = parse_json_object_from_text(text)?;
+    let payload = serde_json::from_value::<GeneralMessagePlanPayload>(payload).ok()?;
+    let kind = match payload.action.trim().to_ascii_lowercase().as_str() {
+        "camera_snapshot" | "snapshot" => GeneralMessagePlanKind::CameraSnapshot,
+        "camera_record_clip" | "record_clip" | "clip" => GeneralMessagePlanKind::CameraRecordClip,
+        "knowledge_search" | "search" => GeneralMessagePlanKind::KnowledgeSearch,
+        _ => GeneralMessagePlanKind::Unsupported,
+    };
+    Some(GeneralMessagePlan {
+        kind,
+        camera_hint: payload
+            .camera_hint
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        query: payload
+            .query
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        reason: payload
+            .reason
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+    })
+}
+
+fn parse_json_object_from_text(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        return Some(value);
+    }
+
+    let fenced = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|value| value.strip_suffix("```"))
+        .map(str::trim)?;
+    serde_json::from_str::<Value>(fenced).ok()
+}
+
+fn fallback_general_message_plan(
+    raw_text: &str,
+    default_camera_hint: Option<&str>,
+) -> Option<GeneralMessagePlan> {
+    let normalized = normalize_command_text(raw_text);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    if matches_any(&normalized, &["录一段", "录视频", "拍视频", "录个视频", "录像"]) {
+        return Some(GeneralMessagePlan {
+            kind: GeneralMessagePlanKind::CameraRecordClip,
+            camera_hint: default_camera_hint.map(str::to_string),
+            query: None,
+            reason: Some("fallback rule inferred a short clip request".to_string()),
+        });
+    }
+    if matches_any(&normalized, &["抓拍", "拍照", "拍一张", "看一眼", "截一张"]) {
+        return Some(GeneralMessagePlan {
+            kind: GeneralMessagePlanKind::CameraSnapshot,
+            camera_hint: default_camera_hint.map(str::to_string),
+            query: None,
+            reason: Some("fallback rule inferred a snapshot request".to_string()),
+        });
+    }
+    if matches_any(
+        &normalized,
+        &["找一下", "找到", "查一下", "搜索", "检索", "找照片", "找视频"],
+    ) {
+        return Some(GeneralMessagePlan {
+            kind: GeneralMessagePlanKind::KnowledgeSearch,
+            camera_hint: None,
+            query: infer_query_from_raw_text(raw_text),
+            reason: Some("fallback rule inferred a knowledge search request".to_string()),
+        });
+    }
+    None
+}
+
+fn matches_any(normalized: &str, candidates: &[&str]) -> bool {
+    candidates
+        .iter()
+        .map(|candidate| normalize_command_text(candidate))
+        .any(|candidate| normalized.contains(&candidate))
+}
+
+fn build_general_message_planner_prompt(
+    request: &TaskRequest,
+    camera_targets: &[ResolvedCameraTarget],
+    selected_camera_device_id: Option<&str>,
+    writable_root: &str,
+    capture_subdirectory: &str,
+    clip_length_seconds: u32,
+) -> String {
+    let cameras = camera_targets
+        .iter()
+        .map(|target| {
+            json!({
+                "device_id": target.device_id,
+                "display_name": target.display_name,
+                "room_name": target.room_name,
+                "vendor": target.vendor,
+                "model": target.model,
+            })
+        })
+        .collect::<Vec<_>>();
+    let available_camera_hint = selected_camera_device_id.unwrap_or_default();
+    format!(
+        concat!(
+            "You are a strict HarborBeacon planner. ",
+            "Interpret the Chinese user message and return ONLY JSON with fields: ",
+            "{{\"action\":\"camera_snapshot|camera_record_clip|knowledge_search|unsupported\",",
+            "\"camera_hint\":\"string|null\",\"query\":\"string|null\",\"reason\":\"string\"}}.\n",
+            "Do not invent new actions. ",
+            "A snapshot means taking one image. ",
+            "A clip means a short video clip only, with configured duration {clip_length_seconds} seconds. ",
+            "Search means searching the configured capture directory using the described visual feature.\n",
+            "Selected camera device: {available_camera_hint}\n",
+            "Writable root: {writable_root}\n",
+            "Capture subdirectory: {capture_subdirectory}\n",
+            "Known cameras: {cameras}\n",
+            "User message: {message}\n"
+        ),
+        clip_length_seconds = clip_length_seconds,
+        available_camera_hint = available_camera_hint,
+        writable_root = writable_root,
+        capture_subdirectory = capture_subdirectory,
+        cameras = serde_json::to_string(&cameras).unwrap_or_else(|_| "[]".to_string()),
+        message = request.intent.raw_text,
+    )
 }
 
 fn knowledge_search_roots(request: &TaskRequest) -> Vec<String> {
@@ -3671,14 +4853,6 @@ fn notification_delivery_mode_from_value(value: &str) -> NotificationDeliveryMod
     }
 }
 
-fn notification_recipient_type_from_value(value: &str) -> Option<NotificationRecipientIdType> {
-    match value.trim().to_lowercase().as_str() {
-        "chat_id" => Some(NotificationRecipientIdType::ChatId),
-        "open_id" => Some(NotificationRecipientIdType::OpenId),
-        _ => None,
-    }
-}
-
 fn notification_payload_format_from_value(value: &str) -> NotificationPayloadFormat {
     match value.trim().to_lowercase().as_str() {
         "markdown" => NotificationPayloadFormat::Markdown,
@@ -3708,40 +4882,7 @@ fn task_artifact_to_notification_attachment(
     })
 }
 
-fn notification_recipient_from_args(args: &Value) -> Option<NotificationRecipient> {
-    let recipient_id = first_string(
-        &[args],
-        &[
-            "/notification/destination/recipient/recipient_id",
-            "/notification/recipient/recipient_id",
-            "/notification/recipient_id",
-        ],
-    )?;
-    let recipient_type = first_string(
-        &[args],
-        &[
-            "/notification/destination/recipient/recipient_type",
-            "/notification/recipient/recipient_type",
-            "/notification/recipient_type",
-        ],
-    )
-    .and_then(|value| notification_recipient_type_from_value(&value))
-    .or_else(|| {
-        if recipient_id.starts_with("oc_") {
-            Some(NotificationRecipientIdType::ChatId)
-        } else if recipient_id.starts_with("ou_") {
-            Some(NotificationRecipientIdType::OpenId)
-        } else {
-            None
-        }
-    })?;
-
-    Some(NotificationRecipient {
-        recipient_id,
-        recipient_type,
-    })
-}
-
+#[cfg(test)]
 fn resolve_notification_recipient(
     destination: &str,
     state: &AdminConsoleState,
@@ -3785,6 +4926,30 @@ fn resolve_notification_recipient(
     None
 }
 
+fn proactive_notification_destination(
+    _request: &TaskRequest,
+    state: &AdminConsoleState,
+) -> Option<NotificationDestination> {
+    let target = default_notification_target(state)?;
+    Some(NotificationDestination {
+        kind: NotificationDestinationKind::Conversation,
+        route_key: target.route_key.clone(),
+        id: String::new(),
+        platform: target.platform_hint.clone(),
+        recipient: None,
+    })
+}
+
+fn default_notification_target(state: &AdminConsoleState) -> Option<&NotificationTargetRecord> {
+    state
+        .notification_targets
+        .iter()
+        .find(|target| target.is_default)
+        .or_else(|| state.notification_targets.first())
+        .filter(|target| !target.route_key.trim().is_empty())
+}
+
+#[cfg(test)]
 fn recipient_from_literal_destination(
     destination: &str,
     bindings: &[IdentityBindingRecord],
@@ -3809,6 +4974,7 @@ fn recipient_from_literal_destination(
     None
 }
 
+#[cfg(test)]
 fn recipient_from_binding_match(
     destination: &str,
     bindings: &[IdentityBindingRecord],
@@ -3833,6 +4999,7 @@ fn recipient_from_binding_match(
         .and_then(recipient_from_binding)
 }
 
+#[cfg(test)]
 fn recipient_from_binding(binding: &IdentityBindingRecord) -> Option<NotificationRecipient> {
     if let Some(chat_id) = binding
         .chat_id
@@ -3915,6 +5082,14 @@ fn notification_delivery_outcome(
         NotificationDeliveryError,
     >,
 ) -> NotificationDeliveryOutcome {
+    let is_proactive = notification_request.destination.kind == NotificationDestinationKind::Recipient
+        || (notification_request.destination.kind == NotificationDestinationKind::Conversation
+            && !notification_request.destination.route_key.trim().is_empty()
+            && notification_request.destination.recipient.is_none()
+            && notification_request.destination.id.trim().is_empty()
+            && !notification_request.destination.platform.trim().is_empty()
+            && notification_request.delivery.reply_to_message_id.trim().is_empty()
+            && notification_request.delivery.update_message_id.trim().is_empty());
     match result {
         Ok(record) if record.ok => NotificationDeliveryOutcome {
             event_type: "task.notification_delivered",
@@ -3922,7 +5097,11 @@ fn notification_delivery_outcome(
             payload: serde_json::to_value(record).unwrap_or(Value::Null),
         },
         Ok(record) => NotificationDeliveryOutcome {
-            event_type: "task.notification_failed",
+            event_type: if is_proactive {
+                "task.proactive_delivery_failed"
+            } else {
+                "task.notification_failed"
+            },
             severity: EventSeverity::Warning,
             payload: serde_json::to_value(record).unwrap_or(Value::Null),
         },
@@ -3930,7 +5109,11 @@ fn notification_delivery_outcome(
             status_code,
             envelope,
         }) => NotificationDeliveryOutcome {
-            event_type: "task.notification_rejected",
+            event_type: if is_proactive {
+                "task.proactive_delivery_failed"
+            } else {
+                "task.notification_rejected"
+            },
             severity: if status_code >= 500 {
                 EventSeverity::Error
             } else {
@@ -3942,49 +5125,28 @@ fn notification_delivery_outcome(
                 "notification_id": notification_request.notification_id,
                 "idempotency_key": notification_request.delivery.idempotency_key,
                 "destination": notification_request.destination,
+                "route_mode": if is_proactive { "proactive" } else { "source_bound" },
                 "error": envelope.error,
                 "trace_id": envelope.trace_id,
             }),
         },
         Err(error) => NotificationDeliveryOutcome {
-            event_type: "task.notification_failed",
+            event_type: if is_proactive {
+                "task.proactive_delivery_failed"
+            } else {
+                "task.notification_failed"
+            },
             severity: EventSeverity::Error,
             payload: json!({
                 "status": "failed",
                 "notification_id": notification_request.notification_id,
                 "idempotency_key": notification_request.delivery.idempotency_key,
                 "destination": notification_request.destination,
+                "route_mode": if is_proactive { "proactive" } else { "source_bound" },
                 "error": error.to_string(),
             }),
         },
     }
-}
-
-fn legacy_im_recipient_fallback_enabled() -> bool {
-    env_var_with_legacy_alias(
-        LEGACY_IM_RECIPIENT_FALLBACK_ENV,
-        LEGACY_IM_RECIPIENT_FALLBACK_ENV_ALIAS,
-    )
-    .map(|value| env_flag_enabled(&value))
-    .unwrap_or(false)
-}
-
-fn env_var_with_legacy_alias(primary: &str, legacy: &str) -> Option<String> {
-    if let Some(value) = env::var(primary)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        return Some(value);
-    }
-
-    env::var(legacy)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .inspect(|_| {
-            eprintln!("warning: {legacy} is deprecated; prefer {primary}");
-        })
 }
 
 fn env_flag_enabled(value: &str) -> bool {
@@ -4045,6 +5207,7 @@ fn new_share_link_id() -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -4054,25 +5217,26 @@ mod tests {
     use super::{
         artifact_kind_from_name, build_artifact_records, conversation_key,
         effective_autonomy_level, effective_autonomy_level_for_task_run,
-        effective_requires_approval, env_flag_enabled, format_pending_candidates,
-        infer_query_from_raw_text, normalize_command_text, notification_delivery_outcome,
-        pending_candidates_from_results, protocol_string, resolve_notification_recipient,
-        room_aliases, should_route_general_message_to_knowledge, PendingTaskCandidate,
-        TaskApiService, TaskArtifact, TaskIntent, TaskMessage, TaskRequest, TaskRequestAcceptance,
-        TaskSource, TaskStatus, KNOWLEDGE_NL_FALLBACK_ENV,
+        effective_requires_approval, ensure_safe_capture_root, env_flag_enabled,
+        format_pending_candidates, infer_query_from_raw_text, normalize_command_text,
+        notification_delivery_outcome, pending_candidates_from_results, protocol_string,
+        resolve_notification_recipient, room_aliases, should_route_general_message_to_knowledge,
+        PendingTaskCandidate, TaskApiService, TaskArtifact, TaskIntent, TaskMessage, TaskRequest,
+        TaskRequestAcceptance, TaskSource, TaskStatus, ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV,
     };
     use crate::connectors::notifications::{
-        NotificationDelivery, NotificationDeliveryError, NotificationDeliveryMode,
-        NotificationDestination, NotificationDestinationKind, NotificationMetadata,
-        NotificationPayloadFormat, NotificationRecipientIdType, NotificationRequest,
-        NotificationSource, SharedHttpErrorDetail, SharedHttpErrorEnvelope,
+        NotificationContent, NotificationDelivery, NotificationDeliveryError,
+        NotificationDeliveryMode, NotificationDestination, NotificationDestinationKind,
+        NotificationMetadata, NotificationPayloadFormat, NotificationRecipientIdType,
+        NotificationRequest, NotificationSource,
+        SharedHttpErrorDetail, SharedHttpErrorEnvelope,
     };
     use crate::connectors::storage::StorageTarget;
     use crate::control_plane::approvals::ApprovalStatus;
     use crate::control_plane::auth::{AuthSource, IdentityBinding};
     use crate::control_plane::media::{MediaAssetKind, StorageTargetKind};
     use crate::control_plane::tasks::{
-        ArtifactKind, ConversationSession, TaskRunStatus, TaskStepRunStatus,
+        ArtifactKind, ConversationSession, ExecutionRoute, TaskRunStatus, TaskStepRunStatus,
     };
     use crate::runtime::admin_console::{
         AdminConsoleState, AdminConsoleStore, IdentityBindingRecord, RemoteViewConfig,
@@ -4088,6 +5252,7 @@ mod tests {
     };
 
     static RETRIEVAL_GATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static HARBOROS_TASK_API_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn unique_path(prefix: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
@@ -4103,6 +5268,64 @@ mod tests {
             .expect("clock")
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{unique}"))
+    }
+
+    fn reset_harbor_task_api_env() {
+        for name in [
+            "HARBOR_FORCE_MIDDLEWARE_ERROR",
+            "HARBOR_URL",
+            "HARBOR_MIDDLEWARE_URL",
+            "HARBOR_API_KEY",
+            "HARBOR_MIDDLEWARE_API_KEY",
+            "HARBOR_USER",
+            "HARBOR_PASSWORD",
+            "HARBOR_MIDCLI_URL",
+            "HARBOR_MIDCLI_USER",
+            "HARBOR_MIDCLI_PASSWORD",
+            "HARBOR_DISABLE_MIDDLEWARE",
+            "HARBOR_DISABLE_MIDCLI",
+            "HARBOR_MIDCLI_BIN",
+            "HARBOR_MIDCLI_PASSTHROUGH",
+        ] {
+            std::env::remove_var(name);
+        }
+    }
+
+    fn build_task_api_service(
+        prefix: &str,
+    ) -> (
+        TaskApiService,
+        TaskConversationStore,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let admin_path = unique_path(&format!("{prefix}-admin"));
+        let registry_path = unique_path(&format!("{prefix}-registry"));
+        let conversation_path = unique_path(&format!("{prefix}-conversation"));
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let service = TaskApiService::new(admin_store, conversation_store.clone());
+        (
+            service,
+            conversation_store,
+            admin_path,
+            registry_path,
+            conversation_path,
+        )
+    }
+
+    fn cleanup_task_api_service(
+        admin_path: std::path::PathBuf,
+        registry_path: std::path::PathBuf,
+        conversation_path: std::path::PathBuf,
+    ) {
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
     }
 
     #[test]
@@ -4570,6 +5793,7 @@ mod tests {
         );
 
         assert_eq!(request.room.as_deref(), Some("Living Room"));
+        assert!(request.snapshot_url.is_none());
     }
 
     #[test]
@@ -4673,6 +5897,7 @@ mod tests {
                 url: "rtsp://192.168.1.10/live".to_string(),
                 requires_auth: false,
             },
+            snapshot_url: None,
             onvif_device_service_url: None,
             ezviz_device_serial: None,
             ezviz_camera_no: None,
@@ -4823,6 +6048,7 @@ mod tests {
                 url: "rtsp://192.168.1.10/live".to_string(),
                 requires_auth: false,
             },
+            snapshot_url: None,
             onvif_device_service_url: None,
             ezviz_device_serial: None,
             ezviz_camera_no: None,
@@ -4979,6 +6205,7 @@ mod tests {
                 url: "rtsp://192.168.1.10/live".to_string(),
                 requires_auth: false,
             },
+            snapshot_url: None,
             onvif_device_service_url: None,
             ezviz_device_serial: None,
             ezviz_camera_no: None,
@@ -5130,6 +6357,7 @@ mod tests {
                 url: "rtsp://192.168.1.10/live".to_string(),
                 requires_auth: false,
             },
+            snapshot_url: None,
             onvif_device_service_url: None,
             ezviz_device_serial: None,
             ezviz_camera_no: None,
@@ -5225,6 +6453,7 @@ mod tests {
                 url: "rtsp://192.168.1.10/live".to_string(),
                 requires_auth: false,
             },
+            snapshot_url: None,
             onvif_device_service_url: None,
             ezviz_device_serial: None,
             ezviz_camera_no: None,
@@ -5255,9 +6484,10 @@ mod tests {
     }
 
     #[test]
-    fn general_message_retrieval_fallback_is_disabled_by_default() {
-        let _guard = RETRIEVAL_GATE_TEST_LOCK.lock().expect("lock");
-        std::env::remove_var(KNOWLEDGE_NL_FALLBACK_ENV);
+    fn general_message_search_like_queries_are_interpreted() {
+        let _guard = RETRIEVAL_GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let request = TaskRequest {
             intent: TaskIntent {
@@ -5267,7 +6497,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(!should_route_general_message_to_knowledge(&request));
+        assert!(should_route_general_message_to_knowledge(&request));
     }
 
     #[test]
@@ -5279,6 +6509,32 @@ mod tests {
         assert!(!env_flag_enabled("0"));
         assert!(!env_flag_enabled("false"));
         assert!(!env_flag_enabled(""));
+    }
+
+    #[test]
+    fn ensure_safe_capture_root_allows_explicit_non_harboros_root_with_guard() {
+        let original = std::env::var(ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV).ok();
+        let allowed_root = if cfg!(windows) {
+            Path::new("C:/tmp/harborbeacon-agent-ci")
+        } else {
+            Path::new("/home/harbor/work/.tmp-live/harborbeacon-agent-ci")
+        };
+        unsafe {
+            std::env::set_var(ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV, "1");
+        }
+
+        let result = ensure_safe_capture_root(allowed_root);
+
+        match original {
+            Some(value) => unsafe {
+                std::env::set_var(ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV, value);
+            },
+            None => unsafe {
+                std::env::remove_var(ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV);
+            },
+        }
+
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -5317,6 +6573,7 @@ mod tests {
             ip: "192.168.1.20".to_string(),
             room: Some("Entry".to_string()),
             port: 554,
+            snapshot_url: Some("http://192.168.1.20/snapshot.jpg".to_string()),
             rtsp_paths: vec!["/live".to_string()],
             requires_auth: true,
             vendor: Some("Demo".to_string()),
@@ -5546,7 +6803,10 @@ mod tests {
 
         assert_eq!(response.status, TaskStatus::Completed);
         assert_eq!(response.executor_used, "camera_hub_service");
-        assert_eq!(response.result.data["camera_target"]["device_id"], "cam-share");
+        assert_eq!(
+            response.result.data["camera_target"]["device_id"],
+            "cam-share"
+        );
         assert_eq!(response.result.data["share_link"]["device_id"], "cam-share");
         assert_eq!(response.result.artifacts.len(), 1);
         assert_eq!(response.result.artifacts[0].kind, "link");
@@ -5610,6 +6870,103 @@ mod tests {
     }
 
     #[test]
+    fn build_notification_request_uses_member_default_surface_for_proactive_delivery() {
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        let conversation_store = TaskConversationStore::new(conversation_path);
+        let service = TaskApiService::new(admin_store.clone(), conversation_store);
+        admin_store
+            .upsert_notification_target(
+                None,
+                "我的微信",
+                "gw_route_weixin_default",
+                "weixin",
+                true,
+            )
+            .expect("save notification target");
+
+        let request = TaskRequest {
+            task_id: "task-proactive".to_string(),
+            trace_id: "trace-proactive".to_string(),
+            step_id: "step-proactive".to_string(),
+            source: TaskSource {
+                channel: "admin_api".to_string(),
+                surface: "harbordesk".to_string(),
+                conversation_id: String::new(),
+                user_id: "user-weixin".to_string(),
+                session_id: "sess-proactive".to_string(),
+                route_key: String::new(),
+            },
+            intent: TaskIntent {
+                domain: "camera".to_string(),
+                action: "analyze".to_string(),
+                raw_text: "后台分析告警".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: Value::Null,
+            autonomy: Default::default(),
+            message: None,
+        };
+        let target = ResolvedCameraTarget {
+            device_id: "cam-proactive".to_string(),
+            display_name: "Front Door".to_string(),
+            status: DeviceStatus::Online,
+            room_name: Some("Entry".to_string()),
+            vendor: None,
+            model: None,
+            ip_address: Some("192.168.1.10".to_string()),
+            mac_address: None,
+            discovery_source: "onvif".to_string(),
+            primary_stream: CameraStreamRef {
+                transport: StreamTransport::Rtsp,
+                url: "rtsp://192.168.1.10/live".to_string(),
+                requires_auth: false,
+            },
+            snapshot_url: None,
+            onvif_device_service_url: None,
+            ezviz_device_serial: None,
+            ezviz_camera_no: None,
+            capabilities: CameraCapabilities {
+                snapshot: true,
+                stream: true,
+                ptz: false,
+                audio: false,
+            },
+            last_seen_at: None,
+        };
+
+        let notification = service
+            .build_notification_request(
+                &request,
+                "task.completed",
+                &target,
+                &json!({
+                    "summary": "独立系统提醒",
+                    "notification_channel": "im_bridge",
+                }),
+                &[],
+            )
+            .expect("proactive notification");
+
+        assert_eq!(
+            notification.destination.kind,
+            NotificationDestinationKind::Conversation
+        );
+        assert_eq!(notification.destination.platform, "weixin");
+        assert_eq!(notification.destination.route_key, "gw_route_weixin_default");
+        assert!(notification.destination.id.is_empty());
+        assert!(notification.destination.recipient.is_none());
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+    }
+
+    #[test]
     fn notification_delivery_outcome_marks_rejected_requests() {
         let request = NotificationRequest {
             notification_id: "notif_01JABC".to_string(),
@@ -5662,6 +7019,53 @@ mod tests {
         assert_eq!(outcome.payload["status"], "rejected");
         assert_eq!(outcome.payload["http_status"], 404);
         assert_eq!(outcome.payload["error"]["code"], "ROUTE_NOT_FOUND");
+    }
+
+    #[test]
+    fn proactive_notification_delivery_outcome_uses_proactive_failure_event() {
+        let request = NotificationRequest {
+            notification_id: "notif_proactive".to_string(),
+            trace_id: "trace_proactive".to_string(),
+            source: NotificationSource {
+                service: "harborbeacon".to_string(),
+                module: "task_api".to_string(),
+                event_type: "task.completed".to_string(),
+            },
+            destination: NotificationDestination {
+                kind: NotificationDestinationKind::Conversation,
+                route_key: "gw_route_weixin_default".to_string(),
+                id: String::new(),
+                platform: "weixin".to_string(),
+                recipient: None,
+            },
+            content: NotificationContent {
+                title: "系统提醒".to_string(),
+                body: "请检查状态".to_string(),
+                payload_format: NotificationPayloadFormat::PlainText,
+                structured_payload: Value::Null,
+                attachments: Vec::new(),
+            },
+            delivery: NotificationDelivery {
+                mode: NotificationDeliveryMode::Send,
+                reply_to_message_id: String::new(),
+                update_message_id: String::new(),
+                idempotency_key: "idem_proactive".to_string(),
+            },
+            metadata: NotificationMetadata {
+                correlation_id: "trace_proactive".to_string(),
+            },
+        };
+
+        let outcome = notification_delivery_outcome(
+            &request,
+            Err(NotificationDeliveryError::Transport(
+                "context token missing".to_string(),
+            )),
+        );
+
+        assert_eq!(outcome.event_type, "task.proactive_delivery_failed");
+        assert_eq!(outcome.payload["route_mode"], "proactive");
+        assert_eq!(outcome.payload["destination"]["platform"], "weixin");
     }
 
     #[test]
@@ -6261,6 +7665,387 @@ mod tests {
     }
 
     #[test]
+    fn handle_service_status_dispatches_to_harboros_router() {
+        let _guard = HARBOROS_TASK_API_TEST_LOCK.lock().expect("lock");
+        reset_harbor_task_api_env();
+        let (service, conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("harbor-service-status");
+        let request = TaskRequest {
+            task_id: "task-service-status".to_string(),
+            trace_id: "trace-service-status".to_string(),
+            step_id: "step-service-status".to_string(),
+            source: TaskSource {
+                channel: "feishu".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-service-status".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-service-status".to_string(),
+                route_key: "gw_route_service_status".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "service".to_string(),
+                action: "status".to_string(),
+                raw_text: "查看 ssh 状态".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "resource": {
+                    "service_name": "ssh"
+                }
+            }),
+            autonomy: Default::default(),
+            message: None,
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.executor_used, "middleware_api");
+        assert_eq!(response.result.data["route_fallback_used"], false);
+        assert_eq!(response.result.data["preview"], true);
+
+        let task_step = conversation_store
+            .load_task_step("step-service-status")
+            .expect("load task step")
+            .expect("task step");
+        assert_eq!(task_step.route, ExecutionRoute::MiddlewareApi);
+        assert_eq!(task_step.executor_used, "middleware_api");
+        assert_eq!(task_step.status, TaskStepRunStatus::Success);
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+        reset_harbor_task_api_env();
+    }
+
+    #[test]
+    fn handle_service_status_falls_back_to_midcli_when_middleware_fails() {
+        let _guard = HARBOROS_TASK_API_TEST_LOCK.lock().expect("lock");
+        reset_harbor_task_api_env();
+        std::env::set_var("HARBOR_FORCE_MIDDLEWARE_ERROR", "1");
+        let (service, conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("harbor-service-fallback");
+        let request = TaskRequest {
+            task_id: "task-service-fallback".to_string(),
+            trace_id: "trace-service-fallback".to_string(),
+            step_id: "step-service-fallback".to_string(),
+            source: TaskSource {
+                channel: "feishu".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-service-fallback".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-service-fallback".to_string(),
+                route_key: "gw_route_service_fallback".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "service".to_string(),
+                action: "status".to_string(),
+                raw_text: "查看 ssh 状态".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "service_name": "ssh"
+            }),
+            autonomy: Default::default(),
+            message: None,
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.executor_used, "midcli");
+        assert_eq!(response.result.data["route_fallback_used"], true);
+
+        let task_step = conversation_store
+            .load_task_step("step-service-fallback")
+            .expect("load task step")
+            .expect("task step");
+        assert_eq!(task_step.route, ExecutionRoute::Midcli);
+        assert_eq!(task_step.executor_used, "midcli");
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+        reset_harbor_task_api_env();
+    }
+
+    #[test]
+    fn handle_service_restart_requires_approval_before_execution() {
+        let _guard = HARBOROS_TASK_API_TEST_LOCK.lock().expect("lock");
+        reset_harbor_task_api_env();
+        let (service, conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("harbor-service-restart");
+        let request = TaskRequest {
+            task_id: "task-service-restart".to_string(),
+            trace_id: "trace-service-restart".to_string(),
+            step_id: "step-service-restart".to_string(),
+            source: TaskSource {
+                channel: "feishu".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-service-restart".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-service-restart".to_string(),
+                route_key: "gw_route_service_restart".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "service".to_string(),
+                action: "restart".to_string(),
+                raw_text: "重启 ssh".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "service_name": "ssh"
+            }),
+            autonomy: Default::default(),
+            message: None,
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::NeedsInput);
+        assert_eq!(response.executor_used, "harboros_router");
+        assert_eq!(response.missing_fields, vec!["approval_token".to_string()]);
+        assert_eq!(
+            response.result.data["approval_ticket"]["policy_ref"],
+            "service.restart"
+        );
+
+        let approvals = conversation_store
+            .approvals_for_task("task-service-restart")
+            .expect("load approvals");
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].status, ApprovalStatus::Pending);
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+        reset_harbor_task_api_env();
+    }
+
+    #[test]
+    fn approve_pending_service_restart_executes_harboros_route() {
+        let _guard = HARBOROS_TASK_API_TEST_LOCK.lock().expect("lock");
+        reset_harbor_task_api_env();
+        let (service, conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("harbor-service-restart-approve");
+        let request = TaskRequest {
+            task_id: "task-service-restart-approve".to_string(),
+            trace_id: "trace-service-restart-approve".to_string(),
+            step_id: "step-service-restart-approve".to_string(),
+            source: TaskSource {
+                channel: "feishu".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-service-restart-approve".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-service-restart-approve".to_string(),
+                route_key: "gw_route_service_restart_approve".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "service".to_string(),
+                action: "restart".to_string(),
+                raw_text: "重启 ssh".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "service_name": "ssh"
+            }),
+            autonomy: Default::default(),
+            message: None,
+        };
+
+        let initial = service.handle_task(request);
+        let approval_id = initial.result.data["approval_ticket"]["approval_id"]
+            .as_str()
+            .expect("approval id")
+            .to_string();
+
+        let (approval, resumed) = service
+            .approve_pending_approval(&approval_id, Some("approver-1".to_string()))
+            .expect("approve");
+
+        assert_eq!(approval.approval_ticket.status, ApprovalStatus::Approved);
+        assert_eq!(resumed.status, TaskStatus::Completed);
+        assert_eq!(resumed.executor_used, "middleware_api");
+        assert_eq!(resumed.result.data["route_fallback_used"], false);
+        assert!(!resumed.audit_ref.is_empty());
+
+        let resume_step_id = format!("approval:{approval_id}:resume");
+        let task_step = conversation_store
+            .load_task_step(&resume_step_id)
+            .expect("load task step")
+            .expect("task step");
+        assert_eq!(task_step.route, ExecutionRoute::MiddlewareApi);
+        assert_eq!(task_step.executor_used, "middleware_api");
+
+        let events = conversation_store
+            .events_for_task("task-service-restart-approve")
+            .expect("load events");
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "task.approval_approved"));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "task.harboros_dispatched"));
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+        reset_harbor_task_api_env();
+    }
+
+    #[test]
+    fn handle_files_list_dispatches_to_harboros_router() {
+        let _guard = HARBOROS_TASK_API_TEST_LOCK.lock().expect("lock");
+        reset_harbor_task_api_env();
+        let (service, conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("harbor-files-list");
+        let request = TaskRequest {
+            task_id: "task-files-list".to_string(),
+            trace_id: "trace-files-list".to_string(),
+            step_id: "step-files-list".to_string(),
+            source: TaskSource {
+                channel: "feishu".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-files-list".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-files-list".to_string(),
+                route_key: "gw_route_files_list".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "files".to_string(),
+                action: "list".to_string(),
+                raw_text: "列出 agent-ci".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "resource": {
+                    "path": "/mnt/agent-ci"
+                },
+                "recursive": true
+            }),
+            autonomy: Default::default(),
+            message: None,
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.executor_used, "middleware_api");
+        assert_eq!(response.result.data["route_fallback_used"], false);
+
+        let task_step = conversation_store
+            .load_task_step("step-files-list")
+            .expect("load task step")
+            .expect("task step");
+        assert_eq!(task_step.route, ExecutionRoute::MiddlewareApi);
+        assert_eq!(task_step.executor_used, "middleware_api");
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+        reset_harbor_task_api_env();
+    }
+
+    #[test]
+    fn handle_files_move_requires_approval_before_execution() {
+        let _guard = HARBOROS_TASK_API_TEST_LOCK.lock().expect("lock");
+        reset_harbor_task_api_env();
+        let (service, conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("harbor-files-move");
+        let request = TaskRequest {
+            task_id: "task-files-move".to_string(),
+            trace_id: "trace-files-move".to_string(),
+            step_id: "step-files-move".to_string(),
+            source: TaskSource {
+                channel: "feishu".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-files-move".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-files-move".to_string(),
+                route_key: "gw_route_files_move".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "files".to_string(),
+                action: "move".to_string(),
+                raw_text: "移动文件".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "source": "/mnt/agent-ci/inbox.txt",
+                "target": "/mnt/agent-ci/archive/inbox.txt"
+            }),
+            autonomy: Default::default(),
+            message: None,
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::NeedsInput);
+        assert_eq!(response.executor_used, "harboros_router");
+        assert_eq!(
+            response.result.data["approval_ticket"]["policy_ref"],
+            "files.move"
+        );
+
+        let approvals = conversation_store
+            .approvals_for_task("task-files-move")
+            .expect("load approvals");
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].status, ApprovalStatus::Pending);
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+        reset_harbor_task_api_env();
+    }
+
+    #[test]
+    fn handle_files_copy_denied_path_surfaces_router_failure_details() {
+        let _guard = HARBOROS_TASK_API_TEST_LOCK.lock().expect("lock");
+        reset_harbor_task_api_env();
+        let (service, conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("harbor-files-copy-denied");
+        let request = TaskRequest {
+            task_id: "task-files-copy-denied".to_string(),
+            trace_id: "trace-files-copy-denied".to_string(),
+            step_id: "step-files-copy-denied".to_string(),
+            source: TaskSource {
+                channel: "feishu".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-files-copy-denied".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-files-copy-denied".to_string(),
+                route_key: "gw_route_files_copy_denied".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "files".to_string(),
+                action: "copy".to_string(),
+                raw_text: "复制 passwd".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "source": "/etc/passwd",
+                "target": "/mnt/agent-ci/out.txt"
+            }),
+            autonomy: Default::default(),
+            message: None,
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Failed);
+        assert_eq!(response.executor_used, "none");
+        assert_eq!(response.result.data["error_code"], "NO_EXECUTOR_AVAILABLE");
+        assert!(response.result.message.contains("denied path"));
+
+        let task_step = conversation_store
+            .load_task_step("step-files-copy-denied")
+            .expect("load task step")
+            .expect("task step");
+        assert_eq!(task_step.route, ExecutionRoute::Local);
+        assert_eq!(
+            task_step.error_code.as_deref(),
+            Some("NO_EXECUTOR_AVAILABLE")
+        );
+        assert!(task_step
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("denied path"));
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+        reset_harbor_task_api_env();
+    }
+
+    #[test]
     fn handle_knowledge_search_returns_document_and_image_hits() {
         let admin_path = unique_path("harborbeacon-admin-state");
         let registry_path = unique_path("harborbeacon-device-registry");
@@ -6354,7 +8139,9 @@ mod tests {
 
     #[test]
     fn general_message_routes_retrieval_query_to_knowledge_search() {
-        let _guard = RETRIEVAL_GATE_TEST_LOCK.lock().expect("lock");
+        let _guard = RETRIEVAL_GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let admin_path = unique_path("harborbeacon-admin-state");
         let registry_path = unique_path("harborbeacon-device-registry");
         let conversation_path = unique_path("harborbeacon-task-runtime");
@@ -6365,8 +8152,6 @@ mod tests {
             "我把樱花相关的文档放在这里，方便后续整理。",
         )
         .expect("write doc");
-
-        std::env::set_var(KNOWLEDGE_NL_FALLBACK_ENV, "1");
 
         let service = TaskApiService::new(
             AdminConsoleStore::new(
@@ -6409,14 +8194,9 @@ mod tests {
 
         assert_eq!(response.status, TaskStatus::Completed);
         assert_eq!(response.executor_used, "knowledge_search_service");
-        assert_eq!(response.result.data["query"], "樱花");
         assert_eq!(
             response.result.message,
             response.result.data["reply_pack"]["summary"]
-        );
-        assert_eq!(
-            response.result.data["documents"].as_array().map(Vec::len),
-            Some(1)
         );
         assert_eq!(
             response.result.data["reply_pack"]["citations"]
@@ -6424,14 +8204,11 @@ mod tests {
                 .map(Vec::len),
             Some(1)
         );
-        assert!(
-            response.result.data["reply_pack"]["citations"][0]["preview"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("樱花")
+        assert_eq!(response.result.artifacts.len(), 1);
+        assert_eq!(
+            response.result.artifacts[0].metadata["citation"]["title"],
+            "sakura-journal.md"
         );
-
-        std::env::remove_var(KNOWLEDGE_NL_FALLBACK_ENV);
         let _ = fs::remove_file(admin_path);
         let _ = fs::remove_file(registry_path);
         let _ = fs::remove_file(conversation_path);
@@ -6440,7 +8217,9 @@ mod tests {
 
     #[test]
     fn retrieval_round_trip_launch_pack_covers_explicit_enabled_and_disabled_paths() {
-        let _guard = RETRIEVAL_GATE_TEST_LOCK.lock().expect("lock");
+        let _guard = RETRIEVAL_GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let admin_path = unique_path("harborbeacon-admin-state");
         let registry_path = unique_path("harborbeacon-device-registry");
         let conversation_path = unique_path("harborbeacon-task-runtime");
@@ -6519,8 +8298,7 @@ mod tests {
             1
         );
 
-        std::env::set_var(KNOWLEDGE_NL_FALLBACK_ENV, "1");
-        let enabled_request = TaskRequest {
+        let general_message_request = TaskRequest {
             task_id: "task-launch-enabled".to_string(),
             trace_id: "trace-launch-enabled".to_string(),
             step_id: "step-launch-enabled".to_string(),
@@ -6549,72 +8327,23 @@ mod tests {
                 attachments: Vec::new(),
             }),
         };
-        assert!(should_route_general_message_to_knowledge(&enabled_request));
-        let enabled_response = service.handle_task(enabled_request);
-        assert_eq!(enabled_response.status, TaskStatus::Completed);
-        assert_eq!(enabled_response.executor_used, "knowledge_search_service");
+        assert!(should_route_general_message_to_knowledge(
+            &general_message_request
+        ));
+        let general_message_response = service.handle_task(general_message_request);
+        assert_eq!(general_message_response.status, TaskStatus::Completed);
+        assert_eq!(general_message_response.executor_used, "knowledge_search_service");
         assert_eq!(
-            enabled_response.result.message,
-            enabled_response.result.data["reply_pack"]["summary"]
+            general_message_response.result.message,
+            general_message_response.result.data["reply_pack"]["summary"]
         );
         assert_eq!(
-            enabled_response.result.data["reply_pack"]["citations"]
+            general_message_response.result.data["reply_pack"]["citations"]
                 .as_array()
                 .map(Vec::len),
-            Some(1)
+            Some(2)
         );
-        assert_eq!(
-            enabled_response.result.data["reply_pack"]["citations"][0]["line_start"],
-            1
-        );
-        assert_eq!(
-            enabled_response.result.artifacts[0].metadata["citation"]["preview"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("樱花"),
-            true
-        );
-
-        std::env::remove_var(KNOWLEDGE_NL_FALLBACK_ENV);
-        let disabled_request = TaskRequest {
-            task_id: "task-launch-disabled".to_string(),
-            trace_id: "trace-launch-disabled".to_string(),
-            step_id: "step-launch-disabled".to_string(),
-            source: TaskSource {
-                channel: "wechat".to_string(),
-                surface: "harborgate".to_string(),
-                conversation_id: "chat-launch".to_string(),
-                user_id: "user-1".to_string(),
-                session_id: "session-launch".to_string(),
-                route_key: "gw_route_launch".to_string(),
-            },
-            intent: TaskIntent {
-                domain: "general".to_string(),
-                action: "message".to_string(),
-                raw_text: "帮我找到和樱花有关的文件".to_string(),
-            },
-            entity_refs: Value::Null,
-            args: json!({
-                "roots": [knowledge_root.to_string_lossy().to_string()]
-            }),
-            autonomy: Default::default(),
-            message: Some(TaskMessage {
-                message_id: "om_launch_02".to_string(),
-                chat_type: "p2p".to_string(),
-                mentions: Vec::new(),
-                attachments: Vec::new(),
-            }),
-        };
-        assert!(!should_route_general_message_to_knowledge(
-            &disabled_request
-        ));
-        let disabled_response = service.handle_task(disabled_request);
-        assert_eq!(disabled_response.status, TaskStatus::Failed);
-        assert_eq!(disabled_response.executor_used, "task_api");
-        assert!(disabled_response
-            .result
-            .message
-            .contains("unsupported task action"));
+        assert_eq!(general_message_response.result.artifacts.len(), 2);
 
         std::env::remove_var("HARBOR_KNOWLEDGE_INDEX_ROOT");
         let _ = fs::remove_file(admin_path);

@@ -70,9 +70,7 @@ fn fail(message: &str) -> ! {
 }
 
 fn print_usage() {
-    eprintln!(
-        "Usage: validate-contract-schemas [--report PATH] [--skip-live] [--require-live]"
-    );
+    eprintln!("Usage: validate-contract-schemas [--report PATH] [--skip-live] [--require-live]");
 }
 
 fn main() {

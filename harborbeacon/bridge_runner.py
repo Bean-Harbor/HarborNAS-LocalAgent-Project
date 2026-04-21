@@ -37,15 +37,6 @@ from harborbeacon.webhook import WebhookRequest
 logger = logging.getLogger("harborbeacon.bridge_runner")
 
 def _resolve_admin_state_path(path: Path) -> Path:
-    if path.exists() or ".harborbeacon" not in str(path):
-        return path
-    legacy = Path(str(path).replace(".harborbeacon", ".harbornas"))
-    if legacy.exists():
-        print(
-            f"warning: legacy HarborNAS state path {legacy} is deprecated; prefer {path}",
-            flush=True,
-        )
-        return legacy
     return path
 
 

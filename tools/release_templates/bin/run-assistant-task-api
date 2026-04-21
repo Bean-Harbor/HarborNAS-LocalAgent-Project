@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RELEASE_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+ENV_FILE="${HARBOR_ENV_FILE:-/etc/default/harborbeacon-agent-hub}"
+
+if [[ -f "${ENV_FILE}" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "${ENV_FILE}"
+  set +a
+fi
+
+exec "${ASSISTANT_TASK_API_BIN:-${RELEASE_ROOT}/bin/assistant-task-api}" \
+  --bind "${HARBOR_TASK_API_BIND:-127.0.0.1:4175}" \
+  --admin-state "${HARBOR_TASK_API_ADMIN_STATE:-${RELEASE_ROOT}/runtime/admin-console.json}" \
+  --device-registry "${HARBOR_TASK_API_DEVICE_REGISTRY:-${RELEASE_ROOT}/runtime/device-registry.json}" \
+  --conversations "${HARBOR_TASK_API_CONVERSATIONS:-${RELEASE_ROOT}/runtime/task-api-conversations.json}" \
+  --service-token "${HARBOR_TASK_API_BEARER_TOKEN:?HARBOR_TASK_API_BEARER_TOKEN is required}" \
+  "$@"

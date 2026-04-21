@@ -75,8 +75,7 @@ impl Cli {
                         PathBuf::from(take_value(&args, &mut index, "--conversations"))
                 }
                 value if value.starts_with("--conversations=") => {
-                    cli.conversations =
-                        PathBuf::from(value["--conversations=".len()..].to_string())
+                    cli.conversations = PathBuf::from(value["--conversations=".len()..].to_string())
                 }
                 "--service-token" => {
                     cli.service_token = Some(take_value(&args, &mut index, "--service-token"))
@@ -354,21 +353,7 @@ fn is_harborgate_surface(surface: &str) -> bool {
 }
 
 fn resolve_state_path(preferred: &Path) -> PathBuf {
-    if preferred.exists() || !is_harborbeacon_state_path(preferred) {
-        return preferred.to_path_buf();
-    }
-
-    let legacy = legacy_state_path(preferred);
-    if legacy.exists() {
-        eprintln!(
-            "warning: legacy .harbornas state path {} is deprecated; prefer {}",
-            legacy.display(),
-            preferred.display()
-        );
-        legacy
-    } else {
-        preferred.to_path_buf()
-    }
+    preferred.to_path_buf()
 }
 
 fn take_value(args: &[String], index: &mut usize, flag: &str) -> String {
@@ -388,17 +373,6 @@ fn print_usage() {
     eprintln!(
         "Usage: assistant-task-api [--bind ADDR] [--admin-state PATH] [--device-registry PATH] [--conversations PATH] [--service-token TOKEN]"
     );
-}
-
-fn is_harborbeacon_state_path(path: &Path) -> bool {
-    path.to_string_lossy().contains(".harborbeacon")
-}
-
-fn legacy_state_path(path: &Path) -> PathBuf {
-    PathBuf::from(
-        path.to_string_lossy()
-            .replace(".harborbeacon", ".harbornas"),
-    )
 }
 
 fn ok_json(payload: &impl Serialize) -> Response<Cursor<Vec<u8>>> {
@@ -488,8 +462,11 @@ fn add_common_headers<R: Read>(response: &mut Response<R>) {
 mod tests {
     use std::fs;
     use std::io::{Cursor, Read};
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use harborbeacon_local_agent::control_plane::approvals::ApprovalStatus;
+    use harborbeacon_local_agent::control_plane::tasks::ExecutionRoute;
     use serde_json::{json, Value};
     use tiny_http::{Header, StatusCode};
 
@@ -501,6 +478,8 @@ mod tests {
     use harborbeacon_local_agent::runtime::registry::DeviceRegistryStore;
     use harborbeacon_local_agent::runtime::task_api::TaskApiService;
     use harborbeacon_local_agent::runtime::task_session::TaskConversationStore;
+
+    static HARBOROS_HTTP_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn unique_path(prefix: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
@@ -549,6 +528,75 @@ mod tests {
         for path in paths {
             let _ = fs::remove_file(path);
         }
+    }
+
+    fn reset_harboros_http_test_env() {
+        for name in [
+            "HARBOR_FORCE_MIDDLEWARE_ERROR",
+            "HARBOR_URL",
+            "HARBOR_MIDDLEWARE_URL",
+            "HARBOR_API_KEY",
+            "HARBOR_MIDDLEWARE_API_KEY",
+            "HARBOR_USER",
+            "HARBOR_PASSWORD",
+            "HARBOR_MIDCLI_URL",
+            "HARBOR_MIDCLI_USER",
+            "HARBOR_MIDCLI_PASSWORD",
+            "HARBOR_DISABLE_MIDDLEWARE",
+            "HARBOR_DISABLE_MIDCLI",
+            "HARBOR_MIDCLI_BIN",
+            "HARBOR_MIDCLI_PASSTHROUGH",
+        ] {
+            std::env::remove_var(name);
+        }
+    }
+
+    fn harbor_headers(token: &str) -> [Header; 2] {
+        [
+            header(HEADER_AUTHORIZATION, &format!("Bearer {token}")),
+            header(HEADER_CONTRACT_VERSION, "1.5"),
+        ]
+    }
+
+    fn harbor_task_request(
+        task_id: &str,
+        trace_id: &str,
+        step_id: &str,
+        message_id: &str,
+        domain: &str,
+        action: &str,
+        args: Value,
+    ) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "task_id": task_id,
+            "trace_id": trace_id,
+            "step_id": step_id,
+            "source": {
+                "channel": "im_bridge",
+                "surface": "harborgate",
+                "conversation_id": format!("chat-{task_id}"),
+                "user_id": "user-1",
+                "session_id": format!("sess-{task_id}"),
+                "route_key": format!("gw_route_{task_id}"),
+            },
+            "intent": {
+                "domain": domain,
+                "action": action,
+                "raw_text": format!("{domain}.{action}")
+            },
+            "entity_refs": {},
+            "args": args,
+            "autonomy": {
+                "level": "supervised"
+            },
+            "message": {
+                "message_id": message_id,
+                "chat_type": "group",
+                "mentions": [],
+                "attachments": []
+            }
+        }))
+        .expect("encode request")
     }
 
     #[test]
@@ -710,6 +758,156 @@ mod tests {
     }
 
     #[test]
+    fn task_endpoint_dispatches_service_status_to_harboros_route() {
+        let _guard = HARBOROS_HTTP_TEST_LOCK.lock().expect("lock");
+        reset_harboros_http_test_env();
+        let (server, paths) = build_server("shared-token");
+        let body = harbor_task_request(
+            "task-http-service-status",
+            "trace-http-service-status",
+            "step-http-service-status",
+            "om_http_service_status",
+            "service",
+            "status",
+            json!({"service_name": "ssh"}),
+        );
+
+        let (status, payload, _) =
+            response_json(server.handle_task_payload(&harbor_headers("shared-token"), &body));
+
+        assert_eq!(status.0, 200);
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["executor_used"], "middleware_api");
+        assert_eq!(payload["result"]["data"]["route_fallback_used"], false);
+        assert_eq!(payload["result"]["data"]["resource"]["service_name"], "ssh");
+
+        let task_step = server
+            .service
+            .conversation_store()
+            .load_task_step("step-http-service-status")
+            .expect("load task step")
+            .expect("task step");
+        assert_eq!(task_step.route, ExecutionRoute::MiddlewareApi);
+        assert_eq!(task_step.executor_used, "middleware_api");
+
+        cleanup(paths);
+        reset_harboros_http_test_env();
+    }
+
+    #[test]
+    fn task_endpoint_falls_back_to_midcli_when_harbor_middleware_fails() {
+        let _guard = HARBOROS_HTTP_TEST_LOCK.lock().expect("lock");
+        reset_harboros_http_test_env();
+        std::env::set_var("HARBOR_FORCE_MIDDLEWARE_ERROR", "1");
+        let (server, paths) = build_server("shared-token");
+        let body = harbor_task_request(
+            "task-http-service-fallback",
+            "trace-http-service-fallback",
+            "step-http-service-fallback",
+            "om_http_service_fallback",
+            "service",
+            "status",
+            json!({"service_name": "ssh"}),
+        );
+
+        let (status, payload, _) =
+            response_json(server.handle_task_payload(&harbor_headers("shared-token"), &body));
+
+        assert_eq!(status.0, 200);
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["executor_used"], "midcli");
+        assert_eq!(payload["result"]["data"]["route_fallback_used"], true);
+
+        let task_step = server
+            .service
+            .conversation_store()
+            .load_task_step("step-http-service-fallback")
+            .expect("load task step")
+            .expect("task step");
+        assert_eq!(task_step.route, ExecutionRoute::Midcli);
+        assert_eq!(task_step.executor_used, "midcli");
+
+        cleanup(paths);
+        reset_harboros_http_test_env();
+    }
+
+    #[test]
+    fn task_endpoint_records_restart_approval_gate_for_harboros_tasks() {
+        let _guard = HARBOROS_HTTP_TEST_LOCK.lock().expect("lock");
+        reset_harboros_http_test_env();
+        let (server, paths) = build_server("shared-token");
+        let body = harbor_task_request(
+            "task-http-service-restart",
+            "trace-http-service-restart",
+            "step-http-service-restart",
+            "om_http_service_restart",
+            "service",
+            "restart",
+            json!({"service_name": "ssh"}),
+        );
+
+        let (status, payload, _) =
+            response_json(server.handle_task_payload(&harbor_headers("shared-token"), &body));
+
+        assert_eq!(status.0, 200);
+        assert_eq!(payload["status"], "needs_input");
+        assert_eq!(payload["executor_used"], "harboros_router");
+        assert_eq!(payload["missing_fields"], json!(["approval_token"]));
+        assert_eq!(
+            payload["result"]["data"]["approval_ticket"]["policy_ref"],
+            "service.restart"
+        );
+
+        let approvals = server
+            .service
+            .conversation_store()
+            .approvals_for_task("task-http-service-restart")
+            .expect("load approvals");
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].status, ApprovalStatus::Pending);
+
+        cleanup(paths);
+        reset_harboros_http_test_env();
+    }
+
+    #[test]
+    fn task_endpoint_dispatches_files_list_to_harboros_route() {
+        let _guard = HARBOROS_HTTP_TEST_LOCK.lock().expect("lock");
+        reset_harboros_http_test_env();
+        let (server, paths) = build_server("shared-token");
+        let body = harbor_task_request(
+            "task-http-files-list",
+            "trace-http-files-list",
+            "step-http-files-list",
+            "om_http_files_list",
+            "files",
+            "list",
+            json!({"path": "/mnt"}),
+        );
+
+        let (status, payload, _) =
+            response_json(server.handle_task_payload(&harbor_headers("shared-token"), &body));
+
+        assert_eq!(status.0, 200);
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["executor_used"], "middleware_api");
+        assert_eq!(payload["result"]["data"]["route_fallback_used"], false);
+        assert_eq!(payload["result"]["data"]["resource"]["path"], "/mnt");
+
+        let task_step = server
+            .service
+            .conversation_store()
+            .load_task_step("step-http-files-list")
+            .expect("load task step")
+            .expect("task step");
+        assert_eq!(task_step.route, ExecutionRoute::MiddlewareApi);
+        assert_eq!(task_step.executor_used, "middleware_api");
+
+        cleanup(paths);
+        reset_harboros_http_test_env();
+    }
+
+    #[test]
     fn task_endpoint_accepts_legacy_im_gateway_surface_for_compatibility_window() {
         let (server, paths) = build_server("shared-token");
         let headers = [
@@ -754,22 +952,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_state_path_prefers_legacy_harbornas_state_when_new_path_is_absent() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("harborbeacon-state-fallback-{unique}"));
-        let preferred = root.join(".harborbeacon").join("admin-console.json");
-        let legacy = root.join(".harbornas").join("admin-console.json");
-        fs::create_dir_all(legacy.parent().expect("legacy parent")).expect("create legacy dir");
-        fs::write(&legacy, "{}").expect("write legacy file");
-
+    fn resolve_state_path_keeps_harborbeacon_location() {
+        let preferred = std::env::temp_dir()
+            .join(".harborbeacon")
+            .join("admin-console.json");
         let resolved = super::resolve_state_path(&preferred);
-
-        assert_eq!(resolved, legacy);
-
-        let _ = fs::remove_dir_all(root);
+        assert_eq!(resolved, preferred);
     }
 
     #[test]

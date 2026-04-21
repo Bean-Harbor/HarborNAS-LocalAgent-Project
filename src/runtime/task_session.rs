@@ -44,6 +44,8 @@ pub struct PendingTaskConnect {
     #[serde(default = "default_rtsp_port")]
     pub port: u16,
     #[serde(default)]
+    pub snapshot_url: Option<String>,
+    #[serde(default)]
     pub rtsp_paths: Vec<String>,
     #[serde(default)]
     pub requires_auth: bool,
@@ -916,6 +918,7 @@ mod tests {
             ip: "192.168.1.20".to_string(),
             room: Some("Entry".to_string()),
             port: 554,
+            snapshot_url: None,
             rtsp_paths: vec!["/live".to_string()],
             requires_auth: true,
             vendor: Some("Demo".to_string()),
@@ -1145,6 +1148,7 @@ mod tests {
                     "name": "Gate Cam",
                     "ip": "192.168.1.20",
                     "port": 554,
+                    "snapshot_url": "http://192.168.1.20/snapshot.jpg",
                     "rtsp_paths": ["/live"],
                     "requires_auth": true
                 }
@@ -1169,6 +1173,7 @@ mod tests {
                 ip: "192.168.1.20".to_string(),
                 room: None,
                 port: 554,
+                snapshot_url: Some("http://192.168.1.20/snapshot.jpg".to_string()),
                 rtsp_paths: vec!["/live".to_string()],
                 requires_auth: true,
                 vendor: None,
@@ -1206,6 +1211,7 @@ mod tests {
             ip: "192.168.1.20".to_string(),
             room: Some("Entry".to_string()),
             port: 554,
+            snapshot_url: Some("http://192.168.1.20/snapshot.jpg".to_string()),
             rtsp_paths: vec!["/live".to_string()],
             requires_auth: true,
             vendor: Some("Demo".to_string()),
@@ -1229,6 +1235,7 @@ mod tests {
                 ip: "192.168.1.20".to_string(),
                 room: Some("Entry".to_string()),
                 port: 554,
+                snapshot_url: Some("http://192.168.1.20/snapshot.jpg".to_string()),
                 rtsp_paths: vec!["/live".to_string()],
                 requires_auth: true,
                 vendor: Some("Demo".to_string()),

@@ -41,6 +41,10 @@ pub struct GatewayStatusResponse {
     #[serde(default)]
     #[serde(alias = "channels")]
     pub platforms: Vec<GatewayPlatformStatus>,
+    #[serde(default)]
+    pub manage_url: String,
+    #[serde(default)]
+    pub gateway_base_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,6 +212,8 @@ mod tests {
                         attachments: true,
                     },
                 }],
+                manage_url: String::new(),
+                gateway_base_url: String::new(),
             }
         );
     }
@@ -245,6 +251,8 @@ mod tests {
                         attachments: false,
                     },
                 }],
+                manage_url: String::new(),
+                gateway_base_url: String::new(),
             }
         );
     }

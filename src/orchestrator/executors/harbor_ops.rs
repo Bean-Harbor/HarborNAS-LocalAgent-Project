@@ -10,13 +10,162 @@ use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message, WebSocket};
 
 use crate::orchestrator::contracts::{Action, ExecutionResult, Route, StepStatus};
-use crate::orchestrator::router::Executor;
+use crate::orchestrator::router::{Executor, Router};
 
 const ALLOWED_READ_ROOTS: [&str; 2] = ["/mnt", "/data"];
 const ALLOWED_WRITE_ROOTS: [&str; 3] = ["/mnt", "/data", "/tmp/agent"];
 const DENIED_ROOTS: [&str; 5] = ["/", "/etc", "/boot", "/root", "/var/lib"];
 const MAX_READ_TEXT_BYTES: u64 = 256 * 1024;
 const DEFAULT_READ_TEXT_BYTES: u64 = 64 * 1024;
+const HARBOR_URL_ENV: &str = "HARBOR_URL";
+const HARBOR_MIDDLEWARE_URL_ENV: &str = "HARBOR_MIDDLEWARE_URL";
+const HARBOR_API_KEY_ENV: &str = "HARBOR_API_KEY";
+const HARBOR_MIDDLEWARE_API_KEY_ENV: &str = "HARBOR_MIDDLEWARE_API_KEY";
+const HARBOR_USER_ENV: &str = "HARBOR_USER";
+const HARBOR_PASSWORD_ENV: &str = "HARBOR_PASSWORD";
+const HARBOR_MIDCLI_URL_ENV: &str = "HARBOR_MIDCLI_URL";
+const HARBOR_MIDCLI_USER_ENV: &str = "HARBOR_MIDCLI_USER";
+const HARBOR_MIDCLI_PASSWORD_ENV: &str = "HARBOR_MIDCLI_PASSWORD";
+const HARBOR_DISABLE_MIDDLEWARE_ENV: &str = "HARBOR_DISABLE_MIDDLEWARE";
+const HARBOR_DISABLE_MIDCLI_ENV: &str = "HARBOR_DISABLE_MIDCLI";
+const HARBOR_MIDCLI_BIN_ENV: &str = "HARBOR_MIDCLI_BIN";
+const HARBOR_MIDCLI_PASSTHROUGH_ENV: &str = "HARBOR_MIDCLI_PASSTHROUGH";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarborExecutorConfig {
+    pub harbor_url: Option<String>,
+    pub harbor_api_key: Option<String>,
+    pub harbor_user: Option<String>,
+    pub harbor_password: Option<String>,
+    pub disable_middleware: bool,
+    pub disable_midcli: bool,
+    pub midcli_bin: String,
+    pub midcli_passthrough: bool,
+}
+
+impl Default for HarborExecutorConfig {
+    fn default() -> Self {
+        Self {
+            harbor_url: None,
+            harbor_api_key: None,
+            harbor_user: None,
+            harbor_password: None,
+            disable_middleware: false,
+            disable_midcli: false,
+            midcli_bin: "midcli".to_string(),
+            midcli_passthrough: false,
+        }
+    }
+}
+
+impl HarborExecutorConfig {
+    pub fn from_env() -> Self {
+        let mut config = Self::default();
+        config.harbor_url = env_non_empty(&[
+            HARBOR_URL_ENV,
+            HARBOR_MIDDLEWARE_URL_ENV,
+            HARBOR_MIDCLI_URL_ENV,
+        ])
+        .map(|value| infer_base_url_from_socket_url(&value));
+        config.harbor_api_key = env_non_empty(&[HARBOR_API_KEY_ENV, HARBOR_MIDDLEWARE_API_KEY_ENV]);
+        config.harbor_user = env_non_empty(&[HARBOR_USER_ENV, HARBOR_MIDCLI_USER_ENV]);
+        config.harbor_password = env_non_empty(&[HARBOR_PASSWORD_ENV, HARBOR_MIDCLI_PASSWORD_ENV]);
+        config.disable_middleware = env_flag_enabled(HARBOR_DISABLE_MIDDLEWARE_ENV);
+        config.disable_midcli = env_flag_enabled(HARBOR_DISABLE_MIDCLI_ENV);
+        if let Some(bin) = env_non_empty(&[HARBOR_MIDCLI_BIN_ENV]) {
+            config.midcli_bin = bin;
+        }
+        config.midcli_passthrough = env_flag_enabled(HARBOR_MIDCLI_PASSTHROUGH_ENV);
+        config
+    }
+
+    pub fn from_cli(
+        harbor_url: Option<String>,
+        harbor_api_key: Option<String>,
+        harbor_user: Option<String>,
+        harbor_password: Option<String>,
+        disable_middleware: bool,
+        disable_midcli: bool,
+        midcli_passthrough: bool,
+    ) -> Self {
+        Self {
+            harbor_url: harbor_url.map(|value| infer_base_url_from_socket_url(&value)),
+            harbor_api_key,
+            harbor_user,
+            harbor_password,
+            disable_middleware,
+            disable_midcli,
+            midcli_bin: "midcli".to_string(),
+            midcli_passthrough,
+        }
+    }
+}
+
+pub fn register_harbor_executors(
+    router: &mut Router,
+    config: &HarborExecutorConfig,
+) -> Result<(), String> {
+    if !config.disable_middleware {
+        if let Some(url) = config.harbor_url.as_deref() {
+            if let Some(api_key) = config.harbor_api_key.as_deref() {
+                router.register(Box::new(MiddlewareHttpExecutor::with_api_key(
+                    url, api_key,
+                )?));
+            } else if let (Some(user), Some(password)) = (
+                config.harbor_user.as_deref(),
+                config.harbor_password.as_deref(),
+            ) {
+                router.register(Box::new(MiddlewareWsExecutor::new(url, user, password)));
+            } else {
+                return Err(
+                    "harbor_url requires harbor_api_key or harbor_user/harbor_password".to_string(),
+                );
+            }
+        } else {
+            router.register(Box::new(MiddlewareExecutor::new(true)));
+        }
+    }
+
+    if !config.disable_midcli {
+        router.register(Box::new(MidcliExecutor::new(
+            true,
+            config.midcli_bin.clone(),
+            config.midcli_passthrough,
+        )));
+    }
+
+    Ok(())
+}
+
+fn env_non_empty(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+}
+
+fn infer_base_url_from_socket_url(value: &str) -> String {
+    let trimmed = value.trim().trim_end_matches('/');
+    let without_socket = trimmed.strip_suffix("/websocket").unwrap_or(trimmed);
+
+    if let Some(rest) = without_socket.strip_prefix("ws://") {
+        return format!("http://{rest}");
+    }
+    if let Some(rest) = without_socket.strip_prefix("wss://") {
+        return format!("https://{rest}");
+    }
+
+    without_socket.to_string()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileOperationContext {
@@ -967,17 +1116,28 @@ impl Executor for MiddlewareWsExecutor {
                 )
             }
             "files" => {
-                let file_ctx = extract_file_operation_context(action)?;
-                let (method, params) = map_ws_file_operation(&action.operation, &file_ctx)?;
-                (
-                    method,
-                    params,
-                    json!({
-                        "source_path": file_ctx.source_path,
-                        "target_path": file_ctx.target_path,
-                        "recursive": file_ctx.recursive,
-                    }),
-                )
+                if is_read_only_file_operation(&action.operation) {
+                    let file_ctx = extract_read_only_file_operation_context(action)?;
+                    let (method, params) =
+                        map_read_only_files_operation(&action.operation, &file_ctx)?;
+                    (
+                        method,
+                        params,
+                        build_read_only_preview_context(&action.operation, &file_ctx),
+                    )
+                } else {
+                    let file_ctx = extract_file_operation_context(action)?;
+                    let (method, params) = map_ws_file_operation(&action.operation, &file_ctx)?;
+                    (
+                        method,
+                        params,
+                        json!({
+                            "source_path": file_ctx.source_path,
+                            "target_path": file_ctx.target_path,
+                            "recursive": file_ctx.recursive,
+                        }),
+                    )
+                }
             }
             other => return Err(format!("unsupported harbor domain: {other}")),
         };
@@ -1218,21 +1378,42 @@ mod tests {
 
     #[test]
     fn harboros_executors_do_not_claim_device_native_domains() {
-        let action = Action {
-            domain: "device".to_string(),
-            operation: "inspect".to_string(),
-            resource: json!({
-                "device_id": "cam-1"
-            }),
-            args: json!({}),
-            risk_level: RiskLevel::Low,
-            requires_approval: false,
-            dry_run: false,
-        };
+        let cases = [
+            ("device", "discover", json!({ "query": "front-door" })),
+            ("device", "inspect", json!({ "device_id": "cam-1" })),
+            (
+                "device",
+                "control",
+                json!({ "device_id": "cam-1", "command": "reboot" }),
+            ),
+            ("camera", "snapshot", json!({ "device_id": "cam-1" })),
+            ("camera", "share_link", json!({ "device_id": "cam-1" })),
+        ];
 
-        assert!(!MiddlewareExecutor::new(true).supports(&action));
-        assert!(!MidcliExecutor::new(true, "midcli".to_string(), false).supports(&action));
-        assert!(!MiddlewareWsExecutor::new("http://nas.local", "root", "secret").supports(&action));
+        for (domain, operation, resource) in cases {
+            let action = Action {
+                domain: domain.to_string(),
+                operation: operation.to_string(),
+                resource,
+                args: json!({}),
+                risk_level: RiskLevel::Low,
+                requires_approval: false,
+                dry_run: false,
+            };
+
+            assert!(
+                !MiddlewareExecutor::new(true).supports(&action),
+                "middleware executor should not claim {domain}.{operation}"
+            );
+            assert!(
+                !MidcliExecutor::new(true, "midcli".to_string(), false).supports(&action),
+                "midcli executor should not claim {domain}.{operation}"
+            );
+            assert!(
+                !MiddlewareWsExecutor::new("http://nas.local", "root", "secret").supports(&action),
+                "ws executor should not claim {domain}.{operation}"
+            );
+        }
     }
 
     #[test]

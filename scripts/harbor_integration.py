@@ -7,11 +7,13 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 
 class IntegrationError(RuntimeError):
@@ -68,7 +70,7 @@ class IntegrationConfig:
     approval_token: str | None = None
     required_approval_token: str | None = None
     approver_id: str | None = None
-    mutation_root: str = "/mnt/agent-ci"
+    mutation_root: str = "/mnt/software/harborbeacon-agent-ci"
     rollback_on_failure: bool = True
 
     @classmethod
@@ -92,7 +94,9 @@ class IntegrationConfig:
             approval_token=os.getenv("HARBOR_APPROVAL_TOKEN"),
             required_approval_token=os.getenv("HARBOR_REQUIRED_APPROVAL_TOKEN"),
             approver_id=os.getenv("HARBOR_APPROVER_ID"),
-            mutation_root=os.getenv("HARBOR_MUTATION_ROOT", "/mnt/agent-ci"),
+            mutation_root=os.getenv(
+                "HARBOR_MUTATION_ROOT", "/mnt/software/harborbeacon-agent-ci"
+            ),
             rollback_on_failure=env_to_bool(os.getenv("HARBOR_ROLLBACK_ON_FAILURE", "1")),
         )
 
@@ -150,6 +154,8 @@ DENIED_ROOTS = ("/", "/etc", "/boot", "/root", "/var/lib")
 
 
 def normalize_path(path: str) -> str:
+    if looks_like_absolute_posix_path(path):
+        return normalize_posix_path(path)
     return str(Path(path).resolve(strict=False))
 
 
@@ -180,6 +186,56 @@ def normalize_contract_path(path: str) -> str:
     if not parts:
         return "/"
     return "/" + "/".join(parts)
+
+
+def looks_like_absolute_posix_path(path: str) -> bool:
+    trimmed = path.strip()
+    return trimmed.startswith("/") and not trimmed.startswith("\\\\")
+
+
+def normalize_posix_path(path: str) -> str:
+    parts: list[str] = []
+    for segment in path.strip().split("/"):
+        if not segment or segment == ".":
+            continue
+        if segment == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(segment)
+
+    if not parts:
+        return "/"
+    return "/" + "/".join(parts)
+
+
+def configured_harbor_target_is_remote(midcli_url: str | None = None) -> bool:
+    url = midcli_url or os.getenv("HARBOR_MIDCLI_URL") or os.getenv("HARBOR_MIDDLEWARE_URL")
+    if not url:
+        return False
+
+    host = urlparse(url).hostname
+    if not host:
+        return False
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        return False
+
+    local_hosts = {socket.gethostname(), socket.getfqdn()}
+    for candidate in tuple(local_hosts):
+        if not candidate:
+            continue
+        try:
+            local_hosts.update(info[4][0] for info in socket.getaddrinfo(candidate, None))
+        except OSError:
+            continue
+
+    return host not in local_hosts
+
+
+def should_skip_local_fixture_staging(normalized_path: str, *, midcli_url: str | None = None) -> bool:
+    return looks_like_absolute_posix_path(normalized_path) and (
+        os.name == "nt" or configured_harbor_target_is_remote(midcli_url)
+    )
 
 
 def ensure_service_name(service_name: str) -> None:
@@ -262,7 +318,11 @@ def build_file_preview(operation: str, src: str, dst: str, executor: str, risk_l
 
 
 def ensure_mutation_fixture(root: str, *, filename: str, content: str) -> str:
-    root_path = Path(normalize_path(root))
+    normalized_root = normalize_path(root)
+    if should_skip_local_fixture_staging(normalized_root):
+        return f"{normalized_root.rstrip('/')}/{filename}"
+
+    root_path = Path(normalized_root)
     root_path.mkdir(parents=True, exist_ok=True)
     file_path = root_path / filename
     file_path.write_text(content, encoding="utf-8")
@@ -271,6 +331,8 @@ def ensure_mutation_fixture(root: str, *, filename: str, content: str) -> str:
 
 def ensure_directory(path: str) -> str:
     normalized = normalize_path(path)
+    if should_skip_local_fixture_staging(normalized):
+        return normalized
     Path(normalized).mkdir(parents=True, exist_ok=True)
     return normalized
 
@@ -441,18 +503,24 @@ def execute_service_action(
 
     ensure_approved(risk_level, config, approval_token=approval_token, action_name=f"service.{operation}")
 
+    middleware_error: str | None = None
     if not prefer_midcli and middleware.is_available():
-        payload, result = middleware.service_control(operation, service_name)
-        return {
-            "preview": False,
-            "executor": "middleware_api",
-            "operation": operation,
-            "service_name": service_name,
-            "risk_level": risk_level,
-            "duration_ms": result.duration_ms,
-            "result": payload,
-            "approver_id": config.approver_id,
-        }
+        try:
+            payload, result = middleware.service_control(operation, service_name)
+        except IntegrationError as exc:
+            middleware_error = str(exc)
+        else:
+            return {
+                "preview": False,
+                "executor": "middleware_api",
+                "operation": operation,
+                "service_name": service_name,
+                "risk_level": risk_level,
+                "duration_ms": result.duration_ms,
+                "result": payload,
+                "approver_id": config.approver_id,
+                "route_fallback_used": False,
+            }
 
     if midcli.is_available():
         result = midcli.service_control(operation, service_name)
@@ -465,7 +533,13 @@ def execute_service_action(
             "duration_ms": result.duration_ms,
             "result": parse_loose_value(result.stdout) or result.stdout.strip(),
             "approver_id": config.approver_id,
+            "route_fallback_used": middleware_error is not None,
         }
+
+    if middleware_error:
+        raise CapabilityUnavailableError(
+            f"middleware failed and midcli is unavailable for service control: {middleware_error}"
+        )
 
     raise CapabilityUnavailableError("neither middleware nor midcli is available for service control")
 
@@ -495,20 +569,28 @@ def execute_file_action(
 
     ensure_approved(risk_level, config, approval_token=approval_token, action_name=f"files.{operation}")
 
+    middleware_error: str | None = None
     if operation == "copy":
         if not prefer_midcli and middleware.is_available():
-            payload, result = middleware.filesystem_copy(src_normalized, dst_normalized, recursive=recursive)
-            return {
-                "preview": False,
-                "executor": "middleware_api",
-                "operation": operation,
-                "src": src_normalized,
-                "dst": dst_normalized,
-                "risk_level": risk_level,
-                "duration_ms": result.duration_ms,
-                "result": payload,
-                "approver_id": config.approver_id,
-            }
+            try:
+                payload, result = middleware.filesystem_copy(
+                    src_normalized, dst_normalized, recursive=recursive
+                )
+            except IntegrationError as exc:
+                middleware_error = str(exc)
+            else:
+                return {
+                    "preview": False,
+                    "executor": "middleware_api",
+                    "operation": operation,
+                    "src": src_normalized,
+                    "dst": dst_normalized,
+                    "risk_level": risk_level,
+                    "duration_ms": result.duration_ms,
+                    "result": payload,
+                    "approver_id": config.approver_id,
+                    "route_fallback_used": False,
+                }
         if midcli.is_available():
             result = midcli.filesystem_copy(src_normalized, dst_normalized, recursive=recursive)
             return {
@@ -521,23 +603,31 @@ def execute_file_action(
                 "duration_ms": result.duration_ms,
                 "result": parse_loose_value(result.stdout) or result.stdout.strip(),
                 "approver_id": config.approver_id,
+                "route_fallback_used": middleware_error is not None,
             }
 
     if operation == "move":
         dst_dir = dst_normalized
         if not prefer_midcli and middleware.is_available():
-            payload, result = middleware.filesystem_move(src_normalized, dst_dir, recursive=recursive)
-            return {
-                "preview": False,
-                "executor": "middleware_api",
-                "operation": operation,
-                "src": src_normalized,
-                "dst": dst_dir,
-                "risk_level": risk_level,
-                "duration_ms": result.duration_ms,
-                "result": payload,
-                "approver_id": config.approver_id,
-            }
+            try:
+                payload, result = middleware.filesystem_move(
+                    src_normalized, dst_dir, recursive=recursive
+                )
+            except IntegrationError as exc:
+                middleware_error = str(exc)
+            else:
+                return {
+                    "preview": False,
+                    "executor": "middleware_api",
+                    "operation": operation,
+                    "src": src_normalized,
+                    "dst": dst_dir,
+                    "risk_level": risk_level,
+                    "duration_ms": result.duration_ms,
+                    "result": payload,
+                    "approver_id": config.approver_id,
+                    "route_fallback_used": False,
+                }
         if midcli.is_available():
             result = midcli.filesystem_move(src_normalized, dst_dir, recursive=recursive)
             return {
@@ -550,6 +640,12 @@ def execute_file_action(
                 "duration_ms": result.duration_ms,
                 "result": parse_loose_value(result.stdout) or result.stdout.strip(),
                 "approver_id": config.approver_id,
+                "route_fallback_used": middleware_error is not None,
             }
+
+    if middleware_error:
+        raise CapabilityUnavailableError(
+            f"middleware failed and midcli is unavailable for files.{operation}: {middleware_error}"
+        )
 
     raise CapabilityUnavailableError(f"no available executor for files.{operation}")
