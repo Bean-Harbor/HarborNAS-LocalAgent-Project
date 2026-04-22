@@ -374,6 +374,13 @@ impl AdminApi {
         )
     }
 
+    fn authorize_workspace_camera_action(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Result<AccessPrincipal, String> {
+        self.authorize_admin_action(hints, AccessAction::CameraOperate)
+    }
+
     fn authorize_camera_action(
         &self,
         hints: &AccessIdentityHints,
@@ -1255,7 +1262,7 @@ impl AdminApi {
         request: &mut Request,
         hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
-        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+        let principal = match self.authorize_workspace_camera_action(hints) {
             Ok(principal) => principal,
             Err(error) => return error_json(StatusCode(403), &error),
         };
@@ -1275,7 +1282,7 @@ impl AdminApi {
         request: &mut Request,
         hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
-        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+        let principal = match self.authorize_workspace_camera_action(hints) {
             Ok(principal) => principal,
             Err(error) => return error_json(StatusCode(403), &error),
         };
@@ -3766,8 +3773,10 @@ mod tests {
     use harborbeacon_local_agent::control_plane::models::{
         ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind,
     };
-    use harborbeacon_local_agent::control_plane::users::RoleKind;
-    use harborbeacon_local_agent::runtime::access_control::{AccessIdentityHints, AccessPrincipal};
+    use harborbeacon_local_agent::control_plane::users::{MembershipStatus, RoleKind};
+    use harborbeacon_local_agent::runtime::access_control::{
+        AccessAction, AccessIdentityHints, AccessPrincipal,
+    };
     use harborbeacon_local_agent::runtime::admin_console::{
         AdminConsoleStore, BridgeProviderConfig, RemoteViewConfig,
     };
@@ -3908,6 +3917,86 @@ mod tests {
             )
             .expect_err("operator manual add should still require approval");
 
+        assert!(error.contains("approval_token"));
+        let approvals = conversation_store
+            .pending_approvals()
+            .expect("load pending approvals");
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].policy_ref, "camera.connect");
+        assert_eq!(approvals[0].requester_user_id, "operator-1");
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn operator_camera_workspace_authorization_reaches_manual_add_approval_path() {
+        let admin_path = unique_store_path("harborbeacon-operator-http-state");
+        let registry_path = unique_store_path("harborbeacon-operator-http-registry");
+        let conversation_path = unique_store_path("harborbeacon-operator-http-runtime");
+        let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let task_service = TaskApiService::new(admin_store.clone(), conversation_store.clone());
+
+        let mut state = admin_store.load_or_create_state().expect("state");
+        state
+            .platform
+            .users
+            .push(harborbeacon_local_agent::control_plane::users::UserAccount {
+                user_id: "operator-1".to_string(),
+                display_name: "operator-1".to_string(),
+                email: None,
+                phone: None,
+                status: harborbeacon_local_agent::control_plane::users::UserStatus::Active,
+                default_workspace_id: Some("home-1".to_string()),
+                preferences: json!({
+                    "auth_source": "harbor_os",
+                    "channel": "harbor_os",
+                }),
+            });
+        state
+            .platform
+            .memberships
+            .push(harborbeacon_local_agent::control_plane::users::Membership {
+                membership_id: "membership-operator-1".to_string(),
+                workspace_id: "home-1".to_string(),
+                user_id: "operator-1".to_string(),
+                role_kind: RoleKind::Operator,
+                status: MembershipStatus::Active,
+                granted_by_user_id: Some("local-owner".to_string()),
+                granted_at: None,
+            });
+        fs::write(
+            &admin_path,
+            serde_json::to_vec_pretty(&state).expect("serialize state"),
+        )
+        .expect("write state");
+
+        let api = AdminApi::new(
+            admin_store,
+            task_service,
+            PathBuf::from("frontend/harbordesk/dist/harbordesk"),
+            "http://harborbeacon.local:4174".to_string(),
+        );
+        let hints = AccessIdentityHints {
+            user_id: Some("operator-1".to_string()),
+            ..AccessIdentityHints::default()
+        };
+
+        let principal = api
+            .authorize_workspace_camera_action(&hints)
+            .expect("operator should be allowed to operate cameras");
+        assert_eq!(principal.user_id, "operator-1");
+        assert_eq!(principal.role_kind, RoleKind::Operator);
+        assert!(api
+            .authorize_admin_action(&hints, AccessAction::AdminManage)
+            .is_err());
+
+        let error = api
+            .manual_add(&principal, build_manual_add_request(""))
+            .expect_err("operator manual add should still require approval");
         assert!(error.contains("approval_token"));
         let approvals = conversation_store
             .pending_approvals()
