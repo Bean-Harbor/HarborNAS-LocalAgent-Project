@@ -54,8 +54,12 @@ The redeployed host was validated with:
 HARBOR_RELEASE_VERSION=20260422-091221-618598c
 HARBOR_PUBLIC_ORIGIN=http://192.168.3.182:4174
 IM_AGENT_PUBLIC_ORIGIN=http://192.168.3.182:8787
+HARBORBEACON_ADMIN_API_URL=http://127.0.0.1:4174
+HARBORBEACON_ADMIN_API_TOKEN=<service-token>
 HARBOR_FFMPEG_BIN=/var/lib/harborbeacon-agent-ci/runtime/media-tools/bin/ffmpeg
 ```
+
+- HarborGate admin sync depends on the admin API loopback at `:4174`; do not rely on task API fallback for `/api/admin/notification-targets`.
 
 ## Service State
 

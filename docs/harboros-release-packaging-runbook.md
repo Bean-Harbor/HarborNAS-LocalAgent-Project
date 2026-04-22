@@ -151,6 +151,8 @@ sudo bash ./install_harboros_release.sh \
 - 把 bundle 解包到 `releases/<version>/`
 - 更新 `current/` 软链接
 - 写入单一 env-file
+- 显式写入 `HARBORBEACON_ADMIN_API_URL=http://127.0.0.1:4174`
+- 显式写入 `HARBORBEACON_ADMIN_API_TOKEN=<service-token>`
 - 写入 `HARBOR_HARBOROS_WRITABLE_ROOT=<writable-root>`
 - 安装/更新 4 个 systemd 服务单元
 - `daemon-reload`
@@ -205,6 +207,7 @@ sudo bash ./rollback_harboros_release.sh \
 - release install root 可以是 `/var/lib/harborbeacon-agent-ci`
 - HarborOS mutation root / writable root 仍然可以是 `/mnt/software/harborbeacon-agent-ci`
 - smoke proof 继续引用 writable root，而不是把 install root 当成 mutation proof
+- HarborGate admin sync 依赖 `:4174`，不要再让它 fallback 到 `:4175` task API 端口
 
 Windows host：
 

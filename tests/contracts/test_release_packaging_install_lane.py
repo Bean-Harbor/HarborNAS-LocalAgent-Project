@@ -82,6 +82,8 @@ def test_harboros_installer_manages_release_layout_and_services() -> None:
         "HARBOR_HARBOROS_USER",
         "WEIXIN_ACCOUNT_ID",
         "EXISTING_WRITABLE_ROOT",
+        "HARBORBEACON_ADMIN_API_URL=http://127.0.0.1:4174",
+        "HARBORBEACON_ADMIN_API_TOKEN",
         "not configured, skipped",
         "append_optional_env",
     ]
@@ -127,6 +129,8 @@ def test_release_packaging_runbook_records_builder_target_and_install_shape() ->
         "/mnt/software/harborbeacon-agent-ci",
         "HARBOR_HARBOROS_WRITABLE_ROOT",
         "HARBOR_RELEASE_VERSION",
+        "HARBORBEACON_ADMIN_API_URL=http://127.0.0.1:4174",
+        "HarborGate admin sync 依赖 `:4174`",
         "not configured, skipped",
     ]
     assert all(phrase in content for phrase in required_phrases)
