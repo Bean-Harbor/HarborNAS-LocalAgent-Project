@@ -12,13 +12,13 @@
 
 - Builder host: `192.168.3.223`
 - HarborBeacon commit: `a4e6d61`
-- HarborGate commit: `5a5cc56`
+- HarborGate commit: `dd93382`
 - Bundle root:
-  - `/home/r86s/artifacts/harborbeacon-release-bundles/harbor-release-20260422-143454-a4e6d61`
+  - `/home/r86s/artifacts/harborbeacon-release-bundles/harbor-release-20260422-144759-a4e6d61`
 - Tarball:
-  - `/home/r86s/artifacts/harborbeacon-release-bundles/harbor-release-20260422-143454-a4e6d61.tar.gz`
+  - `/home/r86s/artifacts/harborbeacon-release-bundles/harbor-release-20260422-144759-a4e6d61.tar.gz`
 - SHA256:
-  - `7f67bd08ca72034539c334b8375e45b03a162d78e58e7662eac50b0372b133fc`
+  - `60f9eae531ab41ca914907d242216971c5910d8d0dbd4868bc79b6ff2a810312`
 
 ## Deploy Target
 
@@ -29,9 +29,9 @@
 - Writable root:
   - `/mnt/software/harborbeacon-agent-ci`
 - Live release after redeploy:
-  - `20260422-143454-a4e6d61`
+  - `20260422-144759-a4e6d61`
 - Current symlink:
-  - `/var/lib/harborbeacon-agent-ci/current -> /var/lib/harborbeacon-agent-ci/releases/20260422-143454-a4e6d61`
+  - `/var/lib/harborbeacon-agent-ci/current -> /var/lib/harborbeacon-agent-ci/releases/20260422-144759-a4e6d61`
 
 ## Install Command
 
@@ -39,7 +39,7 @@ Upload the tarball to HarborOS first, then install as root:
 
 ```bash
 sudo bash /tmp/harbor-release-upload/install_harboros_release.sh \
-  --bundle /tmp/harbor-release-upload/harbor-release-20260422-143454-a4e6d61.tar.gz \
+  --bundle /tmp/harbor-release-upload/harbor-release-20260422-144759-a4e6d61.tar.gz \
   --install-root /var/lib/harborbeacon-agent-ci \
   --writable-root /mnt/software/harborbeacon-agent-ci \
   --public-origin http://192.168.3.182:4174 \
@@ -51,7 +51,7 @@ sudo bash /tmp/harbor-release-upload/install_harboros_release.sh \
 The redeployed host was validated with:
 
 ```text
-HARBOR_RELEASE_VERSION=20260422-143454-a4e6d61
+HARBOR_RELEASE_VERSION=20260422-144759-a4e6d61
 HARBOR_PUBLIC_ORIGIN=http://192.168.3.182:4174
 IM_AGENT_PUBLIC_ORIGIN=http://192.168.3.182:8787
 HARBORBEACON_ADMIN_API_URL=http://127.0.0.1:4174
@@ -80,8 +80,9 @@ Validated on `192.168.3.182` after redeploy:
   - `200 image/jpeg`
 - Real Weixin DM `帮我抓拍一下当前摄像头画面`
   - HarborGate observed `event=inbound_task_handled`
-  - HarborOS archived `/mnt/software/harborbeacon-agent-ci/camera-archive/cam-rtsp-192-168-3-231-1776868605106.jpg`
-  - Weixin runtime persisted `last_send_status=sent`, `last_send_attachment_count=1`, `last_send_content_kind=text+image`
+  - HarborOS archived `/mnt/software/harborbeacon-agent-ci/camera-archive/cam-rtsp-192-168-3-231-1776869373220.jpg`
+  - Weixin runtime persisted `last_send_status=sent`, `last_send_chunk_count=2`, `last_send_attachment_count=1`, `last_send_content_kind=text+image`
+  - User-side verification: Weixin client displayed the returned image and showed `原图 132K`
 
 ## Noexec Note
 
@@ -115,3 +116,6 @@ sudo bash /var/lib/harborbeacon-agent-ci/current/install/rollback_harboros_relea
   - HarborDesk root page smoke
   - camera snapshot proxy smoke
 - The current native Weixin image reply implementation is validated for HarborOS single-host deployment where HarborGate can read HarborBeacon artifact paths locally.
+- The final live-compatible shape uses the official minimal image contract:
+  - original-only upload ticket with `no_need_thumb=true`
+  - separate provider `sendmessage` calls for caption text and image item
