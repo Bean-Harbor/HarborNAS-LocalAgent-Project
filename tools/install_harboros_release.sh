@@ -49,6 +49,24 @@ default_writable_root() {
   fi
 }
 
+resolve_ffmpeg_bin() {
+  local candidate
+  for candidate in "$@"; do
+    if [[ -n "${candidate}" && -f "${candidate}" ]] && "${candidate}" -version >/dev/null 2>&1; then
+      echo "${candidate}"
+      return 0
+    fi
+  done
+  if command -v ffmpeg >/dev/null 2>&1; then
+    candidate="$(command -v ffmpeg)"
+    if "${candidate}" -version >/dev/null 2>&1; then
+      echo "${candidate}"
+      return 0
+    fi
+  fi
+  return 1
+}
+
 DEFAULT_INSTALL_ROOT="/var/lib/harborbeacon-agent-ci"
 INSTALL_ROOT="${DEFAULT_INSTALL_ROOT}"
 WRITABLE_ROOT=""
@@ -199,6 +217,7 @@ EXISTING_WEIXIN_USER_ID="${WEIXIN_USER_ID:-}"
 EXISTING_HARBOROS_USER="${HARBOR_HARBOROS_USER:-}"
 EXISTING_RELEASE_INSTALL_ROOT="${HARBOR_RELEASE_INSTALL_ROOT:-}"
 EXISTING_WRITABLE_ROOT="${HARBOR_HARBOROS_WRITABLE_ROOT:-}"
+EXISTING_FFMPEG_BIN="${HARBOR_FFMPEG_BIN:-}"
 
 if [[ "${INSTALL_ROOT_SET}" -ne 1 && -n "${EXISTING_RELEASE_INSTALL_ROOT}" ]]; then
   INSTALL_ROOT="${EXISTING_RELEASE_INSTALL_ROOT}"
@@ -211,6 +230,11 @@ if [[ "${WRITABLE_ROOT_SET}" -ne 1 ]]; then
     WRITABLE_ROOT="$(default_writable_root)"
   fi
 fi
+
+FFMPEG_BIN="$(resolve_ffmpeg_bin \
+  "${EXISTING_FFMPEG_BIN}" \
+  "${INSTALL_ROOT}/runtime/media-tools/bin/ffmpeg" \
+  "${WRITABLE_ROOT}/media-tools/bin/ffmpeg" || true)"
 
 SERVICE_TOKEN="${SERVICE_TOKEN:-${HARBOR_TASK_API_BEARER_TOKEN:-${HARBORGATE_BEARER_TOKEN:-${IM_AGENT_SERVICE_TOKEN:-}}}}"
 if [[ -z "${SERVICE_TOKEN}" ]]; then
@@ -322,6 +346,7 @@ append_optional_env "WEIXIN_ACCOUNT_ID" "${EXISTING_WEIXIN_ACCOUNT_ID}"
 append_optional_env "WEIXIN_BOT_TOKEN" "${EXISTING_WEIXIN_BOT_TOKEN}"
 append_optional_env "WEIXIN_BASE_URL" "${EXISTING_WEIXIN_BASE_URL}"
 append_optional_env "WEIXIN_USER_ID" "${EXISTING_WEIXIN_USER_ID}"
+append_optional_env "HARBOR_FFMPEG_BIN" "${FFMPEG_BIN}"
 
 chmod 0644 \
   "${ENV_FILE}" \
