@@ -82,6 +82,7 @@ INSTALL_ROOT_SET=0
 WRITABLE_ROOT_SET=0
 
 CORE_SERVICES=(
+  harbor-model-api.service
   assistant-task-api.service
   agent-hub-admin-api.service
   harborgate.service
@@ -217,7 +218,16 @@ EXISTING_WEIXIN_USER_ID="${WEIXIN_USER_ID:-}"
 EXISTING_HARBOROS_USER="${HARBOR_HARBOROS_USER:-}"
 EXISTING_RELEASE_INSTALL_ROOT="${HARBOR_RELEASE_INSTALL_ROOT:-}"
 EXISTING_WRITABLE_ROOT="${HARBOR_HARBOROS_WRITABLE_ROOT:-}"
+EXISTING_KNOWLEDGE_INDEX_ROOT="${HARBOR_KNOWLEDGE_INDEX_ROOT:-}"
 EXISTING_FFMPEG_BIN="${HARBOR_FFMPEG_BIN:-}"
+EXISTING_MODEL_API_BACKEND="${HARBOR_MODEL_API_BACKEND:-}"
+EXISTING_MODEL_API_UPSTREAM_BASE_URL="${HARBOR_MODEL_API_UPSTREAM_BASE_URL:-}"
+EXISTING_MODEL_API_CHAT_MODEL="${HARBOR_MODEL_API_CHAT_MODEL:-}"
+EXISTING_MODEL_API_EMBEDDING_MODEL="${HARBOR_MODEL_API_EMBEDDING_MODEL:-}"
+EXISTING_MODEL_API_REQUEST_TIMEOUT_MS="${HARBOR_MODEL_API_REQUEST_TIMEOUT_MS:-}"
+EXISTING_MODEL_API_CANDLE_CHAT_MODEL_ID="${HARBOR_MODEL_API_CANDLE_CHAT_MODEL_ID:-${HARBOR_MODEL_API_CANDLE_MODEL_ID:-}}"
+EXISTING_MODEL_API_CANDLE_EMBEDDING_MODEL_ID="${HARBOR_MODEL_API_CANDLE_EMBEDDING_MODEL_ID:-}"
+EXISTING_MODEL_API_CANDLE_CACHE_DIR="${HARBOR_MODEL_API_CANDLE_CACHE_DIR:-}"
 
 if [[ "${INSTALL_ROOT_SET}" -ne 1 && -n "${EXISTING_RELEASE_INSTALL_ROOT}" ]]; then
   INSTALL_ROOT="${EXISTING_RELEASE_INSTALL_ROOT}"
@@ -295,6 +305,7 @@ PY
 
 render_template "${RELEASE_DIR}/templates/systemd/assistant-task-api.service.template" "/etc/systemd/system/assistant-task-api.service"
 render_template "${RELEASE_DIR}/templates/systemd/agent-hub-admin-api.service.template" "/etc/systemd/system/agent-hub-admin-api.service"
+render_template "${RELEASE_DIR}/templates/systemd/harbor-model-api.service.template" "/etc/systemd/system/harbor-model-api.service"
 render_template "${RELEASE_DIR}/templates/systemd/harborgate.service.template" "/etc/systemd/system/harborgate.service"
 render_template "${RELEASE_DIR}/templates/systemd/harborgate-weixin-runner.service.template" "/etc/systemd/system/harborgate-weixin-runner.service"
 
@@ -314,6 +325,16 @@ HARBOR_PUBLIC_ORIGIN=${PUBLIC_ORIGIN}
 HARBORDESK_DIST=${CURRENT_LINK}/harbordesk/dist/harbordesk
 HARBOR_HARBOROS_USER=${HARBOROS_PRINCIPAL}
 HARBOR_HARBOROS_WRITABLE_ROOT=${WRITABLE_ROOT}
+HARBOR_KNOWLEDGE_INDEX_ROOT=${EXISTING_KNOWLEDGE_INDEX_ROOT:-${WRITABLE_ROOT}/knowledge-index}
+
+HARBOR_MODEL_API_BIND=127.0.0.1:4176
+HARBOR_MODEL_API_BASE_URL=http://127.0.0.1:4176/v1
+HARBOR_MODEL_API_TOKEN=${SERVICE_TOKEN}
+HARBOR_MODEL_API_BACKEND=${EXISTING_MODEL_API_BACKEND:-openai_proxy}
+HARBOR_MODEL_API_UPSTREAM_BASE_URL=${EXISTING_MODEL_API_UPSTREAM_BASE_URL:-http://127.0.0.1:11434/v1}
+HARBOR_MODEL_API_CHAT_MODEL=${EXISTING_MODEL_API_CHAT_MODEL:-harbor-local-chat}
+HARBOR_MODEL_API_EMBEDDING_MODEL=${EXISTING_MODEL_API_EMBEDDING_MODEL:-harbor-local-embed}
+HARBOR_MODEL_API_REQUEST_TIMEOUT_MS=${EXISTING_MODEL_API_REQUEST_TIMEOUT_MS:-30000}
 
 HARBOR_TASK_API_BIND=127.0.0.1:4175
 HARBOR_TASK_API_URL=http://127.0.0.1:4175
@@ -349,9 +370,13 @@ append_optional_env "WEIXIN_BOT_TOKEN" "${EXISTING_WEIXIN_BOT_TOKEN}"
 append_optional_env "WEIXIN_BASE_URL" "${EXISTING_WEIXIN_BASE_URL}"
 append_optional_env "WEIXIN_USER_ID" "${EXISTING_WEIXIN_USER_ID}"
 append_optional_env "HARBOR_FFMPEG_BIN" "${FFMPEG_BIN}"
+append_optional_env "HARBOR_MODEL_API_CANDLE_CHAT_MODEL_ID" "${EXISTING_MODEL_API_CANDLE_CHAT_MODEL_ID}"
+append_optional_env "HARBOR_MODEL_API_CANDLE_EMBEDDING_MODEL_ID" "${EXISTING_MODEL_API_CANDLE_EMBEDDING_MODEL_ID}"
+append_optional_env "HARBOR_MODEL_API_CANDLE_CACHE_DIR" "${EXISTING_MODEL_API_CANDLE_CACHE_DIR}"
 
 chmod 0644 \
   "${ENV_FILE}" \
+  /etc/systemd/system/harbor-model-api.service \
   /etc/systemd/system/assistant-task-api.service \
   /etc/systemd/system/agent-hub-admin-api.service \
   /etc/systemd/system/harborgate.service \

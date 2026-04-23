@@ -293,7 +293,7 @@ def test_remote_posix_mutation_roots_skip_local_fixture_staging_for_linux_verifi
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(harbor_integration.os, "name", "posix")
-    monkeypatch.setenv("HARBOR_MIDCLI_URL", "ws://192.168.3.169/websocket")
+    monkeypatch.setenv("HARBOR_MIDCLI_URL", "ws://192.168.3.182/websocket")
     monkeypatch.setattr(
         harbor_integration.Path,
         "mkdir",

@@ -6,6 +6,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use markitdown::model::ConversionOptions;
+use markitdown::MarkItDown;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -18,11 +20,32 @@ const MAX_INDEX_TEXT_BYTES: u64 = 512 * 1024;
 const MAX_CHUNK_LINES: usize = 4;
 const MAX_CHUNK_CHARS: usize = 320;
 const INDEX_SCHEMA_VERSION: u32 = 1;
+const EMBEDDING_STORE_SCHEMA_VERSION: u32 = 1;
 const DOCUMENT_EXTENSIONS: &[&str] = &[
-    "txt", "md", "markdown", "json", "csv", "html", "htm", "yaml", "yml", "log",
+    "txt",
+    "md",
+    "markdown",
+    "json",
+    "csv",
+    "html",
+    "htm",
+    "yaml",
+    "yml",
+    "log",
+    "xml",
+    "rss",
+    "atom",
+    "pdf",
+    "docx",
+    "pptx",
+    "xlsx",
+    "zip",
 ];
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp"];
 const SIDECAR_EXTENSIONS: &[&str] = &["txt", "md", "markdown", "json", "csv", "yaml", "yml"];
+const MARKITDOWN_EXTENSIONS: &[&str] = &[
+    "html", "htm", "xml", "rss", "atom", "pdf", "docx", "pptx", "xlsx", "zip",
+];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -242,8 +265,39 @@ impl KnowledgeIndexService {
     fn manifest_path_for_root(&self, root: &Path) -> PathBuf {
         self.config
             .index_root
-            .join(format!("{}.json", root_hash(root)))
+            .join(format!("{}.json", root_storage_key(root)))
     }
+
+    pub fn embedding_store_path_for_root(&self, root: &Path) -> PathBuf {
+        self.config
+            .index_root
+            .join(format!("{}.embeddings.json", root_storage_key(root)))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct KnowledgeEmbeddingStore {
+    pub schema_version: u32,
+    pub root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_endpoint_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+    #[serde(default)]
+    pub entries: Vec<KnowledgeEmbeddingEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct KnowledgeEmbeddingEntry {
+    pub key: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_id: Option<String>,
+    pub text_hash: String,
+    #[serde(default)]
+    pub vector: Vec<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -331,6 +385,58 @@ fn save_manifest(path: &Path, manifest: &KnowledgeIndexManifest) -> Result<(), S
     fs::write(path, payload).map_err(|error| {
         format!(
             "failed to write knowledge index manifest {}: {error}",
+            path.display()
+        )
+    })
+}
+
+pub fn load_embedding_store(path: &Path) -> Result<KnowledgeEmbeddingStore, String> {
+    if !path.exists() {
+        return Ok(KnowledgeEmbeddingStore {
+            schema_version: EMBEDDING_STORE_SCHEMA_VERSION,
+            ..KnowledgeEmbeddingStore::default()
+        });
+    }
+
+    let text = fs::read_to_string(path).map_err(|error| {
+        format!(
+            "failed to read knowledge embedding store {}: {error}",
+            path.display()
+        )
+    })?;
+    let store = serde_json::from_str::<KnowledgeEmbeddingStore>(&text).map_err(|error| {
+        format!(
+            "failed to parse knowledge embedding store {}: {error}",
+            path.display()
+        )
+    })?;
+    if store.schema_version != EMBEDDING_STORE_SCHEMA_VERSION {
+        return Ok(KnowledgeEmbeddingStore {
+            schema_version: EMBEDDING_STORE_SCHEMA_VERSION,
+            ..KnowledgeEmbeddingStore::default()
+        });
+    }
+    Ok(store)
+}
+
+pub fn save_embedding_store(path: &Path, store: &KnowledgeEmbeddingStore) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create knowledge embedding directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let payload = serde_json::to_string_pretty(store).map_err(|error| {
+        format!(
+            "failed to serialize knowledge embedding store {}: {error}",
+            path.display()
+        )
+    })?;
+    fs::write(path, payload).map_err(|error| {
+        format!(
+            "failed to write knowledge embedding store {}: {error}",
             path.display()
         )
     })
@@ -438,13 +544,13 @@ fn refresh_entry(
                     return Ok(Some(old_entry.clone()));
                 }
             }
-            let Some(text) = load_text_file(path) else {
+            let Some(text) = load_document_text(path) else {
                 return Ok(None);
             };
             let text_sources = vec![KnowledgeIndexTextSource {
-                source_kind: "document".to_string(),
+                source_kind: document_source_kind(path).to_string(),
                 source_path: Some(path_key.clone()),
-                provider_key: None,
+                provider_key: markitdown_provider_key(path),
                 text: text.clone(),
             }];
             let chunks = build_text_chunks(&text_sources);
@@ -582,6 +688,58 @@ fn load_text_file(path: &Path) -> Option<String> {
     let bytes = fs::read(path).ok()?;
     let text = String::from_utf8_lossy(&bytes).trim().to_string();
     (!text.is_empty()).then_some(text)
+}
+
+fn load_document_text(path: &Path) -> Option<String> {
+    if should_normalize_with_markitdown(path) {
+        if let Some(normalized) = normalize_document_with_markitdown(path) {
+            return Some(normalized);
+        }
+    }
+    load_text_file(path)
+}
+
+fn should_normalize_with_markitdown(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+        .is_some_and(|extension| MARKITDOWN_EXTENSIONS.contains(&extension))
+}
+
+fn normalize_document_with_markitdown(path: &Path) -> Option<String> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!(".{}", value.to_ascii_lowercase()));
+    let path_text = path.to_string_lossy().into_owned();
+    let converter = MarkItDown::new();
+    let result = converter
+        .convert(
+            &path_text,
+            Some(ConversionOptions {
+                file_extension: extension,
+                url: None,
+                llm_client: None,
+                llm_model: None,
+            }),
+        )
+        .ok()
+        .flatten()?;
+    let text = result.text_content.trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+fn document_source_kind(path: &Path) -> &'static str {
+    if should_normalize_with_markitdown(path) {
+        "normalized_markdown"
+    } else {
+        "document"
+    }
+}
+
+fn markitdown_provider_key(path: &Path) -> Option<String> {
+    should_normalize_with_markitdown(path).then(|| "markitdown".to_string())
 }
 
 fn join_text_sources(text_sources: &[KnowledgeIndexTextSource]) -> String {
@@ -747,7 +905,7 @@ fn default_index_root() -> PathBuf {
     PathBuf::from(DEFAULT_INDEX_DIR)
 }
 
-fn root_hash(root: &Path) -> String {
+pub fn root_storage_key(root: &Path) -> String {
     let canonical = root
         .canonicalize()
         .ok()
@@ -942,6 +1100,46 @@ mod tests {
         assert_eq!(first.manifest_path, second.manifest_path);
         assert_eq!(first.manifest.entries, second.manifest.entries);
         assert!(second.stats.reused >= 1);
+
+        cleanup_dir(&knowledge_root);
+        cleanup_dir(&index_root);
+    }
+
+    #[test]
+    fn html_documents_are_normalized_before_indexing() {
+        let knowledge_root = unique_dir("harborbeacon-knowledge-index-html");
+        let index_root = unique_dir("harborbeacon-knowledge-index-store");
+        fs::create_dir_all(knowledge_root.join("docs")).expect("create docs");
+        fs::create_dir_all(&index_root).expect("create index root");
+        fs::write(
+            knowledge_root.join("docs").join("garden.html"),
+            "<html><body><h1>樱花整理</h1><p>春季归档清单。</p></body></html>",
+        )
+        .expect("write html");
+
+        let service = KnowledgeIndexService::from_config(
+            KnowledgeIndexConfig::new(index_root.clone()).expect("config"),
+        )
+        .expect("service");
+        let snapshot = service
+            .load_or_refresh(&knowledge_root)
+            .expect("index refresh");
+        let document = snapshot
+            .manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path.ends_with("garden.html"))
+            .expect("normalized html entry");
+
+        assert_eq!(document.modality, KnowledgeModality::Document);
+        assert!(document.searchable_text.contains("樱花整理"));
+        assert!(document.searchable_text.contains("春季归档清单"));
+        assert!(!document.searchable_text.contains("<html>"));
+        assert_eq!(
+            document.text_sources[0].provider_key.as_deref(),
+            Some("markitdown")
+        );
+        assert_eq!(document.text_sources[0].source_kind, "normalized_markdown");
 
         cleanup_dir(&knowledge_root);
         cleanup_dir(&index_root);

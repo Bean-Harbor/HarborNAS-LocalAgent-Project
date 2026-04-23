@@ -1,6 +1,6 @@
 # HarborOS Release Packaging / Install Runbook
 
-更新时间：2026-04-20
+更新时间：2026-04-23
 
 ## 1. 目的
 
@@ -16,11 +16,13 @@
 release-v1 的默认形态固定为：
 
 - Linux builder 负责预构建 HarborBeacon Rust 二进制
+- Linux builder 负责预构建 `harbor-model-api` 本地 OpenAI-compatible 模型服务二进制
 - Linux builder 负责构建 HarborDesk Angular `dist`
 - Linux builder 负责组装 HarborGate Python 运行包
 - HarborOS 目标机只负责部署与运行，不在机上执行 `cargo`、`rustc`、`node`、`npm` 或 `pip`
 - HarborBeacon Rust Linux 默认目标为 `x86_64-unknown-linux-musl`
 - 当目标为 musl 时，builder 使用 `cargo zigbuild --release --target <target>`，并要求 builder 上已有 `cargo-zigbuild` 与 `zig`
+- `harbor-model-api` backend 的 frozen seam 是本地 OpenAI-compatible API；是否允许把 backend 从 `openai_proxy` 切到 `candle`，要看 benchmark gate 结果，而不是手工拍板
 
 当前默认 builder：
 
@@ -29,7 +31,7 @@ release-v1 的默认形态固定为：
 
 当前默认 HarborOS 目标机：
 
-- `192.168.3.169`
+- `192.168.3.182`
 
 当前默认 install root：
 
@@ -46,6 +48,7 @@ builder 产出一个单一版本化 bundle，结构固定为：
 ```text
 harbor-release-<version>/
   bin/
+    harbor-model-api
     assistant-task-api
     agent-hub-admin-api
     validate-contract-schemas
@@ -127,11 +130,67 @@ builder 结果至少应包含：
 
 - `assistant-task-api` Linux release binary
 - `agent-hub-admin-api` Linux release binary
+- `harbor-model-api` Linux release binary
 - HarborDesk Angular dist
 - HarborGate vendored site-packages
 - `manifest.json`
 - `checksums.sha256`
 - `harbor-release-<version>.tar.gz`
+
+## 4.1 Model Backend Benchmark Gate
+
+在把 HarborOS 的默认 backend 从 `openai_proxy` 切到 `candle` 之前，先跑
+repo-local benchmark lane。
+这里的 lane 分工固定为：
+
+- `.182` 是权威 Candle runtime gate
+- `.223` 只用于 build / prefetch / spawned benchmark 证据
+- `4176` 继续保持默认 `openai_proxy`
+- `4186` 继续保留给 Candle candidate lane
+
+观察已运行服务：
+
+```bash
+cargo run --bin benchmark-local-model-backend -- \
+  --base-url http://127.0.0.1:4176/v1 \
+  --healthz-url http://127.0.0.1:4176/healthz \
+  --backend openai_proxy \
+  --output /tmp/local-model-benchmark-openai-proxy.json
+```
+
+正式 promotion gate：
+
+```bash
+cargo run --bin benchmark-local-model-backend -- \
+  --spawn-binary ./target/x86_64-unknown-linux-musl/release/harbor-model-api \
+  --backend candle \
+  --bind 127.0.0.1:4186 \
+  --candle-chat-model-id Qwen/Qwen3-1.7B \
+  --candle-embedding-model-id jinaai/jina-embeddings-v2-base-zh \
+  --output /tmp/local-model-benchmark-candle.json
+```
+
+只有当报告里的 `gate.promotable=true`，才允许把 env 里的
+`HARBOR_MODEL_API_BACKEND` 改成 `candle`。否则保持 `openai_proxy`，
+HarborBeacon 的 local OpenAI-compatible seam 不变。
+
+补充说明：
+
+- `127.0.0.1:4186` 只保留给 `candle` 旁路实验实例，例如
+  `harbor-model-api-candle-exp` 这种 transient unit。
+- 当前 Candle 候选默认组合是 `Qwen/Qwen3-1.7B + jinaai/jina-embeddings-v2-base-zh`。
+- `Qwen3.5` 已明确延期到后续 loader/backend 轮次，不进入这一轮 gate。
+- HarborOS env template 允许保留这 3 个 side-lane 变量：
+  - `HARBOR_MODEL_API_CANDLE_CHAT_MODEL_ID`
+  - `HARBOR_MODEL_API_CANDLE_EMBEDDING_MODEL_ID`
+  - `HARBOR_MODEL_API_CANDLE_CACHE_DIR`
+- 只要 `/healthz` 仍报告 `degraded` / `ready=false`，或者 chat / embeddings 任一
+  gate 没过，就不能把 `4186` 的结果写成 Candle 已可切默认 backend。
+- `.223` 的 spawned benchmark 只保留为 build / prefetch 兼容性证据；是否允许
+  进入 cutover rehearsal，只看 `.182` 的 target-runtime report。
+- 当 `.182` 已经拿到 `gate.promotable=true` 的 Candle report 时，下一步也仍然是
+  单独开一轮 cutover rehearsal，而不是直接把 `4176` 从 `openai_proxy` 改成
+  `candle`。
 
 ## 5. HarborOS 安装
 
@@ -153,15 +212,18 @@ sudo bash ./install_harboros_release.sh \
 - 写入单一 env-file
 - 显式写入 `HARBORBEACON_ADMIN_API_URL=http://127.0.0.1:4174`
 - 显式写入 `HARBORBEACON_ADMIN_API_TOKEN=<service-token>`
+- 显式写入 `HARBOR_MODEL_API_BASE_URL=http://127.0.0.1:4176/v1`
+- 显式写入 `HARBOR_MODEL_API_TOKEN=<service-token>`
 - 写入 `HARBOR_HARBOROS_WRITABLE_ROOT=<writable-root>`
-- 安装/更新 4 个 systemd 服务单元
+- 安装/更新 5 个 systemd 服务单元
 - `daemon-reload`
 - 默认 enable/start 3 个 core services
 - 仅在已有 Weixin account config 时 enable/start `harborgate-weixin-runner`
 - 若未配置 Weixin，则明确输出 `not configured, skipped`
 
-固定安装的 4 个服务单元：
+固定安装的 5 个服务单元：
 
+- `harbor-model-api.service`
 - `assistant-task-api.service`
 - `agent-hub-admin-api.service`
 - `harborgate.service`
@@ -171,6 +233,7 @@ clean install 的健康预期：
 
 - 默认活跃服务是 `assistant-task-api.service`
 - 默认活跃服务是 `agent-hub-admin-api.service`
+- 默认活跃服务是 `harbor-model-api.service`
 - 默认活跃服务是 `harborgate.service`
 - `harborgate-weixin-runner.service` 在未配置 Weixin 凭据时允许保持 inactive/disabled
 
@@ -208,12 +271,14 @@ sudo bash ./rollback_harboros_release.sh \
 - HarborOS mutation root / writable root 仍然可以是 `/mnt/software/harborbeacon-agent-ci`
 - smoke proof 继续引用 writable root，而不是把 install root 当成 mutation proof
 - HarborGate admin sync 依赖 `:4174`，不要再让它 fallback 到 `:4175` task API 端口
+- 本地 OpenAI-compatible 模型服务固定依赖 `:4176`，由 HarborOS 单机承载；HarborBeacon 继续拥有检索语义、排序和引用包装
+- `HARBOR_KNOWLEDGE_INDEX_ROOT` 必须指向 writable root，例如 `/mnt/software/harborbeacon-agent-ci/knowledge-index`；不要让 retrieval 回落到相对路径 `.harborbeacon/knowledge-index`
 
 Windows host：
 
 ```powershell
 .\tools\run_harboros_vm_smoke.ps1 `
-  -WebSocketUrl ws://192.168.3.169/websocket `
+  -WebSocketUrl ws://192.168.3.182/websocket `
   -Username <harboros-user> `
   -Password '<password>' `
   -AllowMutations `

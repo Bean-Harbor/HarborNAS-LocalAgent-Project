@@ -19,6 +19,7 @@ ENV_FILE="/etc/default/harborbeacon-agent-hub"
 TARGET_VERSION=""
 SKIP_START=0
 CORE_SERVICES=(
+  harbor-model-api.service
   assistant-task-api.service
   agent-hub-admin-api.service
   harborgate.service

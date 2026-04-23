@@ -121,6 +121,7 @@ build_rust_binaries() {
   local cargo_args=(
     --release
     --target "${RUST_TARGET}"
+    --bin harbor-model-api
     --bin assistant-task-api
     --bin agent-hub-admin-api
     --bin validate-contract-schemas
@@ -210,7 +211,7 @@ echo "==> Building HarborBeacon release binaries (${RUST_TARGET}, ${RUST_LINKAGE
 )
 
 RUST_RELEASE_DIR="$(rust_release_dir)"
-for binary in assistant-task-api agent-hub-admin-api validate-contract-schemas run-e2e-suite; do
+for binary in harbor-model-api assistant-task-api agent-hub-admin-api validate-contract-schemas run-e2e-suite; do
   assert_binary_linkage "${RUST_RELEASE_DIR}/${binary}"
 done
 
@@ -240,6 +241,7 @@ echo
 echo "==> Assembling bundle layout"
 cp "${RUST_RELEASE_DIR}/assistant-task-api" "${BUNDLE_ROOT}/bin/assistant-task-api"
 cp "${RUST_RELEASE_DIR}/agent-hub-admin-api" "${BUNDLE_ROOT}/bin/agent-hub-admin-api"
+cp "${RUST_RELEASE_DIR}/harbor-model-api" "${BUNDLE_ROOT}/bin/harbor-model-api"
 cp "${RUST_RELEASE_DIR}/validate-contract-schemas" "${BUNDLE_ROOT}/bin/validate-contract-schemas"
 cp "${RUST_RELEASE_DIR}/run-e2e-suite" "${BUNDLE_ROOT}/bin/run-e2e-suite"
 cp -R "${HARBORDESK_DIST_PATH}" "${BUNDLE_ROOT}/harbordesk/dist/"
@@ -283,6 +285,7 @@ payload = {
             "linkage": sys.argv[7],
             "linux_portability_expectation": sys.argv[8],
             "binaries": [
+                "bin/harbor-model-api",
                 "bin/assistant-task-api",
                 "bin/agent-hub-admin-api",
                 "bin/validate-contract-schemas",
@@ -309,6 +312,7 @@ payload = {
         "install_root_default": sys.argv[9],
         "writable_root_default": sys.argv[10],
         "service_names": [
+            "harbor-model-api.service",
             "assistant-task-api.service",
             "agent-hub-admin-api.service",
             "harborgate.service",

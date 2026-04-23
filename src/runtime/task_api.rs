@@ -272,6 +272,7 @@ pub enum TaskRequestAcceptance {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GeneralMessagePlanKind {
+    CapabilitySummary,
     CameraSnapshot,
     CameraRecordClip,
     KnowledgeSearch,
@@ -1132,12 +1133,13 @@ impl TaskApiService {
     fn handle_general_message(&self, request: &TaskRequest) -> TaskResponse {
         let plan = match self.general_message_plan(request) {
             Ok(plan) => plan,
-            Err(error) => {
-                return self.failed(request, "agentic_interpreter", RiskLevel::Low, error);
-            }
+            Err(_) => return self.general_message_unsupported_response(request),
         };
 
         match plan.kind {
+            GeneralMessagePlanKind::CapabilitySummary => {
+                self.general_message_capability_summary_response(request)
+            }
             GeneralMessagePlanKind::CameraSnapshot => {
                 let mut routed = request.clone();
                 routed.intent.domain = "camera".to_string();
@@ -1170,18 +1172,78 @@ impl TaskApiService {
                 }
                 self.handle_knowledge_search(&routed)
             }
-            GeneralMessagePlanKind::Unsupported => self.failed(
-                request,
-                "agentic_interpreter",
-                RiskLevel::Low,
-                plan.reason.unwrap_or_else(|| {
-                    "当前自然语义没有被解释成可执行的抓拍、短视频或检索任务。".to_string()
-                }),
-            ),
+            GeneralMessagePlanKind::Unsupported => self.general_message_unsupported_response(request),
         }
     }
 
+    fn general_message_capability_summary_response(&self, request: &TaskRequest) -> TaskResponse {
+        let summary = general_message_support_summary();
+        let examples = general_message_supported_examples();
+        self.completed(
+            request,
+            "agentic_interpreter",
+            RiskLevel::Low,
+            summary.clone(),
+            json!({
+                "reply_pack": {
+                    "kind": "capability_summary",
+                    "summary": summary,
+                    "capabilities": [
+                        "camera_snapshot",
+                        "camera_record_clip",
+                        "knowledge_search",
+                    ],
+                    "examples": examples,
+                }
+            }),
+            Vec::new(),
+            vec![
+                "帮我抓拍一下当前摄像头画面".to_string(),
+                "帮我录一段门口摄像头".to_string(),
+                "帮我找到和樱花有关的文件".to_string(),
+            ],
+        )
+    }
+
+    fn general_message_unsupported_response(&self, request: &TaskRequest) -> TaskResponse {
+        let summary = general_message_unsupported_summary();
+        let examples = general_message_supported_examples();
+        self.completed(
+            request,
+            "agentic_interpreter",
+            RiskLevel::Low,
+            summary.clone(),
+            json!({
+                "reply_pack": {
+                    "kind": "unsupported",
+                    "summary": summary,
+                    "capabilities": [
+                        "camera_snapshot",
+                        "camera_record_clip",
+                        "knowledge_search",
+                    ],
+                    "examples": examples,
+                }
+            }),
+            Vec::new(),
+            vec![
+                "帮我抓拍一下当前摄像头画面".to_string(),
+                "帮我录一段门口摄像头".to_string(),
+                "帮我找到和樱花有关的文件".to_string(),
+            ],
+        )
+    }
+
     fn general_message_plan(&self, request: &TaskRequest) -> Result<GeneralMessagePlan, String> {
+        if general_message_requests_capability_summary(request.intent.raw_text.as_str()) {
+            return Ok(GeneralMessagePlan {
+                kind: GeneralMessagePlanKind::CapabilitySummary,
+                camera_hint: None,
+                query: None,
+                reason: None,
+            });
+        }
+
         let admin_state = self.admin_store.load_or_create_state()?;
         let camera_targets = self
             .admin_store
@@ -1213,12 +1275,7 @@ impl TaskApiService {
             selected_camera.as_deref(),
         )
         .ok_or_else(|| {
-            if llm_plan.summary.trim().is_empty() {
-                "当前没有可用的自然语义解释器，请先在 Model Center 配置可用的 LLM endpoint。"
-                    .to_string()
-            } else {
-                format!("自然语义解释失败：{}", llm_plan.summary)
-            }
+            "当前自然语义暂时只能稳定处理抓拍、短视频和知识检索。".to_string()
         })
     }
 
@@ -4434,6 +4491,59 @@ fn should_route_general_message_to_knowledge(request: &TaskRequest) -> bool {
     .is_some_and(|plan| matches!(plan.kind, GeneralMessagePlanKind::KnowledgeSearch))
 }
 
+fn general_message_requests_capability_summary(raw_text: &str) -> bool {
+    let normalized = normalize_command_text(raw_text);
+    if normalized.is_empty() {
+        return false;
+    }
+
+    let exact_matches = ["帮助", "帮助一下", "help", "helpme"];
+    if exact_matches
+        .iter()
+        .any(|candidate| normalized == normalize_command_text(candidate))
+    {
+        return true;
+    }
+
+    [
+        "你能做什么",
+        "你还能做什么",
+        "你可以做什么",
+        "你会做什么",
+        "你能干什么",
+        "你可以干什么",
+        "你能帮我做什么",
+        "你还能帮我做什么",
+    ]
+    .iter()
+    .map(|candidate| normalize_command_text(candidate))
+    .any(|candidate| normalized.contains(&candidate))
+}
+
+fn general_message_supported_examples() -> Vec<String> {
+    vec![
+        "帮我抓拍一下当前摄像头画面".to_string(),
+        "帮我录一段门口摄像头".to_string(),
+        "帮我找到和樱花有关的文件".to_string(),
+    ]
+}
+
+fn general_message_support_summary() -> String {
+    let examples = general_message_supported_examples();
+    format!(
+        "我可以帮你抓拍摄像头、录制短视频、搜索知识库内容。你可以直接说：{}。",
+        examples.join("；")
+    )
+}
+
+fn general_message_unsupported_summary() -> String {
+    let examples = general_message_supported_examples();
+    format!(
+        "我暂时还不能稳定理解这类请求，但我可以帮你抓拍摄像头、录制短视频、搜索知识库内容。你可以直接说：{}。",
+        examples.join("；")
+    )
+}
+
 fn knowledge_search_query(request: &TaskRequest) -> Option<String> {
     first_string(
         &[&request.args],
@@ -5218,11 +5328,13 @@ mod tests {
         artifact_kind_from_name, build_artifact_records, conversation_key,
         effective_autonomy_level, effective_autonomy_level_for_task_run,
         effective_requires_approval, ensure_safe_capture_root, env_flag_enabled,
-        format_pending_candidates, infer_query_from_raw_text, normalize_command_text,
-        notification_delivery_outcome, pending_candidates_from_results, protocol_string,
-        resolve_notification_recipient, room_aliases, should_route_general_message_to_knowledge,
-        PendingTaskCandidate, TaskApiService, TaskArtifact, TaskIntent, TaskMessage, TaskRequest,
-        TaskRequestAcceptance, TaskSource, TaskStatus, ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV,
+        fallback_general_message_plan, format_pending_candidates, infer_query_from_raw_text,
+        normalize_command_text, notification_delivery_outcome, pending_candidates_from_results,
+        protocol_string, resolve_notification_recipient, room_aliases,
+        should_route_general_message_to_knowledge, general_message_requests_capability_summary,
+        GeneralMessagePlanKind, PendingTaskCandidate, TaskApiService, TaskArtifact, TaskIntent,
+        TaskMessage, TaskRequest, TaskRequestAcceptance, TaskSource, TaskStatus,
+        ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV,
     };
     use crate::connectors::notifications::{
         NotificationContent, NotificationDelivery, NotificationDeliveryError,
@@ -8213,6 +8325,160 @@ mod tests {
         let _ = fs::remove_file(registry_path);
         let _ = fs::remove_file(conversation_path);
         let _ = fs::remove_dir_all(knowledge_root);
+    }
+
+    #[test]
+    fn general_message_capability_queries_are_detected_without_shadowing_commands() {
+        assert!(general_message_requests_capability_summary("你能做什么"));
+        assert!(general_message_requests_capability_summary("你还能做什么"));
+        assert!(general_message_requests_capability_summary("帮助"));
+        assert!(!general_message_requests_capability_summary(
+            "帮助我抓拍一下当前摄像头画面"
+        ));
+
+        assert_eq!(
+            fallback_general_message_plan("帮我抓拍一下当前摄像头画面", None)
+                .expect("snapshot plan")
+                .kind,
+            GeneralMessagePlanKind::CameraSnapshot
+        );
+        assert_eq!(
+            fallback_general_message_plan("帮我录一段门口摄像头", None)
+                .expect("clip plan")
+                .kind,
+            GeneralMessagePlanKind::CameraRecordClip
+        );
+        assert_eq!(
+            fallback_general_message_plan("帮我找到和樱花有关的文件", None)
+                .expect("search plan")
+                .kind,
+            GeneralMessagePlanKind::KnowledgeSearch
+        );
+    }
+
+    #[test]
+    fn general_message_capability_query_returns_summary_without_llm() {
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
+        let service = TaskApiService::new(
+            AdminConsoleStore::new(
+                admin_path.clone(),
+                DeviceRegistryStore::new(registry_path.clone()),
+            ),
+            TaskConversationStore::new(conversation_path.clone()),
+        );
+        let request = TaskRequest {
+            task_id: "task-capability".to_string(),
+            trace_id: "trace-capability".to_string(),
+            step_id: "step-capability".to_string(),
+            source: TaskSource {
+                channel: "wechat".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-capability".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "session-capability".to_string(),
+                route_key: "gw_route_capability".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "general".to_string(),
+                action: "message".to_string(),
+                raw_text: "你还能做什么".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: Value::Null,
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_capability".to_string(),
+                chat_type: "p2p".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.executor_used, "agentic_interpreter");
+        assert_eq!(
+            response.result.message,
+            response.result.data["reply_pack"]["summary"]
+        );
+        assert_eq!(
+            response.result.data["reply_pack"]["kind"],
+            "capability_summary"
+        );
+        assert_eq!(
+            response.result.data["reply_pack"]["examples"]
+                .as_array()
+                .map(Vec::len),
+            Some(3)
+        );
+        assert!(response.result.message.contains("抓拍摄像头"));
+        assert!(response.result.message.contains("知识库内容"));
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn general_message_unsupported_query_returns_friendly_summary_without_backend_error() {
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
+        let service = TaskApiService::new(
+            AdminConsoleStore::new(
+                admin_path.clone(),
+                DeviceRegistryStore::new(registry_path.clone()),
+            ),
+            TaskConversationStore::new(conversation_path.clone()),
+        );
+        let request = TaskRequest {
+            task_id: "task-unsupported-general".to_string(),
+            trace_id: "trace-unsupported-general".to_string(),
+            step_id: "step-unsupported-general".to_string(),
+            source: TaskSource {
+                channel: "wechat".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-unsupported".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "session-unsupported".to_string(),
+                route_key: "gw_route_unsupported_general".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "general".to_string(),
+                action: "message".to_string(),
+                raw_text: "今天的天气怎么样".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: Value::Null,
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_unsupported_general".to_string(),
+                chat_type: "p2p".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.executor_used, "agentic_interpreter");
+        assert_eq!(
+            response.result.message,
+            response.result.data["reply_pack"]["summary"]
+        );
+        assert_eq!(response.result.data["reply_pack"]["kind"], "unsupported");
+        assert!(response.result.message.contains("抓拍摄像头"));
+        assert!(response.result.message.contains("录制短视频"));
+        assert!(response.result.message.contains("搜索知识库内容"));
+        assert!(!response.result.message.contains("LLM endpoint"));
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
     }
 
     #[test]

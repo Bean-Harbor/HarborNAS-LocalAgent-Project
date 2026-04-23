@@ -1,13 +1,14 @@
 # Cited Retrieval Reply Pack
 
 This note describes the HarborBeacon-owned reply packaging used by
-`knowledge.search` and the natural-language retrieval fallback.
+`knowledge.search` and the natural-language retrieval path.
 
 ## Boundary
 
 - HarborBeacon owns retrieval semantics, ranking, citation packaging, and reply meaning.
 - HarborGate only renders the returned task payload and artifacts.
-- HarborOS remains a read-only file substrate.
+- HarborOS remains a read-only file substrate and may host the local model,
+  archive, and knowledge roots.
 - AIoT remains the producer of image metadata and sidecar content.
 
 ## Reply Pack Shape
@@ -21,12 +22,15 @@ This note describes the HarborBeacon-owned reply packaging used by
   - `matched_terms`
   - `preview`
   - `score`
+  - `embedding_score`
+  - `hybrid_score`
+  - `provenance`
 - `result.artifacts[]` mirrors the visible citations for downstream rendering.
 
 ## Limits
 
-- No OCR.
-- No vector search.
 - No video semantics.
 - No audio semantics.
+- OCR and vector search are supported upstream in the retrieval pipeline; this
+  note only constrains how their outputs are packaged.
 - Previews are text-only and come from indexed file text or sidecar metadata.

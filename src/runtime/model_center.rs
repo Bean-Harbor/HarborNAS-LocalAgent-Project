@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::connectors::ai_provider::{
-    OpenAiCompatibleConfig, OpenAiCompatibleTextClient, OpenAiCompatibleVisionClient,
-    TextCompletionRequest, VisionSummaryRequest,
+    EmbeddingRequest, OpenAiCompatibleConfig, OpenAiCompatibleEmbeddingClient,
+    OpenAiCompatibleTextClient, OpenAiCompatibleVisionClient, TextCompletionRequest,
+    VisionSummaryRequest,
 };
 use crate::control_plane::models::{ModelEndpoint, ModelEndpointStatus, ModelKind};
 use crate::runtime::admin_console::{
@@ -24,6 +25,7 @@ pub const ADMIN_STATE_PATH_ENV: &str = "HARBOR_ADMIN_STATE_PATH";
 pub const OCR_TESSERACT_PATH_ENV: &str = "HARBOR_OCR_TESSERACT_PATH";
 pub const OCR_TESSERACT_LANGS_ENV: &str = "HARBOR_OCR_LANGS";
 const OCR_POLICY_ID: &str = "retrieval.ocr";
+const EMBED_POLICY_ID: &str = "retrieval.embed";
 const LLM_POLICY_ID: &str = "retrieval.answer";
 const VLM_POLICY_ID: &str = "retrieval.vision_summary";
 const DEFAULT_ADMIN_STATE_PATH: &str = ".harborbeacon/admin-console.json";
@@ -89,6 +91,26 @@ pub struct LlmTextExecution {
     pub model_endpoint_id: Option<String>,
     #[serde(default)]
     pub text: String,
+    #[serde(default)]
+    pub details: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct EmbeddingExecution {
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub provider_key: String,
+    #[serde(default)]
+    pub model_endpoint_id: Option<String>,
+    #[serde(default)]
+    pub model_name: Option<String>,
+    #[serde(default)]
+    pub vector: Vec<f32>,
     #[serde(default)]
     pub details: Value,
 }
@@ -425,6 +447,11 @@ pub fn run_llm_text(prompt: &str) -> LlmTextExecution {
     run_llm_text_with_state(prompt, &state)
 }
 
+pub fn run_embedding(text: &str) -> EmbeddingExecution {
+    let state = load_model_center_state();
+    run_embedding_with_state(text, &state)
+}
+
 pub fn run_llm_text_with_state(prompt: &str, state: &AdminModelCenterState) -> LlmTextExecution {
     let Some(endpoint) = resolve_endpoint(state, ModelKind::Llm, LLM_POLICY_ID) else {
         return LlmTextExecution {
@@ -531,6 +558,129 @@ pub fn run_llm_text_with_state(prompt: &str, state: &AdminModelCenterState) -> L
             provider_key: endpoint.provider_key.clone(),
             model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
             text: String::new(),
+            details: json!({}),
+        },
+    }
+}
+
+pub fn run_embedding_with_state(text: &str, state: &AdminModelCenterState) -> EmbeddingExecution {
+    let input = text.trim();
+    if input.is_empty() {
+        return EmbeddingExecution {
+            available: false,
+            status: "disabled".to_string(),
+            summary: "Embedding input is empty.".to_string(),
+            provider_key: String::new(),
+            model_endpoint_id: None,
+            model_name: None,
+            vector: Vec::new(),
+            details: json!({}),
+        };
+    }
+
+    let Some(endpoint) = resolve_endpoint(state, ModelKind::Embedder, EMBED_POLICY_ID) else {
+        return EmbeddingExecution {
+            available: false,
+            status: "disabled".to_string(),
+            summary: "No embedding endpoint is enabled.".to_string(),
+            provider_key: String::new(),
+            model_endpoint_id: None,
+            model_name: None,
+            vector: Vec::new(),
+            details: json!({}),
+        };
+    };
+
+    if let Some(vector) = mock_embedding_vector_from_endpoint(&endpoint, input) {
+        return EmbeddingExecution {
+            available: !vector.is_empty(),
+            status: "active".to_string(),
+            summary: "Mock embedding endpoint resolved.".to_string(),
+            provider_key: endpoint.provider_key.clone(),
+            model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+            model_name: Some(endpoint.model_name.clone()),
+            vector,
+            details: json!({
+                "endpoint_kind": endpoint.endpoint_kind.as_str(),
+            }),
+        };
+    }
+
+    if !endpoint
+        .provider_key
+        .eq_ignore_ascii_case("openai_compatible")
+    {
+        return EmbeddingExecution {
+            available: false,
+            status: "degraded".to_string(),
+            summary: format!(
+                "Embedding endpoint {} is configured, but provider {} is not implemented yet.",
+                endpoint.model_endpoint_id, endpoint.provider_key
+            ),
+            provider_key: endpoint.provider_key.clone(),
+            model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+            model_name: Some(endpoint.model_name.clone()),
+            vector: Vec::new(),
+            details: json!({
+                "endpoint_kind": endpoint.endpoint_kind.as_str(),
+            }),
+        };
+    }
+
+    let Some(config) = openai_compatible_config_from_endpoint(&endpoint) else {
+        return EmbeddingExecution {
+            available: false,
+            status: "degraded".to_string(),
+            summary: "Embedding endpoint base_url / api_key / model_name are not configured.".to_string(),
+            provider_key: endpoint.provider_key.clone(),
+            model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+            model_name: Some(endpoint.model_name.clone()),
+            vector: Vec::new(),
+            details: json!({
+                "endpoint_kind": endpoint.endpoint_kind.as_str(),
+            }),
+        };
+    };
+
+    let client = match OpenAiCompatibleEmbeddingClient::new(config) {
+        Ok(client) => client,
+        Err(error) => {
+            return EmbeddingExecution {
+                available: false,
+                status: "degraded".to_string(),
+                summary: format!("Failed to build embedding client: {error}"),
+                provider_key: endpoint.provider_key.clone(),
+                model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+                model_name: Some(endpoint.model_name.clone()),
+                vector: Vec::new(),
+                details: json!({}),
+            };
+        }
+    };
+
+    match client.embed_text(&EmbeddingRequest {
+        input: input.to_string(),
+    }) {
+        Ok(response) => EmbeddingExecution {
+            available: !response.embedding.is_empty(),
+            status: "active".to_string(),
+            summary: "Embedding request completed.".to_string(),
+            provider_key: endpoint.provider_key.clone(),
+            model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+            model_name: Some(endpoint.model_name.clone()),
+            vector: response.embedding,
+            details: json!({
+                "raw_response": response.raw_response,
+            }),
+        },
+        Err(error) => EmbeddingExecution {
+            available: false,
+            status: "degraded".to_string(),
+            summary: format!("Embedding request failed: {error}"),
+            provider_key: endpoint.provider_key.clone(),
+            model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
+            model_name: Some(endpoint.model_name.clone()),
+            vector: Vec::new(),
             details: json!({}),
         },
     }
@@ -655,7 +805,7 @@ fn test_http_endpoint(endpoint: &ModelEndpoint) -> ModelEndpointTestResult {
         };
     };
 
-    let url = connectivity_url(&endpoint.provider_key, &base_url);
+    let url = connectivity_url(endpoint, &base_url);
     let client = match Client::builder().timeout(Duration::from_secs(4)).build() {
         Ok(client) => client,
         Err(error) => {
@@ -710,9 +860,12 @@ fn test_http_endpoint(endpoint: &ModelEndpoint) -> ModelEndpointTestResult {
     }
 }
 
-fn connectivity_url(provider_key: &str, base_url: &str) -> String {
+fn connectivity_url(endpoint: &ModelEndpoint, base_url: &str) -> String {
+    if let Some(healthz_url) = metadata_string(&endpoint.metadata, "healthz_url") {
+        return healthz_url;
+    }
     let trimmed = base_url.trim().trim_end_matches('/');
-    if provider_key.eq_ignore_ascii_case("ollama") {
+    if endpoint.provider_key.eq_ignore_ascii_case("ollama") {
         format!("{trimmed}/api/tags")
     } else if trimmed.ends_with("/v1") {
         format!("{trimmed}/models")
@@ -794,6 +947,61 @@ fn metadata_string(metadata: &Value, key: &str) -> Option<String> {
         .map(|value| value.to_string())
 }
 
+fn mock_embedding_vector_from_endpoint(endpoint: &ModelEndpoint, input: &str) -> Option<Vec<f32>> {
+    if let Some(vector) = endpoint
+        .metadata
+        .get("mock_embeddings")
+        .and_then(Value::as_object)
+        .and_then(|map| map.get(input))
+        .and_then(parse_embedding_vector)
+    {
+        return Some(vector);
+    }
+
+    let dimensions = endpoint
+        .metadata
+        .get("mock_embedding_dimensions")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .filter(|value| *value > 0)
+        .or_else(|| {
+            endpoint
+                .metadata
+                .get("mock_embedding")
+                .and_then(Value::as_bool)
+                .filter(|value| *value)
+                .map(|_| 8usize)
+        })?;
+
+    Some(build_mock_embedding(input, dimensions))
+}
+
+fn parse_embedding_vector(value: &Value) -> Option<Vec<f32>> {
+    let items = value.as_array()?;
+    let mut vector = Vec::with_capacity(items.len());
+    for item in items {
+        vector.push(item.as_f64()? as f32);
+    }
+    (!vector.is_empty()).then_some(vector)
+}
+
+fn build_mock_embedding(input: &str, dimensions: usize) -> Vec<f32> {
+    let mut vector = vec![0.0f32; dimensions.max(1)];
+    for (index, ch) in input.chars().enumerate() {
+        let slot = index % vector.len();
+        let weight = ((ch as u32 % 17) + 1) as f32;
+        vector[slot] += weight;
+    }
+
+    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for value in &mut vector {
+            *value /= norm;
+        }
+    }
+    vector
+}
+
 fn redact_secret_value(value: &mut Value) {
     match value {
         Value::Object(map) => {
@@ -844,7 +1052,10 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{redact_model_endpoint, run_vlm_summary_with_state, test_model_endpoint};
+    use super::{
+        connectivity_url, redact_model_endpoint, run_embedding_with_state, run_vlm_summary_with_state,
+        test_model_endpoint,
+    };
     use crate::control_plane::models::{
         ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, ModelRoutePolicy,
         PrivacyLevel,
@@ -952,5 +1163,74 @@ mod tests {
         assert_eq!(result.text, "画面里有一台放在门口的快递箱");
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn run_embedding_supports_mock_dimensions_and_overrides() {
+        let state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "embed-mock".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Embedder,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "mock-embed".to_string(),
+                capability_tags: vec!["embeddings".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "mock_embedding_dimensions": 4,
+                    "mock_embeddings": {
+                        "樱花整理": [1.0, 0.0, 0.0, 0.0]
+                    }
+                }),
+            }],
+            route_policies: vec![ModelRoutePolicy {
+                route_policy_id: "retrieval.embed".to_string(),
+                workspace_id: "home-1".to_string(),
+                domain_scope: "retrieval".to_string(),
+                modality: "text".to_string(),
+                privacy_level: PrivacyLevel::StrictLocal,
+                local_preferred: true,
+                max_cost_per_run: None,
+                fallback_order: vec!["local".to_string(), "cloud".to_string()],
+                status: "active".to_string(),
+                metadata: json!({}),
+            }],
+        };
+
+        let exact = run_embedding_with_state("樱花整理", &state);
+        assert!(exact.available);
+        assert_eq!(exact.vector, vec![1.0, 0.0, 0.0, 0.0]);
+
+        let generated = run_embedding_with_state("整理计划", &state);
+        assert!(generated.available);
+        assert_eq!(generated.vector.len(), 4);
+    }
+
+    #[test]
+    fn connectivity_url_prefers_explicit_healthz_metadata() {
+        let endpoint = ModelEndpoint {
+            model_endpoint_id: "llm-local".to_string(),
+            workspace_id: Some("home-1".to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Llm,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "openai_compatible".to_string(),
+            model_name: "chat".to_string(),
+            capability_tags: vec!["chat".to_string()],
+            cost_policy: json!({}),
+            status: ModelEndpointStatus::Degraded,
+            metadata: json!({
+                "base_url": "http://127.0.0.1:4176/v1",
+                "healthz_url": "http://127.0.0.1:4176/healthz",
+            }),
+        };
+
+        assert_eq!(
+            connectivity_url(&endpoint, "http://127.0.0.1:4176/v1"),
+            "http://127.0.0.1:4176/healthz"
+        );
     }
 }

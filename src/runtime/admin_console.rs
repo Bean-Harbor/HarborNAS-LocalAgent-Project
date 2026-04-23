@@ -378,6 +378,10 @@ const DEFAULT_PROACTIVE_DELIVERY_SURFACE: &str = "feishu";
 const HARBOROS_CURRENT_USER_ENV: &str = "HARBOR_HARBOROS_USER";
 const HARBOROS_WRITABLE_ROOT_ENV: &str = "HARBOR_HARBOROS_WRITABLE_ROOT";
 const DEFAULT_HARBOROS_WRITABLE_ROOT: &str = "/mnt/software/harborbeacon-agent-ci";
+const MODEL_API_BASE_URL_ENV: &str = "HARBOR_MODEL_API_BASE_URL";
+const MODEL_API_TOKEN_ENV: &str = "HARBOR_MODEL_API_TOKEN";
+const DEFAULT_MODEL_API_BASE_URL: &str = "http://127.0.0.1:4176/v1";
+const DEFAULT_MODEL_API_TOKEN: &str = "harbor-local-model-token";
 
 impl AdminConsoleStore {
     pub fn new(path: impl Into<PathBuf>, registry_store: DeviceRegistryStore) -> Self {
@@ -1342,6 +1346,9 @@ pub fn sanitize_model_route_policy(
 }
 
 pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
+    let local_base_url = local_model_api_base_url();
+    let local_healthz_url = local_model_api_healthz_url(&local_base_url);
+    let local_api_key = local_model_api_token();
     vec![
         ModelEndpoint {
             model_endpoint_id: "ocr-local-tesseract".to_string(),
@@ -1372,15 +1379,16 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
             model_kind: ModelKind::Embedder,
             endpoint_kind: ModelEndpointKind::Local,
             provider_key: "openai_compatible".to_string(),
-            model_name: "embeddings".to_string(),
+            model_name: "harbor-local-embed".to_string(),
             capability_tags: vec!["embeddings".to_string(), "local_first".to_string()],
             cost_policy: json!({"cost_hint": "local_or_sidecar"}),
-            status: ModelEndpointStatus::Disabled,
+            status: ModelEndpointStatus::Degraded,
             metadata: json!({
                 "builtin": true,
-                "base_url": "",
-                "api_key": "",
-                "api_key_configured": false,
+                "base_url": local_base_url.clone(),
+                "healthz_url": local_healthz_url.clone(),
+                "api_key": local_api_key.clone(),
+                "api_key_configured": true,
             }),
         },
         ModelEndpoint {
@@ -1390,15 +1398,16 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
             model_kind: ModelKind::Llm,
             endpoint_kind: ModelEndpointKind::Local,
             provider_key: "openai_compatible".to_string(),
-            model_name: "chat".to_string(),
+            model_name: "harbor-local-chat".to_string(),
             capability_tags: vec!["chat".to_string(), "local_first".to_string()],
             cost_policy: json!({"cost_hint": "local_or_sidecar"}),
-            status: ModelEndpointStatus::Disabled,
+            status: ModelEndpointStatus::Degraded,
             metadata: json!({
                 "builtin": true,
-                "base_url": "",
-                "api_key": "",
-                "api_key_configured": false,
+                "base_url": local_base_url.clone(),
+                "healthz_url": local_healthz_url.clone(),
+                "api_key": local_api_key.clone(),
+                "api_key_configured": true,
             }),
         },
         ModelEndpoint {
@@ -1418,12 +1427,38 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
             status: ModelEndpointStatus::Disabled,
             metadata: json!({
                 "builtin": true,
-                "base_url": "",
-                "api_key": "",
-                "api_key_configured": false,
+                "base_url": local_base_url,
+                "healthz_url": local_healthz_url,
+                "api_key": local_api_key,
+                "api_key_configured": true,
             }),
         },
     ]
+}
+
+fn local_model_api_base_url() -> String {
+    env::var(MODEL_API_BASE_URL_ENV)
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_MODEL_API_BASE_URL.to_string())
+}
+
+fn local_model_api_healthz_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if let Some(prefix) = trimmed.strip_suffix("/v1") {
+        format!("{prefix}/healthz")
+    } else {
+        format!("{trimmed}/healthz")
+    }
+}
+
+fn local_model_api_token() -> String {
+    env::var(MODEL_API_TOKEN_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_MODEL_API_TOKEN.to_string())
 }
 
 pub fn default_model_route_policies() -> Vec<ModelRoutePolicy> {

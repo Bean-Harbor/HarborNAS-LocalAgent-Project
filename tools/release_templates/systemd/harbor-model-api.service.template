@@ -1,0 +1,16 @@
+[Unit]
+Description=HarborBeacon Local Model API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__SERVICE_USER__
+WorkingDirectory=__INSTALL_ROOT__/current
+EnvironmentFile=-__ENV_FILE__
+ExecStart=__INSTALL_ROOT__/current/templates/bin/run-harbor-model-api
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -21,7 +21,7 @@ The current cross-repo rehearsal is intentionally narrow:
 - Feishu baseline evidence remains historical reference on the same frozen seam and is not today's gate driver
 - HarborBeacon still only accepts `POST /api/tasks` and emits `POST /api/notifications/deliveries`
 - Weixin group-chat semantics remain out of scope and must not be smuggled into HarborBeacon types
-- HarborOS remains an accepted southbound on `192.168.3.169`; this document does not widen it into IM ownership
+- HarborOS remains an accepted southbound on `192.168.3.182`; this document does not widen it into IM ownership
 
 ## Frozen Endpoints
 

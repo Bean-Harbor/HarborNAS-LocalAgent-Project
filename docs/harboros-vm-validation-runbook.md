@@ -310,7 +310,7 @@ Windows 等价命令：
 也就是先验证“能连通、能走通、路由正确”，然后再在明确批准和
 allowlist sandbox 下做高风险写操作。
 
-当前 `.169` live target 的默认验证 root 已确认使用：
+当前 HarborOS live target `192.168.3.182` 的默认验证 root 已确认使用：
 
 - `/mnt/software/harborbeacon-agent-ci`
 
@@ -323,7 +323,7 @@ allowlist sandbox 下做高风险写操作。
 必须先单独补 HarborOS policy 和一次真实 live proof。
 
 `2026-04-21` 已经从 Debian13 verifier `192.168.3.223` 成功复跑到
-HarborOS `192.168.3.169`，当前仓库下的归档报告位于：
+HarborOS `192.168.3.182`，当前仓库下的归档报告位于：
 
 - `.tmp-live/debian-dualhost/reports/validate-contract-20260419-095711.json`
 - `.tmp-live/debian-dualhost/reports/e2e-20260419-095711.json`
@@ -377,7 +377,7 @@ HarborOS `192.168.3.169`，当前仓库下的归档报告位于：
 - 记录同一组 validate / e2e / drift 报告
 - 把缺的仅标记为“认证自动化环境债”，不要升级成代码 blocker
 
-当前这条建议已经在 `192.168.3.223 -> 192.168.3.169` 路径上得到验证。
+当前这条建议已经在 `192.168.3.223 -> 192.168.3.182` 路径上得到验证。
 
 ## 13. 官方参考
 

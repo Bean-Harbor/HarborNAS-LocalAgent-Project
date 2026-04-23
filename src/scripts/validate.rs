@@ -7,7 +7,7 @@ use crate::scripts::integration::{
     default_midcli_service_query, IntegrationConfig, MidcliClient, MiddlewareClient,
 };
 
-const REQUIRED_FILES: [&str; 11] = [
+const REQUIRED_FILES: [&str; 15] = [
     "HarborBeacon-LocalAgent-V2-Assistant-Skills-Roadmap.md",
     "HarborBeacon-Middleware-Endpoint-Contract-v1.md",
     "HarborBeacon-Files-BatchOps-Contract-v1.md",
@@ -17,8 +17,12 @@ const REQUIRED_FILES: [&str; 11] = [
     "HarborBeacon-GitHub-Actions-Workflow-Draft-v1.md",
     "HarborBeacon-HarborGate-v1.5-Cutover-Evidence.md",
     "docs/hos-system-domain-cutover-smoke.md",
+    "docs/cited-retrieval-reply-pack.md",
+    "docs/knowledge-indexing-pack.md",
+    "docs/retrieval-canary-roundtrip-evidence.md",
     "docs/retrieval-roundtrip-launch-pack.md",
     "docs/document-rag-mvp.md",
+    "docs/local-model-backend-benchmark-gate.md",
 ];
 
 const REQUIRED_MIDDLEWARE_METHODS: [&str; 5] = [
@@ -75,13 +79,19 @@ pub fn build_checks(root: &Path) -> Vec<CheckResult> {
             .unwrap_or_default();
     let hos_smoke_doc = fs::read_to_string(root.join("docs/hos-system-domain-cutover-smoke.md"))
         .unwrap_or_default();
+    let cited_reply_doc =
+        fs::read_to_string(root.join("docs/cited-retrieval-reply-pack.md")).unwrap_or_default();
+    let knowledge_index_doc =
+        fs::read_to_string(root.join("docs/knowledge-indexing-pack.md")).unwrap_or_default();
+    let canary_doc = fs::read_to_string(root.join("docs/retrieval-canary-roundtrip-evidence.md"))
+        .unwrap_or_default();
     let retrieval_launch_doc =
         fs::read_to_string(root.join("docs/retrieval-roundtrip-launch-pack.md"))
             .unwrap_or_default();
     let document_rag_doc =
         fs::read_to_string(root.join("docs/document-rag-mvp.md")).unwrap_or_default();
-    let launch_checklist =
-        fs::read_to_string(root.join("HarborBeacon-LocalAgent-LaunchChecklist.md"))
+    let local_model_benchmark_doc =
+        fs::read_to_string(root.join("docs/local-model-backend-benchmark-gate.md"))
             .unwrap_or_default();
 
     checks.push(CheckResult {
@@ -188,16 +198,54 @@ pub fn build_checks(root: &Path) -> Vec<CheckResult> {
     });
 
     checks.push(CheckResult {
-        name: "launch-checklist:retrieval-handoff-section".to_string(),
+        name: "cited-retrieval-reply-pack:boundary-and-packaging".to_string(),
         passed: [
-            "Retrieval Round-Trip Launch / Handoff Pack",
-            "explicit `knowledge.search` 仍然可用",
-            "`general.message` 不再机会路由到 retrieval",
-            "operator note 能在一页里说明输入、输出和 rollback 行为",
+            "HarborBeacon owns retrieval semantics, ranking, citation packaging, and reply meaning.",
+            "HarborOS remains a read-only file substrate and may host the local model,",
+            "OCR and vector search are supported upstream in the retrieval pipeline; this",
         ]
         .iter()
-        .all(|item| launch_checklist.contains(item)),
-        details: "Main launch checklist must point operators at the explicit-only retrieval handoff story.".to_string(),
+        .all(|item| cited_reply_doc.contains(item)),
+        details: "Reply-pack doc must preserve the HarborBeacon boundary while acknowledging OCR/vector-backed packaging upstream.".to_string(),
+        skipped: None,
+    });
+
+    checks.push(CheckResult {
+        name: "knowledge-indexing-pack:image-ocr-and-vector-loop".to_string(),
+        passed: [
+            "Documents are indexed from file text or normalization output.",
+            "Images are indexed from the image file plus OCR text and the first matching",
+            "OCR and vector search are part of the indexed document/image loop in this",
+        ]
+        .iter()
+        .all(|item| knowledge_index_doc.contains(item)),
+        details: "Knowledge indexing doc must describe OCR-backed image ingestion and local vector-aware retrieval.".to_string(),
+        skipped: None,
+    });
+
+    checks.push(CheckResult {
+        name: "retrieval-canary-roundtrip:planner-routed-nl-retrieval".to_string(),
+        passed: [
+            "Planner-routed natural-language retrieval for retrieval-intent",
+            "Opportunistic natural-language retrieval is now a supported route when the",
+            "Explicit `knowledge.search` remains the direct retrieval path.",
+        ]
+        .iter()
+        .all(|item| canary_doc.contains(item)),
+        details: "Canary doc must describe the supported natural-language retrieval route and preserve explicit search as the direct path.".to_string(),
+        skipped: None,
+    });
+
+    checks.push(CheckResult {
+        name: "retrieval-launch-pack:general-message-route".to_string(),
+        passed: [
+            "General Message Can Route To Retrieval",
+            "result.status = completed",
+            "natural-language retrieval routing is allowed when the planner recognizes",
+        ]
+        .iter()
+        .all(|item| retrieval_launch_doc.contains(item)),
+        details: "Launch pack must describe the general-message retrieval path and the expected completed reply shape.".to_string(),
         skipped: None,
     });
 
@@ -206,14 +254,30 @@ pub fn build_checks(root: &Path) -> Vec<CheckResult> {
         passed: [
             "Document RAG MVP",
             "chunk/snippet level",
-            "chunk_id",
-            "No OCR.",
-            "No vector search.",
-            "No audio or video semantics.",
+            "Image retrieval uses OCR-derived text",
+            "Retrieval combines lexical and vector signals",
+            "Natural-language `general.message` can also enter retrieval",
         ]
         .iter()
         .all(|item| document_rag_doc.contains(item)),
-        details: "Document RAG note must describe chunk grounding and explicitly state the remaining out-of-scope semantics.".to_string(),
+        details: "Document RAG note must describe chunk grounding, OCR-backed image retrieval, and the planner-routed retrieval path.".to_string(),
+        skipped: None,
+    });
+
+    checks.push(CheckResult {
+        name: "local-model-benchmark-gate:openai-seam-and-candle-policy".to_string(),
+        passed: [
+            "Local Model Backend Benchmark Gate",
+            "local OpenAI-compatible API seam is frozen",
+            "Candle is a preferred backend candidate, not the frozen contract.",
+            "keep `openai_proxy` as the default backend",
+            "cold start",
+            "Chinese chat probes",
+            "embedding retrieval quality relative to a lexical baseline",
+        ]
+        .iter()
+        .all(|item| local_model_benchmark_doc.contains(item)),
+        details: "Local model benchmark gate doc must freeze the OpenAI-compatible seam and document the Candle promotion criteria.".to_string(),
         skipped: None,
     });
 

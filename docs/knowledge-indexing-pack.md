@@ -4,7 +4,8 @@
 
 This pack keeps `knowledge.search` inside the HarborBeacon framework lane.
 It adds a local manifest-backed index for documents and images so repeated
-searches do not reread the full tree on every request.
+searches do not reread the full tree on every request, and it keeps retrieval
+local-first.
 
 ## Why This Belongs To Framework
 
@@ -22,9 +23,9 @@ searches do not reread the full tree on every request.
 
 ## Refresh Rules
 
-- Documents are indexed from file text.
-- Images are indexed from the image file plus the first matching sidecar text
-  file.
+- Documents are indexed from file text or normalization output.
+- Images are indexed from the image file plus OCR text and the first matching
+  sidecar text file.
 - Refresh is incremental:
   - unchanged files are reused from the manifest
   - changed files are re-read and rewritten into the manifest
@@ -43,5 +44,6 @@ searches do not reread the full tree on every request.
 - This is still a metadata walk, not a content-aware filesystem watcher.
 - If a NAS does not update directory signatures promptly, a refresh may lag
   until the next visible directory change.
-- There is still no OCR, vector search, video, or audio semantic layer in this
-  pack; it only closes the loop for indexed documents and images.
+- Audio and video semantic layers are still out of scope for this pack.
+- OCR and vector search are part of the indexed document/image loop in this
+  round, but they remain local-only and file-backed.

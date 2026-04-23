@@ -89,14 +89,14 @@ def test_harboros_webui_summary_separates_live_status_from_proof_summary() -> No
     assert "Feishu/Weixin delivery routing issues belong to the IM lane" in preflight_content
 
 
-def test_current_harboros_docs_promote_169_as_the_active_target() -> None:
+def test_current_harboros_docs_promote_182_as_the_active_target() -> None:
     readme_content = read_doc("README.md")
     packaging_content = read_doc("docs/harboros-release-packaging-runbook.md")
     runbook_content = read_doc("docs/harboros-vm-validation-runbook.md")
     cutover_content = read_doc("HarborBeacon-HarborGate-v1.5-Cutover-Evidence.md")
 
-    assert "192.168.3.169" in readme_content
+    assert "192.168.3.182" in readme_content
     assert "当前默认 HarborOS 目标机：" in packaging_content
-    assert "192.168.3.169" in packaging_content
-    assert "192.168.3.223 -> 192.168.3.169" in runbook_content
-    assert "HarborOS remains an accepted southbound on `192.168.3.169`" in cutover_content
+    assert "192.168.3.182" in packaging_content
+    assert "192.168.3.223 -> 192.168.3.182" in runbook_content
+    assert "HarborOS remains an accepted southbound on `192.168.3.182`" in cutover_content

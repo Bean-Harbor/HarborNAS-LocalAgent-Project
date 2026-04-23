@@ -211,6 +211,6 @@ For reviewable smoke runs, the repo now ships both verifier entrypoints:
 - Windows: `.\tools\run_harboros_vm_smoke.ps1`
 - Debian/Linux: `bash ./tools/run_harboros_vm_smoke.sh`
 
-Current live policy note: the verified HarborOS mutation sandbox on `192.168.3.169`
+Current live policy note: the verified HarborOS mutation sandbox on `192.168.3.182`
 is `/mnt/software/harborbeacon-agent-ci`; do not assume `/data` is writable on
 that target unless operators explicitly provision and validate it.
