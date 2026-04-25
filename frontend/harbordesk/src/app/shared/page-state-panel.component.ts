@@ -4,6 +4,7 @@ import { Component, EventEmitter, Input, Output } from '@angular/core';
 import {
   DeliverySurface,
   DeskPageModel,
+  FeatureAvailabilityStatus,
   MetricTone,
   ModelEndpointTestResult,
   PageState,
@@ -72,5 +73,39 @@ export class PageStatePanelComponent {
 
   protected requestNotificationTargetDelete(targetId: string): void {
     this.notificationTargetDelete.emit(targetId);
+  }
+
+  protected featureStatusToneClass(status: FeatureAvailabilityStatus): string {
+    switch (status) {
+      case 'available':
+        return 'tone-good';
+      case 'blocked':
+        return 'tone-danger';
+      case 'degraded':
+      case 'not_configured':
+      default:
+        return 'tone-warn';
+    }
+  }
+
+  protected featureFallbackLabel(values: string[]): string {
+    return values.length > 0 ? values.join(' -> ') : 'none';
+  }
+
+  protected featureWhereToEdit(featureId: string): string {
+    switch (featureId) {
+      case 'retrieval.ocr':
+      case 'retrieval.embed':
+      case 'retrieval.answer':
+      case 'retrieval.vision_summary':
+        return 'Models & Policies';
+      case 'interactive_reply':
+      case 'proactive_delivery':
+        return 'System Settings';
+      case 'binding_availability':
+        return 'Account Management';
+      default:
+        return 'Admin API projection';
+    }
   }
 }

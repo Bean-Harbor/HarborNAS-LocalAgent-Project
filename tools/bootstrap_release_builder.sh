@@ -179,13 +179,14 @@ if [[ "$(uname -s)" != "Linux" ]]; then
   exit 2
 fi
 
+append_path_front "${HOME}/.cargo/bin"
+
+install_rustup_if_missing
 require_command cargo
 require_command rustc
-append_path_front "${HOME}/.cargo/bin"
 
 ZIG_DIR="${HOME}/.local/zig/${ZIG_VERSION}/zig-$(detect_zig_arch)-linux-${ZIG_VERSION}"
 
-install_rustup_if_missing
 configure_rust_target
 ensure_zig_on_path "${ZIG_DIR}"
 install_cargo_zigbuild_if_missing

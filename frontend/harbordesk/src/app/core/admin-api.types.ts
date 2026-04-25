@@ -299,12 +299,43 @@ export interface ModelPoliciesResponse {
   route_policies: ModelRoutePolicyRecord[];
 }
 
+export type FeatureAvailabilityStatus = 'available' | 'degraded' | 'blocked' | 'not_configured';
+
+export interface FeatureAvailabilityItem {
+  feature_id: string;
+  label: string;
+  owner_lane: string;
+  status: FeatureAvailabilityStatus;
+  source_of_truth: string;
+  current_option: string;
+  fallback_order: string[];
+  blocker: string;
+  evidence: string[];
+}
+
+export interface FeatureAvailabilityGroup {
+  group_id: string;
+  label: string;
+  items: FeatureAvailabilityItem[];
+}
+
+export interface FeatureAvailabilityResponse {
+  groups: FeatureAvailabilityGroup[];
+}
+
 export interface ModelEndpointTestResult {
   ok: boolean;
   status: string;
   summary: string;
   endpoint: ModelEndpointRecord;
   details?: Record<string, unknown>;
+}
+
+export interface RuntimeAlignmentSummary {
+  status: string;
+  detail: string;
+  tone: MetricTone;
+  rows: DeskRow[];
 }
 
 export interface DeskPageModel {
@@ -325,6 +356,8 @@ export interface DeskPageModel {
   notificationTargets?: NotificationTargetRecord[];
   modelEndpoints?: ModelEndpointRecord[];
   modelPolicies?: ModelRoutePolicyRecord[];
+  featureGroups?: FeatureAvailabilityGroup[];
+  runtimeAlignment?: RuntimeAlignmentSummary;
 }
 
 export interface PageState<T> {

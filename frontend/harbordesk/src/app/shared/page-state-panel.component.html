@@ -100,8 +100,86 @@
               <li class="muted">Output: <code>{{ state.data.outputDirectory }}</code></li>
             </ul>
           }
+          </article>
+        </div>
+
+      @if (state.data.runtimeAlignment) {
+        <article class="content-card expanded-card">
+          <div class="section-head">
+            <div>
+              <p class="content-label">Runtime alignment</p>
+              <p class="table-copy">{{ state.data.runtimeAlignment.detail }}</p>
+            </div>
+            <div class="inline-badge" [ngClass]="toneClass(state.data.runtimeAlignment.tone)">
+              {{ state.data.runtimeAlignment.status }}
+            </div>
+          </div>
+          <div class="detail-grid">
+            @for (row of state.data.runtimeAlignment.rows; track row.title + row.subtitle) {
+              <section class="detail-row" [ngClass]="row.tone ? toneClass(row.tone) : ''">
+                <div class="detail-row-head">
+                  <strong>{{ row.title }}</strong>
+                  @if (row.subtitle) {
+                    <span>{{ row.subtitle }}</span>
+                  }
+                </div>
+                @if (row.meta?.length) {
+                  <ul class="detail-meta">
+                    @for (item of row.meta; track item) {
+                      <li>{{ item }}</li>
+                    }
+                  </ul>
+                }
+              </section>
+            }
+          </div>
         </article>
-      </div>
+      }
+
+      @if (state.data.featureGroups?.length) {
+        <article class="content-card expanded-card">
+          <div class="section-head">
+            <div>
+              <p class="content-label">Feature availability</p>
+              <p class="table-copy">Live runtime, route policy, account management, and gateway status are merged into a grouped read-model here.</p>
+            </div>
+          </div>
+          <div class="feature-group-stack">
+            @for (group of state.data.featureGroups; track group.group_id) {
+              <section class="feature-group">
+                <div class="feature-group-head">
+                  <strong>{{ group.label }}</strong>
+                  <span class="cell-note">{{ group.group_id }}</span>
+                </div>
+                <div class="feature-grid">
+                  @for (item of group.items; track item.feature_id) {
+                    <section class="detail-row" [ngClass]="featureStatusToneClass(item.status)">
+                      <div class="detail-row-head">
+                        <strong>{{ item.label }}</strong>
+                        <span class="status-pill" [ngClass]="featureStatusToneClass(item.status)">{{ item.status }}</span>
+                      </div>
+                      <p class="feature-copy">{{ item.current_option }}</p>
+                      <ul class="detail-meta">
+                        <li>Feature ID: {{ item.feature_id }}</li>
+                        <li>Owner lane: {{ item.owner_lane }}</li>
+                        <li>Source of truth: {{ item.source_of_truth }}</li>
+                        <li>Fallback: {{ featureFallbackLabel(item.fallback_order) }}</li>
+                        <li>Where to edit: {{ featureWhereToEdit(item.feature_id) }}</li>
+                        @if (item.blocker) {
+                          <li class="tone-danger">Blocker: {{ item.blocker }}</li>
+                        }
+                        @if (item.evidence.length) {
+                          <li>Evidence: {{ item.evidence.join(' | ') }}</li>
+                        }
+                      </ul>
+                    </section>
+                  }
+                </div>
+              </section>
+            }
+          </div>
+        </article>
+      }
 
       @if (state.data.detailRows?.length) {
         <article class="content-card expanded-card">

@@ -7,6 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::thread;
+use std::time::Duration;
 
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -15,17 +16,19 @@ use tiny_http::{Header, Method, Request, Response, ResponseBox, Server, StatusCo
 
 use harborbeacon_local_agent::connectors::im_gateway::GatewayPlatformStatus;
 use harborbeacon_local_agent::control_plane::media::{MediaSession, MediaSessionStatus, ShareLink};
-use harborbeacon_local_agent::control_plane::models::{ModelEndpoint, ModelRoutePolicy};
+use harborbeacon_local_agent::control_plane::models::{
+    ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, ModelRoutePolicy,
+};
 use harborbeacon_local_agent::control_plane::users::{MembershipStatus, RoleKind};
 use harborbeacon_local_agent::runtime::access_control::{
     authorize_access, AccessAction, AccessIdentityHints, AccessPrincipal,
 };
 use harborbeacon_local_agent::runtime::admin_console::{
     account_management_snapshot, default_capture_subdirectory, default_clip_length_seconds,
-    default_keyframe_count, default_keyframe_interval_seconds, normalize_delivery_surface,
-    user_default_delivery_surface, user_recent_interactive_surface, AccountManagementSnapshot,
-    AdminConsoleState, AdminConsoleStore, AdminDefaults, BridgeProviderConfig,
-    GatewayStatusSummary,
+    default_keyframe_count, default_keyframe_interval_seconds, default_model_endpoints,
+    normalize_delivery_surface, user_default_delivery_surface, user_recent_interactive_surface,
+    AccountManagementSnapshot, AdminConsoleState, AdminConsoleStore, AdminDefaults,
+    BridgeProviderConfig, GatewayStatusSummary,
 };
 use harborbeacon_local_agent::runtime::hub::{
     CameraConnectRequest, CameraHubService, HubManualAddSummary, HubScanRequest, HubScanSummary,
@@ -33,7 +36,7 @@ use harborbeacon_local_agent::runtime::hub::{
 };
 use harborbeacon_local_agent::runtime::media_tools::{ffmpeg_resolution_hint, resolve_ffmpeg_bin};
 use harborbeacon_local_agent::runtime::model_center::{
-    redact_model_center_state, redact_model_endpoint, test_model_endpoint, ModelEndpointTestResult,
+    redact_model_endpoint, test_model_endpoint, ModelEndpointTestResult,
 };
 use harborbeacon_local_agent::runtime::registry::{CameraDevice, DeviceRegistryStore};
 use harborbeacon_local_agent::runtime::remote_view;
@@ -255,6 +258,45 @@ struct ModelPoliciesResponse {
     route_policies: Vec<ModelRoutePolicy>,
 }
 
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct FeatureAvailabilityResponse {
+    groups: Vec<FeatureAvailabilityGroup>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct FeatureAvailabilityGroup {
+    group_id: String,
+    label: String,
+    items: Vec<FeatureAvailabilityItem>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct FeatureAvailabilityItem {
+    feature_id: String,
+    label: String,
+    owner_lane: String,
+    status: String,
+    source_of_truth: String,
+    current_option: String,
+    fallback_order: Vec<String>,
+    blocker: String,
+    evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LocalModelRuntimeProjection {
+    base_url: String,
+    healthz_url: String,
+    api_key_configured: bool,
+    ready: bool,
+    backend_ready: bool,
+    backend_kind: Option<String>,
+    chat_model: Option<String>,
+    embedding_model: Option<String>,
+    note: Option<String>,
+    error: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ModelPoliciesRequest {
     #[serde(default)]
@@ -448,6 +490,9 @@ impl AdminApi {
             }
             Method::Get if path == "/api/models/endpoints" => {
                 self.handle_model_endpoints(&identity_hints).boxed()
+            }
+            Method::Get if path == "/api/feature-availability" => {
+                self.handle_feature_availability(&identity_hints).boxed()
             }
             Method::Get if path == "/api/models/policies" => {
                 self.handle_model_policies(&identity_hints).boxed()
@@ -680,9 +725,58 @@ impl AdminApi {
             return error_json(StatusCode(403), &error);
         }
         match self.admin_store.load_or_create_state() {
-            Ok(state) => ok_json(&ModelEndpointsResponse {
-                endpoints: redact_model_center_state(&state.models).endpoints,
-            }),
+            Ok(state) => {
+                let runtime_projection = probe_local_model_runtime(&state.models.endpoints);
+                let endpoints = overlay_model_endpoints_with_runtime_truth(
+                    &state.models.endpoints,
+                    &runtime_projection,
+                );
+                ok_json(&ModelEndpointsResponse {
+                    endpoints: endpoints.iter().map(redact_model_endpoint).collect(),
+                })
+            }
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_feature_availability(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+
+        self.refresh_gateway_projection_best_effort();
+        let live_gateway_status = fetch_remote_gateway_status().ok();
+        let live_bridge_provider = live_gateway_status
+            .as_ref()
+            .and_then(live_bridge_provider_from_setup_status);
+
+        match self.admin_store.load_or_create_state() {
+            Ok(state) => {
+                let runtime_projection = probe_local_model_runtime(&state.models.endpoints);
+                let endpoints = overlay_model_endpoints_with_runtime_truth(
+                    &state.models.endpoints,
+                    &runtime_projection,
+                );
+                let mut account_management =
+                    account_management_snapshot(&state, Some(&self.public_origin));
+                if let Some(provider) = live_bridge_provider.as_ref() {
+                    apply_bridge_provider_projection_to_gateway_summary(
+                        &mut account_management.gateway,
+                        provider,
+                    );
+                }
+                let response = build_feature_availability_response(
+                    &endpoints,
+                    &state.models.route_policies,
+                    &account_management,
+                    live_gateway_status.as_ref(),
+                    &runtime_projection,
+                );
+                ok_json(&response)
+            }
             Err(error) => error_json(StatusCode(500), &error),
         }
     }
@@ -3511,6 +3605,854 @@ fn fetch_remote_gateway_status() -> Result<Value, String> {
         .map_err(|error| format!("failed to parse HarborGate status response: {error}"))
 }
 
+fn probe_local_model_runtime(endpoints: &[ModelEndpoint]) -> LocalModelRuntimeProjection {
+    let builtin_defaults = default_model_endpoints();
+    let preferred = endpoints
+        .iter()
+        .find(|endpoint| is_builtin_local_openai_endpoint(endpoint))
+        .cloned()
+        .or_else(|| builtin_defaults.iter().find(|endpoint| is_builtin_local_openai_endpoint(endpoint)).cloned());
+    let Some(template) = preferred else {
+        return LocalModelRuntimeProjection {
+            error: Some("local OpenAI-compatible runtime is not configured".to_string()),
+            ..Default::default()
+        };
+    };
+    let fallback = builtin_defaults
+        .iter()
+        .find(|endpoint| endpoint.model_endpoint_id == template.model_endpoint_id)
+        .or_else(|| {
+            builtin_defaults
+                .iter()
+                .find(|endpoint| is_builtin_local_openai_endpoint(endpoint))
+        });
+
+    let base_url = metadata_string_value(&template.metadata, "base_url")
+        .or_else(|| fallback.and_then(|endpoint| metadata_string_value(&endpoint.metadata, "base_url")))
+        .unwrap_or_default();
+    let healthz_url = metadata_string_value(&template.metadata, "healthz_url")
+        .or_else(|| {
+            fallback.and_then(|endpoint| metadata_string_value(&endpoint.metadata, "healthz_url"))
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| infer_healthz_url(&base_url));
+    let api_key_configured = metadata_bool_value(&template.metadata, "api_key_configured")
+        || metadata_string_value(&template.metadata, "api_key")
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+    let api_key_configured = api_key_configured
+        || fallback
+            .map(|endpoint| {
+                metadata_bool_value(&endpoint.metadata, "api_key_configured")
+                    || metadata_string_value(&endpoint.metadata, "api_key")
+                        .map(|value| !value.trim().is_empty())
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false);
+
+    if healthz_url.trim().is_empty() {
+        return LocalModelRuntimeProjection {
+            base_url,
+            healthz_url,
+            api_key_configured,
+            error: Some("local model healthz URL is not configured".to_string()),
+            ..Default::default()
+        };
+    }
+
+    let client = match Client::builder().timeout(Duration::from_secs(3)).build() {
+        Ok(client) => client,
+        Err(error) => {
+            return LocalModelRuntimeProjection {
+                base_url,
+                healthz_url,
+                api_key_configured,
+                error: Some(format!("failed to build local runtime probe client: {error}")),
+                ..Default::default()
+            }
+        }
+    };
+
+    let response = match client.get(&healthz_url).send() {
+        Ok(response) => response,
+        Err(error) => {
+            return LocalModelRuntimeProjection {
+                base_url,
+                healthz_url,
+                api_key_configured,
+                error: Some(format!("local model healthz request failed: {error}")),
+                ..Default::default()
+            }
+        }
+    };
+    let body = match response.text() {
+        Ok(body) => body,
+        Err(error) => {
+            return LocalModelRuntimeProjection {
+                base_url,
+                healthz_url,
+                api_key_configured,
+                error: Some(format!("failed to read local model healthz response: {error}")),
+                ..Default::default()
+            }
+        }
+    };
+    let payload = match serde_json::from_str::<Value>(&body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return LocalModelRuntimeProjection {
+                base_url,
+                healthz_url,
+                api_key_configured,
+                error: Some(format!("local model healthz returned invalid JSON: {error}")),
+                ..Default::default()
+            }
+        }
+    };
+
+    LocalModelRuntimeProjection {
+        base_url,
+        healthz_url,
+        api_key_configured,
+        ready: payload.get("ready").and_then(Value::as_bool).unwrap_or(false),
+        backend_ready: payload
+            .get("backend")
+            .and_then(|value| value.get("ready"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        backend_kind: payload
+            .get("backend")
+            .and_then(|value| value.get("kind"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        chat_model: payload
+            .get("chat_model")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        embedding_model: payload
+            .get("embedding_model")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        note: payload.get("note").and_then(Value::as_str).map(str::to_string),
+        error: None,
+    }
+}
+
+fn overlay_model_endpoints_with_runtime_truth(
+    endpoints: &[ModelEndpoint],
+    runtime: &LocalModelRuntimeProjection,
+) -> Vec<ModelEndpoint> {
+    let builtin_defaults = default_model_endpoints()
+        .into_iter()
+        .map(|endpoint| (endpoint.model_endpoint_id.clone(), endpoint))
+        .collect::<HashMap<_, _>>();
+
+    endpoints
+        .iter()
+        .map(|endpoint| {
+            let mut overlayed = endpoint.clone();
+            let original_status = overlayed.status;
+            let mut projection_mismatch = false;
+
+            if let Some(default_endpoint) = builtin_defaults.get(&overlayed.model_endpoint_id) {
+                if is_builtin_local_openai_endpoint(default_endpoint) {
+                    if metadata_missing_or_empty(&overlayed.metadata, "base_url") {
+                        if let Some(base_url) =
+                            metadata_string_value(&default_endpoint.metadata, "base_url")
+                        {
+                            set_metadata_string(&mut overlayed.metadata, "base_url", base_url);
+                            projection_mismatch = true;
+                        }
+                    }
+                    if metadata_missing_or_empty(&overlayed.metadata, "healthz_url") {
+                        if let Some(healthz_url) =
+                            metadata_string_value(&default_endpoint.metadata, "healthz_url")
+                        {
+                            set_metadata_string(
+                                &mut overlayed.metadata,
+                                "healthz_url",
+                                healthz_url,
+                            );
+                            projection_mismatch = true;
+                        }
+                    }
+                    if metadata_missing_or_empty(&overlayed.metadata, "api_key") {
+                        if let Some(api_key) =
+                            metadata_string_value(&default_endpoint.metadata, "api_key")
+                        {
+                            set_metadata_string(&mut overlayed.metadata, "api_key", api_key);
+                            projection_mismatch = true;
+                        }
+                    }
+                    if !metadata_bool_value(&overlayed.metadata, "api_key_configured")
+                        && metadata_bool_value(&default_endpoint.metadata, "api_key_configured")
+                    {
+                        set_metadata_bool(&mut overlayed.metadata, "api_key_configured", true);
+                        projection_mismatch = true;
+                    }
+
+                    set_metadata_string(
+                        &mut overlayed.metadata,
+                        "projection_source",
+                        "local_runtime_overlay".to_string(),
+                    );
+                    set_metadata_bool(
+                        &mut overlayed.metadata,
+                        "runtime_ready",
+                        runtime.ready && runtime.backend_ready,
+                    );
+                    if let Some(kind) = runtime.backend_kind.as_ref() {
+                        set_metadata_string(
+                            &mut overlayed.metadata,
+                            "runtime_backend_kind",
+                            kind.clone(),
+                        );
+                    }
+                    if let Some(chat_model) = runtime.chat_model.as_ref() {
+                        set_metadata_string(
+                            &mut overlayed.metadata,
+                            "runtime_chat_model",
+                            chat_model.clone(),
+                        );
+                    }
+                    if let Some(embedding_model) = runtime.embedding_model.as_ref() {
+                        set_metadata_string(
+                            &mut overlayed.metadata,
+                            "runtime_embedding_model",
+                            embedding_model.clone(),
+                        );
+                    }
+                    if let Some(note) = runtime.note.as_ref() {
+                        set_metadata_string(
+                            &mut overlayed.metadata,
+                            "runtime_note",
+                            note.clone(),
+                        );
+                    }
+                    if let Some(error) = runtime.error.as_ref() {
+                        set_metadata_string(
+                            &mut overlayed.metadata,
+                            "runtime_error",
+                            error.clone(),
+                        );
+                    }
+
+                    if matches!(overlayed.model_kind, ModelKind::Llm | ModelKind::Embedder)
+                        && runtime.ready
+                        && runtime.backend_ready
+                    {
+                        overlayed.status = ModelEndpointStatus::Active;
+                    }
+                }
+            }
+
+            if overlayed.status != original_status {
+                projection_mismatch = true;
+            }
+            if projection_mismatch {
+                set_metadata_bool(&mut overlayed.metadata, "projection_mismatch", true);
+                set_metadata_string(
+                    &mut overlayed.metadata,
+                    "projection_mismatch_reason",
+                    "runtime truth overrode stale admin endpoint state".to_string(),
+                );
+            }
+
+            overlayed
+        })
+        .collect()
+}
+
+fn build_feature_availability_response(
+    endpoints: &[ModelEndpoint],
+    route_policies: &[ModelRoutePolicy],
+    account_management: &AccountManagementSnapshot,
+    gateway_status: Option<&Value>,
+    runtime: &LocalModelRuntimeProjection,
+) -> FeatureAvailabilityResponse {
+    let retrieval_group = FeatureAvailabilityGroup {
+        group_id: "retrieval".to_string(),
+        label: "Retrieval & Models".to_string(),
+        items: vec![
+            build_ocr_feature(endpoints, route_policies),
+            build_embed_feature(endpoints, route_policies, runtime),
+            build_answer_feature(endpoints, route_policies, runtime),
+            build_vision_summary_feature(endpoints, route_policies),
+        ],
+    };
+    let delivery_group = FeatureAvailabilityGroup {
+        group_id: "delivery".to_string(),
+        label: "Interaction & Delivery".to_string(),
+        items: vec![
+            build_interactive_reply_feature(account_management),
+            build_proactive_delivery_feature(account_management, gateway_status),
+        ],
+    };
+    let binding_group = FeatureAvailabilityGroup {
+        group_id: "binding".to_string(),
+        label: "Binding & Access".to_string(),
+        items: vec![build_binding_availability_feature(account_management, gateway_status)],
+    };
+
+    FeatureAvailabilityResponse {
+        groups: vec![retrieval_group, delivery_group, binding_group],
+    }
+}
+
+fn build_ocr_feature(
+    endpoints: &[ModelEndpoint],
+    route_policies: &[ModelRoutePolicy],
+) -> FeatureAvailabilityItem {
+    let policy = find_route_policy(route_policies, "retrieval.ocr");
+    let endpoint = select_model_endpoint(endpoints, "ocr-local-tesseract", ModelKind::Ocr);
+    let fallback_order = policy_fallback_order(policy);
+    let endpoint_status = endpoint
+        .map(|value| value.status.as_str().to_string())
+        .unwrap_or_else(|| "missing".to_string());
+    let status = match endpoint {
+        Some(value) if value.status == ModelEndpointStatus::Active => "available",
+        Some(_) => "degraded",
+        None => "not_configured",
+    };
+    let blocker = if status == "available" {
+        String::new()
+    } else if endpoint.is_none() {
+        "No OCR endpoint is configured.".to_string()
+    } else {
+        "OCR route is present, but the local tesseract path still needs verification.".to_string()
+    };
+
+    FeatureAvailabilityItem {
+        feature_id: "retrieval.ocr".to_string(),
+        label: "OCR extraction".to_string(),
+        owner_lane: "harbor-framework".to_string(),
+        status: status.to_string(),
+        source_of_truth: "route_policy + model_endpoint".to_string(),
+        current_option: endpoint
+            .map(|value| format!("{} / {}", value.model_endpoint_id, value.provider_key))
+            .unwrap_or_else(|| "unconfigured".to_string()),
+        fallback_order,
+        blocker,
+        evidence: vec![
+            format!("route_policy_status={}", policy_status_value(policy)),
+            format!("endpoint_status={endpoint_status}"),
+            format!(
+                "provider={}",
+                endpoint
+                    .map(|value| value.provider_key.clone())
+                    .unwrap_or_else(|| "none".to_string())
+            ),
+        ],
+    }
+}
+
+fn build_embed_feature(
+    endpoints: &[ModelEndpoint],
+    route_policies: &[ModelRoutePolicy],
+    runtime: &LocalModelRuntimeProjection,
+) -> FeatureAvailabilityItem {
+    let policy = find_route_policy(route_policies, "retrieval.embed");
+    let endpoint = select_model_endpoint(
+        endpoints,
+        "embed-local-openai-compatible",
+        ModelKind::Embedder,
+    );
+    let runtime_ready = runtime.ready && runtime.backend_ready;
+    let projection_mismatch = endpoint.is_some_and(has_projection_mismatch);
+    let status = if runtime_ready {
+        "available"
+    } else if endpoint.is_some() {
+        "degraded"
+    } else {
+        "not_configured"
+    };
+    let blocker = if runtime_ready {
+        String::new()
+    } else if let Some(error) = runtime.error.as_ref() {
+        error.clone()
+    } else {
+        "Local embeddings runtime is not ready.".to_string()
+    };
+
+    let mut evidence = vec![
+        format!("route_policy_status={}", policy_status_value(policy)),
+        format!("runtime_ready={runtime_ready}"),
+    ];
+    if let Some(kind) = runtime.backend_kind.as_ref() {
+        evidence.push(format!("4176.backend.kind={kind}"));
+    }
+    if let Some(model) = runtime.embedding_model.as_ref() {
+        evidence.push(format!("embedding_model={model}"));
+    }
+    if let Some(endpoint) = endpoint {
+        evidence.push(format!(
+            "endpoint={} status={}",
+            endpoint.model_endpoint_id,
+            endpoint.status.as_str()
+        ));
+        if projection_mismatch {
+            evidence.push("projection_mismatch=runtime_overrode_stale_admin_state".to_string());
+        }
+    }
+
+    FeatureAvailabilityItem {
+        feature_id: "retrieval.embed".to_string(),
+        label: "Embedding retrieval".to_string(),
+        owner_lane: "harbor-framework".to_string(),
+        status: status.to_string(),
+        source_of_truth: "4176 /healthz + route_policy".to_string(),
+        current_option: endpoint
+            .map(|value| {
+                format!(
+                    "{} / {}",
+                    value.model_endpoint_id,
+                    runtime
+                        .backend_kind
+                        .clone()
+                        .unwrap_or_else(|| value.provider_key.clone())
+                )
+            })
+            .unwrap_or_else(|| {
+                runtime
+                    .backend_kind
+                    .as_deref()
+                    .map(|kind| format!("local runtime / {kind}"))
+                    .unwrap_or_else(|| "unconfigured".to_string())
+            }),
+        fallback_order: policy_fallback_order(policy),
+        blocker,
+        evidence,
+    }
+}
+
+fn build_answer_feature(
+    endpoints: &[ModelEndpoint],
+    route_policies: &[ModelRoutePolicy],
+    runtime: &LocalModelRuntimeProjection,
+) -> FeatureAvailabilityItem {
+    let policy = find_route_policy(route_policies, "retrieval.answer");
+    let endpoint =
+        select_model_endpoint(endpoints, "llm-local-openai-compatible", ModelKind::Llm);
+    let runtime_ready = runtime.ready && runtime.backend_ready;
+    let projection_mismatch = endpoint.is_some_and(has_projection_mismatch);
+    let status = if runtime_ready {
+        "available"
+    } else if endpoint.is_some() {
+        "degraded"
+    } else {
+        "not_configured"
+    };
+    let blocker = if runtime_ready {
+        String::new()
+    } else if let Some(error) = runtime.error.as_ref() {
+        error.clone()
+    } else {
+        "Local answer runtime is not ready.".to_string()
+    };
+
+    let mut evidence = vec![
+        format!("route_policy_status={}", policy_status_value(policy)),
+        format!("runtime_ready={runtime_ready}"),
+    ];
+    if let Some(kind) = runtime.backend_kind.as_ref() {
+        evidence.push(format!("4176.backend.kind={kind}"));
+    }
+    if let Some(model) = runtime.chat_model.as_ref() {
+        evidence.push(format!("chat_model={model}"));
+    }
+    if let Some(endpoint) = endpoint {
+        evidence.push(format!(
+            "endpoint={} status={}",
+            endpoint.model_endpoint_id,
+            endpoint.status.as_str()
+        ));
+        if projection_mismatch {
+            evidence.push("projection_mismatch=runtime_overrode_stale_admin_state".to_string());
+        }
+    }
+
+    FeatureAvailabilityItem {
+        feature_id: "retrieval.answer".to_string(),
+        label: "Retrieval answer synthesis".to_string(),
+        owner_lane: "harbor-framework".to_string(),
+        status: status.to_string(),
+        source_of_truth: "4176 /healthz + route_policy".to_string(),
+        current_option: endpoint
+            .map(|value| {
+                format!(
+                    "{} / {}",
+                    value.model_endpoint_id,
+                    runtime
+                        .backend_kind
+                        .clone()
+                        .unwrap_or_else(|| value.provider_key.clone())
+                )
+            })
+            .unwrap_or_else(|| {
+                runtime
+                    .backend_kind
+                    .as_deref()
+                    .map(|kind| format!("local runtime / {kind}"))
+                    .unwrap_or_else(|| "unconfigured".to_string())
+            }),
+        fallback_order: policy_fallback_order(policy),
+        blocker,
+        evidence,
+    }
+}
+
+fn build_vision_summary_feature(
+    endpoints: &[ModelEndpoint],
+    route_policies: &[ModelRoutePolicy],
+) -> FeatureAvailabilityItem {
+    let policy = find_route_policy(route_policies, "retrieval.vision_summary");
+    let endpoint =
+        select_model_endpoint(endpoints, "vlm-local-openai-compatible", ModelKind::Vlm);
+    let status = match endpoint {
+        Some(value) if value.status == ModelEndpointStatus::Active => "available",
+        Some(value) if value.status == ModelEndpointStatus::Degraded => "degraded",
+        Some(_) if policy.is_some_and(|value| value.status.eq_ignore_ascii_case("degraded")) => {
+            "degraded"
+        }
+        _ if policy.is_some_and(|value| value.status.eq_ignore_ascii_case("degraded")) => {
+            "degraded"
+        }
+        _ => "not_configured",
+    };
+    let blocker = if status == "available" {
+        String::new()
+    } else {
+        "No live VLM endpoint is enabled for still-image summary.".to_string()
+    };
+
+    FeatureAvailabilityItem {
+        feature_id: "retrieval.vision_summary".to_string(),
+        label: "Still-image vision summary".to_string(),
+        owner_lane: "harbor-framework".to_string(),
+        status: status.to_string(),
+        source_of_truth: "route_policy + vlm endpoint".to_string(),
+        current_option: endpoint
+            .map(|value| format!("{} / {}", value.model_endpoint_id, value.provider_key))
+            .unwrap_or_else(|| "unconfigured".to_string()),
+        fallback_order: policy_fallback_order(policy),
+        blocker,
+        evidence: vec![
+            format!("route_policy_status={}", policy_status_value(policy)),
+            format!(
+                "endpoint_status={}",
+                endpoint
+                    .map(|value| value.status.as_str().to_string())
+                    .unwrap_or_else(|| "missing".to_string())
+            ),
+        ],
+    }
+}
+
+fn build_interactive_reply_feature(
+    account_management: &AccountManagementSnapshot,
+) -> FeatureAvailabilityItem {
+    let delivery_policy = &account_management.delivery_policy.interactive_reply;
+    let gateway = &account_management.gateway;
+    let configured = gateway.bridge_provider.configured;
+    let connected = gateway.bridge_provider.connected;
+    let status = if delivery_policy.eq_ignore_ascii_case("source_bound") && connected {
+        "available"
+    } else if delivery_policy.eq_ignore_ascii_case("source_bound") && configured {
+        "degraded"
+    } else if delivery_policy.trim().is_empty() {
+        "not_configured"
+    } else {
+        "blocked"
+    };
+    let blocker = match status {
+        "available" => String::new(),
+        "degraded" => "Gateway is configured but not fully connected.".to_string(),
+        "not_configured" => "Interactive reply policy is not configured.".to_string(),
+        _ => format!(
+            "Interactive reply must stay source_bound, but current option is {}.",
+            to_non_empty_option(delivery_policy)
+        ),
+    };
+
+    FeatureAvailabilityItem {
+        feature_id: "interactive_reply".to_string(),
+        label: "Interaction-linked reply".to_string(),
+        owner_lane: "harbor-im-gateway".to_string(),
+        status: status.to_string(),
+        source_of_truth: "delivery_policy + gateway_status".to_string(),
+        current_option: to_non_empty_option(delivery_policy),
+        fallback_order: Vec::new(),
+        blocker,
+        evidence: vec![
+            format!("binding_channel={}", to_non_empty_option(&gateway.binding_channel)),
+            format!("gateway_configured={}", yes_no(configured)),
+            format!("gateway_connected={}", yes_no(connected)),
+        ],
+    }
+}
+
+fn build_proactive_delivery_feature(
+    account_management: &AccountManagementSnapshot,
+    gateway_status: Option<&Value>,
+) -> FeatureAvailabilityItem {
+    let delivery_policy = &account_management.delivery_policy.proactive_delivery;
+    let default_target = account_management
+        .notification_targets
+        .iter()
+        .find(|target| target.is_default)
+        .or_else(|| account_management.notification_targets.first());
+    let gateway_blocker = gateway_platform_blocker(gateway_status, "weixin");
+    let status = if gateway_blocker.is_some() {
+        "blocked"
+    } else if default_target.is_none() {
+        "not_configured"
+    } else if account_management.gateway.bridge_provider.connected {
+        "available"
+    } else if account_management.gateway.bridge_provider.configured {
+        "degraded"
+    } else {
+        "not_configured"
+    };
+    let blocker = if let Some(blocker) = gateway_blocker.clone() {
+        blocker
+    } else if default_target.is_none() {
+        "No default notification target is configured.".to_string()
+    } else if status == "degraded" {
+        "Bridge provider is configured but not yet connected for proactive delivery.".to_string()
+    } else {
+        String::new()
+    };
+
+    let mut evidence = vec![
+        format!("delivery_policy={}", to_non_empty_option(delivery_policy)),
+        format!(
+            "default_target={}",
+            default_target
+                .map(|target| format!("{} / {}", target.label, target.route_key))
+                .unwrap_or_else(|| "none".to_string())
+        ),
+    ];
+    if let Some(record_count) = gateway_delivery_record_count(gateway_status) {
+        evidence.push(format!("delivery_observability.record_count={record_count}"));
+    }
+
+    FeatureAvailabilityItem {
+        feature_id: "proactive_delivery".to_string(),
+        label: "Proactive delivery".to_string(),
+        owner_lane: "harbor-im-gateway".to_string(),
+        status: status.to_string(),
+        source_of_truth: "delivery_policy + notification_targets + gateway_status".to_string(),
+        current_option: to_non_empty_option(delivery_policy),
+        fallback_order: Vec::new(),
+        blocker,
+        evidence,
+    }
+}
+
+fn build_binding_availability_feature(
+    account_management: &AccountManagementSnapshot,
+    gateway_status: Option<&Value>,
+) -> FeatureAvailabilityItem {
+    let bindings = &account_management.identity_bindings;
+    let available_count = bindings.iter().filter(|binding| binding.binding_available).count();
+    let status = if bindings.is_empty() {
+        "not_configured"
+    } else if available_count == bindings.len() {
+        "available"
+    } else if available_count > 0 {
+        "degraded"
+    } else {
+        "blocked"
+    };
+    let blocker = if bindings.is_empty() {
+        "No HarborGate-owned identity bindings are projected yet.".to_string()
+    } else {
+        bindings
+            .iter()
+            .find(|binding| !binding.binding_available)
+            .map(|binding| binding.binding_availability_note.clone())
+            .or_else(|| gateway_platform_blocker(gateway_status, "weixin"))
+            .unwrap_or_default()
+    };
+
+    FeatureAvailabilityItem {
+        feature_id: "binding_availability".to_string(),
+        label: "Binding availability".to_string(),
+        owner_lane: "harbor-im-gateway".to_string(),
+        status: status.to_string(),
+        source_of_truth: "account_management.identity_bindings + gateway_status".to_string(),
+        current_option: format!("identity_bindings={}", bindings.len()),
+        fallback_order: Vec::new(),
+        blocker,
+        evidence: vec![
+            format!("available_bindings={available_count}"),
+            format!(
+                "binding_surfaces={}",
+                if bindings.is_empty() {
+                    "none".to_string()
+                } else {
+                    bindings
+                        .iter()
+                        .map(|binding| binding.proactive_delivery_surface.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            ),
+        ],
+    }
+}
+
+fn find_route_policy<'a>(
+    route_policies: &'a [ModelRoutePolicy],
+    route_policy_id: &str,
+) -> Option<&'a ModelRoutePolicy> {
+    route_policies
+        .iter()
+        .find(|policy| policy.route_policy_id == route_policy_id)
+}
+
+fn select_model_endpoint<'a>(
+    endpoints: &'a [ModelEndpoint],
+    preferred_id: &str,
+    model_kind: ModelKind,
+) -> Option<&'a ModelEndpoint> {
+    endpoints
+        .iter()
+        .find(|endpoint| endpoint.model_endpoint_id == preferred_id)
+        .or_else(|| {
+            endpoints
+                .iter()
+                .filter(|endpoint| endpoint.model_kind == model_kind)
+                .min_by_key(|endpoint| {
+                    (
+                        model_endpoint_status_rank(endpoint.status),
+                        endpoint.model_endpoint_id.clone(),
+                    )
+                })
+        })
+}
+
+fn model_endpoint_status_rank(status: ModelEndpointStatus) -> usize {
+    match status {
+        ModelEndpointStatus::Active => 0,
+        ModelEndpointStatus::Degraded => 1,
+        ModelEndpointStatus::Disabled => 2,
+    }
+}
+
+fn is_builtin_local_openai_endpoint(endpoint: &ModelEndpoint) -> bool {
+    endpoint.endpoint_kind == ModelEndpointKind::Local
+        && endpoint.provider_key.eq_ignore_ascii_case("openai_compatible")
+        && matches!(
+            endpoint.model_kind,
+            ModelKind::Llm | ModelKind::Embedder | ModelKind::Vlm
+        )
+}
+
+fn infer_healthz_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if let Some(prefix) = trimmed.strip_suffix("/v1") {
+        format!("{prefix}/healthz")
+    } else if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("{trimmed}/healthz")
+    }
+}
+
+fn metadata_missing_or_empty(metadata: &Value, key: &str) -> bool {
+    metadata_string_value(metadata, key)
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true)
+}
+
+fn metadata_string_value(metadata: &Value, key: &str) -> Option<String> {
+    metadata
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn metadata_bool_value(metadata: &Value, key: &str) -> bool {
+    metadata
+        .get(key)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn ensure_metadata_object(metadata: &mut Value) -> &mut serde_json::Map<String, Value> {
+    if !metadata.is_object() {
+        *metadata = json!({});
+    }
+    metadata.as_object_mut().expect("metadata object")
+}
+
+fn set_metadata_string(metadata: &mut Value, key: &str, value: String) {
+    ensure_metadata_object(metadata).insert(key.to_string(), Value::String(value));
+}
+
+fn set_metadata_bool(metadata: &mut Value, key: &str, value: bool) {
+    ensure_metadata_object(metadata).insert(key.to_string(), Value::Bool(value));
+}
+
+fn has_projection_mismatch(endpoint: &ModelEndpoint) -> bool {
+    metadata_bool_value(&endpoint.metadata, "projection_mismatch")
+}
+
+fn policy_fallback_order(policy: Option<&ModelRoutePolicy>) -> Vec<String> {
+    policy
+        .map(|value| value.fallback_order.clone())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            vec![
+                "local".to_string(),
+                "sidecar".to_string(),
+                "cloud".to_string(),
+            ]
+        })
+}
+
+fn policy_status_value(policy: Option<&ModelRoutePolicy>) -> String {
+    policy
+        .map(|value| value.status.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "missing".to_string())
+}
+
+fn gateway_platform_blocker(payload: Option<&Value>, platform: &str) -> Option<String> {
+    let platform_value = payload.and_then(|value| value.get(platform))?;
+    platform_value
+        .get("blocker_category")
+        .and_then(Value::as_str)
+        .or_else(|| platform_value.get("blocker").and_then(Value::as_str))
+        .or_else(|| platform_value.get("error").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn gateway_delivery_record_count(payload: Option<&Value>) -> Option<u64> {
+    payload
+        .and_then(|value| value.get("delivery_observability"))
+        .and_then(|value| value.get("record_count"))
+        .and_then(Value::as_u64)
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
+fn to_non_empty_option(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        "unconfigured".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn redact_model_endpoint_response(endpoints: &[ModelEndpoint]) -> ModelEndpointsResponse {
     ModelEndpointsResponse {
         endpoints: endpoints.iter().map(redact_model_endpoint).collect(),
@@ -3750,11 +4692,13 @@ impl Drop for FfmpegMjpegStream {
 mod tests {
     use super::{
         apply_bridge_provider_binding_projection, authorize_gateway_service_request,
+        build_feature_availability_response,
         ensure_local_admin_access,
         ensure_local_camera_access, harbordesk_build_missing_response, has_forwarding_headers,
         identity_query_suffix, is_admin_surface_path, is_harbordesk_client_route,
         is_harbordesk_surface_path, live_bridge_provider_from_setup_status, mime_type_for_path,
-        ManualAddRequest,
+        LocalModelRuntimeProjection, ManualAddRequest,
+        overlay_model_endpoints_with_runtime_truth, probe_local_model_runtime,
         parse_approval_decision_path, parse_camera_analyze_path, parse_camera_live_page_path,
         parse_camera_live_stream_path, parse_camera_share_link_path, parse_camera_snapshot_path,
         parse_camera_task_snapshot_path, parse_member_default_delivery_surface_update_path,
@@ -3785,9 +4729,12 @@ mod tests {
     use harborbeacon_local_agent::runtime::task_api::TaskApiService;
     use harborbeacon_local_agent::runtime::task_session::TaskConversationStore;
     use serde_json::json;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::fs;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::path::{Path, PathBuf};
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tiny_http::{Header, StatusCode};
 
@@ -4369,6 +5316,333 @@ mod tests {
             payload.endpoints[0].metadata["nested"]["token_configured"],
             json!(true)
         );
+    }
+
+    #[test]
+    fn runtime_overlay_promotes_live_local_llm_and_embedder_rows() {
+        let mut endpoints = harborbeacon_local_agent::runtime::admin_console::default_model_endpoints();
+        for endpoint in &mut endpoints {
+            if matches!(endpoint.model_kind, ModelKind::Llm | ModelKind::Embedder | ModelKind::Vlm)
+            {
+                endpoint.status = ModelEndpointStatus::Disabled;
+                endpoint.metadata = json!({
+                    "builtin": true,
+                    "base_url": "",
+                    "healthz_url": "",
+                    "api_key": "",
+                    "api_key_configured": false,
+                });
+            }
+        }
+
+        let overlayed = overlay_model_endpoints_with_runtime_truth(
+            &endpoints,
+            &LocalModelRuntimeProjection {
+                ready: true,
+                backend_ready: true,
+                backend_kind: Some("candle".to_string()),
+                chat_model: Some("/models/qwen".to_string()),
+                embedding_model: Some("/models/jina".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let llm = overlayed
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "llm-local-openai-compatible")
+            .expect("llm endpoint");
+        assert_eq!(llm.status, ModelEndpointStatus::Active);
+        assert_eq!(llm.metadata["projection_mismatch"], json!(true));
+        assert_ne!(llm.metadata["base_url"], json!(""));
+        assert_eq!(llm.metadata["runtime_backend_kind"], json!("candle"));
+
+        let embedder = overlayed
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "embed-local-openai-compatible")
+            .expect("embedder endpoint");
+        assert_eq!(embedder.status, ModelEndpointStatus::Active);
+        assert_eq!(embedder.metadata["api_key_configured"], json!(true));
+
+        let vlm = overlayed
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "vlm-local-openai-compatible")
+            .expect("vlm endpoint");
+        assert_eq!(vlm.status, ModelEndpointStatus::Disabled);
+    }
+
+    #[test]
+    fn runtime_probe_falls_back_to_builtin_local_endpoint_urls() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let body = json!({
+                "service": "harbor-model-api",
+                "status": "ok",
+                "backend": {
+                    "kind": "candle",
+                    "ready": true
+                },
+                "chat_model": "/models/qwen",
+                "embedding_model": "/models/jina",
+                "ready": true
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+
+        let _base_url = EnvGuard::set(
+            "HARBOR_MODEL_API_BASE_URL",
+            &format!("http://{addr}/v1"),
+        );
+        let mut endpoints =
+            harborbeacon_local_agent::runtime::admin_console::default_model_endpoints();
+        for endpoint in &mut endpoints {
+            if matches!(endpoint.model_kind, ModelKind::Llm | ModelKind::Embedder) {
+                endpoint.metadata = json!({
+                    "builtin": true,
+                    "base_url": "",
+                    "healthz_url": "",
+                    "api_key": "",
+                    "api_key_configured": false
+                });
+            }
+        }
+
+        let projection = probe_local_model_runtime(&endpoints);
+
+        assert!(projection.ready);
+        assert!(projection.backend_ready);
+        assert_eq!(projection.backend_kind.as_deref(), Some("candle"));
+        assert_eq!(projection.chat_model.as_deref(), Some("/models/qwen"));
+        assert_eq!(projection.embedding_model.as_deref(), Some("/models/jina"));
+        assert!(projection.api_key_configured);
+        assert_eq!(
+            projection.healthz_url,
+            format!("http://{addr}/healthz")
+        );
+
+        server.join().expect("server join");
+    }
+
+    #[test]
+    fn feature_availability_prefers_runtime_truth_for_embed_and_answer() {
+        let registry_path = unique_store_path("harborbeacon-feature-runtime-registry");
+        let admin_path = unique_store_path("harborbeacon-feature-runtime-state");
+        let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
+        let mut state = admin_store.load_or_create_state().expect("state");
+        for endpoint in &mut state.models.endpoints {
+            if matches!(endpoint.model_kind, ModelKind::Llm | ModelKind::Embedder) {
+                endpoint.status = ModelEndpointStatus::Disabled;
+                endpoint.metadata = json!({
+                    "builtin": true,
+                    "base_url": "",
+                    "healthz_url": "",
+                    "api_key": "",
+                    "api_key_configured": false,
+                });
+            }
+        }
+        let account_management =
+            harborbeacon_local_agent::runtime::admin_console::account_management_snapshot(
+                &state,
+                Some("http://harborbeacon.local:4174"),
+            );
+        let overlayed = overlay_model_endpoints_with_runtime_truth(
+            &state.models.endpoints,
+            &LocalModelRuntimeProjection {
+                ready: true,
+                backend_ready: true,
+                backend_kind: Some("candle".to_string()),
+                chat_model: Some("/models/qwen".to_string()),
+                embedding_model: Some("/models/jina".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let response = build_feature_availability_response(
+            &overlayed,
+            &state.models.route_policies,
+            &account_management,
+            None,
+            &LocalModelRuntimeProjection {
+                ready: true,
+                backend_ready: true,
+                backend_kind: Some("candle".to_string()),
+                chat_model: Some("/models/qwen".to_string()),
+                embedding_model: Some("/models/jina".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let embed = response
+            .groups
+            .iter()
+            .flat_map(|group| group.items.iter())
+            .find(|item| item.feature_id == "retrieval.embed")
+            .expect("embed feature");
+        assert_eq!(embed.status, "available");
+        assert!(embed
+            .evidence
+            .iter()
+            .any(|entry| entry.contains("projection_mismatch")));
+
+        let answer = response
+            .groups
+            .iter()
+            .flat_map(|group| group.items.iter())
+            .find(|item| item.feature_id == "retrieval.answer")
+            .expect("answer feature");
+        assert_eq!(answer.status, "available");
+        assert!(answer
+            .evidence
+            .iter()
+            .any(|entry| entry.contains("4176.backend.kind=candle")));
+
+        let vision = response
+            .groups
+            .iter()
+            .flat_map(|group| group.items.iter())
+            .find(|item| item.feature_id == "retrieval.vision_summary")
+            .expect("vision feature");
+        assert_ne!(vision.status, "available");
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn feature_availability_surfaces_weixin_blocker_without_secret_material() {
+        let registry_path = unique_store_path("harborbeacon-feature-weixin-registry");
+        let admin_path = unique_store_path("harborbeacon-feature-weixin-state");
+        let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
+        let state = admin_store.load_or_create_state().expect("state");
+        let account_management =
+            harborbeacon_local_agent::runtime::admin_console::account_management_snapshot(
+                &state,
+                Some("http://harborbeacon.local:4174"),
+            );
+        let gateway_payload = json!({
+            "weixin": {
+                "blocker_category": "weixin_dns_resolution",
+                "app_secret": "should-not-leak"
+            },
+            "delivery_observability": {
+                "record_count": 0
+            }
+        });
+
+        let response = build_feature_availability_response(
+            &state.models.endpoints,
+            &state.models.route_policies,
+            &account_management,
+            Some(&gateway_payload),
+            &LocalModelRuntimeProjection::default(),
+        );
+
+        let proactive = response
+            .groups
+            .iter()
+            .flat_map(|group| group.items.iter())
+            .find(|item| item.feature_id == "proactive_delivery")
+            .expect("proactive delivery");
+        assert_eq!(proactive.status, "blocked");
+        assert_eq!(proactive.blocker, "weixin_dns_resolution");
+        assert!(proactive
+            .evidence
+            .iter()
+            .any(|entry| entry.contains("delivery_observability.record_count=0")));
+        assert!(!proactive.blocker.contains("should-not-leak"));
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn feature_availability_keeps_runtime_features_available_while_weixin_blocker_isolated() {
+        let registry_path = unique_store_path("harborbeacon-feature-isolated-runtime-registry");
+        let admin_path = unique_store_path("harborbeacon-feature-isolated-runtime-state");
+        let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
+        let mut state = admin_store.load_or_create_state().expect("state");
+        for endpoint in &mut state.models.endpoints {
+            if matches!(endpoint.model_kind, ModelKind::Llm | ModelKind::Embedder) {
+                endpoint.status = ModelEndpointStatus::Disabled;
+                endpoint.metadata = json!({
+                    "builtin": true,
+                    "base_url": "",
+                    "healthz_url": "",
+                    "api_key": "",
+                    "api_key_configured": false,
+                });
+            }
+        }
+        let account_management =
+            harborbeacon_local_agent::runtime::admin_console::account_management_snapshot(
+                &state,
+                Some("http://harborbeacon.local:4174"),
+            );
+        let runtime = LocalModelRuntimeProjection {
+            ready: true,
+            backend_ready: true,
+            backend_kind: Some("candle".to_string()),
+            chat_model: Some("/models/qwen".to_string()),
+            embedding_model: Some("/models/jina".to_string()),
+            ..Default::default()
+        };
+        let overlayed = overlay_model_endpoints_with_runtime_truth(&state.models.endpoints, &runtime);
+        let gateway_payload = json!({
+            "weixin": {
+                "blocker_category": "weixin_dns_resolution"
+            },
+            "delivery_observability": {
+                "record_count": 0
+            }
+        });
+
+        let response = build_feature_availability_response(
+            &overlayed,
+            &state.models.route_policies,
+            &account_management,
+            Some(&gateway_payload),
+            &runtime,
+        );
+
+        let answer = response
+            .groups
+            .iter()
+            .flat_map(|group| group.items.iter())
+            .find(|item| item.feature_id == "retrieval.answer")
+            .expect("answer feature");
+        assert_eq!(answer.status, "available");
+        assert!(answer.blocker.is_empty());
+        assert!(answer
+            .evidence
+            .iter()
+            .any(|entry| entry.contains("4176.backend.kind=candle")));
+
+        let proactive = response
+            .groups
+            .iter()
+            .flat_map(|group| group.items.iter())
+            .find(|item| item.feature_id == "proactive_delivery")
+            .expect("proactive delivery");
+        assert_eq!(proactive.status, "blocked");
+        assert_eq!(proactive.blocker, "weixin_dns_resolution");
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
     }
 
     #[test]

@@ -117,6 +117,7 @@ Admin surfaces:
 - `PATCH /api/models/endpoints/:id`
 - `POST /api/models/endpoints/:id/test`
 - `GET/PUT /api/models/policies`
+- `GET /api/feature-availability`
 - `GET /admin/models`
 
 Current provider model:
@@ -131,6 +132,12 @@ Current defaults:
 - `retrieval.embed` prefers local OpenAI-compatible endpoints
 - `retrieval.answer` supports local-first with cloud fallback
 - `retrieval.vision_summary` is present in policy but still degraded until a VLM is configured
+
+Runtime-truth rule:
+
+- `GET /api/feature-availability` is the grouped read-model for runtime truth, route policy, account management, and gateway status
+- local runtime truth from `4176 /healthz` may override stale stored endpoint projection for the built-in LLM/embedder rows
+- HarborDesk keeps `projection_mismatch` visible instead of silently flattening runtime truth back into stored admin state
 
 ## Executable CI Scaffold
 

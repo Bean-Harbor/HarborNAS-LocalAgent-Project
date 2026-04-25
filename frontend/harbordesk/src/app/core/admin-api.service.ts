@@ -10,6 +10,10 @@ import {
   DeliverySurface,
   DeskPageModel,
   DeskRow,
+  FeatureAvailabilityGroup,
+  FeatureAvailabilityItem,
+  FeatureAvailabilityResponse,
+  FeatureAvailabilityStatus,
   GatewayPlatformStatus,
   GatewayStatusResponse,
   MetricCard,
@@ -82,13 +86,15 @@ export class HarborDeskAdminApiService {
       case 'models-policies':
         return forkJoin({
           endpoints: this.getModelEndpoints(),
-          policies: this.getModelPolicies()
-        }).pipe(map(({ endpoints, policies }) => this.buildModelsState(endpoints, policies)));
+          policies: this.getModelPolicies(),
+          availability: this.getFeatureAvailability()
+        }).pipe(map(({ endpoints, policies, availability }) => this.buildModelsState(endpoints, policies, availability)));
       case 'system-settings':
         return forkJoin({
           state: this.getState(),
-          gateway: this.getGatewayStatus()
-        }).pipe(map(({ state, gateway }) => this.buildSystemSettingsState(state, gateway)));
+          gateway: this.getGatewayStatus(),
+          availability: this.getFeatureAvailability()
+        }).pipe(map(({ state, gateway, availability }) => this.buildSystemSettingsState(state, gateway, availability)));
       default:
         return throwError(() => new Error(`Unknown HarborDesk page: ${pageId}`));
     }
@@ -120,6 +126,10 @@ export class HarborDeskAdminApiService {
 
   private getModelPolicies(): Observable<ModelPoliciesResponse> {
     return this.http.get<ModelPoliciesResponse>('/api/models/policies');
+  }
+
+  private getFeatureAvailability(): Observable<FeatureAvailabilityResponse> {
+    return this.http.get<FeatureAvailabilityResponse>('/api/feature-availability');
   }
 
   private loadingState(pageId: HarborDeskPageId): PageState<DeskPageModel> {
@@ -620,65 +630,80 @@ export class HarborDeskAdminApiService {
 
   private buildModelsState(
     endpoints: ModelEndpointsResponse,
-    policies: ModelPoliciesResponse
+    policies: ModelPoliciesResponse,
+    availability: FeatureAvailabilityResponse
   ): PageState<DeskPageModel> {
     const endpointRows = endpoints.endpoints ?? [];
+    const featureGroups = availability.groups ?? [];
+    const retrievalFeatures = this.findFeatureGroup(featureGroups, 'retrieval')?.items ?? [];
+    const availableRetrievalCount = retrievalFeatures.filter((item) => item.status === 'available').length;
+    const runtimeAlignment = this.buildRuntimeAlignmentSummary(endpointRows);
     const kind = endpointRows.length === 0 ? 'empty' : 'success';
     return {
       kind,
-      detail: 'Model Center is wired for operational visibility: endpoint status, route policies, fallback order, and on-demand test actions.',
+      detail: 'Model Center now keeps runtime truth, endpoint projection, and route-policy inventory on the same page.',
       data: {
         ...this.baseModel('models-policies'),
         eyebrow: 'Model center operations',
-        summary: 'VLM-first retrieval and route-policy control now share the same HarborDesk page.',
-        endpoint: 'GET /api/models/endpoints + /api/models/policies',
+        summary: 'Runtime alignment, feature availability, endpoint state, and route-policy control now share the same HarborDesk page.',
+        endpoint: 'GET /api/models/endpoints + /api/models/policies + /api/feature-availability',
         setupFlow: this.setupFlow(
           'Release-v1 model setup flow',
-          'The setup flow exposes OCR, VLM, and reply policy choices using the existing endpoint and route-policy inventory.',
+          'The setup flow exposes OCR, retrieval, and reply choices using the live runtime overlay plus the existing endpoint and route-policy inventory.',
           [
             this.setupStep(
-              'OCR / VLM / reply selections',
-              endpointRows.length > 0 && policies.route_policies.length > 0 ? 'ready' : 'needs-config',
-              endpointRows.length > 0 && policies.route_policies.length > 0
-                ? 'The page can already surface the available model endpoints and route policies.'
-                : 'Model inventory still needs to be filled in before the setup flow can be considered ready.',
-              endpointRows.length > 0 && policies.route_policies.length > 0
-                ? `Endpoints: ${endpointRows.length}. Route policies: ${policies.route_policies.length}. Use the tables below to inspect OCR/VLM/reply candidates.`
-                : 'Register endpoints and policies before trying to select OCR, VLM, or reply operators.',
-              ['VLM-first stays the multimodal priority.', 'Audio and full video understanding remain pending.']
+              'Runtime alignment',
+              runtimeAlignment?.status === 'aligned' ? 'ready' : endpointRows.length > 0 ? 'read-only' : 'blocked',
+              runtimeAlignment?.status === 'aligned'
+                ? 'The persisted endpoint projection matches the current local runtime.'
+                : runtimeAlignment
+                  ? 'The page is surfacing a projection mismatch instead of hiding it.'
+                  : 'Local endpoint inventory is not projected yet.',
+              runtimeAlignment?.detail ?? 'Register endpoints before HarborDesk can compare runtime truth against the stored endpoint projection.',
+              runtimeAlignment
+                ? ['Use Runtime alignment as the first stop before editing endpoint metadata.', 'Projection mismatch means runtime truth is overruling stale admin state.']
+                : ['No local endpoint projection is available yet.']
             ),
             this.setupStep(
-              'Endpoint operator status',
-              endpointRows.some((endpoint) => endpoint.status === 'active') ? 'ready' : endpointRows.length > 0 ? 'needs-config' : 'blocked',
-              endpointRows.some((endpoint) => endpoint.status === 'active')
-                ? 'At least one endpoint is active and testable from HarborDesk.'
-                : endpointRows.length > 0
-                  ? 'Endpoints exist, but none are marked active yet.'
-                  : 'No model endpoint inventory is projected yet.',
-              endpointRows.length > 0
-                ? 'Use the Run test control to inspect the current operator/test state for each endpoint.'
-                : 'Add endpoints before the operator status can become meaningful.',
-              ['The endpoint test action uses the existing backend write path.', 'Policy selection should remain visible alongside the operator state.']
+              'Feature availability',
+              retrievalFeatures.some((item) => item.status === 'available') ? 'ready' : retrievalFeatures.length > 0 ? 'needs-config' : 'blocked',
+              retrievalFeatures.some((item) => item.status === 'available')
+                ? 'At least one retrieval feature is confirmed available from live runtime and policy state.'
+                : retrievalFeatures.length > 0
+                  ? 'Feature rows are projected, but none are green yet.'
+                  : 'Feature availability has not been projected yet.',
+              retrievalFeatures.length > 0
+                ? `Retrieval features available: ${availableRetrievalCount}/${retrievalFeatures.length}. Use the grouped cards below to inspect OCR, embed, answer, and vision availability.`
+                : 'Expose feature availability before trying to make model-center decisions from this page.',
+              ['VLM-first stays the multimodal priority when a real VLM endpoint exists.', 'Audio and full video understanding remain pending.']
             )
           ]
         ),
         metrics: [
           this.metric('Endpoints', `${endpointRows.length}`, 'Visible model endpoints in the current workspace.', endpointRows.length > 0 ? 'good' : 'warn'),
           this.metric(
-            'VLM endpoints',
-            `${endpointRows.filter((endpoint) => endpoint.model_kind === 'vlm').length}`,
-            'VLM-first remains the active multimodal priority.',
-            endpointRows.some((endpoint) => endpoint.model_kind === 'vlm') ? 'good' : 'warn'
+            'Runtime alignment',
+            runtimeAlignment?.status ?? 'unavailable',
+            runtimeAlignment?.detail ?? 'No local runtime projection is available yet.',
+            runtimeAlignment?.tone ?? 'warn'
+          ),
+          this.metric(
+            'Retrieval features',
+            `${availableRetrievalCount}/${retrievalFeatures.length || 0}`,
+            'Grouped feature availability keeps runtime truth and route-policy state visible together.',
+            availableRetrievalCount > 0 ? 'good' : 'warn'
           ),
           this.metric('Policies', `${policies.route_policies.length}`, 'Route policies exposed by the admin-plane.', policies.route_policies.length > 0 ? 'good' : 'neutral')
         ],
         highlights: [
-          'Audio and video remain pending by design.',
+          'Projection mismatch stays visible instead of being silently flattened into the stored admin state.',
           'Endpoint tests are operator actions, not hidden background probes.'
         ],
-        blockers: [],
+        blockers: this.featureBlockers(featureGroups),
         modelEndpoints: endpointRows,
         modelPolicies: policies.route_policies,
+        featureGroups,
+        runtimeAlignment,
         detailRows: policies.route_policies.map((policy) => ({
           title: policy.route_policy_id,
           subtitle: `${policy.domain_scope} / ${policy.modality}`,
@@ -690,28 +715,35 @@ export class HarborDeskAdminApiService {
           tone: policy.local_preferred ? 'good' : 'neutral'
         })),
         emptyNote: 'No model endpoints are projected yet.',
-        nextStep: endpointRows.length === 0 ? 'Register model endpoints before operating the model center.' : 'Run endpoint tests and inspect fallback ordering from this page.'
+        nextStep: endpointRows.length === 0
+          ? 'Register model endpoints before operating the model center.'
+          : 'Use Runtime alignment first, then inspect feature availability and fallback ordering before changing endpoint metadata.'
       }
     };
   }
 
   private buildSystemSettingsState(
     state: AdminStateResponse,
-    gateway: GatewayStatusResponse
+    gateway: GatewayStatusResponse,
+    availability: FeatureAvailabilityResponse
   ): PageState<DeskPageModel> {
     const gatewayBaseUrl = state.bridge_provider.gateway_base_url || gateway.gateway_base_url || 'not configured';
     const manageUrl = gateway.manage_url || state.account_management?.gateway?.manage_url || 'not surfaced';
+    const featureGroups = availability.groups ?? [];
+    const interactiveReply = this.findFeatureItem(featureGroups, 'interactive_reply');
+    const proactiveDelivery = this.findFeatureItem(featureGroups, 'proactive_delivery');
+    const bindingAvailability = this.findFeatureItem(featureGroups, 'binding_availability');
     return {
       kind: 'success',
-      detail: 'System settings surfaces only backend-backed routing and gateway metadata.',
+      detail: 'System settings now combines backend-backed routing metadata with the grouped feature-availability read model.',
       data: {
         ...this.baseModel('system-settings'),
         eyebrow: 'Routing and gateway policy',
-        summary: 'This page exposes the frozen reply/delivery policy and same-origin gateway linkage without guessing unsupported settings.',
-        endpoint: 'GET /api/state + /api/gateway/status',
+        summary: 'This page exposes the frozen reply/delivery policy and the grouped read-model that says which options are really usable right now.',
+        endpoint: 'GET /api/state + /api/gateway/status + /api/feature-availability',
         setupFlow: this.setupFlow(
           'Release-v1 system setup flow',
-          'This page keeps the OS-install contract honest: only backend-backed settings are surfaced, and missing storage fields stay visible as blockers.',
+          'This page keeps the OS-install contract honest: only backend-backed settings are surfaced, and feature status is derived from real routing, binding, and gateway signals.',
           [
             this.setupStep(
               'Gateway linkage',
@@ -719,6 +751,15 @@ export class HarborDeskAdminApiService {
               gatewayBaseUrl === 'not configured' ? 'HarborGate base URL still needs to be configured.' : 'HarborGate is reachable from the same-origin admin UI.',
               `Gateway base URL: ${gatewayBaseUrl}.`,
               ['Use this as the single source of truth for same-origin gateway status.']
+            ),
+            this.setupStep(
+              'Reply / delivery option readiness',
+              interactiveReply?.status === 'available' && proactiveDelivery?.status !== 'blocked' ? 'ready' : 'needs-config',
+              interactiveReply?.status === 'available'
+                ? 'Interactive reply is live, and proactive delivery readiness is derived from the same frozen delivery policy.'
+                : 'At least one delivery option still needs configuration or gateway cleanup.',
+              `Interactive reply=${interactiveReply?.status ?? 'unknown'}, proactive delivery=${proactiveDelivery?.status ?? 'unknown'}, binding availability=${bindingAvailability?.status ?? 'unknown'}.`,
+              ['Use Feature availability below to see the exact blocker and source of truth for each option.']
             ),
             this.setupStep(
               'Writable root and capture target',
@@ -734,15 +775,32 @@ export class HarborDeskAdminApiService {
           ]
         ),
         metrics: [
-          this.metric('Interactive reply', state.delivery_policy.interactive_reply, 'Replies follow the original source surface.', 'good'),
-          this.metric('Proactive delivery', state.delivery_policy.proactive_delivery, 'Independent notifications follow the default named HarborGate target.', 'good'),
+          this.metric(
+            'Interactive reply',
+            interactiveReply?.status ?? state.delivery_policy.interactive_reply,
+            interactiveReply?.current_option || 'Replies follow the original source surface.',
+            interactiveReply ? this.featureTone(interactiveReply.status) : 'good'
+          ),
+          this.metric(
+            'Proactive delivery',
+            proactiveDelivery?.status ?? state.delivery_policy.proactive_delivery,
+            proactiveDelivery?.blocker || proactiveDelivery?.current_option || 'Independent notifications follow the default named HarborGate target.',
+            proactiveDelivery ? this.featureTone(proactiveDelivery.status) : 'good'
+          ),
+          this.metric(
+            'Binding availability',
+            bindingAvailability?.status ?? `${state.account_management?.workspace?.identity_binding_count ?? 0}`,
+            bindingAvailability?.current_option || 'Current HarborGate-owned identity binding projection.',
+            bindingAvailability ? this.featureTone(bindingAvailability.status) : 'neutral'
+          ),
           this.metric('Gateway base URL', gatewayBaseUrl, 'Current HarborGate admin/status origin.', gatewayBaseUrl === 'not configured' ? 'warn' : 'neutral')
         ],
         highlights: [
           `HarborGate manage URL: ${manageUrl}`,
           `Gateway status: ${state.bridge_provider.status}`
         ],
-        blockers: this.imBlockers(gateway),
+        blockers: this.uniqueLines([...this.imBlockers(gateway), ...this.featureBlockers(featureGroups)]),
+        featureGroups,
         detailRows: [
           {
             title: 'Default scan CIDR',
@@ -760,7 +818,7 @@ export class HarborDeskAdminApiService {
           }
         ],
         emptyNote: 'No settings metadata available.',
-        nextStep: 'Only settings backed by the admin-plane are shown here; clear blockers in IM Gateway before widening rollout.'
+        nextStep: 'Use Feature availability to decide which options are actually usable before touching gateway or delivery settings.'
       }
     };
   }
@@ -824,6 +882,89 @@ export class HarborDeskAdminApiService {
       blockers.push(`Weixin parity blocker: ${weixinBlocker}`);
     }
     return blockers;
+  }
+
+  private featureTone(status: FeatureAvailabilityStatus): MetricCard['tone'] {
+    switch (status) {
+      case 'available':
+        return 'good';
+      case 'blocked':
+        return 'danger';
+      case 'degraded':
+      case 'not_configured':
+      default:
+        return 'warn';
+    }
+  }
+
+  private findFeatureGroup(groups: FeatureAvailabilityGroup[], groupId: string): FeatureAvailabilityGroup | undefined {
+    return groups.find((group) => group.group_id === groupId);
+  }
+
+  private findFeatureItem(groups: FeatureAvailabilityGroup[], featureId: string): FeatureAvailabilityItem | undefined {
+    return groups.flatMap((group) => group.items).find((item) => item.feature_id === featureId);
+  }
+
+  private featureBlockers(groups: FeatureAvailabilityGroup[]): string[] {
+    return this.uniqueLines(
+      groups
+        .flatMap((group) => group.items)
+        .filter((item) => item.status === 'blocked' && item.blocker)
+        .map((item) => `${item.label}: ${item.blocker}`)
+    );
+  }
+
+  private buildRuntimeAlignmentSummary(endpointRows: ModelEndpointRecord[]): DeskPageModel['runtimeAlignment'] {
+    const runtimeRows = endpointRows.filter((endpoint) =>
+      ['llm-local-openai-compatible', 'embed-local-openai-compatible', 'vlm-local-openai-compatible'].includes(endpoint.model_endpoint_id)
+    );
+    if (runtimeRows.length === 0) {
+      return undefined;
+    }
+
+    const mismatchedRows = runtimeRows.filter((endpoint) => this.metadataBoolean(endpoint, 'projection_mismatch'));
+    return {
+      status: mismatchedRows.length > 0 ? 'projection_mismatch' : 'aligned',
+      detail:
+        mismatchedRows.length > 0
+          ? `Live runtime is overriding stale admin endpoint state for ${mismatchedRows.length} built-in endpoint${mismatchedRows.length === 1 ? '' : 's'}.`
+          : 'The stored endpoint projection matches the current local runtime signals.',
+      tone: mismatchedRows.length > 0 ? 'warn' : 'good',
+      rows: runtimeRows.map((endpoint) => {
+        const runtimeKind = this.metadataString(endpoint, 'runtime_backend_kind') || endpoint.provider_key || 'runtime';
+        const meta = [
+          `status: ${endpoint.status}`,
+          `provider: ${endpoint.provider_key}`,
+          `runtime backend: ${runtimeKind}`,
+          `base_url: ${this.metadataString(endpoint, 'base_url') || 'n/a'}`,
+          `healthz_url: ${this.metadataString(endpoint, 'healthz_url') || 'n/a'}`,
+          `api_key_configured: ${String(this.metadataBoolean(endpoint, 'api_key_configured'))}`
+        ];
+        const mismatchReason = this.metadataString(endpoint, 'projection_mismatch_reason');
+        if (mismatchReason) {
+          meta.push(`projection mismatch: ${mismatchReason}`);
+        }
+        return {
+          title: endpoint.model_endpoint_id,
+          subtitle: `${endpoint.model_kind} / ${runtimeKind}`,
+          meta,
+          tone: this.metadataBoolean(endpoint, 'projection_mismatch') ? 'warn' : endpoint.status === 'active' ? 'good' : 'neutral'
+        };
+      })
+    };
+  }
+
+  private metadataString(endpoint: ModelEndpointRecord, key: string): string | null {
+    const value = endpoint.metadata?.[key];
+    return typeof value === 'string' && value.trim() ? value : null;
+  }
+
+  private metadataBoolean(endpoint: ModelEndpointRecord, key: string): boolean {
+    return endpoint.metadata?.[key] === true;
+  }
+
+  private uniqueLines(entries: string[]): string[] {
+    return Array.from(new Set(entries.filter((entry) => entry.trim().length > 0)));
   }
 
   private metric(label: string, value: string, detail: string, tone: MetricCard['tone']): MetricCard {

@@ -72,6 +72,9 @@ const state = {
   modelPolicies: [],
   modelPoliciesLoaded: false,
   modelPoliciesError: "",
+  featureAvailabilityGroups: [],
+  featureAvailabilityLoaded: false,
+  featureAvailabilityError: "",
   modelEndpointTestResults: {},
   shareLinks: [],
   shareLinksLoaded: false,
@@ -163,6 +166,7 @@ const els = {
   modelEndpointList: document.querySelector("#model-endpoint-list"),
   modelPolicySummary: document.querySelector("#model-policy-summary"),
   modelPolicyList: document.querySelector("#model-policy-list"),
+  modelRuntimeAlignmentList: document.querySelector("#model-runtime-alignment-list"),
   modelCenterNotes: document.querySelector("#model-center-notes"),
   refreshModelCenter: document.querySelector("#refresh-model-center"),
   saveRoutePolicies: document.querySelector("#save-route-policies"),
@@ -174,6 +178,8 @@ const els = {
   harborosProofNote: document.querySelector("#harboros-proof-note"),
   systemRoutingList: document.querySelector("#system-routing-list"),
   systemBlockerList: document.querySelector("#system-blocker-list"),
+  featureAvailabilitySummary: document.querySelector("#feature-availability-summary"),
+  featureAvailabilityGroups: document.querySelector("#feature-availability-groups"),
   taskOutcomeStatus: document.querySelector("#task-outcome-status"),
   taskOutcomeMessage: document.querySelector("#task-outcome-message"),
   taskOutcomeAction: document.querySelector("#task-outcome-action"),
@@ -1132,6 +1138,34 @@ function mapModelPolicy(policy) {
   };
 }
 
+function mapFeatureAvailabilityItem(item) {
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+  return {
+    featureId: item.feature_id || "",
+    label: item.label || item.feature_id || "Unnamed feature",
+    ownerLane: item.owner_lane || "",
+    status: item.status || "unknown",
+    sourceOfTruth: item.source_of_truth || "",
+    currentOption: item.current_option || "",
+    fallbackOrder: Array.isArray(item.fallback_order) ? item.fallback_order : [],
+    blocker: item.blocker || "",
+    evidence: Array.isArray(item.evidence) ? item.evidence : [],
+  };
+}
+
+function mapFeatureAvailabilityGroup(group) {
+  if (!group || typeof group !== "object") {
+    return null;
+  }
+  return {
+    groupId: group.group_id || "",
+    label: group.label || group.group_id || "Unnamed group",
+    items: Array.isArray(group.items) ? group.items.map(mapFeatureAvailabilityItem).filter(Boolean) : [],
+  };
+}
+
 function yesNo(value) {
   return value ? "yes" : "no";
 }
@@ -1163,6 +1197,59 @@ function toAvailabilityLabel(value) {
     default:
       return value ? String(value) : "待验证";
   }
+}
+
+function toFeatureStatusLabel(status) {
+  switch (String(status || "").toLowerCase()) {
+    case "available":
+      return "available";
+    case "degraded":
+      return "degraded";
+    case "blocked":
+      return "blocked";
+    case "not_configured":
+      return "not configured";
+    default:
+      return status ? String(status) : "unknown";
+  }
+}
+
+function toFeatureStatusClass(status) {
+  switch (String(status || "").toLowerCase()) {
+    case "available":
+      return "approval-status-approved";
+    case "degraded":
+      return "approval-status-pending";
+    case "blocked":
+      return "approval-status-rejected";
+    case "not_configured":
+      return "";
+    default:
+      return "";
+  }
+}
+
+function toFeatureEditHint(featureId) {
+  switch (String(featureId || "").toLowerCase()) {
+    case "retrieval.ocr":
+      return "Models & Policies -> model endpoints / route policies";
+    case "retrieval.embed":
+    case "retrieval.answer":
+    case "retrieval.vision_summary":
+      return "Models & Policies -> runtime projection + route policies";
+    case "interactive_reply":
+    case "proactive_delivery":
+      return "IM Gateway + Account Management";
+    case "binding_availability":
+      return "Account Management + IM Gateway";
+    default:
+      return "System Settings";
+  }
+}
+
+function hasFeatureProjectionMismatch(item) {
+  return Array.isArray(item?.evidence)
+    && item.evidence.some((entry) => String(entry || "").includes("projection_mismatch"));
 }
 
 function toDefaultLabel(value) {
@@ -1560,9 +1647,10 @@ async function loadGatewayStatus(options = {}) {
 
 async function loadModelCenter(options = {}) {
   const { silent = false } = options;
-  const [endpointsResult, policiesResult] = await Promise.allSettled([
+  const [endpointsResult, policiesResult, featureAvailabilityResult] = await Promise.allSettled([
     api("/models/endpoints"),
     api("/models/policies"),
+    api("/feature-availability"),
   ]);
 
   const nextErrors = [];
@@ -1595,6 +1683,21 @@ async function loadModelCenter(options = {}) {
     nextErrors.push(state.modelPoliciesError);
   }
 
+  if (featureAvailabilityResult.status === "fulfilled") {
+    const payload = featureAvailabilityResult.value;
+    state.featureAvailabilityGroups = Array.isArray(payload?.groups)
+      ? payload.groups.map(mapFeatureAvailabilityGroup).filter(Boolean)
+      : [];
+    state.featureAvailabilityLoaded = true;
+    state.featureAvailabilityError = "";
+  } else {
+    state.featureAvailabilityGroups = [];
+    state.featureAvailabilityLoaded = true;
+    state.featureAvailabilityError =
+      featureAvailabilityResult.reason?.message || "unknown error";
+    nextErrors.push(state.featureAvailabilityError);
+  }
+
   const endpointIds = new Set(state.modelEndpoints.map((endpoint) => endpoint.modelEndpointId));
   state.modelEndpointTestResults = Object.fromEntries(
     Object.entries(state.modelEndpointTestResults || {}).filter(([endpointId]) =>
@@ -1603,6 +1706,7 @@ async function loadModelCenter(options = {}) {
   );
 
   renderModelsPolicies();
+  renderSystemSettings();
 
   if (nextErrors.length && !silent) {
     pushEvent({
@@ -2715,28 +2819,38 @@ function renderModelsPolicies() {
     return;
   }
 
-  const loading = !state.modelEndpointsLoaded || !state.modelPoliciesLoaded;
-  const blocker = Boolean(state.modelEndpointsError || state.modelPoliciesError);
+  const loading =
+    !state.modelEndpointsLoaded ||
+    !state.modelPoliciesLoaded ||
+    !state.featureAvailabilityLoaded;
+  const blocker = Boolean(
+    state.modelEndpointsError || state.modelPoliciesError || state.featureAvailabilityError
+  );
   const empty =
     !loading &&
     !blocker &&
     !state.modelEndpoints.length &&
-    !state.modelPolicies.length;
+    !state.modelPolicies.length &&
+    !state.featureAvailabilityGroups.length;
+  const mismatchCount = state.featureAvailabilityGroups
+    .flatMap((group) => group.items || [])
+    .filter(hasFeatureProjectionMismatch).length;
 
   renderPageState(
     els.modelsPoliciesPageState,
     loading ? "loading" : blocker ? "blocker" : empty ? "empty" : "success",
     "Models & Policies page state",
     loading
-      ? "Model Center is waiting for endpoint and route policy projections."
+      ? "Model Center is waiting for endpoint, route policy, and feature-availability projections."
       : blocker
         ? "At least one model-center read path has a backend blocker; HarborDesk will show the exact endpoint/policy gap instead of pretending policy state exists."
         : empty
-          ? "Model Center is reachable, but there are no endpoints or route policies projected yet."
-          : "Model Center is showing endpoint status, test result, kind/provider, and route policy/fallback order side by side.",
+          ? "Model Center is reachable, but there are no endpoints, route policies, or feature-availability rows projected yet."
+          : "Model Center is showing endpoint status, runtime-overlay alignment, and route policy/fallback order side by side.",
     [
       `endpoints = ${state.modelEndpoints.length}`,
       `route policies = ${state.modelPolicies.length}`,
+      `projection mismatches = ${mismatchCount}`,
       `VLM endpoints = ${state.modelEndpoints.filter((endpoint) => String(endpoint.modelKind || "").toLowerCase() === "vlm").length}`,
     ]
   );
@@ -2748,7 +2862,7 @@ function renderModelsPolicies() {
     els.modelEndpointSummary.textContent = loading
       ? "Waiting for model endpoint projection..."
       : blocker
-        ? `Model endpoint read blocked: ${state.modelEndpointsError || state.modelPoliciesError}`
+        ? `Model endpoint read blocked: ${state.modelEndpointsError || state.modelPoliciesError || state.featureAvailabilityError}`
         : state.modelEndpoints.length
           ? `${state.modelEndpoints.length} endpoints · active ${active} · degraded ${degraded} · disabled ${disabled}`
           : "No endpoints projected yet.";
@@ -2759,10 +2873,42 @@ function renderModelsPolicies() {
     els.modelPolicySummary.textContent = loading
       ? "Waiting for route policy projection..."
       : blocker
-        ? `Route policy read blocked: ${state.modelPoliciesError || state.modelEndpointsError}`
+        ? `Route policy read blocked: ${state.modelPoliciesError || state.modelEndpointsError || state.featureAvailabilityError}`
         : policyCount
           ? `${policyCount} route policies · fallback order and privacy level are editable below`
           : "No route policies projected yet.";
+  }
+
+  if (els.modelRuntimeAlignmentList) {
+    if (!state.featureAvailabilityLoaded) {
+      renderFeatureList(
+        els.modelRuntimeAlignmentList,
+        [],
+        "正在加载 runtime projection 和配置投影对齐结果..."
+      );
+    } else if (state.featureAvailabilityError) {
+      renderFeatureList(
+        els.modelRuntimeAlignmentList,
+        [],
+        `runtime alignment 暂不可用：${state.featureAvailabilityError}`
+      );
+    } else {
+      const mismatchItems = state.featureAvailabilityGroups
+        .flatMap((group) => group.items || [])
+        .filter(hasFeatureProjectionMismatch);
+      const alignmentLines = mismatchItems.length
+        ? mismatchItems.map((item) => {
+            return `${item.label} · runtime truth is overriding stale config projection · source=${item.sourceOfTruth}`;
+          })
+        : [
+            "Runtime truth currently matches the projected endpoint/policy state for the first-wave feature matrix.",
+          ];
+      renderFeatureList(
+        els.modelRuntimeAlignmentList,
+        alignmentLines,
+        "当前没有 runtime/config alignment 信号。"
+      );
+    }
   }
 
   els.modelEndpointList.innerHTML = "";
@@ -3075,6 +3221,7 @@ function renderModelsPolicies() {
     const notes = [
       `endpoint status/test result/kind/provider now have a real admin-plane home.`,
       `route policy and fallback order are editable in place and saved back to /api/models/policies.`,
+      `runtime truth from 4176 can override stale llm/embedder projection without rewriting the stored admin state.`,
       `VLM first stays limited to still images and snapshots; audio/video remains pending.`,
     ];
     renderFeatureList(els.modelCenterNotes, notes, "Model Center notes pending.");
@@ -3134,25 +3281,155 @@ function renderHarborOsSummary() {
   }
 }
 
+function renderFeatureAvailabilityGroups() {
+  if (!els.featureAvailabilityGroups || !els.featureAvailabilitySummary) {
+    return;
+  }
+
+  els.featureAvailabilityGroups.innerHTML = "";
+
+  if (!state.featureAvailabilityLoaded) {
+    els.featureAvailabilitySummary.textContent =
+      "Waiting for grouped feature-availability projection from runtime truth and gateway state.";
+    return;
+  }
+
+  if (state.featureAvailabilityError) {
+    els.featureAvailabilitySummary.textContent =
+      `Feature availability read blocked: ${state.featureAvailabilityError}`;
+    return;
+  }
+
+  const groups = Array.isArray(state.featureAvailabilityGroups)
+    ? state.featureAvailabilityGroups
+    : [];
+  const items = groups.flatMap((group) => group.items || []);
+  const availableCount = items.filter(
+    (item) => String(item.status || "").toLowerCase() === "available"
+  ).length;
+  const blockerCount = items.filter(
+    (item) => String(item.status || "").toLowerCase() === "blocked"
+  ).length;
+  const mismatchCount = items.filter(hasFeatureProjectionMismatch).length;
+
+  els.featureAvailabilitySummary.textContent = groups.length
+    ? `${items.length} feature rows · available ${availableCount} · blocked ${blockerCount} · projection mismatches ${mismatchCount}`
+    : "No grouped feature availability has been projected yet.";
+
+  if (!groups.length) {
+    return;
+  }
+
+  groups.forEach((group) => {
+    const card = document.createElement("article");
+    card.className = "stack-card muted-card";
+
+    const title = document.createElement("h4");
+    title.textContent = group.label || group.groupId || "Unnamed group";
+    card.appendChild(title);
+
+    const list = document.createElement("ul");
+    list.className = "scan-result-list";
+
+    if (!group.items.length) {
+      const empty = document.createElement("li");
+      empty.className = "scan-result-item";
+      empty.textContent = "No feature rows projected yet for this group.";
+      list.appendChild(empty);
+      card.appendChild(list);
+      els.featureAvailabilityGroups.appendChild(card);
+      return;
+    }
+
+    group.items.forEach((item) => {
+      const row = document.createElement("li");
+      row.className = "scan-result-item approval-item";
+      row.dataset.featureId = item.featureId;
+
+      const copy = document.createElement("div");
+      copy.className = "scan-result-main approval-copy";
+
+      const heading = document.createElement("span");
+      heading.className = "scan-result-title";
+      heading.textContent = item.label || item.featureId || "Unnamed feature";
+      copy.appendChild(heading);
+
+      const pills = document.createElement("div");
+      pills.className = "approval-pill-row";
+
+      const statusPill = document.createElement("span");
+      statusPill.className = `status-chip ${toFeatureStatusClass(item.status)}`.trim();
+      statusPill.textContent = `status=${toFeatureStatusLabel(item.status)}`;
+      pills.appendChild(statusPill);
+
+      const ownerPill = document.createElement("span");
+      ownerPill.className = "pill pill-plan";
+      ownerPill.textContent = `owner=${item.ownerLane || "unknown"}`;
+      pills.appendChild(ownerPill);
+
+      const sourcePill = document.createElement("span");
+      sourcePill.className = "pill";
+      sourcePill.textContent = `source=${item.sourceOfTruth || "unknown"}`;
+      pills.appendChild(sourcePill);
+
+      copy.appendChild(pills);
+
+      const meta = document.createElement("span");
+      meta.className = "scan-result-meta";
+      meta.textContent = [
+        `current=${toMaybeLabel(item.currentOption, "unconfigured")}`,
+        `fallback=${item.fallbackOrder.length ? item.fallbackOrder.join(" -> ") : "n/a"}`,
+      ].join(" · ");
+      copy.appendChild(meta);
+
+      const note = document.createElement("span");
+      note.className = "scan-result-note";
+      note.textContent = [
+        `blocker=${toMaybeLabel(item.blocker, "none")}`,
+        `edit=${toFeatureEditHint(item.featureId)}`,
+      ].join(" · ");
+      copy.appendChild(note);
+
+      if (Array.isArray(item.evidence) && item.evidence.length) {
+        const evidence = document.createElement("span");
+        evidence.className = "scan-result-note";
+        evidence.textContent = `evidence=${item.evidence.join(" | ")}`;
+        copy.appendChild(evidence);
+      }
+
+      row.appendChild(copy);
+      list.appendChild(row);
+    });
+
+    card.appendChild(list);
+    els.featureAvailabilityGroups.appendChild(card);
+  });
+}
+
 function renderSystemSettings() {
   const gateway = state.gatewayStatus;
-  const loading = !state.gatewayStatusLoaded;
-  const blocker = Boolean(state.gatewayStatusError);
-  const empty = !loading && !blocker && !gateway;
+  const loading = !state.gatewayStatusLoaded || !state.featureAvailabilityLoaded;
+  const blocker = Boolean(state.gatewayStatusError || state.featureAvailabilityError);
+  const empty =
+    !loading &&
+    !blocker &&
+    !gateway &&
+    !state.featureAvailabilityGroups.length;
   renderPageState(
     els.systemSettingsPageState,
     loading ? "loading" : blocker ? "blocker" : empty ? "empty" : "success",
     "System Settings page state",
     loading
-      ? "System Settings is waiting for real routing and gateway status."
+      ? "System Settings is waiting for real routing, gateway status, and feature availability."
       : blocker
         ? "Routing/gateway status has a backend blocker, so the page shows only explicit blockers instead of inferred settings."
         : empty
-          ? "Routing policy is present, but no gateway summary is available yet."
-          : "System Settings is showing only real routing/gateway state and blocker rows.",
+          ? "Routing policy is present, but no gateway summary or feature availability is available yet."
+          : "System Settings is showing real routing/gateway state plus grouped feature availability.",
     [
       `interactive reply = ${(state.deliveryPolicy?.interactiveReply || "source_bound").replaceAll("_", "-")}`,
       `proactive delivery = ${(state.deliveryPolicy?.proactiveDelivery || "member_default").replaceAll("_", " ")}`,
+      `feature rows = ${state.featureAvailabilityGroups.flatMap((group) => group.items || []).length}`,
     ]
   );
 
@@ -3210,11 +3487,15 @@ function renderSystemSettings() {
   if (!state.accountManagement) {
     blockerLines.push("Account Management 还没有返回 gateway / provisioning 投影，binding availability 不能确认。");
   }
+  if (state.featureAvailabilityError) {
+    blockerLines.push(`Feature availability 暂不可用：${state.featureAvailabilityError}`);
+  }
   if (!routingLines.length) {
     blockerLines.push("当前没有可用的 routing/gateway status。");
   }
   renderFeatureList(els.systemRoutingList, routingLines, "当前没有 real routing/gateway status。");
   renderFeatureList(els.systemBlockerList, blockerLines, "当前没有 explicit blockers。");
+  renderFeatureAvailabilityGroups();
 }
 
 function renderAll() {
