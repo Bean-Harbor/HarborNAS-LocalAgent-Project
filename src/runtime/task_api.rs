@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
@@ -56,16 +56,25 @@ use crate::runtime::knowledge::{
 };
 use crate::runtime::media::{ClipCaptureRequest, ClipCaptureResult, SnapshotCaptureResult};
 use crate::runtime::model_center::{
-    run_llm_text_with_state, run_ocr_with_state, run_vlm_summary_with_state,
+    run_llm_text_with_state_and_options, run_ocr_with_state, run_vlm_summary_with_state,
+    LlmTextOptions,
 };
 use crate::runtime::registry::ResolvedCameraTarget;
 use crate::runtime::remote_view;
 use crate::runtime::task_session::{
-    session_state_value_from_conversation, PendingTaskCandidate, PendingTaskConnect,
+    session_state_value_from_conversation, PendingTaskCandidate, PendingTaskClipConfirmation,
+    PendingTaskConnect, PendingTaskGeneralMessageLoop, RecentClipPlaybackState,
     TaskConversationState, TaskConversationStore,
 };
 
 const ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV: &str = "HARBOR_ALLOW_NON_HARBOROS_CAPTURE_ROOT";
+const GENERAL_MESSAGE_RECAP_LIMIT: usize = 3;
+const GENERAL_MESSAGE_TURN_BUDGET_MS: u64 = 12_000;
+const GENERAL_MESSAGE_ROUTER_BUDGET_MS: u64 = 3_500;
+const GENERAL_MESSAGE_ROUTER_MAX_TOKENS: u32 = 8;
+const GENERAL_MESSAGE_RENDERER_BUDGET_MS: u64 = 1_800;
+const GENERAL_MESSAGE_RENDERER_MAX_TOKENS: u32 = 48;
+const RECENT_CLIP_PLAYBACK_WINDOW_MS: u128 = 15 * 60 * 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct TaskSource {
@@ -273,6 +282,8 @@ pub enum TaskRequestAcceptance {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GeneralMessagePlanKind {
     CapabilitySummary,
+    Clarify,
+    CameraReplayRecentClip,
     CameraSnapshot,
     CameraRecordClip,
     KnowledgeSearch,
@@ -282,21 +293,69 @@ enum GeneralMessagePlanKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GeneralMessagePlan {
     kind: GeneralMessagePlanKind,
+    reply_text: Option<String>,
     camera_hint: Option<String>,
     query: Option<String>,
+    recent_clip: Option<RecentClipPlaybackState>,
     reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 struct GeneralMessagePlanPayload {
     #[serde(default)]
+    decision: String,
+    #[serde(default)]
     action: String,
+    #[serde(default)]
+    reply_text: Option<String>,
     #[serde(default)]
     camera_hint: Option<String>,
     #[serde(default)]
     query: Option<String>,
     #[serde(default)]
     reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct GeneralMessageSignals {
+    normalized: String,
+    asks_capability: bool,
+    explicit_clip_playback: bool,
+    explicit_snapshot: bool,
+    explicit_clip: bool,
+    explicit_search: bool,
+    mentions_camera_context: bool,
+    ambiguous_visual_request: bool,
+    recent_camera_context: bool,
+    recent_clip_available: bool,
+    recent_search_context: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GeneralMessageCandidate {
+    kind: GeneralMessagePlanKind,
+    confidence: u8,
+    camera_hint: Option<String>,
+    query: Option<String>,
+    recent_clip: Option<RecentClipPlaybackState>,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipConfirmationReplyDecision {
+    Deliver,
+    Decline,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct GeneralMessageControllerTrace {
+    controller_stage: String,
+    router_llm: bool,
+    router_latency_ms: Option<u64>,
+    renderer_latency_ms: Option<u64>,
+    fallback_reason: Option<String>,
+    candidate_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1131,16 +1190,123 @@ impl TaskApiService {
     }
 
     fn handle_general_message(&self, request: &TaskRequest) -> TaskResponse {
-        let plan = match self.general_message_plan(request) {
+        let turn_started = Instant::now();
+        if let Some(resume_token) = string_at_paths(&request.args, &["/resume_token"]) {
+            let conversation = self.load_or_create_conversation(request);
+            if conversation.clip_pending_confirmation().is_some() {
+                return self.resume_camera_record_clip_confirmation(request, &resume_token);
+            }
+            if conversation.camera_pending_connect().is_some() {
+                let routed = inject_password_arg_from_raw_text(request);
+                return self.resume_camera_connect(&routed, &resume_token);
+            }
+            if conversation.general_message_loop().is_some() {
+                return self.resume_general_message_loop(request, &resume_token);
+            }
+        }
+
+        let (plan, trace) = match self.general_message_plan(request, None) {
             Ok(plan) => plan,
-            Err(_) => return self.general_message_unsupported_response(request),
+            Err(error) => {
+                let mut response = self.general_message_unsupported_response(request, None);
+                attach_general_message_controller_trace(
+                    &mut response,
+                    &GeneralMessageControllerTrace {
+                        controller_stage: "controller_error".to_string(),
+                        fallback_reason: Some(error),
+                        ..Default::default()
+                    },
+                    turn_started.elapsed(),
+                );
+                return response;
+            }
         };
 
+        let mut response = self.execute_general_message_plan(request, plan, None);
+        attach_general_message_controller_trace(&mut response, &trace, turn_started.elapsed());
+        response
+    }
+
+    fn resume_general_message_loop(
+        &self,
+        request: &TaskRequest,
+        resume_token: &str,
+    ) -> TaskResponse {
+        let turn_started = Instant::now();
+        let conversation = self.load_or_create_conversation(request);
+        let Some(pending) = conversation.general_message_loop() else {
+            return self.failed(
+                request,
+                "agentic_interpreter",
+                RiskLevel::Low,
+                "当前没有待补充的自然语义流程，请直接重新描述你的需求。".to_string(),
+            );
+        };
+        if pending.resume_token != resume_token {
+            return self.failed(
+                request,
+                "agentic_interpreter",
+                RiskLevel::Low,
+                "这次补充说明的令牌已失效，请重新描述你的需求。".to_string(),
+            );
+        }
+
+        let (plan, trace) = match self.general_message_plan(request, Some(&pending)) {
+            Ok(plan) => plan,
+            Err(error) => {
+                let mut response = self.general_message_unsupported_response(request, None);
+                attach_general_message_controller_trace(
+                    &mut response,
+                    &GeneralMessageControllerTrace {
+                        controller_stage: "controller_error".to_string(),
+                        fallback_reason: Some(error),
+                        ..Default::default()
+                    },
+                    turn_started.elapsed(),
+                );
+                return response;
+            }
+        };
+        let mut response = self.execute_general_message_plan(request, plan, Some(&pending));
+        attach_general_message_controller_trace(&mut response, &trace, turn_started.elapsed());
+        response
+    }
+
+    fn execute_general_message_plan(
+        &self,
+        request: &TaskRequest,
+        plan: GeneralMessagePlan,
+        prior_pending: Option<&PendingTaskGeneralMessageLoop>,
+    ) -> TaskResponse {
         match plan.kind {
             GeneralMessagePlanKind::CapabilitySummary => {
-                self.general_message_capability_summary_response(request)
+                if let Err(response) = self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                self.general_message_capability_summary_response(
+                    request,
+                    plan.reply_text.as_deref(),
+                )
+            }
+            GeneralMessagePlanKind::Clarify => {
+                self.general_message_clarification_response(request, &plan, prior_pending)
+            }
+            GeneralMessagePlanKind::CameraReplayRecentClip => {
+                if let Err(response) = self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                let Some(recent_clip) = plan.recent_clip else {
+                    return self.general_message_unsupported_response(request, None);
+                };
+                self.complete_recent_clip_playback(request, &recent_clip)
             }
             GeneralMessagePlanKind::CameraSnapshot => {
+                if let Err(response) = self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
                 let mut routed = request.clone();
                 routed.intent.domain = "camera".to_string();
                 routed.intent.action = "snapshot".to_string();
@@ -1150,6 +1316,10 @@ impl TaskApiService {
                 self.handle_camera_snapshot(&routed)
             }
             GeneralMessagePlanKind::CameraRecordClip => {
+                if let Err(response) = self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
                 let mut routed = request.clone();
                 routed.intent.domain = "camera".to_string();
                 routed.intent.action = "record_clip".to_string();
@@ -1159,6 +1329,10 @@ impl TaskApiService {
                 self.handle_camera_record_clip(&routed)
             }
             GeneralMessagePlanKind::KnowledgeSearch => {
+                if let Err(response) = self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
                 let mut routed = request.clone();
                 routed.intent.domain = KNOWLEDGE_DOMAIN.to_string();
                 routed.intent.action = KNOWLEDGE_OP_SEARCH.to_string();
@@ -1172,12 +1346,45 @@ impl TaskApiService {
                 }
                 self.handle_knowledge_search(&routed)
             }
-            GeneralMessagePlanKind::Unsupported => self.general_message_unsupported_response(request),
+            GeneralMessagePlanKind::Unsupported => {
+                if let Err(response) = self.clear_general_message_loop_if_matches(request, prior_pending)
+                {
+                    return response;
+                }
+                self.general_message_unsupported_response(
+                    request,
+                    plan.reply_text.as_deref(),
+                )
+            }
         }
     }
 
-    fn general_message_capability_summary_response(&self, request: &TaskRequest) -> TaskResponse {
-        let summary = general_message_support_summary();
+    fn complete_recent_clip_playback(
+        &self,
+        request: &TaskRequest,
+        recent_clip: &RecentClipPlaybackState,
+    ) -> TaskResponse {
+        self.completed(
+            request,
+            "camera_hub_service",
+            RiskLevel::Low,
+            "完整回放如下".to_string(),
+            build_clip_delivery_payload(recent_clip),
+            vec![build_clip_delivery_artifact(recent_clip)],
+            Vec::new(),
+        )
+    }
+
+    fn general_message_capability_summary_response(
+        &self,
+        request: &TaskRequest,
+        reply_text: Option<&str>,
+    ) -> TaskResponse {
+        let summary = reply_text
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(general_message_support_summary);
         let examples = general_message_supported_examples();
         self.completed(
             request,
@@ -1205,8 +1412,16 @@ impl TaskApiService {
         )
     }
 
-    fn general_message_unsupported_response(&self, request: &TaskRequest) -> TaskResponse {
-        let summary = general_message_unsupported_summary();
+    fn general_message_unsupported_response(
+        &self,
+        request: &TaskRequest,
+        reply_text: Option<&str>,
+    ) -> TaskResponse {
+        let summary = reply_text
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(general_message_unsupported_summary);
         let examples = general_message_supported_examples();
         self.completed(
             request,
@@ -1234,49 +1449,244 @@ impl TaskApiService {
         )
     }
 
-    fn general_message_plan(&self, request: &TaskRequest) -> Result<GeneralMessagePlan, String> {
-        if general_message_requests_capability_summary(request.intent.raw_text.as_str()) {
-            return Ok(GeneralMessagePlan {
-                kind: GeneralMessagePlanKind::CapabilitySummary,
-                camera_hint: None,
-                query: None,
-                reason: None,
-            });
+    fn general_message_clarification_response(
+        &self,
+        request: &TaskRequest,
+        plan: &GeneralMessagePlan,
+        prior_pending: Option<&PendingTaskGeneralMessageLoop>,
+    ) -> TaskResponse {
+        let prompt = plan
+            .reply_text
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| general_message_default_clarification_prompt(request.intent.raw_text.as_str()));
+        let resume_token = ensure_resume_token();
+        let mut conversation = self.load_or_create_conversation(request);
+        conversation.set_general_message_loop(Some(PendingTaskGeneralMessageLoop {
+            resume_token: resume_token.clone(),
+            original_goal: prior_pending
+                .and_then(|pending| {
+                    (!pending.original_goal.trim().is_empty()).then(|| pending.original_goal.clone())
+                })
+                .unwrap_or_else(|| request.intent.raw_text.trim().to_string()),
+            latest_user_intent_text: request.intent.raw_text.trim().to_string(),
+            last_clarification_prompt: prompt.clone(),
+            selected_candidate_action: prior_pending
+                .and_then(|pending| pending.selected_candidate_action.clone()),
+            camera_hint: plan.camera_hint.clone(),
+            query: plan.query.clone(),
+        }));
+        if let Err(error) = self.save_conversation(request, &conversation) {
+            return self.failed(
+                request,
+                "agentic_interpreter",
+                RiskLevel::Low,
+                format!("无法保存自然语义澄清状态: {error}"),
+            );
         }
 
-        let admin_state = self.admin_store.load_or_create_state()?;
-        let camera_targets = self
-            .admin_store
-            .registry_store()
-            .load_camera_targets()
-            .unwrap_or_default();
-        let selected_camera = admin_state.defaults.selected_camera_device_id.clone();
-        let writable_root = harboros_writable_root();
-        let capture_subdirectory = admin_state.defaults.capture_subdirectory.clone();
-        let clip_length_seconds = admin_state.defaults.clip_length_seconds;
-        let llm_prompt = build_general_message_planner_prompt(
+        self.needs_input_with_context(
             request,
-            &camera_targets,
-            selected_camera.as_deref(),
-            writable_root.as_str(),
-            capture_subdirectory.as_str(),
-            clip_length_seconds,
-        );
+            "agentic_interpreter",
+            RiskLevel::Low,
+            prompt.clone(),
+            Vec::new(),
+            resume_token,
+            json!({
+                "reply_pack": {
+                    "kind": "clarification",
+                    "summary": prompt,
+                },
+                "general_message_loop": {
+                    "kind": "general_message_loop",
+                    "camera_hint": plan.camera_hint,
+                    "query": plan.query,
+                    "reason": plan.reason,
+                }
+            }),
+            Vec::new(),
+            vec![
+                "拍一张".to_string(),
+                "录一段".to_string(),
+                "搜索已有内容".to_string(),
+            ],
+        )
+    }
 
-        let llm_plan = run_llm_text_with_state(&llm_prompt, &admin_state.models);
-        if llm_plan.available && !llm_plan.text.trim().is_empty() {
-            if let Some(plan) = parse_general_message_plan(&llm_plan.text) {
-                return Ok(plan);
+    fn clear_general_message_loop_if_matches(
+        &self,
+        request: &TaskRequest,
+        pending: Option<&PendingTaskGeneralMessageLoop>,
+    ) -> Result<(), TaskResponse> {
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        let mut conversation = self.load_or_create_conversation(request);
+        if conversation
+            .general_message_loop()
+            .is_some_and(|current| current.resume_token == pending.resume_token)
+        {
+            conversation.set_general_message_loop(None);
+            self.save_conversation(request, &conversation)
+                .map_err(|error| {
+                    self.failed(
+                        request,
+                        "agentic_interpreter",
+                        RiskLevel::Low,
+                        format!("无法更新自然语义流程状态: {error}"),
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    fn general_message_plan(
+        &self,
+        request: &TaskRequest,
+        pending_loop: Option<&PendingTaskGeneralMessageLoop>,
+    ) -> Result<(GeneralMessagePlan, GeneralMessageControllerTrace), String> {
+        let admin_state = self.admin_store.load_or_create_state()?;
+        let selected_camera = admin_state.defaults.selected_camera_device_id.clone();
+        let recent_clip = self
+            .load_conversation(request)
+            .and_then(|conversation| conversation.recent_clip_playback())
+            .filter(recent_clip_playback_is_fresh);
+        let session_recap = self.recent_general_message_session_recap(request);
+        let signals = extract_general_message_signals(
+            request,
+            &session_recap,
+            pending_loop,
+            recent_clip.as_ref(),
+        );
+        let candidates = build_general_message_candidates(
+            request,
+            &signals,
+            selected_camera.as_deref(),
+            pending_loop,
+            &session_recap,
+            recent_clip.as_ref(),
+        );
+        let mut trace = GeneralMessageControllerTrace {
+            controller_stage: "candidate_builder".to_string(),
+            candidate_count: candidates.len(),
+            ..Default::default()
+        };
+
+        if let Some(mut plan) =
+            resolve_deterministic_general_message_plan(request, &candidates, pending_loop)
+        {
+            trace.controller_stage = deterministic_stage_for_plan(&plan).to_string();
+            maybe_render_general_message_reply(
+                request,
+                pending_loop,
+                &admin_state.models,
+                &mut plan,
+                &mut trace,
+            );
+            return Ok((plan, trace));
+        }
+
+        if should_try_general_message_router_llm(&signals, pending_loop) {
+            let router_started = Instant::now();
+            let router_prompt =
+                build_general_message_router_prompt(request, &session_recap, pending_loop);
+            let router_result = run_llm_text_with_state_and_options(
+                &router_prompt,
+                &admin_state.models,
+                &LlmTextOptions {
+                    purpose: Some("router".to_string()),
+                    system_prompt: Some(build_general_message_router_system_prompt()),
+                    temperature: Some(0.0),
+                    max_tokens: Some(GENERAL_MESSAGE_ROUTER_MAX_TOKENS),
+                    timeout: Some(Duration::from_millis(
+                        GENERAL_MESSAGE_ROUTER_BUDGET_MS.min(GENERAL_MESSAGE_TURN_BUDGET_MS),
+                    )),
+                },
+            );
+            trace.router_llm = true;
+            trace.router_latency_ms = Some(router_started.elapsed().as_millis() as u64);
+            if router_result.available {
+                if let Some(kind) = parse_general_message_router_decision(&router_result.text) {
+                    let mut plan = plan_from_router_decision(
+                        kind,
+                        request,
+                        selected_camera.as_deref(),
+                        pending_loop,
+                    );
+                    trace.controller_stage = "router_llm".to_string();
+                    maybe_render_general_message_reply(
+                        request,
+                        pending_loop,
+                        &admin_state.models,
+                        &mut plan,
+                        &mut trace,
+                    );
+                    return Ok((plan, trace));
+                }
+                trace.fallback_reason = Some("router_invalid_label".to_string());
+            } else {
+                trace.fallback_reason = Some(router_result.summary);
             }
         }
 
-        fallback_general_message_plan(
-            request.intent.raw_text.as_str(),
-            selected_camera.as_deref(),
-        )
-        .ok_or_else(|| {
-            "当前自然语义暂时只能稳定处理抓拍、短视频和知识检索。".to_string()
-        })
+        if let Some(mut plan) =
+            fallback_general_message_plan(request.intent.raw_text.as_str(), selected_camera.as_deref())
+        {
+            trace.controller_stage = "deterministic_fallback".to_string();
+            trace
+                .fallback_reason
+                .get_or_insert_with(|| "deterministic_fallback".to_string());
+            maybe_render_general_message_reply(
+                request,
+                pending_loop,
+                &admin_state.models,
+                &mut plan,
+                &mut trace,
+            );
+            return Ok((plan, trace));
+        }
+
+        let mut plan = GeneralMessagePlan {
+            kind: GeneralMessagePlanKind::Unsupported,
+            reply_text: None,
+            camera_hint: pending_loop.and_then(|pending| pending.camera_hint.clone()),
+            query: pending_loop
+                .and_then(|pending| pending.query.clone())
+                .or_else(|| infer_query_from_raw_text(request.intent.raw_text.as_str())),
+            recent_clip: None,
+            reason: Some("no_supported_candidate".to_string()),
+        };
+        trace.controller_stage = "unsupported".to_string();
+        trace
+            .fallback_reason
+            .get_or_insert_with(|| "no_supported_candidate".to_string());
+        maybe_render_general_message_reply(
+            request,
+            pending_loop,
+            &admin_state.models,
+            &mut plan,
+            &mut trace,
+        );
+        Ok((plan, trace))
+    }
+
+    fn recent_general_message_session_recap(&self, request: &TaskRequest) -> Vec<Value> {
+        let session_id = session_id_for_request(request);
+        self.conversation_store
+            .recent_task_runs_for_session(&session_id, GENERAL_MESSAGE_RECAP_LIMIT + 1)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|task_run| task_run.task_id != request.task_id)
+            .take(GENERAL_MESSAGE_RECAP_LIMIT)
+            .map(|task_run| {
+                json!({
+                    "intent_text": task_run.intent_text,
+                    "domain": task_run.domain,
+                    "action": task_run.action,
+                    "status": serde_json::to_value(task_run.status).unwrap_or(Value::Null),
+                })
+            })
+            .collect()
     }
 
     fn handle_camera_record_clip(&self, request: &TaskRequest) -> TaskResponse {
@@ -1379,15 +1789,141 @@ impl TaskApiService {
             );
         }
 
-        self.completed(
+        let Some(cover_artifact) = build_clip_confirmation_cover_artifact(&clip, &keyframes, &media_asset) else {
+            return self.failed(
+                request,
+                "camera_hub_service",
+                RiskLevel::Low,
+                "短视频已保存，但无法生成首帧预览，请稍后重试。".to_string(),
+            );
+        };
+        let resume_token = ensure_resume_token();
+        let recent_clip = recent_clip_playback_from_capture(
+            &clip,
+            &media_asset,
+            &cover_artifact,
+            &target.display_name,
+        );
+        let mut conversation = self.load_or_create_conversation(request);
+        conversation.set_clip_pending_confirmation(Some(PendingTaskClipConfirmation {
+            resume_token: resume_token.clone(),
+            clip_media_asset_id: media_asset.asset_id.clone(),
+            clip_path: clip.storage.relative_path.clone(),
+            clip_mime_type: clip.mime_type.clone(),
+            cover_path: cover_artifact.path.clone().unwrap_or_default(),
+            display_name: target.display_name.clone(),
+        }));
+        conversation.set_recent_clip_playback(Some(recent_clip));
+        if let Err(error) = self.save_conversation(request, &conversation) {
+            return self.failed(
+                request,
+                "camera_hub_service",
+                RiskLevel::Low,
+                format!("短视频已保存，但保存回放确认状态失败: {error}"),
+            );
+        }
+
+        let prompt = format!(
+            "已录制 {} 的短视频片段。是否看完整回放？回复：要 / 不要",
+            target.display_name
+        );
+        self.needs_input_with_artifacts_context(
             request,
             "camera_hub_service",
             RiskLevel::Low,
-            format!("已录制 {} 的短视频片段。", target.display_name),
-            build_clip_payload(&target, &clip, &keyframes, &media_asset),
-            build_clip_artifacts(&clip, &keyframes, &media_asset),
-            vec!["检索这段视频".to_string()],
+            prompt,
+            Vec::new(),
+            resume_token,
+            build_clip_confirmation_payload(&target, &clip, &media_asset),
+            vec![cover_artifact],
+            Vec::new(),
+            vec!["要".to_string(), "不要".to_string()],
         )
+    }
+
+    fn resume_camera_record_clip_confirmation(
+        &self,
+        request: &TaskRequest,
+        resume_token: &str,
+    ) -> TaskResponse {
+        let turn_started = Instant::now();
+        let mut conversation = self.load_or_create_conversation(request);
+        let Some(pending) = conversation.clip_pending_confirmation() else {
+            return self.failed(
+                request,
+                "camera_hub_service",
+                RiskLevel::Low,
+                "当前没有待确认的回放，请重新发送“录一段”。".to_string(),
+            );
+        };
+        if pending.resume_token != resume_token {
+            return self.failed(
+                request,
+                "camera_hub_service",
+                RiskLevel::Low,
+                "回放确认令牌已失效，请重新发送“录一段”。".to_string(),
+            );
+        }
+
+        let decision = clip_confirmation_reply_decision(request.intent.raw_text.as_str());
+        conversation.set_clip_pending_confirmation(None);
+        if let Err(error) = self.save_conversation(request, &conversation) {
+            return self.failed(
+                request,
+                "camera_hub_service",
+                RiskLevel::Low,
+                format!("无法更新回放确认状态: {error}"),
+            );
+        }
+
+        let recent_clip = conversation
+            .recent_clip_playback()
+            .unwrap_or_else(|| recent_clip_playback_from_pending(&pending, current_epoch_ms()));
+        match decision {
+            ClipConfirmationReplyDecision::Deliver => {
+                self.complete_recent_clip_playback(request, &recent_clip)
+            }
+            ClipConfirmationReplyDecision::Decline => self.completed(
+                request,
+                "camera_hub_service",
+                RiskLevel::Low,
+                "好的，这段回放先不发。".to_string(),
+                json!({
+                    "clip_confirmation": {
+                        "kind": "clip_confirmation",
+                        "clip_media_asset_id": pending.clip_media_asset_id,
+                        "decision": "declined",
+                    }
+                }),
+                Vec::new(),
+                Vec::new(),
+            ),
+            ClipConfirmationReplyDecision::Unknown => {
+                let (plan, trace) = match self.general_message_plan(request, None) {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        let mut response = self.general_message_unsupported_response(request, None);
+                        attach_general_message_controller_trace(
+                            &mut response,
+                            &GeneralMessageControllerTrace {
+                                controller_stage: "controller_error".to_string(),
+                                fallback_reason: Some(error),
+                                ..Default::default()
+                            },
+                            turn_started.elapsed(),
+                        );
+                        return response;
+                    }
+                };
+                let mut response = self.execute_general_message_plan(request, plan, None);
+                attach_general_message_controller_trace(
+                    &mut response,
+                    &trace,
+                    turn_started.elapsed(),
+                );
+                response
+            }
+        }
     }
 
     fn handle_camera_snapshot(&self, request: &TaskRequest) -> TaskResponse {
@@ -1819,6 +2355,33 @@ impl TaskApiService {
         events: Vec<Value>,
         next_actions: Vec<String>,
     ) -> TaskResponse {
+        self.needs_input_with_artifacts_context(
+            request,
+            executor_used,
+            risk_level,
+            prompt,
+            missing_fields,
+            resume_token,
+            data,
+            Vec::new(),
+            events,
+            next_actions,
+        )
+    }
+
+    fn needs_input_with_artifacts_context(
+        &self,
+        request: &TaskRequest,
+        executor_used: &str,
+        risk_level: RiskLevel,
+        prompt: String,
+        missing_fields: Vec<String>,
+        resume_token: String,
+        data: Value,
+        artifacts: Vec<TaskArtifact>,
+        events: Vec<Value>,
+        next_actions: Vec<String>,
+    ) -> TaskResponse {
         TaskResponse {
             task_id: request.task_id.clone(),
             trace_id: request.trace_id.clone(),
@@ -1828,7 +2391,7 @@ impl TaskApiService {
             result: TaskResultEnvelope {
                 message: prompt.clone(),
                 data,
-                artifacts: Vec::new(),
+                artifacts,
                 events,
                 next_actions,
             },
@@ -3047,10 +3610,9 @@ fn build_clip_media_asset(
     }
 }
 
-fn build_clip_payload(
+fn build_clip_confirmation_payload(
     target: &ResolvedCameraTarget,
     clip: &ClipCaptureResult,
-    keyframes: &[PathBuf],
     media_asset: &MediaAsset,
 ) -> Value {
     json!({
@@ -3063,49 +3625,196 @@ fn build_clip_payload(
             "started_at_epoch_ms": clip.started_at_epoch_ms,
             "ended_at_epoch_ms": clip.ended_at_epoch_ms,
             "clip_length_seconds": clip.clip_length_seconds,
-            "storage": clip.storage.clone(),
-            "keyframe_count": keyframes.len(),
-            "keyframes": keyframes
-                .iter()
-                .map(|path| path.to_string_lossy().to_string())
-                .collect::<Vec<_>>(),
+            "keyframe_count": clip.keyframe_count,
+        },
+        "clip_confirmation": {
+            "kind": "clip_confirmation",
+            "clip_media_asset_id": media_asset.asset_id.clone(),
+            "cover_artifact_role": "video_cover_frame",
+            "delivery_target": "weixin",
+            "fallback_delivery": "file",
         }
     })
 }
 
-fn build_clip_artifacts(
+fn build_clip_confirmation_cover_artifact(
     clip: &ClipCaptureResult,
     keyframes: &[PathBuf],
     media_asset: &MediaAsset,
-) -> Vec<TaskArtifact> {
-    let mut artifacts = vec![TaskArtifact {
-        kind: "video".to_string(),
-        label: "短视频".to_string(),
-        mime_type: clip.mime_type.clone(),
-        media_asset_id: Some(media_asset.asset_id.clone()),
-        path: Some(clip.storage.relative_path.clone()),
-        url: None,
-        metadata: json!({
-            "media_asset_id": media_asset.asset_id.clone(),
-            "storage_target": clip.storage.target,
-            "captured_at_epoch_ms": clip.captured_at_epoch_ms,
-            "byte_size": clip.byte_size,
-            "keyframe_count": keyframes.len(),
-        }),
-    }];
-    artifacts.extend(keyframes.iter().take(3).map(|path| TaskArtifact {
+) -> Option<TaskArtifact> {
+    let cover = keyframes.first()?;
+    Some(TaskArtifact {
         kind: "image".to_string(),
-        label: "视频关键帧".to_string(),
+        label: "视频首帧".to_string(),
         mime_type: "image/jpeg".to_string(),
         media_asset_id: None,
-        path: Some(path.to_string_lossy().to_string()),
+        path: Some(cover.to_string_lossy().to_string()),
         url: None,
         metadata: json!({
-            "artifact_role": "video_keyframe",
+            "artifact_role": "video_cover_frame",
+            "clip_media_asset_id": media_asset.asset_id.clone(),
             "source_video_path": clip.storage.relative_path.clone(),
+            "captured_at_epoch_ms": clip.captured_at_epoch_ms,
         }),
-    }));
-    artifacts
+    })
+}
+
+fn recent_clip_playback_from_capture(
+    clip: &ClipCaptureResult,
+    media_asset: &MediaAsset,
+    cover_artifact: &TaskArtifact,
+    display_name: &str,
+) -> RecentClipPlaybackState {
+    RecentClipPlaybackState {
+        clip_media_asset_id: media_asset.asset_id.clone(),
+        clip_path: clip.storage.relative_path.clone(),
+        clip_mime_type: clip.mime_type.clone(),
+        cover_path: cover_artifact.path.clone().unwrap_or_default(),
+        display_name: display_name.to_string(),
+        captured_at_epoch_ms: clip.captured_at_epoch_ms,
+    }
+}
+
+fn recent_clip_playback_from_pending(
+    pending: &PendingTaskClipConfirmation,
+    captured_at_epoch_ms: u128,
+) -> RecentClipPlaybackState {
+    RecentClipPlaybackState {
+        clip_media_asset_id: pending.clip_media_asset_id.clone(),
+        clip_path: pending.clip_path.clone(),
+        clip_mime_type: pending.clip_mime_type.clone(),
+        cover_path: pending.cover_path.clone(),
+        display_name: pending.display_name.clone(),
+        captured_at_epoch_ms,
+    }
+}
+
+fn build_clip_delivery_payload(recent_clip: &RecentClipPlaybackState) -> Value {
+    json!({
+        "clip": {
+            "media_asset_id": recent_clip.clip_media_asset_id.clone(),
+            "mime_type": recent_clip.clip_mime_type.clone(),
+            "path": recent_clip.clip_path.clone(),
+        },
+        "clip_delivery": {
+            "kind": "clip_delivery",
+            "clip_media_asset_id": recent_clip.clip_media_asset_id.clone(),
+            "preferred_transport": "native_video",
+            "fallback_transport": "file",
+            "caption": "完整回放如下",
+        }
+    })
+}
+
+fn build_clip_delivery_artifact(recent_clip: &RecentClipPlaybackState) -> TaskArtifact {
+    TaskArtifact {
+        kind: "video".to_string(),
+        label: format!("{} 完整回放", recent_clip.display_name),
+        mime_type: recent_clip.clip_mime_type.clone(),
+        media_asset_id: Some(recent_clip.clip_media_asset_id.clone()),
+        path: Some(recent_clip.clip_path.clone()),
+        url: None,
+        metadata: json!({
+            "artifact_role": "video_full_clip",
+            "clip_media_asset_id": recent_clip.clip_media_asset_id.clone(),
+            "delivery_target": "weixin",
+            "fallback_delivery": "file",
+        }),
+    }
+}
+
+fn clip_confirmation_reply_decision(raw_text: &str) -> ClipConfirmationReplyDecision {
+    let normalized = normalize_command_text(raw_text);
+    if normalized.is_empty() {
+        return ClipConfirmationReplyDecision::Unknown;
+    }
+    if clip_confirmation_reply_is_negative(&normalized) {
+        return ClipConfirmationReplyDecision::Decline;
+    }
+    if clip_confirmation_reply_is_affirmative(&normalized)
+        || recent_clip_playback_request_from_normalized(&normalized)
+    {
+        return ClipConfirmationReplyDecision::Deliver;
+    }
+    ClipConfirmationReplyDecision::Unknown
+}
+
+fn clip_confirmation_reply_is_affirmative(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "要" | "要看" | "看" | "发我" | "发出来" | "给我看" | "给我看完整回放" | "好" | "好的"
+            | "行" | "可以" | "好的发我" | "可以发我"
+    )
+}
+
+fn clip_confirmation_reply_is_negative(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "不要"
+            | "不用"
+            | "不用了"
+            | "不看"
+            | "不看了"
+            | "先不要"
+            | "先不用"
+            | "先不看"
+            | "先不发"
+            | "不用发"
+            | "不要发"
+            | "算了"
+    )
+}
+
+fn recent_clip_playback_request_from_normalized(normalized: &str) -> bool {
+    if normalized.is_empty() {
+        return false;
+    }
+
+    if matches_any(
+        normalized,
+        &[
+            "完整回放",
+            "回放",
+            "回放一下",
+            "回放一段",
+            "回看",
+            "播放",
+            "播放一下",
+            "播一下",
+            "播出来",
+            "放一下",
+            "放出来",
+            "发一下视频",
+            "把视频发我",
+        ],
+    ) {
+        return true;
+    }
+
+    let has_playback_verb = ["回放", "回看", "播放", "播", "放"]
+        .iter()
+        .map(|token| normalize_command_text(token))
+        .any(|token| normalized.contains(&token));
+    let has_watch_or_delivery_target = ["一下", "给我", "出来", "完整", "视频", "片段", "回放"]
+        .iter()
+        .map(|token| normalize_command_text(token))
+        .any(|token| normalized.contains(&token));
+    if has_playback_verb && has_watch_or_delivery_target {
+        return true;
+    }
+
+    (normalized.contains('看') || normalized.contains('发'))
+        && ["完整", "回放", "视频", "片段"]
+            .iter()
+            .map(|token| normalize_command_text(token))
+            .any(|token| normalized.contains(&token))
+}
+
+fn recent_clip_playback_is_fresh(recent_clip: &RecentClipPlaybackState) -> bool {
+    if recent_clip.captured_at_epoch_ms == 0 {
+        return true;
+    }
+    current_epoch_ms().saturating_sub(recent_clip.captured_at_epoch_ms) <= RECENT_CLIP_PLAYBACK_WINDOW_MS
 }
 
 fn resolved_recording_policy(
@@ -4482,6 +5191,682 @@ fn normalize_command_text(text: &str) -> String {
         .collect()
 }
 
+fn extract_general_message_signals(
+    request: &TaskRequest,
+    session_recap: &[Value],
+    pending_loop: Option<&PendingTaskGeneralMessageLoop>,
+    recent_clip: Option<&RecentClipPlaybackState>,
+) -> GeneralMessageSignals {
+    let normalized = normalize_command_text(request.intent.raw_text.as_str());
+    let recent_camera_context = session_recap.iter().any(|entry| {
+        entry
+            .get("domain")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case("camera"))
+    });
+    let recent_search_context = session_recap.iter().any(|entry| {
+        entry
+            .get("domain")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case(KNOWLEDGE_DOMAIN))
+    });
+    let explicit_snapshot = matches_any(
+        &normalized,
+        &["抓拍", "拍照", "拍一张", "来一张", "快照", "截图", "截一张"],
+    );
+    let explicit_clip = matches_any(
+        &normalized,
+        &["录一段", "录一下", "录个", "录像", "录视频", "拍视频", "短视频"],
+    );
+    let explicit_search = matches_any(
+        &normalized,
+        &[
+            "找一下",
+            "找到",
+            "查一下",
+            "查找",
+            "搜索",
+            "搜一下",
+            "搜搜",
+            "检索",
+            "找视频",
+            "找照片",
+            "找图片",
+            "搜索已有内容",
+        ],
+    );
+    let recent_clip_available = recent_clip.is_some();
+    let explicit_clip_playback =
+        recent_clip_available && recent_clip_playback_request_from_normalized(&normalized);
+    let asks_capability = general_message_requests_capability_summary(request.intent.raw_text.as_str());
+    let mentions_camera_context = matches_any(
+        &normalized,
+        &["摄像头", "监控", "画面", "门口", "客厅", "卧室", "车库", "院子", "阳台"],
+    ) || pending_loop.and_then(|pending| pending.camera_hint.as_ref()).is_some();
+    let ambiguous_visual_request = !asks_capability
+        && !explicit_snapshot
+        && !explicit_clip
+        && !explicit_search
+        && (matches_any(&normalized, &["看一下", "看一眼", "看下", "看看", "瞅一眼", "瞅瞅"])
+            || (mentions_camera_context && matches_any(&normalized, &["看", "瞅"])));
+
+    GeneralMessageSignals {
+        normalized,
+        asks_capability,
+        explicit_clip_playback,
+        explicit_snapshot,
+        explicit_clip,
+        explicit_search,
+        mentions_camera_context,
+        ambiguous_visual_request,
+        recent_camera_context,
+        recent_clip_available,
+        recent_search_context,
+    }
+}
+
+fn build_general_message_candidates(
+    request: &TaskRequest,
+    signals: &GeneralMessageSignals,
+    default_camera_hint: Option<&str>,
+    pending_loop: Option<&PendingTaskGeneralMessageLoop>,
+    _session_recap: &[Value],
+    recent_clip: Option<&RecentClipPlaybackState>,
+) -> Vec<GeneralMessageCandidate> {
+    let mut candidates = Vec::new();
+    let camera_hint = pending_loop
+        .and_then(|pending| pending.camera_hint.clone())
+        .or_else(|| infer_camera_hint_from_general_message(
+            request.intent.raw_text.as_str(),
+            default_camera_hint,
+        ));
+    let query = pending_loop
+        .and_then(|pending| pending.query.clone())
+        .or_else(|| infer_query_from_raw_text(request.intent.raw_text.as_str()));
+
+    if signals.asks_capability {
+        push_general_message_candidate(
+            &mut candidates,
+            GeneralMessageCandidate {
+                kind: GeneralMessagePlanKind::CapabilitySummary,
+                confidence: 100,
+                camera_hint: None,
+                query: None,
+                recent_clip: None,
+                reason: "structured_signal_capability_summary".to_string(),
+            },
+        );
+    }
+    if signals.explicit_clip_playback {
+        push_general_message_candidate(
+            &mut candidates,
+            GeneralMessageCandidate {
+                kind: GeneralMessagePlanKind::CameraReplayRecentClip,
+                confidence: 98,
+                camera_hint: None,
+                query: None,
+                recent_clip: recent_clip.cloned(),
+                reason: "structured_signal_recent_clip_playback".to_string(),
+            },
+        );
+    }
+    if signals.explicit_snapshot {
+        push_general_message_candidate(
+            &mut candidates,
+            GeneralMessageCandidate {
+                kind: GeneralMessagePlanKind::CameraSnapshot,
+                confidence: 95,
+                camera_hint: camera_hint.clone(),
+                query: None,
+                recent_clip: None,
+                reason: "structured_signal_snapshot".to_string(),
+            },
+        );
+    }
+    if signals.explicit_clip {
+        push_general_message_candidate(
+            &mut candidates,
+            GeneralMessageCandidate {
+                kind: GeneralMessagePlanKind::CameraRecordClip,
+                confidence: 95,
+                camera_hint: camera_hint.clone(),
+                query: None,
+                recent_clip: None,
+                reason: "structured_signal_clip".to_string(),
+            },
+        );
+    }
+    if signals.explicit_search {
+        push_general_message_candidate(
+            &mut candidates,
+            GeneralMessageCandidate {
+                kind: GeneralMessagePlanKind::KnowledgeSearch,
+                confidence: 95,
+                camera_hint: None,
+                query: query.clone(),
+                recent_clip: None,
+                reason: "structured_signal_search".to_string(),
+            },
+        );
+    }
+
+    if signals.ambiguous_visual_request {
+        push_general_message_candidate(
+            &mut candidates,
+            GeneralMessageCandidate {
+                kind: GeneralMessagePlanKind::Clarify,
+                confidence: 90,
+                camera_hint: camera_hint.clone(),
+                query: query.clone(),
+                recent_clip: None,
+                reason: "ambiguous_visual_request".to_string(),
+            },
+        );
+        push_general_message_candidate(
+            &mut candidates,
+            GeneralMessageCandidate {
+                kind: GeneralMessagePlanKind::CameraSnapshot,
+                confidence: 55,
+                camera_hint: camera_hint.clone(),
+                query: None,
+                recent_clip: None,
+                reason: "plausible_visual_snapshot".to_string(),
+            },
+        );
+        push_general_message_candidate(
+            &mut candidates,
+            GeneralMessageCandidate {
+                kind: GeneralMessagePlanKind::CameraRecordClip,
+                confidence: 55,
+                camera_hint,
+                query: None,
+                recent_clip: None,
+                reason: "plausible_visual_clip".to_string(),
+            },
+        );
+    }
+
+    if !signals.explicit_snapshot
+        && !signals.explicit_clip
+        && signals.recent_camera_context
+        && matches_any(&signals.normalized, &["再来一张", "再拍一张", "再看一眼"])
+    {
+        push_general_message_candidate(
+            &mut candidates,
+            GeneralMessageCandidate {
+                kind: GeneralMessagePlanKind::CameraSnapshot,
+                confidence: 85,
+                camera_hint: pending_loop
+                    .and_then(|pending| pending.camera_hint.clone())
+                    .or_else(|| default_camera_hint.map(str::to_string)),
+                query: None,
+                recent_clip: None,
+                reason: "recent_camera_context_snapshot".to_string(),
+            },
+        );
+    }
+
+    if !signals.explicit_clip
+        && signals.recent_camera_context
+        && matches_any(&signals.normalized, &["再来一段", "再录一段", "再录一下"])
+    {
+        push_general_message_candidate(
+            &mut candidates,
+            GeneralMessageCandidate {
+                kind: GeneralMessagePlanKind::CameraRecordClip,
+                confidence: 85,
+                camera_hint: pending_loop
+                    .and_then(|pending| pending.camera_hint.clone())
+                    .or_else(|| default_camera_hint.map(str::to_string)),
+                query: None,
+                recent_clip: None,
+                reason: "recent_camera_context_clip".to_string(),
+            },
+        );
+    }
+
+    if !signals.explicit_clip_playback
+        && signals.recent_clip_available
+        && matches_any(&signals.normalized, &["再放一下", "再回放一下", "再播一下"])
+    {
+        push_general_message_candidate(
+            &mut candidates,
+            GeneralMessageCandidate {
+                kind: GeneralMessagePlanKind::CameraReplayRecentClip,
+                confidence: 85,
+                camera_hint: None,
+                query: None,
+                recent_clip: recent_clip.cloned(),
+                reason: "recent_clip_context_playback".to_string(),
+            },
+        );
+    }
+
+    if !signals.explicit_search
+        && signals.recent_search_context
+        && matches_any(&signals.normalized, &["再搜一下", "再查一下", "再找找", "搜已有内容"])
+    {
+        push_general_message_candidate(
+            &mut candidates,
+            GeneralMessageCandidate {
+                kind: GeneralMessagePlanKind::KnowledgeSearch,
+                confidence: 85,
+                camera_hint: None,
+                query,
+                recent_clip: None,
+                reason: "recent_search_context_search".to_string(),
+            },
+        );
+    }
+
+    candidates
+}
+
+fn push_general_message_candidate(
+    candidates: &mut Vec<GeneralMessageCandidate>,
+    candidate: GeneralMessageCandidate,
+) {
+    if let Some(existing) = candidates.iter_mut().find(|item| item.kind == candidate.kind) {
+        if candidate.confidence > existing.confidence {
+            *existing = candidate;
+            return;
+        }
+        if existing.camera_hint.is_none() {
+            existing.camera_hint = candidate.camera_hint;
+        }
+        if existing.query.is_none() {
+            existing.query = candidate.query;
+        }
+        if existing.recent_clip.is_none() {
+            existing.recent_clip = candidate.recent_clip;
+        }
+        if existing.reason.trim().is_empty() {
+            existing.reason = candidate.reason;
+        }
+        return;
+    }
+    candidates.push(candidate);
+}
+
+fn infer_camera_hint_from_general_message(
+    raw_text: &str,
+    default_camera_hint: Option<&str>,
+) -> Option<String> {
+    if let Some(default_camera_hint) = default_camera_hint
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(default_camera_hint.to_string());
+    }
+
+    let normalized = normalize_command_text(raw_text);
+    [
+        ("front-door", &["门口", "门前", "前门", "玄关"][..]),
+        ("living-room", &["客厅"][..]),
+        ("bedroom", &["卧室"][..]),
+        ("garage", &["车库"][..]),
+        ("yard", &["院子", "院门"][..]),
+        ("balcony", &["阳台"][..]),
+    ]
+    .into_iter()
+    .find_map(|(hint, tokens)| {
+        tokens
+            .iter()
+            .any(|token| normalized.contains(&normalize_command_text(token)))
+            .then(|| hint.to_string())
+    })
+}
+
+fn resolve_deterministic_general_message_plan(
+    request: &TaskRequest,
+    candidates: &[GeneralMessageCandidate],
+    pending_loop: Option<&PendingTaskGeneralMessageLoop>,
+) -> Option<GeneralMessagePlan> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let mut actionable = candidates
+        .iter()
+        .filter(|candidate| {
+            !matches!(
+                candidate.kind,
+                GeneralMessagePlanKind::Clarify | GeneralMessagePlanKind::Unsupported
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    actionable.sort_by(|left, right| {
+        right
+            .confidence
+            .cmp(&left.confidence)
+            .then_with(|| left.reason.cmp(&right.reason))
+    });
+
+    if let Some(primary) = actionable.first() {
+        let competing = actionable
+            .iter()
+            .skip(1)
+            .filter(|candidate| candidate.confidence + 15 >= primary.confidence)
+            .count();
+        if primary.confidence >= 90 && competing == 0 {
+            return Some(plan_from_general_message_candidate(primary));
+        }
+    }
+
+    if let Some(clarify) = candidates
+        .iter()
+        .filter(|candidate| candidate.kind == GeneralMessagePlanKind::Clarify)
+        .max_by_key(|candidate| candidate.confidence)
+    {
+        let plausible_actions = actionable
+            .iter()
+            .filter(|candidate| candidate.confidence >= 50)
+            .count();
+        if clarify.confidence >= 80 || plausible_actions >= 2 {
+            return Some(plan_from_general_message_candidate(clarify));
+        }
+    }
+
+    if let Some(primary) = actionable.first() {
+        let runner_up = actionable.get(1).map(|candidate| candidate.confidence).unwrap_or(0);
+        if primary.confidence >= 80 && primary.confidence >= runner_up + 20 {
+            return Some(plan_from_general_message_candidate(primary));
+        }
+    }
+
+    if pending_loop.is_some() {
+        return fallback_general_message_plan(
+            request.intent.raw_text.as_str(),
+            pending_loop.and_then(|pending| pending.camera_hint.as_deref()),
+        );
+    }
+
+    None
+}
+
+fn plan_from_general_message_candidate(candidate: &GeneralMessageCandidate) -> GeneralMessagePlan {
+    GeneralMessagePlan {
+        kind: candidate.kind.clone(),
+        reply_text: None,
+        camera_hint: candidate.camera_hint.clone(),
+        query: candidate.query.clone(),
+        recent_clip: candidate.recent_clip.clone(),
+        reason: Some(candidate.reason.clone()),
+    }
+}
+
+fn deterministic_stage_for_plan(plan: &GeneralMessagePlan) -> &'static str {
+    match plan.kind {
+        GeneralMessagePlanKind::Clarify => "deterministic_clarify",
+        _ => "deterministic_single_candidate",
+    }
+}
+
+fn should_try_general_message_router_llm(
+    signals: &GeneralMessageSignals,
+    pending_loop: Option<&PendingTaskGeneralMessageLoop>,
+) -> bool {
+    !signals.normalized.is_empty()
+        && !signals.asks_capability
+        && !signals.explicit_clip_playback
+        && !signals.explicit_snapshot
+        && !signals.explicit_clip
+        && !signals.explicit_search
+        && !signals.ambiguous_visual_request
+        && (signals.mentions_camera_context
+            || signals.recent_camera_context
+            || signals.recent_clip_available
+            || signals.recent_search_context
+            || pending_loop.is_some())
+}
+
+fn build_general_message_router_system_prompt() -> String {
+    "You are a HarborBeacon router. Return exactly one lowercase label from this closed set and nothing else: capability_summary, camera_snapshot, camera_record_clip, knowledge_search, clarify, unsupported.".to_string()
+}
+
+fn build_general_message_router_prompt(
+    request: &TaskRequest,
+    session_recap: &[Value],
+    pending_loop: Option<&PendingTaskGeneralMessageLoop>,
+) -> String {
+    format!(
+        concat!(
+            "User message: {message}\n",
+            "Recent session recap (newest first, max {limit}): {session_recap}\n",
+            "Pending loop context: {pending_loop}\n",
+            "Choose the single best label.\n"
+        ),
+        message = request.intent.raw_text,
+        limit = GENERAL_MESSAGE_RECAP_LIMIT,
+        session_recap = serde_json::to_string(session_recap).unwrap_or_else(|_| "[]".to_string()),
+        pending_loop = serde_json::to_string(&pending_loop.map(|pending| {
+            json!({
+                "original_goal": pending.original_goal,
+                "latest_user_intent_text": pending.latest_user_intent_text,
+                "last_clarification_prompt": pending.last_clarification_prompt,
+                "camera_hint": pending.camera_hint,
+                "query": pending.query,
+            })
+        }))
+        .unwrap_or_else(|_| "null".to_string()),
+    )
+}
+
+fn parse_general_message_router_decision(text: &str) -> Option<GeneralMessagePlanKind> {
+    if let Some(plan) = parse_general_message_plan(text) {
+        return Some(plan.kind);
+    }
+
+    let candidates = [
+        text.trim().to_ascii_lowercase(),
+        text.lines().next().unwrap_or_default().trim().to_ascii_lowercase(),
+        text.split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | ',' | '.' | ';' | '：' | ':'))
+            .to_ascii_lowercase(),
+    ];
+
+    for candidate in candidates {
+        match candidate.as_str() {
+            "clarify" => return Some(GeneralMessagePlanKind::Clarify),
+            "capability_summary" | "capability" | "help" => {
+                return Some(GeneralMessagePlanKind::CapabilitySummary)
+            }
+            "camera_snapshot" | "snapshot" => {
+                return Some(GeneralMessagePlanKind::CameraSnapshot)
+            }
+            "camera_record_clip" | "record_clip" | "clip" => {
+                return Some(GeneralMessagePlanKind::CameraRecordClip)
+            }
+            "knowledge_search" | "search" => {
+                return Some(GeneralMessagePlanKind::KnowledgeSearch)
+            }
+            "unsupported" => return Some(GeneralMessagePlanKind::Unsupported),
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn plan_from_router_decision(
+    kind: GeneralMessagePlanKind,
+    request: &TaskRequest,
+    default_camera_hint: Option<&str>,
+    pending_loop: Option<&PendingTaskGeneralMessageLoop>,
+) -> GeneralMessagePlan {
+    let camera_hint = pending_loop
+        .and_then(|pending| pending.camera_hint.clone())
+        .or_else(|| {
+            infer_camera_hint_from_general_message(request.intent.raw_text.as_str(), default_camera_hint)
+        });
+    let query = pending_loop
+        .and_then(|pending| pending.query.clone())
+        .or_else(|| infer_query_from_raw_text(request.intent.raw_text.as_str()));
+    let plan_camera_hint = match kind {
+        GeneralMessagePlanKind::CameraSnapshot
+        | GeneralMessagePlanKind::CameraRecordClip
+        | GeneralMessagePlanKind::Clarify => camera_hint,
+        _ => None,
+    };
+    let plan_query = match kind {
+        GeneralMessagePlanKind::KnowledgeSearch | GeneralMessagePlanKind::Clarify => query,
+        _ => None,
+    };
+    GeneralMessagePlan {
+        kind,
+        reply_text: None,
+        camera_hint: plan_camera_hint,
+        query: plan_query,
+        recent_clip: None,
+        reason: Some("router_llm".to_string()),
+    }
+}
+
+fn maybe_render_general_message_reply(
+    request: &TaskRequest,
+    pending_loop: Option<&PendingTaskGeneralMessageLoop>,
+    model_state: &crate::runtime::admin_console::AdminModelCenterState,
+    plan: &mut GeneralMessagePlan,
+    trace: &mut GeneralMessageControllerTrace,
+) {
+    if plan.reply_text.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+        return;
+    }
+    if !matches!(
+        plan.kind,
+        GeneralMessagePlanKind::Clarify | GeneralMessagePlanKind::Unsupported
+    ) {
+        return;
+    }
+
+    let default_text = match plan.kind {
+        GeneralMessagePlanKind::Clarify => {
+            general_message_default_clarification_prompt(request.intent.raw_text.as_str())
+        }
+        GeneralMessagePlanKind::Unsupported => general_message_unsupported_summary(),
+        _ => return,
+    };
+    let remaining_budget_ms = GENERAL_MESSAGE_TURN_BUDGET_MS
+        .saturating_sub(trace.router_latency_ms.unwrap_or(0))
+        .min(GENERAL_MESSAGE_RENDERER_BUDGET_MS);
+    if remaining_budget_ms < 600 {
+        return;
+    }
+    let started = Instant::now();
+    let prompt = build_general_message_renderer_prompt(
+        request,
+        pending_loop,
+        plan.kind.clone(),
+        default_text.as_str(),
+    );
+    let render_result = run_llm_text_with_state_and_options(
+        &prompt,
+        model_state,
+        &LlmTextOptions {
+            purpose: Some("renderer".to_string()),
+            system_prompt: Some(build_general_message_renderer_system_prompt()),
+            temperature: Some(0.2),
+            max_tokens: Some(GENERAL_MESSAGE_RENDERER_MAX_TOKENS),
+            timeout: Some(Duration::from_millis(remaining_budget_ms)),
+        },
+    );
+    trace.renderer_latency_ms = Some(started.elapsed().as_millis() as u64);
+    if render_result.available {
+        if let Some(parsed) = parse_general_message_plan(&render_result.text)
+            .and_then(|parsed| parsed.reply_text)
+            .filter(|value| !value.trim().is_empty())
+        {
+            plan.reply_text = Some(parsed);
+            return;
+        }
+
+        let rendered = render_result.text.trim();
+        if !rendered.is_empty()
+            && parse_general_message_router_decision(rendered).is_none()
+            && !rendered.contains('|')
+            && !rendered.starts_with('{')
+            && !rendered
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || matches!(ch, '_' | '-' | ' '))
+        {
+            plan.reply_text = Some(rendered.to_string());
+        }
+    }
+}
+
+fn build_general_message_renderer_system_prompt() -> String {
+    "You are a concise Chinese HarborBeacon reply writer. Output only one short Chinese user-facing sentence or question. Do not mention internal reasoning or JSON.".to_string()
+}
+
+fn build_general_message_renderer_prompt(
+    request: &TaskRequest,
+    pending_loop: Option<&PendingTaskGeneralMessageLoop>,
+    kind: GeneralMessagePlanKind,
+    fallback_text: &str,
+) -> String {
+    format!(
+        concat!(
+            "Reply kind: {kind}\n",
+            "Current user message: {message}\n",
+            "Pending loop context: {pending_loop}\n",
+            "Fallback text: {fallback}\n",
+            "Write a short natural Chinese reply. If the fallback text is already appropriate, keep its meaning.\n"
+        ),
+        kind = match kind {
+            GeneralMessagePlanKind::Clarify => "clarify",
+            GeneralMessagePlanKind::Unsupported => "unsupported",
+            GeneralMessagePlanKind::CapabilitySummary => "capability_summary",
+            GeneralMessagePlanKind::CameraReplayRecentClip => "camera_replay_recent_clip",
+            GeneralMessagePlanKind::CameraSnapshot => "camera_snapshot",
+            GeneralMessagePlanKind::CameraRecordClip => "camera_record_clip",
+            GeneralMessagePlanKind::KnowledgeSearch => "knowledge_search",
+        },
+        message = request.intent.raw_text,
+        pending_loop = serde_json::to_string(&pending_loop.map(|pending| {
+            json!({
+                "original_goal": pending.original_goal,
+                "latest_user_intent_text": pending.latest_user_intent_text,
+                "last_clarification_prompt": pending.last_clarification_prompt,
+            })
+        }))
+        .unwrap_or_else(|_| "null".to_string()),
+        fallback = fallback_text,
+    )
+}
+
+fn attach_general_message_controller_trace(
+    response: &mut TaskResponse,
+    trace: &GeneralMessageControllerTrace,
+    elapsed: Duration,
+) {
+    let previous = std::mem::replace(&mut response.result.data, Value::Null);
+    let mut payload = if previous.is_object() {
+        previous
+    } else if previous.is_null() {
+        json!({})
+    } else {
+        json!({ "payload": previous })
+    };
+    if let Some(map) = payload.as_object_mut() {
+        map.insert(
+            "general_message_controller".to_string(),
+            json!({
+                "controller_stage": trace.controller_stage,
+                "router_llm": trace.router_llm,
+                "router_latency_ms": trace.router_latency_ms,
+                "renderer_latency_ms": trace.renderer_latency_ms,
+                "candidate_count": trace.candidate_count,
+                "fallback_reason": trace.fallback_reason,
+                "total_turn_latency_ms": elapsed.as_millis() as u64,
+            }),
+        );
+    }
+    response.result.data = payload;
+}
+
 #[cfg(test)]
 fn should_route_general_message_to_knowledge(request: &TaskRequest) -> bool {
     fallback_general_message_plan(
@@ -4514,6 +5899,14 @@ fn general_message_requests_capability_summary(raw_text: &str) -> bool {
         "你可以干什么",
         "你能帮我做什么",
         "你还能帮我做什么",
+        "摄像头能做什么",
+        "摄像头可以做什么",
+        "摄像头能干什么",
+        "摄像头可以干什么",
+        "监控能做什么",
+        "监控可以做什么",
+        "监控能干什么",
+        "监控可以干什么",
     ]
     .iter()
     .map(|candidate| normalize_command_text(candidate))
@@ -4529,11 +5922,8 @@ fn general_message_supported_examples() -> Vec<String> {
 }
 
 fn general_message_support_summary() -> String {
-    let examples = general_message_supported_examples();
-    format!(
-        "我可以帮你抓拍摄像头、录制短视频、搜索知识库内容。你可以直接说：{}。",
-        examples.join("；")
-    )
+    "我可以帮你抓拍最新画面、录一段短视频，也能搜索已经保存的内容。你想先试哪个？"
+        .to_string()
 }
 
 fn general_message_unsupported_summary() -> String {
@@ -4542,6 +5932,41 @@ fn general_message_unsupported_summary() -> String {
         "我暂时还不能稳定理解这类请求，但我可以帮你抓拍摄像头、录制短视频、搜索知识库内容。你可以直接说：{}。",
         examples.join("；")
     )
+}
+
+fn general_message_default_clarification_prompt(raw_text: &str) -> String {
+    let normalized = normalize_command_text(raw_text);
+    if normalized.contains("看") || normalized.contains("门口") || normalized.contains("摄像头") {
+        return "你是想让我拍一张最新画面、录一段短视频，还是搜索已经保存的内容？"
+            .to_string();
+    }
+    "你是想让我拍一张、录一段，还是搜索已有内容？".to_string()
+}
+
+fn extract_password_from_raw_text(raw_text: &str) -> Option<String> {
+    for prefix in ["密码是", "密码", "password", "passwd"] {
+        if let Some(rest) = raw_text.trim().strip_prefix(prefix) {
+            let password = rest
+                .trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, ':' | '：'))
+                .trim();
+            if !password.is_empty() {
+                return Some(password.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn inject_password_arg_from_raw_text(request: &TaskRequest) -> TaskRequest {
+    if string_at_paths(&request.args, &["/password"]).is_some() {
+        return request.clone();
+    }
+    let Some(password) = extract_password_from_raw_text(request.intent.raw_text.as_str()) else {
+        return request.clone();
+    };
+    let mut routed = request.clone();
+    upsert_json_string(&mut routed.args, "/password", &password);
+    routed
 }
 
 fn knowledge_search_query(request: &TaskRequest) -> Option<String> {
@@ -4633,27 +6058,40 @@ fn infer_query_from_raw_text(raw_text: &str) -> Option<String> {
 fn parse_general_message_plan(text: &str) -> Option<GeneralMessagePlan> {
     let payload = parse_json_object_from_text(text)?;
     let payload = serde_json::from_value::<GeneralMessagePlanPayload>(payload).ok()?;
-    let kind = match payload.action.trim().to_ascii_lowercase().as_str() {
+    let decision = if payload.decision.trim().is_empty() {
+        payload.action.trim().to_ascii_lowercase()
+    } else {
+        payload.decision.trim().to_ascii_lowercase()
+    };
+    let kind = match decision.as_str() {
+        "clarify" => GeneralMessagePlanKind::Clarify,
+        "capability_summary" | "capability" | "help" => GeneralMessagePlanKind::CapabilitySummary,
         "camera_snapshot" | "snapshot" => GeneralMessagePlanKind::CameraSnapshot,
         "camera_record_clip" | "record_clip" | "clip" => GeneralMessagePlanKind::CameraRecordClip,
         "knowledge_search" | "search" => GeneralMessagePlanKind::KnowledgeSearch,
-        _ => GeneralMessagePlanKind::Unsupported,
+        "unsupported" => GeneralMessagePlanKind::Unsupported,
+        _ => return None,
     };
     Some(GeneralMessagePlan {
         kind,
-        camera_hint: payload
-            .camera_hint
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()),
-        query: payload
-            .query
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()),
-        reason: payload
-            .reason
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()),
+        reply_text: normalize_optional_general_message_plan_field(payload.reply_text),
+        camera_hint: normalize_optional_general_message_plan_field(payload.camera_hint),
+        query: normalize_optional_general_message_plan_field(payload.query),
+        recent_clip: None,
+        reason: normalize_optional_general_message_plan_field(payload.reason),
     })
+}
+
+fn normalize_optional_general_message_plan_field(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| {
+            !value.is_empty()
+                && !matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "null" | "none" | "n/a"
+                )
+        })
 }
 
 fn parse_json_object_from_text(text: &str) -> Option<Value> {
@@ -4662,12 +6100,65 @@ fn parse_json_object_from_text(text: &str) -> Option<Value> {
         return Some(value);
     }
 
-    let fenced = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .and_then(|value| value.strip_suffix("```"))
-        .map(str::trim)?;
-    serde_json::from_str::<Value>(fenced).ok()
+    if let Some(value) = trimmed
+        .split("```")
+        .map(str::trim)
+        .filter(|candidate| !candidate.is_empty())
+        .find_map(|candidate| {
+            let candidate = candidate
+                .strip_prefix("json")
+                .map(str::trim)
+                .unwrap_or(candidate);
+            serde_json::from_str::<Value>(candidate).ok()
+        })
+    {
+        return Some(value);
+    }
+
+    extract_first_balanced_json_object(trimmed)
+        .and_then(|candidate| serde_json::from_str::<Value>(candidate).ok())
+}
+
+fn extract_first_balanced_json_object(text: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    let mut start_index = None;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (index, ch) in text.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '\\' if in_string => {
+                escaped = true;
+            }
+            '"' => {
+                in_string = !in_string;
+            }
+            '{' if !in_string => {
+                if depth == 0 {
+                    start_index = Some(index);
+                }
+                depth += 1;
+            }
+            '}' if !in_string => {
+                if depth == 0 {
+                    continue;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    let start = start_index?;
+                    return Some(&text[start..=index]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 fn fallback_general_message_plan(
@@ -4679,19 +6170,34 @@ fn fallback_general_message_plan(
         return None;
     }
 
+    if general_message_requests_capability_summary(raw_text) {
+        return Some(GeneralMessagePlan {
+            kind: GeneralMessagePlanKind::CapabilitySummary,
+            reply_text: None,
+            camera_hint: None,
+            query: None,
+            recent_clip: None,
+            reason: Some("fallback rule inferred a capability summary request".to_string()),
+        });
+    }
+
     if matches_any(&normalized, &["录一段", "录视频", "拍视频", "录个视频", "录像"]) {
         return Some(GeneralMessagePlan {
             kind: GeneralMessagePlanKind::CameraRecordClip,
+            reply_text: None,
             camera_hint: default_camera_hint.map(str::to_string),
             query: None,
+            recent_clip: None,
             reason: Some("fallback rule inferred a short clip request".to_string()),
         });
     }
     if matches_any(&normalized, &["抓拍", "拍照", "拍一张", "看一眼", "截一张"]) {
         return Some(GeneralMessagePlan {
             kind: GeneralMessagePlanKind::CameraSnapshot,
+            reply_text: None,
             camera_hint: default_camera_hint.map(str::to_string),
             query: None,
+            recent_clip: None,
             reason: Some("fallback rule inferred a snapshot request".to_string()),
         });
     }
@@ -4701,8 +6207,10 @@ fn fallback_general_message_plan(
     ) {
         return Some(GeneralMessagePlan {
             kind: GeneralMessagePlanKind::KnowledgeSearch,
+            reply_text: None,
             camera_hint: None,
             query: infer_query_from_raw_text(raw_text),
+            recent_clip: None,
             reason: Some("fallback rule inferred a knowledge search request".to_string()),
         });
     }
@@ -4714,52 +6222,6 @@ fn matches_any(normalized: &str, candidates: &[&str]) -> bool {
         .iter()
         .map(|candidate| normalize_command_text(candidate))
         .any(|candidate| normalized.contains(&candidate))
-}
-
-fn build_general_message_planner_prompt(
-    request: &TaskRequest,
-    camera_targets: &[ResolvedCameraTarget],
-    selected_camera_device_id: Option<&str>,
-    writable_root: &str,
-    capture_subdirectory: &str,
-    clip_length_seconds: u32,
-) -> String {
-    let cameras = camera_targets
-        .iter()
-        .map(|target| {
-            json!({
-                "device_id": target.device_id,
-                "display_name": target.display_name,
-                "room_name": target.room_name,
-                "vendor": target.vendor,
-                "model": target.model,
-            })
-        })
-        .collect::<Vec<_>>();
-    let available_camera_hint = selected_camera_device_id.unwrap_or_default();
-    format!(
-        concat!(
-            "You are a strict HarborBeacon planner. ",
-            "Interpret the Chinese user message and return ONLY JSON with fields: ",
-            "{{\"action\":\"camera_snapshot|camera_record_clip|knowledge_search|unsupported\",",
-            "\"camera_hint\":\"string|null\",\"query\":\"string|null\",\"reason\":\"string\"}}.\n",
-            "Do not invent new actions. ",
-            "A snapshot means taking one image. ",
-            "A clip means a short video clip only, with configured duration {clip_length_seconds} seconds. ",
-            "Search means searching the configured capture directory using the described visual feature.\n",
-            "Selected camera device: {available_camera_hint}\n",
-            "Writable root: {writable_root}\n",
-            "Capture subdirectory: {capture_subdirectory}\n",
-            "Known cameras: {cameras}\n",
-            "User message: {message}\n"
-        ),
-        clip_length_seconds = clip_length_seconds,
-        available_camera_hint = available_camera_hint,
-        writable_root = writable_root,
-        capture_subdirectory = capture_subdirectory,
-        cameras = serde_json::to_string(&cameras).unwrap_or_else(|_| "[]".to_string()),
-        message = request.intent.raw_text,
-    )
 }
 
 fn knowledge_search_roots(request: &TaskRequest) -> Vec<String> {
@@ -5332,8 +6794,9 @@ mod tests {
         normalize_command_text, notification_delivery_outcome, pending_candidates_from_results,
         protocol_string, resolve_notification_recipient, room_aliases,
         should_route_general_message_to_knowledge, general_message_requests_capability_summary,
-        GeneralMessagePlanKind, PendingTaskCandidate, TaskApiService, TaskArtifact, TaskIntent,
-        TaskMessage, TaskRequest, TaskRequestAcceptance, TaskSource, TaskStatus,
+        parse_general_message_plan, GeneralMessagePlanKind, PendingTaskCandidate,
+        TaskApiService, TaskArtifact, TaskIntent, TaskMessage, TaskRequest,
+        TaskRequestAcceptance, TaskSource, TaskStatus,
         ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV,
     };
     use crate::connectors::notifications::{
@@ -5347,6 +6810,9 @@ mod tests {
     use crate::control_plane::approvals::ApprovalStatus;
     use crate::control_plane::auth::{AuthSource, IdentityBinding};
     use crate::control_plane::media::{MediaAssetKind, StorageTargetKind};
+    use crate::control_plane::models::{
+        ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind,
+    };
     use crate::control_plane::tasks::{
         ArtifactKind, ConversationSession, ExecutionRoute, TaskRunStatus, TaskStepRunStatus,
     };
@@ -5360,7 +6826,8 @@ mod tests {
         ResolvedCameraTarget, StreamTransport,
     };
     use crate::runtime::task_session::{
-        PendingTaskConnect, TaskConversationState, TaskConversationStore,
+        PendingTaskClipConfirmation, PendingTaskConnect, RecentClipPlaybackState,
+        TaskConversationState, TaskConversationStore,
     };
 
     static RETRIEVAL_GATE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -5428,6 +6895,28 @@ mod tests {
             registry_path,
             conversation_path,
         )
+    }
+
+    fn configure_mock_general_message_llm(service: &TaskApiService, mock_text: &str) {
+        service
+            .clone()
+            .admin_store
+            .save_model_endpoint(ModelEndpoint {
+                model_endpoint_id: "llm-local-openai-compatible".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Llm,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "harbor-local-chat".to_string(),
+                capability_tags: vec!["chat".to_string(), "local_first".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "mock_text": mock_text,
+                }),
+            })
+            .expect("save mock llm endpoint");
     }
 
     fn cleanup_task_api_service(
@@ -6747,6 +8236,385 @@ mod tests {
             Some("resume-opaque-1".to_string())
         );
         assert_eq!(loaded.key, "chat-resume");
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn handle_general_message_resume_token_can_confirm_clip_delivery() {
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let service = TaskApiService::new(admin_store, conversation_store.clone());
+
+        let session = ConversationSession {
+            session_id: "sess-clip".to_string(),
+            workspace_id: "home-1".to_string(),
+            channel: "weixin".to_string(),
+            surface: "harborgate".to_string(),
+            conversation_id: "chat-clip".to_string(),
+            user_id: "user-1".to_string(),
+            route_key: "gw_route_clip".to_string(),
+            last_message_id: "om_clip".to_string(),
+            chat_type: "p2p".to_string(),
+            state: Value::Null,
+            resume_token: None,
+            expires_at: None,
+        };
+        let mut conversation = TaskConversationState {
+            key: "chat-clip".to_string(),
+            ..Default::default()
+        };
+        conversation.set_clip_pending_confirmation(Some(PendingTaskClipConfirmation {
+            resume_token: "resume-clip-1".to_string(),
+            clip_media_asset_id: "asset-clip-1".to_string(),
+            clip_path: "captures/clips/front-door.mp4".to_string(),
+            clip_mime_type: "video/mp4".to_string(),
+            cover_path: "captures/keyframes/front-door-1.jpg".to_string(),
+            display_name: "门口摄像头".to_string(),
+        }));
+        conversation_store
+            .save_for_session(&session, &conversation)
+            .expect("save conversation");
+
+        let request = TaskRequest {
+            task_id: "task-clip-confirm".to_string(),
+            trace_id: "trace-clip-confirm".to_string(),
+            step_id: "step-clip-confirm".to_string(),
+            source: TaskSource {
+                channel: "weixin".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-clip".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-clip".to_string(),
+                route_key: "gw_route_clip".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "general".to_string(),
+                action: "message".to_string(),
+                raw_text: "要".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "resume_token": "resume-clip-1"
+            }),
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_clip_followup".to_string(),
+                chat_type: "p2p".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.result.message, "完整回放如下");
+        assert_eq!(response.result.data["clip_delivery"]["kind"], "clip_delivery");
+        assert_eq!(response.result.artifacts.len(), 1);
+        assert_eq!(response.result.artifacts[0].kind, "video");
+        assert_eq!(
+            response.result.artifacts[0].media_asset_id.as_deref(),
+            Some("asset-clip-1")
+        );
+
+        let loaded = conversation_store
+            .load_for_session("sess-clip", Some("chat-clip"))
+            .expect("load conversation")
+            .expect("conversation");
+        assert!(loaded.clip_pending_confirmation().is_none());
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn handle_general_message_resume_token_accepts_playback_phrase_for_clip_delivery() {
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let service = TaskApiService::new(admin_store, conversation_store.clone());
+
+        let session = ConversationSession {
+            session_id: "sess-clip-playback".to_string(),
+            workspace_id: "home-1".to_string(),
+            channel: "weixin".to_string(),
+            surface: "harborgate".to_string(),
+            conversation_id: "chat-clip-playback".to_string(),
+            user_id: "user-1".to_string(),
+            route_key: "gw_route_clip_playback".to_string(),
+            last_message_id: "om_clip_playback".to_string(),
+            chat_type: "p2p".to_string(),
+            state: Value::Null,
+            resume_token: None,
+            expires_at: None,
+        };
+        let mut conversation = TaskConversationState {
+            key: "chat-clip-playback".to_string(),
+            ..Default::default()
+        };
+        conversation.set_clip_pending_confirmation(Some(PendingTaskClipConfirmation {
+            resume_token: "resume-clip-playback".to_string(),
+            clip_media_asset_id: "asset-clip-playback".to_string(),
+            clip_path: "captures/clips/front-door-playback.mp4".to_string(),
+            clip_mime_type: "video/mp4".to_string(),
+            cover_path: "captures/keyframes/front-door-playback.jpg".to_string(),
+            display_name: "门口摄像头".to_string(),
+        }));
+        conversation.set_recent_clip_playback(Some(RecentClipPlaybackState {
+            clip_media_asset_id: "asset-clip-playback".to_string(),
+            clip_path: "captures/clips/front-door-playback.mp4".to_string(),
+            clip_mime_type: "video/mp4".to_string(),
+            cover_path: "captures/keyframes/front-door-playback.jpg".to_string(),
+            display_name: "门口摄像头".to_string(),
+            captured_at_epoch_ms: super::current_epoch_ms(),
+        }));
+        conversation_store
+            .save_for_session(&session, &conversation)
+            .expect("save conversation");
+
+        let request = TaskRequest {
+            task_id: "task-clip-playback".to_string(),
+            trace_id: "trace-clip-playback".to_string(),
+            step_id: "step-clip-playback".to_string(),
+            source: TaskSource {
+                channel: "weixin".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-clip-playback".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-clip-playback".to_string(),
+                route_key: "gw_route_clip_playback".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "general".to_string(),
+                action: "message".to_string(),
+                raw_text: "放一下".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "resume_token": "resume-clip-playback"
+            }),
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_clip_playback_followup".to_string(),
+                chat_type: "p2p".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.result.message, "完整回放如下");
+        assert_eq!(response.result.data["clip_delivery"]["kind"], "clip_delivery");
+        assert_eq!(response.result.artifacts.len(), 1);
+        assert_eq!(response.result.artifacts[0].kind, "video");
+
+        let loaded = conversation_store
+            .load_for_session("sess-clip-playback", Some("chat-clip-playback"))
+            .expect("load conversation")
+            .expect("conversation");
+        assert!(loaded.clip_pending_confirmation().is_none());
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn handle_general_message_resume_token_can_decline_clip_delivery() {
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let service = TaskApiService::new(admin_store, conversation_store.clone());
+
+        let session = ConversationSession {
+            session_id: "sess-clip-decline".to_string(),
+            workspace_id: "home-1".to_string(),
+            channel: "weixin".to_string(),
+            surface: "harborgate".to_string(),
+            conversation_id: "chat-clip-decline".to_string(),
+            user_id: "user-1".to_string(),
+            route_key: "gw_route_clip_decline".to_string(),
+            last_message_id: "om_clip_decline".to_string(),
+            chat_type: "p2p".to_string(),
+            state: Value::Null,
+            resume_token: None,
+            expires_at: None,
+        };
+        let mut conversation = TaskConversationState {
+            key: "chat-clip-decline".to_string(),
+            ..Default::default()
+        };
+        conversation.set_clip_pending_confirmation(Some(PendingTaskClipConfirmation {
+            resume_token: "resume-clip-decline".to_string(),
+            clip_media_asset_id: "asset-clip-decline".to_string(),
+            clip_path: "captures/clips/front-door-decline.mp4".to_string(),
+            clip_mime_type: "video/mp4".to_string(),
+            cover_path: "captures/keyframes/front-door-decline.jpg".to_string(),
+            display_name: "门口摄像头".to_string(),
+        }));
+        conversation_store
+            .save_for_session(&session, &conversation)
+            .expect("save conversation");
+
+        let request = TaskRequest {
+            task_id: "task-clip-decline".to_string(),
+            trace_id: "trace-clip-decline".to_string(),
+            step_id: "step-clip-decline".to_string(),
+            source: TaskSource {
+                channel: "weixin".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-clip-decline".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-clip-decline".to_string(),
+                route_key: "gw_route_clip_decline".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "general".to_string(),
+                action: "message".to_string(),
+                raw_text: "不要".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "resume_token": "resume-clip-decline"
+            }),
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_clip_decline_followup".to_string(),
+                chat_type: "p2p".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.result.message, "好的，这段回放先不发。");
+        assert!(response.result.artifacts.is_empty());
+        assert_eq!(
+            response.result.data["clip_confirmation"]["decision"],
+            "declined"
+        );
+
+        let loaded = conversation_store
+            .load_for_session("sess-clip-decline", Some("chat-clip-decline"))
+            .expect("load conversation")
+            .expect("conversation");
+        assert!(loaded.clip_pending_confirmation().is_none());
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn general_message_can_replay_recent_clip_without_resume_token() {
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let service = TaskApiService::new(admin_store, conversation_store.clone());
+
+        let session = ConversationSession {
+            session_id: "sess-clip-replay".to_string(),
+            workspace_id: "home-1".to_string(),
+            channel: "weixin".to_string(),
+            surface: "harborgate".to_string(),
+            conversation_id: "chat-clip-replay".to_string(),
+            user_id: "user-1".to_string(),
+            route_key: "gw_route_clip_replay".to_string(),
+            last_message_id: "om_clip_replay".to_string(),
+            chat_type: "p2p".to_string(),
+            state: Value::Null,
+            resume_token: None,
+            expires_at: None,
+        };
+        let mut conversation = TaskConversationState {
+            key: "chat-clip-replay".to_string(),
+            ..Default::default()
+        };
+        conversation.set_recent_clip_playback(Some(RecentClipPlaybackState {
+            clip_media_asset_id: "asset-clip-replay".to_string(),
+            clip_path: "captures/clips/front-door-replay.mp4".to_string(),
+            clip_mime_type: "video/mp4".to_string(),
+            cover_path: "captures/keyframes/front-door-replay.jpg".to_string(),
+            display_name: "门口摄像头".to_string(),
+            captured_at_epoch_ms: super::current_epoch_ms(),
+        }));
+        conversation_store
+            .save_for_session(&session, &conversation)
+            .expect("save conversation");
+
+        let request = TaskRequest {
+            task_id: "task-clip-replay".to_string(),
+            trace_id: "trace-clip-replay".to_string(),
+            step_id: "step-clip-replay".to_string(),
+            source: TaskSource {
+                channel: "weixin".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-clip-replay".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "sess-clip-replay".to_string(),
+                route_key: "gw_route_clip_replay".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "general".to_string(),
+                action: "message".to_string(),
+                raw_text: "现在回放一下".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: Value::Null,
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_clip_replay_followup".to_string(),
+                chat_type: "p2p".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.executor_used, "camera_hub_service");
+        assert_eq!(response.result.message, "完整回放如下");
+        assert_eq!(response.result.data["clip_delivery"]["kind"], "clip_delivery");
+        assert_eq!(
+            response.result.data["general_message_controller"]["controller_stage"],
+            "deterministic_single_candidate"
+        );
+        assert_eq!(response.result.artifacts.len(), 1);
+        assert_eq!(response.result.artifacts[0].kind, "video");
+        assert_eq!(
+            response.result.artifacts[0].media_asset_id.as_deref(),
+            Some("asset-clip-replay")
+        );
 
         let _ = fs::remove_file(admin_path);
         let _ = fs::remove_file(registry_path);
@@ -8332,10 +10200,17 @@ mod tests {
         assert!(general_message_requests_capability_summary("你能做什么"));
         assert!(general_message_requests_capability_summary("你还能做什么"));
         assert!(general_message_requests_capability_summary("帮助"));
+        assert!(general_message_requests_capability_summary("摄像头能干什么"));
         assert!(!general_message_requests_capability_summary(
             "帮助我抓拍一下当前摄像头画面"
         ));
 
+        assert_eq!(
+            fallback_general_message_plan("摄像头能干什么", None)
+                .expect("capability summary plan")
+                .kind,
+            GeneralMessagePlanKind::CapabilitySummary
+        );
         assert_eq!(
             fallback_general_message_plan("帮我抓拍一下当前摄像头画面", None)
                 .expect("snapshot plan")
@@ -8354,6 +10229,32 @@ mod tests {
                 .kind,
             GeneralMessagePlanKind::KnowledgeSearch
         );
+    }
+
+    #[test]
+    fn parse_general_message_plan_accepts_json_embedded_in_text() {
+        let plan = parse_general_message_plan(
+            r#"先给出结论：
+```json
+{
+  "decision": "capability_summary",
+  "reply_text": "我可以帮你看摄像头、录短视频，也能搜索保存的内容。",
+  "camera_hint": "null",
+  "query": "null",
+  "reason": "camera capability question"
+}
+```
+如果你愿意，我可以继续执行。"#,
+        )
+        .expect("embedded plan");
+
+        assert_eq!(plan.kind, GeneralMessagePlanKind::CapabilitySummary);
+        assert_eq!(
+            plan.reply_text.as_deref(),
+            Some("我可以帮你看摄像头、录短视频，也能搜索保存的内容。")
+        );
+        assert_eq!(plan.camera_hint, None);
+        assert_eq!(plan.query, None);
     }
 
     #[test]
@@ -8383,7 +10284,7 @@ mod tests {
             intent: TaskIntent {
                 domain: "general".to_string(),
                 action: "message".to_string(),
-                raw_text: "你还能做什么".to_string(),
+                raw_text: "摄像头能干什么".to_string(),
             },
             entity_refs: Value::Null,
             args: Value::Null,
@@ -8414,12 +10315,498 @@ mod tests {
                 .map(Vec::len),
             Some(3)
         );
-        assert!(response.result.message.contains("抓拍摄像头"));
-        assert!(response.result.message.contains("知识库内容"));
+        assert!(response.result.message.contains("抓拍最新画面"));
+        assert!(response.result.message.contains("已经保存的内容"));
 
         let _ = fs::remove_file(admin_path);
         let _ = fs::remove_file(registry_path);
         let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn general_message_capability_query_records_controller_trace() {
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
+        let service = TaskApiService::new(
+            AdminConsoleStore::new(
+                admin_path.clone(),
+                DeviceRegistryStore::new(registry_path.clone()),
+            ),
+            TaskConversationStore::new(conversation_path.clone()),
+        );
+        let request = TaskRequest {
+            task_id: "task-capability-trace".to_string(),
+            trace_id: "trace-capability-trace".to_string(),
+            step_id: "step-capability-trace".to_string(),
+            source: TaskSource {
+                channel: "wechat".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-capability-trace".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "session-capability-trace".to_string(),
+                route_key: "gw_route_capability_trace".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "general".to_string(),
+                action: "message".to_string(),
+                raw_text: "摄像头能干什么".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: Value::Null,
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_capability_trace".to_string(),
+                chat_type: "p2p".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(
+            response.result.data["general_message_controller"]["controller_stage"],
+            "deterministic_single_candidate"
+        );
+        assert_eq!(
+            response.result.data["general_message_controller"]["router_llm"],
+            false
+        );
+        assert!(
+            response.result.data["general_message_controller"]["total_turn_latency_ms"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0
+        );
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn general_message_ambiguous_request_returns_clarification_and_persists_loop_state() {
+        let (service, conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-clarification");
+        configure_mock_general_message_llm(
+            &service,
+            r#"{
+                "decision": "clarify",
+                "reply_text": "你是想拍一张门口画面，还是录一段短视频？",
+                "camera_hint": "front-door",
+                "reason": "need one follow-up"
+            }"#,
+        );
+
+        let request = TaskRequest {
+            task_id: "task-general-clarify".to_string(),
+            trace_id: "trace-general-clarify".to_string(),
+            step_id: "step-general-clarify".to_string(),
+            source: TaskSource {
+                channel: "weixin".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-general-clarify".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "session-general-clarify".to_string(),
+                route_key: "gw_route_general_clarify".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "general".to_string(),
+                action: "message".to_string(),
+                raw_text: "帮我看一下门口".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: Value::Null,
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_general_clarify".to_string(),
+                chat_type: "p2p".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::NeedsInput);
+        assert_eq!(response.executor_used, "agentic_interpreter");
+        assert_eq!(response.result.data["reply_pack"]["kind"], "clarification");
+        assert_eq!(
+            response.result.message,
+            "你是想拍一张门口画面，还是录一段短视频？"
+        );
+        let resume_token = response.resume_token.clone().expect("resume token");
+        let loaded = conversation_store
+            .load_for_session("session-general-clarify", Some("chat-general-clarify"))
+            .expect("load conversation")
+            .expect("conversation");
+        let pending = loaded.general_message_loop().expect("pending loop");
+        assert_eq!(pending.resume_token, resume_token);
+        assert_eq!(pending.original_goal, "帮我看一下门口");
+        assert_eq!(pending.latest_user_intent_text, "帮我看一下门口");
+        assert_eq!(
+            pending.last_clarification_prompt,
+            "你是想拍一张门口画面，还是录一段短视频？"
+        );
+        assert_eq!(pending.camera_hint.as_deref(), Some("front-door"));
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+    }
+
+    #[test]
+    fn general_message_resume_token_can_route_follow_up_to_knowledge_search() {
+        let _guard = RETRIEVAL_GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (service, conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-resume-search");
+        let knowledge_root = unique_dir("harborbeacon-general-message-loop-search");
+        fs::create_dir_all(knowledge_root.join("docs")).expect("create docs");
+        fs::write(
+            knowledge_root.join("docs").join("sakura-journal.md"),
+            "这里整理了樱花相关的历史记录。",
+        )
+        .expect("write doc");
+
+        configure_mock_general_message_llm(
+            &service,
+            r#"{
+                "decision": "clarify",
+                "reply_text": "你是想实时拍摄，还是搜索已经保存的樱花内容？",
+                "query": "樱花",
+                "reason": "need one follow-up"
+            }"#,
+        );
+
+        let first_request = TaskRequest {
+            task_id: "task-general-resume-search-1".to_string(),
+            trace_id: "trace-general-resume-search-1".to_string(),
+            step_id: "step-general-resume-search-1".to_string(),
+            source: TaskSource {
+                channel: "weixin".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-general-resume-search".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "session-general-resume-search".to_string(),
+                route_key: "gw_route_general_resume_search".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "general".to_string(),
+                action: "message".to_string(),
+                raw_text: "帮我看一下樱花".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "roots": [knowledge_root.to_string_lossy().to_string()]
+            }),
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_general_resume_search_1".to_string(),
+                chat_type: "p2p".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+
+        let first_response = service.handle_task(first_request);
+        assert_eq!(first_response.status, TaskStatus::NeedsInput);
+        let resume_token = first_response.resume_token.clone().expect("resume token");
+
+        configure_mock_general_message_llm(
+            &service,
+            r#"{
+                "decision": "knowledge_search",
+                "query": "樱花",
+                "reason": "user chose stored content"
+            }"#,
+        );
+
+        let second_request = TaskRequest {
+            task_id: "task-general-resume-search-2".to_string(),
+            trace_id: "trace-general-resume-search-2".to_string(),
+            step_id: "step-general-resume-search-2".to_string(),
+            source: TaskSource {
+                channel: "weixin".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-general-resume-search".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "session-general-resume-search".to_string(),
+                route_key: "gw_route_general_resume_search".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "general".to_string(),
+                action: "message".to_string(),
+                raw_text: "搜索已有内容".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "resume_token": resume_token,
+                "roots": [knowledge_root.to_string_lossy().to_string()]
+            }),
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_general_resume_search_2".to_string(),
+                chat_type: "p2p".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+
+        let response = service.handle_task(second_request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.executor_used, "knowledge_search_service");
+        assert_eq!(
+            response.result.data["reply_pack"]["citations"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        let loaded = conversation_store
+            .load_for_session(
+                "session-general-resume-search",
+                Some("chat-general-resume-search"),
+            )
+            .expect("load conversation")
+            .expect("conversation");
+        assert!(loaded.general_message_loop().is_none());
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+        let _ = fs::remove_dir_all(knowledge_root);
+    }
+
+    #[test]
+    fn general_message_capability_summary_short_circuits_before_llm_when_available() {
+        let (service, _conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-capability-llm");
+        configure_mock_general_message_llm(
+            &service,
+            r#"{
+                "decision": "capability_summary",
+                "reply_text": "我现在可以帮你看摄像头、录短视频，也能搜索已经保存的内容。你想先试哪个？",
+                "reason": "user is asking about supported camera capabilities"
+            }"#,
+        );
+
+        let request = TaskRequest {
+            task_id: "task-general-capability-llm".to_string(),
+            trace_id: "trace-general-capability-llm".to_string(),
+            step_id: "step-general-capability-llm".to_string(),
+            source: TaskSource {
+                channel: "weixin".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-general-capability-llm".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "session-general-capability-llm".to_string(),
+                route_key: "gw_route_general_capability_llm".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "general".to_string(),
+                action: "message".to_string(),
+                raw_text: "摄像头能干什么".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: Value::Null,
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_general_capability_llm".to_string(),
+                chat_type: "p2p".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.executor_used, "agentic_interpreter");
+        assert_eq!(
+            response.result.message,
+            "我可以帮你抓拍最新画面、录一段短视频，也能搜索已经保存的内容。你想先试哪个？"
+        );
+        assert_eq!(
+            response.result.data["reply_pack"]["summary"],
+            response.result.message
+        );
+        assert_eq!(
+            response.result.data["reply_pack"]["kind"],
+            "capability_summary"
+        );
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+    }
+
+    #[test]
+    fn general_message_unsupported_uses_llm_reply_text_when_available() {
+        let (service, _conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-unsupported-llm");
+        configure_mock_general_message_llm(
+            &service,
+            r#"{
+                "decision": "unsupported",
+                "reply_text": "天气这类问题我现在还不能稳定回答，但我可以马上帮你抓拍、录一段，或者查本地保存的内容。",
+                "reason": "request is out of current scope"
+            }"#,
+        );
+
+        let request = TaskRequest {
+            task_id: "task-general-unsupported-llm".to_string(),
+            trace_id: "trace-general-unsupported-llm".to_string(),
+            step_id: "step-general-unsupported-llm".to_string(),
+            source: TaskSource {
+                channel: "weixin".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-general-unsupported-llm".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "session-general-unsupported-llm".to_string(),
+                route_key: "gw_route_general_unsupported_llm".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "general".to_string(),
+                action: "message".to_string(),
+                raw_text: "今天天气怎么样".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: Value::Null,
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_general_unsupported_llm".to_string(),
+                chat_type: "p2p".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.executor_used, "agentic_interpreter");
+        assert_eq!(
+            response.result.message,
+            "天气这类问题我现在还不能稳定回答，但我可以马上帮你抓拍、录一段，或者查本地保存的内容。"
+        );
+        assert_eq!(
+            response.result.data["reply_pack"]["summary"],
+            response.result.message
+        );
+        assert_eq!(response.result.data["reply_pack"]["kind"], "unsupported");
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+    }
+
+    #[test]
+    fn general_message_invalid_llm_json_falls_back_to_deterministic_routing() {
+        let _guard = RETRIEVAL_GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (service, _conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-invalid-json");
+        let knowledge_root = unique_dir("harborbeacon-general-message-invalid-json");
+        fs::create_dir_all(knowledge_root.join("docs")).expect("create docs");
+        fs::write(
+            knowledge_root.join("docs").join("sakura-journal.md"),
+            "这里整理了樱花相关的历史记录。",
+        )
+        .expect("write doc");
+
+        configure_mock_general_message_llm(&service, "definitely-not-json");
+
+        let request = TaskRequest {
+            task_id: "task-general-invalid-json".to_string(),
+            trace_id: "trace-general-invalid-json".to_string(),
+            step_id: "step-general-invalid-json".to_string(),
+            source: TaskSource {
+                channel: "weixin".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-general-invalid-json".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "session-general-invalid-json".to_string(),
+                route_key: "gw_route_general_invalid_json".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "general".to_string(),
+                action: "message".to_string(),
+                raw_text: "帮我找到和樱花有关的文件".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({
+                "roots": [knowledge_root.to_string_lossy().to_string()]
+            }),
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_general_invalid_json".to_string(),
+                chat_type: "p2p".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.executor_used, "knowledge_search_service");
+        assert_eq!(
+            response.result.data["reply_pack"]["citations"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+        let _ = fs::remove_dir_all(knowledge_root);
+    }
+
+    #[test]
+    fn general_message_router_invalid_label_falls_back_to_template_unsupported() {
+        let (service, _conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-router-invalid-label");
+        configure_mock_general_message_llm(&service, "camera_snapshot|knowledge_search");
+
+        let request = TaskRequest {
+            task_id: "task-general-router-invalid".to_string(),
+            trace_id: "trace-general-router-invalid".to_string(),
+            step_id: "step-general-router-invalid".to_string(),
+            source: TaskSource {
+                channel: "weixin".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-general-router-invalid".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "session-general-router-invalid".to_string(),
+                route_key: "gw_route_general_router_invalid".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "general".to_string(),
+                action: "message".to_string(),
+                raw_text: "门口咋样".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: Value::Null,
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_general_router_invalid".to_string(),
+                chat_type: "p2p".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.executor_used, "agentic_interpreter");
+        assert_eq!(response.result.data["reply_pack"]["kind"], "unsupported");
+        assert_eq!(
+            response.result.data["general_message_controller"]["router_llm"],
+            true
+        );
+        assert_eq!(
+            response.result.data["general_message_controller"]["fallback_reason"],
+            "router_invalid_label"
+        );
+        assert!(response.result.message.contains("抓拍摄像头"));
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
     }
 
     #[test]

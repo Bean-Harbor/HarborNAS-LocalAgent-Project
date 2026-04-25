@@ -46,6 +46,8 @@ pub struct TextCompletionRequest {
     pub system_prompt: Option<String>,
     pub user_prompt: String,
     pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+    pub timeout: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,17 +281,27 @@ impl OpenAiCompatibleTextClient {
             "content": request.user_prompt,
         }));
 
-        let payload = json!({
-            "model": self.config.model,
-            "temperature": request.temperature.unwrap_or(0.1),
-            "messages": messages,
-        });
+        let mut payload = serde_json::Map::new();
+        payload.insert("model".to_string(), json!(self.config.model));
+        payload.insert(
+            "temperature".to_string(),
+            json!(request.temperature.unwrap_or(0.1)),
+        );
+        payload.insert("messages".to_string(), json!(messages));
+        if let Some(max_tokens) = request.max_tokens {
+            payload.insert("max_tokens".to_string(), json!(max_tokens));
+        }
 
-        let response = self
+        let mut request_builder = self
             .client
             .post(format!("{}/chat/completions", self.config.base_url))
             .headers(openai_compatible_headers(&self.config.api_key)?)
-            .json(&payload)
+            .json(&payload);
+        if let Some(timeout) = request.timeout {
+            request_builder = request_builder.timeout(timeout);
+        }
+
+        let response = request_builder
             .send()
             .map_err(|e| format!("OpenAI-compatible text request failed: {e}"))?;
 

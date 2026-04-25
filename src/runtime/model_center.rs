@@ -5,7 +5,8 @@ use base64::Engine as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -18,7 +19,8 @@ use crate::connectors::ai_provider::{
 };
 use crate::control_plane::models::{ModelEndpoint, ModelEndpointStatus, ModelKind};
 use crate::runtime::admin_console::{
-    sanitize_model_center_state, AdminConsoleState, AdminModelCenterState,
+    default_model_endpoints, sanitize_model_center_state, AdminConsoleState,
+    AdminModelCenterState,
 };
 
 pub const ADMIN_STATE_PATH_ENV: &str = "HARBOR_ADMIN_STATE_PATH";
@@ -93,6 +95,15 @@ pub struct LlmTextExecution {
     pub text: String,
     #[serde(default)]
     pub details: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LlmTextOptions {
+    pub purpose: Option<String>,
+    pub system_prompt: Option<String>,
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+    pub timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -453,6 +464,14 @@ pub fn run_embedding(text: &str) -> EmbeddingExecution {
 }
 
 pub fn run_llm_text_with_state(prompt: &str, state: &AdminModelCenterState) -> LlmTextExecution {
+    run_llm_text_with_state_and_options(prompt, state, &LlmTextOptions::default())
+}
+
+pub fn run_llm_text_with_state_and_options(
+    prompt: &str,
+    state: &AdminModelCenterState,
+    options: &LlmTextOptions,
+) -> LlmTextExecution {
     let Some(endpoint) = resolve_endpoint(state, ModelKind::Llm, LLM_POLICY_ID) else {
         return LlmTextExecution {
             available: false,
@@ -513,11 +532,13 @@ pub fn run_llm_text_with_state(prompt: &str, state: &AdminModelCenterState) -> L
         };
     };
 
-    let system_prompt = metadata_string(&endpoint.metadata, "system_prompt").or_else(|| {
-        Some(
-            "You are a strict HarborBeacon planning translator. Return only valid JSON that follows the requested schema."
-                .to_string(),
-        )
+    let system_prompt = options.system_prompt.clone().or_else(|| {
+        metadata_string(&endpoint.metadata, "system_prompt").or_else(|| {
+            Some(
+                "You are a strict HarborBeacon planning translator. Return only valid JSON that follows the requested schema."
+                    .to_string(),
+            )
+        })
     });
 
     let client = match OpenAiCompatibleTextClient::new(config) {
@@ -538,16 +559,28 @@ pub fn run_llm_text_with_state(prompt: &str, state: &AdminModelCenterState) -> L
     match client.complete_text(&TextCompletionRequest {
         system_prompt,
         user_prompt: prompt.to_string(),
-        temperature: Some(0.1),
+        temperature: options.temperature.or(Some(0.1)),
+        max_tokens: options.max_tokens,
+        timeout: options.timeout,
     }) {
         Ok(response) => LlmTextExecution {
             available: true,
             status: "active".to_string(),
-            summary: "LLM text planning completed.".to_string(),
+            summary: format!(
+                "LLM {} completed.",
+                options
+                    .purpose
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("text completion")
+            ),
             provider_key: endpoint.provider_key.clone(),
             model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
             text: response.text,
             details: json!({
+                "purpose": options.purpose.clone(),
+                "max_tokens": options.max_tokens,
+                "timeout_ms": options.timeout.map(|value| value.as_millis() as u64),
                 "raw_response": response.raw_response,
             }),
         },
@@ -686,11 +719,60 @@ pub fn run_embedding_with_state(text: &str, state: &AdminModelCenterState) -> Em
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct LocalRuntimeProjection {
+    base_url: String,
+    healthz_url: String,
+    api_key: String,
+    api_key_configured: bool,
+    ready: bool,
+    backend_ready: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct LocalRuntimeProbeTarget {
+    cache_key: String,
+    base_url: String,
+    healthz_url: String,
+    api_key: String,
+    api_key_configured: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CachedLocalRuntimeProjection {
+    target_cache_key: String,
+    expires_at: Instant,
+    projection: LocalRuntimeProjection,
+}
+
+const LOCAL_RUNTIME_PROJECTION_CACHE_TTL: Duration = Duration::from_secs(2);
+
+fn local_runtime_projection_cache() -> &'static Mutex<Option<CachedLocalRuntimeProjection>> {
+    static CACHE: OnceLock<Mutex<Option<CachedLocalRuntimeProjection>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn clear_local_runtime_projection_cache() {
+    *local_runtime_projection_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+fn runtime_wired_model_center_state(state: &AdminModelCenterState) -> AdminModelCenterState {
+    let runtime = probe_local_runtime(&state.endpoints);
+    AdminModelCenterState {
+        endpoints: overlay_endpoints_with_runtime_truth(&state.endpoints, &runtime),
+        route_policies: state.route_policies.clone(),
+    }
+}
+
 fn resolve_endpoint(
     state: &AdminModelCenterState,
     model_kind: ModelKind,
     route_policy_id: &str,
 ) -> Option<ModelEndpoint> {
+    let state = runtime_wired_model_center_state(state);
     let policy = state
         .route_policies
         .iter()
@@ -722,6 +804,239 @@ fn resolve_endpoint(
     });
 
     candidates.into_iter().next()
+}
+
+fn probe_local_runtime(endpoints: &[ModelEndpoint]) -> LocalRuntimeProjection {
+    let Some(target) = resolve_local_runtime_probe_target(endpoints) else {
+        return LocalRuntimeProjection::default();
+    };
+
+    let now = Instant::now();
+    if let Some(cached) = local_runtime_projection_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|cached| cached.target_cache_key == target.cache_key && cached.expires_at > now)
+        .cloned()
+    {
+        return cached.projection;
+    }
+
+    let projection = probe_local_runtime_target(&target);
+    *local_runtime_projection_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some(CachedLocalRuntimeProjection {
+            target_cache_key: target.cache_key,
+            expires_at: now + LOCAL_RUNTIME_PROJECTION_CACHE_TTL,
+            projection: projection.clone(),
+        });
+    projection
+}
+
+fn resolve_local_runtime_probe_target(
+    endpoints: &[ModelEndpoint],
+) -> Option<LocalRuntimeProbeTarget> {
+    let builtin_defaults = default_model_endpoints();
+    let preferred = endpoints
+        .iter()
+        .find(|endpoint| is_builtin_local_openai_endpoint(endpoint))
+        .cloned()
+        .or_else(|| {
+            builtin_defaults
+                .iter()
+                .find(|endpoint| is_builtin_local_openai_endpoint(endpoint))
+                .cloned()
+        });
+    let template = preferred?;
+    let fallback = builtin_defaults
+        .iter()
+        .find(|endpoint| endpoint.model_endpoint_id == template.model_endpoint_id)
+        .or_else(|| {
+            builtin_defaults
+                .iter()
+                .find(|endpoint| is_builtin_local_openai_endpoint(endpoint))
+        });
+
+    let base_url = metadata_string(&template.metadata, "base_url")
+        .or_else(|| fallback.and_then(|endpoint| metadata_string(&endpoint.metadata, "base_url")))
+        .unwrap_or_default();
+    let healthz_url = metadata_string(&template.metadata, "healthz_url")
+        .or_else(|| {
+            fallback.and_then(|endpoint| metadata_string(&endpoint.metadata, "healthz_url"))
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| infer_healthz_url(&base_url));
+    let api_key = metadata_string(&template.metadata, "api_key")
+        .or_else(|| fallback.and_then(|endpoint| metadata_string(&endpoint.metadata, "api_key")))
+        .unwrap_or_default();
+    let api_key_configured = metadata_bool(&template.metadata, "api_key_configured")
+        || !api_key.trim().is_empty()
+        || fallback
+            .map(|endpoint| metadata_bool(&endpoint.metadata, "api_key_configured"))
+            .unwrap_or(false);
+
+    Some(LocalRuntimeProbeTarget {
+        cache_key: format!(
+            "{}|{}|{}|{}",
+            template.model_endpoint_id,
+            base_url,
+            healthz_url,
+            api_key,
+        ),
+        base_url,
+        healthz_url,
+        api_key,
+        api_key_configured,
+    })
+}
+
+fn probe_local_runtime_target(target: &LocalRuntimeProbeTarget) -> LocalRuntimeProjection {
+    if target.healthz_url.trim().is_empty() {
+        return LocalRuntimeProjection {
+            base_url: target.base_url.clone(),
+            healthz_url: target.healthz_url.clone(),
+            api_key: target.api_key.clone(),
+            api_key_configured: target.api_key_configured,
+            ready: false,
+            backend_ready: false,
+        };
+    }
+
+    let client = match Client::builder().timeout(Duration::from_secs(3)).build() {
+        Ok(client) => client,
+        Err(_) => {
+            return LocalRuntimeProjection {
+                base_url: target.base_url.clone(),
+                healthz_url: target.healthz_url.clone(),
+                api_key: target.api_key.clone(),
+                api_key_configured: target.api_key_configured,
+                ready: false,
+                backend_ready: false,
+            }
+        }
+    };
+
+    let response = match client.get(&target.healthz_url).send() {
+        Ok(response) => response,
+        Err(_) => {
+            return LocalRuntimeProjection {
+                base_url: target.base_url.clone(),
+                healthz_url: target.healthz_url.clone(),
+                api_key: target.api_key.clone(),
+                api_key_configured: target.api_key_configured,
+                ready: false,
+                backend_ready: false,
+            }
+        }
+    };
+    let body = match response.text() {
+        Ok(body) => body,
+        Err(_) => {
+            return LocalRuntimeProjection {
+                base_url: target.base_url.clone(),
+                healthz_url: target.healthz_url.clone(),
+                api_key: target.api_key.clone(),
+                api_key_configured: target.api_key_configured,
+                ready: false,
+                backend_ready: false,
+            }
+        }
+    };
+    let payload = match serde_json::from_str::<Value>(&body) {
+        Ok(payload) => payload,
+        Err(_) => {
+            return LocalRuntimeProjection {
+                base_url: target.base_url.clone(),
+                healthz_url: target.healthz_url.clone(),
+                api_key: target.api_key.clone(),
+                api_key_configured: target.api_key_configured,
+                ready: false,
+                backend_ready: false,
+            }
+        }
+    };
+
+    LocalRuntimeProjection {
+        base_url: target.base_url.clone(),
+        healthz_url: target.healthz_url.clone(),
+        api_key: target.api_key.clone(),
+        api_key_configured: target.api_key_configured,
+        ready: payload.get("ready").and_then(Value::as_bool).unwrap_or(false),
+        backend_ready: payload
+            .get("backend")
+            .and_then(|value| value.get("ready"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
+}
+
+fn overlay_endpoints_with_runtime_truth(
+    endpoints: &[ModelEndpoint],
+    runtime: &LocalRuntimeProjection,
+) -> Vec<ModelEndpoint> {
+    let builtin_defaults = default_model_endpoints()
+        .into_iter()
+        .map(|endpoint| (endpoint.model_endpoint_id.clone(), endpoint))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    endpoints
+        .iter()
+        .map(|endpoint| {
+            let mut overlayed = endpoint.clone();
+            if let Some(default_endpoint) = builtin_defaults.get(&overlayed.model_endpoint_id) {
+                if is_builtin_local_openai_endpoint(default_endpoint) {
+                    if metadata_missing_or_empty(&overlayed.metadata, "base_url") {
+                        set_metadata_string(
+                            &mut overlayed.metadata,
+                            "base_url",
+                            runtime
+                                .base_url
+                                .clone()
+                                .if_empty_then(|| metadata_string(&default_endpoint.metadata, "base_url"))
+                                .unwrap_or_default(),
+                        );
+                    }
+                    if metadata_missing_or_empty(&overlayed.metadata, "healthz_url") {
+                        set_metadata_string(
+                            &mut overlayed.metadata,
+                            "healthz_url",
+                            runtime
+                                .healthz_url
+                                .clone()
+                                .if_empty_then(|| {
+                                    metadata_string(&default_endpoint.metadata, "healthz_url")
+                                })
+                                .unwrap_or_else(|| infer_healthz_url(&runtime.base_url)),
+                        );
+                    }
+                    if metadata_missing_or_empty(&overlayed.metadata, "api_key") {
+                        set_metadata_string(
+                            &mut overlayed.metadata,
+                            "api_key",
+                            runtime
+                                .api_key
+                                .clone()
+                                .if_empty_then(|| metadata_string(&default_endpoint.metadata, "api_key"))
+                                .unwrap_or_default(),
+                        );
+                    }
+                    if !metadata_bool(&overlayed.metadata, "api_key_configured")
+                        && runtime.api_key_configured
+                    {
+                        set_metadata_bool(&mut overlayed.metadata, "api_key_configured", true);
+                    }
+                    if matches!(overlayed.model_kind, ModelKind::Llm | ModelKind::Embedder)
+                        && runtime.ready
+                        && runtime.backend_ready
+                    {
+                        overlayed.status = ModelEndpointStatus::Active;
+                    }
+                }
+            }
+            overlayed
+        })
+        .collect()
 }
 
 fn endpoint_priority(endpoint: &ModelEndpoint, fallback_order: &[String]) -> usize {
@@ -947,6 +1262,75 @@ fn metadata_string(metadata: &Value, key: &str) -> Option<String> {
         .map(|value| value.to_string())
 }
 
+fn metadata_bool(metadata: &Value, key: &str) -> bool {
+    metadata.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn metadata_missing_or_empty(metadata: &Value, key: &str) -> bool {
+    metadata_string(metadata, key).is_none()
+}
+
+fn set_metadata_string(metadata: &mut Value, key: &str, value: String) {
+    if value.trim().is_empty() {
+        return;
+    }
+    if !metadata.is_object() {
+        *metadata = json!({});
+    }
+    if let Some(map) = metadata.as_object_mut() {
+        map.insert(key.to_string(), Value::String(value));
+    }
+}
+
+fn set_metadata_bool(metadata: &mut Value, key: &str, value: bool) {
+    if !metadata.is_object() {
+        *metadata = json!({});
+    }
+    if let Some(map) = metadata.as_object_mut() {
+        map.insert(key.to_string(), Value::Bool(value));
+    }
+}
+
+fn infer_healthz_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Some(prefix) = trimmed.strip_suffix("/v1") {
+        format!("{prefix}/healthz")
+    } else {
+        format!("{trimmed}/healthz")
+    }
+}
+
+fn is_builtin_local_openai_endpoint(endpoint: &ModelEndpoint) -> bool {
+    matches!(
+        endpoint.model_kind,
+        ModelKind::Llm | ModelKind::Embedder | ModelKind::Vlm
+    ) && endpoint.endpoint_kind == crate::control_plane::models::ModelEndpointKind::Local
+        && endpoint.provider_key.eq_ignore_ascii_case("openai_compatible")
+        && metadata_bool(&endpoint.metadata, "builtin")
+}
+
+trait EmptyStringFallback {
+    fn if_empty_then<F>(self, fallback: F) -> Option<String>
+    where
+        F: FnOnce() -> Option<String>;
+}
+
+impl EmptyStringFallback for String {
+    fn if_empty_then<F>(self, fallback: F) -> Option<String>
+    where
+        F: FnOnce() -> Option<String>,
+    {
+        if self.trim().is_empty() {
+            fallback()
+        } else {
+            Some(self)
+        }
+    }
+}
+
 fn mock_embedding_vector_from_endpoint(endpoint: &ModelEndpoint, input: &str) -> Option<Vec<f32>> {
     if let Some(vector) = endpoint
         .metadata
@@ -1048,19 +1432,25 @@ fn secret_present(value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::Mutex;
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
+    use tiny_http::{Header, Method, Response, Server};
 
     use super::{
-        connectivity_url, redact_model_endpoint, run_embedding_with_state, run_vlm_summary_with_state,
-        test_model_endpoint,
+        clear_local_runtime_projection_cache, connectivity_url, redact_model_endpoint,
+        run_embedding_with_state, run_llm_text_with_state, run_llm_text_with_state_and_options,
+        run_vlm_summary_with_state, test_model_endpoint, LlmTextOptions,
     };
     use crate::control_plane::models::{
         ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, ModelRoutePolicy,
         PrivacyLevel,
     };
     use crate::runtime::admin_console::AdminModelCenterState;
+
+    static MODEL_RUNTIME_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn redact_model_endpoint_masks_api_keys() {
@@ -1232,5 +1622,268 @@ mod tests {
             connectivity_url(&endpoint, "http://127.0.0.1:4176/v1"),
             "http://127.0.0.1:4176/healthz"
         );
+    }
+
+    #[test]
+    fn run_llm_text_with_state_uses_runtime_overlay_for_stale_builtin_local_endpoint() {
+        let _guard = MODEL_RUNTIME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        clear_local_runtime_projection_cache();
+        let server = Server::http("127.0.0.1:0").expect("server");
+        let base_url = format!("http://{}/v1", server.server_addr());
+        let healthz_header =
+            Header::from_bytes(b"Content-Type", b"application/json").expect("health header");
+        let chat_header =
+            Header::from_bytes(b"Content-Type", b"application/json").expect("chat header");
+
+        let server_thread = thread::spawn(move || {
+            for _ in 0..2 {
+                let request = server.recv().expect("request");
+                match (request.method(), request.url()) {
+                    (&Method::Get, "/healthz") => request
+                        .respond(
+                            Response::from_string(
+                                r#"{"ready":true,"backend":{"ready":true,"kind":"candle"}}"#,
+                            )
+                            .with_header(healthz_header.clone()),
+                        )
+                        .expect("health response"),
+                    (&Method::Post, "/v1/chat/completions") => request
+                        .respond(
+                            Response::from_string(
+                                r#"{"choices":[{"message":{"content":"{\"decision\":\"capability_summary\",\"reply_text\":\"我可以帮你抓拍最新画面。\"}"}}]}"#,
+                            )
+                            .with_header(chat_header.clone()),
+                        )
+                        .expect("chat response"),
+                    _ => request
+                        .respond(Response::from_string("not found").with_status_code(404))
+                        .expect("404 response"),
+                }
+            }
+        });
+
+        std::env::set_var("HARBOR_MODEL_API_BASE_URL", &base_url);
+        std::env::set_var("HARBOR_MODEL_API_TOKEN", "runtime-overlay-token");
+
+        let state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "llm-local-openai-compatible".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Llm,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "harbor-local-chat".to_string(),
+                capability_tags: vec!["chat".to_string(), "local_first".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Disabled,
+                metadata: json!({
+                    "builtin": true,
+                    "base_url": "",
+                    "healthz_url": "",
+                    "api_key": "",
+                    "api_key_configured": false,
+                }),
+            }],
+            route_policies: vec![ModelRoutePolicy {
+                route_policy_id: "retrieval.answer".to_string(),
+                workspace_id: "home-1".to_string(),
+                domain_scope: "retrieval".to_string(),
+                modality: "text".to_string(),
+                privacy_level: PrivacyLevel::AllowRedactedCloud,
+                local_preferred: true,
+                max_cost_per_run: None,
+                fallback_order: vec!["local".to_string(), "cloud".to_string()],
+                status: "active".to_string(),
+                metadata: json!({}),
+            }],
+        };
+
+        let result = run_llm_text_with_state("摄像头能干什么", &state);
+
+        std::env::remove_var("HARBOR_MODEL_API_BASE_URL");
+        std::env::remove_var("HARBOR_MODEL_API_TOKEN");
+        clear_local_runtime_projection_cache();
+        server_thread.join().expect("server thread");
+
+        assert!(result.available);
+        assert_eq!(result.status, "active");
+        assert!(result.text.contains("\"decision\":\"capability_summary\""));
+        assert!(result.text.contains("我可以帮你抓拍最新画面。"));
+    }
+
+    #[test]
+    fn run_llm_text_with_state_and_options_forwards_max_tokens() {
+        let _guard = MODEL_RUNTIME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let server = Server::http("127.0.0.1:0").expect("server");
+        let base_url = format!("http://{}/v1", server.server_addr());
+        let healthz_url = format!("http://{}/healthz", server.server_addr());
+        let chat_header =
+            Header::from_bytes(b"Content-Type", b"application/json").expect("chat header");
+
+        let server_thread = thread::spawn(move || {
+            let mut request = server.recv().expect("request");
+            assert_eq!(request.method(), &Method::Post);
+            assert_eq!(request.url(), "/v1/chat/completions");
+            let mut body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut body)
+                .expect("read body");
+            let payload: serde_json::Value =
+                serde_json::from_str(&body).expect("payload json");
+            assert_eq!(payload["max_tokens"], json!(12), "{body}");
+            request
+                .respond(
+                    Response::from_string(
+                        r#"{"choices":[{"message":{"content":"capability_summary"}}]}"#,
+                    )
+                    .with_header(chat_header.clone()),
+                )
+                .expect("chat response");
+        });
+
+        let state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "llm-local-openai-compatible".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Llm,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "harbor-local-chat".to_string(),
+                capability_tags: vec!["chat".to_string(), "local_first".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "builtin": false,
+                    "base_url": base_url,
+                    "healthz_url": healthz_url,
+                    "api_key": "runtime-overlay-token",
+                    "api_key_configured": true,
+                }),
+            }],
+            route_policies: vec![ModelRoutePolicy {
+                route_policy_id: "retrieval.answer".to_string(),
+                workspace_id: "home-1".to_string(),
+                domain_scope: "retrieval".to_string(),
+                modality: "text".to_string(),
+                privacy_level: PrivacyLevel::AllowRedactedCloud,
+                local_preferred: true,
+                max_cost_per_run: None,
+                fallback_order: vec!["local".to_string(), "cloud".to_string()],
+                status: "active".to_string(),
+                metadata: json!({}),
+            }],
+        };
+
+        let result = run_llm_text_with_state_and_options(
+            "摄像头能干什么",
+            &state,
+            &LlmTextOptions {
+                purpose: Some("router".to_string()),
+                max_tokens: Some(12),
+                ..Default::default()
+            },
+        );
+
+        clear_local_runtime_projection_cache();
+        server_thread.join().expect("server thread");
+
+        assert!(result.available);
+        assert_eq!(result.text, "capability_summary");
+        assert_eq!(result.details["max_tokens"], json!(12));
+    }
+
+    #[test]
+    fn run_llm_text_with_state_reuses_runtime_probe_within_ttl() {
+        let _guard = MODEL_RUNTIME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        clear_local_runtime_projection_cache();
+        let server = Server::http("127.0.0.1:0").expect("server");
+        let base_url = format!("http://{}/v1", server.server_addr());
+        let healthz_header =
+            Header::from_bytes(b"Content-Type", b"application/json").expect("health header");
+        let chat_header =
+            Header::from_bytes(b"Content-Type", b"application/json").expect("chat header");
+
+        let server_thread = thread::spawn(move || {
+            for _ in 0..3 {
+                let request = server.recv().expect("request");
+                match (request.method(), request.url()) {
+                    (&Method::Get, "/healthz") => request
+                        .respond(
+                            Response::from_string(
+                                r#"{"ready":true,"backend":{"ready":true,"kind":"candle"}}"#,
+                            )
+                            .with_header(healthz_header.clone()),
+                        )
+                        .expect("health response"),
+                    (&Method::Post, "/v1/chat/completions") => request
+                        .respond(
+                            Response::from_string(
+                                r#"{"choices":[{"message":{"content":"capability_summary"}}]}"#,
+                            )
+                            .with_header(chat_header.clone()),
+                        )
+                        .expect("chat response"),
+                    _ => request
+                        .respond(Response::from_string("not found").with_status_code(404))
+                        .expect("404 response"),
+                }
+            }
+        });
+
+        std::env::set_var("HARBOR_MODEL_API_BASE_URL", &base_url);
+        std::env::set_var("HARBOR_MODEL_API_TOKEN", "runtime-overlay-token");
+        let state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "llm-local-openai-compatible".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Llm,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "harbor-local-chat".to_string(),
+                capability_tags: vec!["chat".to_string(), "local_first".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Disabled,
+                metadata: json!({
+                    "builtin": true,
+                    "base_url": "",
+                    "healthz_url": "",
+                    "api_key": "",
+                    "api_key_configured": false,
+                }),
+            }],
+            route_policies: vec![ModelRoutePolicy {
+                route_policy_id: "retrieval.answer".to_string(),
+                workspace_id: "home-1".to_string(),
+                domain_scope: "retrieval".to_string(),
+                modality: "text".to_string(),
+                privacy_level: PrivacyLevel::AllowRedactedCloud,
+                local_preferred: true,
+                max_cost_per_run: None,
+                fallback_order: vec!["local".to_string(), "cloud".to_string()],
+                status: "active".to_string(),
+                metadata: json!({}),
+            }],
+        };
+
+        let first = run_llm_text_with_state("摄像头能干什么", &state);
+        let second = run_llm_text_with_state("再说一遍", &state);
+
+        std::env::remove_var("HARBOR_MODEL_API_BASE_URL");
+        std::env::remove_var("HARBOR_MODEL_API_TOKEN");
+        clear_local_runtime_projection_cache();
+        server_thread.join().expect("server thread");
+
+        assert!(first.available);
+        assert!(second.available);
     }
 }

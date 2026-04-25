@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const CAMERA_CONNECT_OPERATION: &str = "camera.connect";
+const CAMERA_RECORD_CLIP_CONFIRMATION_OPERATION: &str = "camera.record_clip_confirmation";
+const GENERAL_MESSAGE_LOOP_OPERATION: &str = "general.message_loop";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct PendingTaskCandidate {
@@ -56,6 +58,56 @@ pub struct PendingTaskConnect {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PendingTaskClipConfirmation {
+    #[serde(default)]
+    pub resume_token: String,
+    #[serde(default)]
+    pub clip_media_asset_id: String,
+    #[serde(default)]
+    pub clip_path: String,
+    #[serde(default)]
+    pub clip_mime_type: String,
+    #[serde(default)]
+    pub cover_path: String,
+    #[serde(default)]
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RecentClipPlaybackState {
+    #[serde(default)]
+    pub clip_media_asset_id: String,
+    #[serde(default)]
+    pub clip_path: String,
+    #[serde(default)]
+    pub clip_mime_type: String,
+    #[serde(default)]
+    pub cover_path: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub captured_at_epoch_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PendingTaskGeneralMessageLoop {
+    #[serde(default)]
+    pub resume_token: String,
+    #[serde(default)]
+    pub original_goal: String,
+    #[serde(default)]
+    pub latest_user_intent_text: String,
+    #[serde(default)]
+    pub last_clarification_prompt: String,
+    #[serde(default)]
+    pub selected_candidate_action: Option<String>,
+    #[serde(default)]
+    pub camera_hint: Option<String>,
+    #[serde(default)]
+    pub query: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct PendingTaskSelectionItem {
     #[serde(default)]
     pub item_id: String,
@@ -93,6 +145,8 @@ pub struct TaskConversationState {
     pub pending_candidates: Vec<PendingTaskCandidate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_connect: Option<PendingTaskConnect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_clip_playback: Option<RecentClipPlaybackState>,
     #[serde(default)]
     pub last_scan_cidr: String,
 }
@@ -129,6 +183,48 @@ impl TaskConversationState {
     pub fn set_camera_pending_connect(&mut self, pending: Option<PendingTaskConnect>) {
         self.pending_resume = pending.as_ref().map(pending_resume_from_camera_connect);
         self.pending_connect = None;
+    }
+
+    pub fn clip_pending_confirmation(&self) -> Option<PendingTaskClipConfirmation> {
+        pending_clip_confirmation_from_resume(self.pending_resume.as_ref())
+    }
+
+    pub fn set_clip_pending_confirmation(&mut self, pending: Option<PendingTaskClipConfirmation>) {
+        if pending.is_some()
+            || matches!(
+                self.pending_resume.as_ref(),
+                Some(current) if current.operation == CAMERA_RECORD_CLIP_CONFIRMATION_OPERATION
+            )
+        {
+            self.pending_resume = pending
+                .as_ref()
+                .map(pending_resume_from_clip_confirmation);
+        }
+    }
+
+    pub fn general_message_loop(&self) -> Option<PendingTaskGeneralMessageLoop> {
+        pending_general_message_loop_from_resume(self.pending_resume.as_ref())
+    }
+
+    pub fn set_general_message_loop(&mut self, pending: Option<PendingTaskGeneralMessageLoop>) {
+        if pending.is_some()
+            || matches!(
+                self.pending_resume.as_ref(),
+                Some(current) if current.operation == GENERAL_MESSAGE_LOOP_OPERATION
+            )
+        {
+            self.pending_resume = pending
+                .as_ref()
+                .map(pending_resume_from_general_message_loop);
+        }
+    }
+
+    pub fn recent_clip_playback(&self) -> Option<RecentClipPlaybackState> {
+        self.recent_clip_playback.clone()
+    }
+
+    pub fn set_recent_clip_playback(&mut self, recent_clip: Option<RecentClipPlaybackState>) {
+        self.recent_clip_playback = recent_clip;
     }
 }
 
@@ -173,6 +269,26 @@ fn pending_resume_from_camera_connect(pending: &PendingTaskConnect) -> PendingTa
     }
 }
 
+fn pending_resume_from_clip_confirmation(
+    pending: &PendingTaskClipConfirmation,
+) -> PendingTaskResumeState {
+    PendingTaskResumeState {
+        operation: CAMERA_RECORD_CLIP_CONFIRMATION_OPERATION.to_string(),
+        resume_token: pending.resume_token.clone(),
+        payload: serde_json::to_value(pending).unwrap_or(Value::Null),
+    }
+}
+
+fn pending_resume_from_general_message_loop(
+    pending: &PendingTaskGeneralMessageLoop,
+) -> PendingTaskResumeState {
+    PendingTaskResumeState {
+        operation: GENERAL_MESSAGE_LOOP_OPERATION.to_string(),
+        resume_token: pending.resume_token.clone(),
+        payload: serde_json::to_value(pending).unwrap_or(Value::Null),
+    }
+}
+
 fn pending_connect_from_resume(
     pending_resume: Option<&PendingTaskResumeState>,
 ) -> Option<PendingTaskConnect> {
@@ -182,6 +298,39 @@ fn pending_connect_from_resume(
     }
     let mut pending =
         serde_json::from_value::<PendingTaskConnect>(pending_resume.payload.clone()).ok()?;
+    if pending.resume_token.trim().is_empty() {
+        pending.resume_token = pending_resume.resume_token.clone();
+    }
+    Some(pending)
+}
+
+fn pending_clip_confirmation_from_resume(
+    pending_resume: Option<&PendingTaskResumeState>,
+) -> Option<PendingTaskClipConfirmation> {
+    let pending_resume = pending_resume?;
+    if pending_resume.operation != CAMERA_RECORD_CLIP_CONFIRMATION_OPERATION {
+        return None;
+    }
+    let mut pending = serde_json::from_value::<PendingTaskClipConfirmation>(
+        pending_resume.payload.clone(),
+    )
+    .ok()?;
+    if pending.resume_token.trim().is_empty() {
+        pending.resume_token = pending_resume.resume_token.clone();
+    }
+    Some(pending)
+}
+
+fn pending_general_message_loop_from_resume(
+    pending_resume: Option<&PendingTaskResumeState>,
+) -> Option<PendingTaskGeneralMessageLoop> {
+    let pending_resume = pending_resume?;
+    if pending_resume.operation != GENERAL_MESSAGE_LOOP_OPERATION {
+        return None;
+    }
+    let mut pending =
+        serde_json::from_value::<PendingTaskGeneralMessageLoop>(pending_resume.payload.clone())
+            .ok()?;
     if pending.resume_token.trim().is_empty() {
         pending.resume_token = pending_resume.resume_token.clone();
     }
@@ -386,6 +535,32 @@ impl TaskConversationStore {
         file.task_runs
             .insert(task_run.task_id.clone(), task_run.clone());
         self.save_file(&file)
+    }
+
+    pub fn recent_task_runs_for_session(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TaskRun>, String> {
+        if session_id.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let file = self.load_file()?;
+        let mut runs = file
+            .task_runs
+            .values()
+            .filter(|task_run| task_run.session_id == session_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        runs.sort_by(|left, right| {
+            right
+                .started_at
+                .cmp(&left.started_at)
+                .then_with(|| right.task_id.cmp(&left.task_id))
+        });
+        runs.truncate(limit);
+        Ok(runs)
     }
 
     pub fn load_task_step(&self, step_id: &str) -> Result<Option<TaskStepRun>, String> {
@@ -874,8 +1049,9 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        PendingTaskCandidate, PendingTaskConnect, TaskConversationState, TaskConversationStore,
-        TaskSessionStateEnvelope,
+        PendingTaskCandidate, PendingTaskClipConfirmation, PendingTaskConnect,
+        PendingTaskGeneralMessageLoop, RecentClipPlaybackState, TaskConversationState,
+        TaskConversationStore, TaskSessionStateEnvelope,
     };
     use crate::control_plane::approvals::{ApprovalStatus, ApprovalTicket};
     use crate::control_plane::events::{EventRecord, EventSeverity, EventSourceKind};
@@ -1243,6 +1419,188 @@ mod tests {
             })
         );
         assert_eq!(loaded.key, "chat-resume");
+        let _ = fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn save_for_session_round_trips_clip_confirmation_pending_resume() {
+        let path = unique_store_path("harborbeacon-task-session-clip-confirmation");
+        let store = TaskConversationStore::new(&path);
+        let session = ConversationSession {
+            session_id: "sess-clip".to_string(),
+            workspace_id: "home-1".to_string(),
+            channel: "weixin".to_string(),
+            surface: "harborgate".to_string(),
+            conversation_id: "chat-clip".to_string(),
+            user_id: "user-1".to_string(),
+            route_key: "gw_route_clip".to_string(),
+            last_message_id: "om_clip".to_string(),
+            chat_type: "p2p".to_string(),
+            state: Value::Null,
+            resume_token: None,
+            expires_at: None,
+        };
+        let pending = PendingTaskClipConfirmation {
+            resume_token: "resume-clip-1".to_string(),
+            clip_media_asset_id: "asset-clip-1".to_string(),
+            clip_path: "captures/clip-1.mp4".to_string(),
+            clip_mime_type: "video/mp4".to_string(),
+            cover_path: "captures/keyframes/clip-1/frame-1.jpg".to_string(),
+            display_name: "门口摄像头".to_string(),
+        };
+        let mut state = TaskConversationState {
+            key: "chat-clip".to_string(),
+            ..Default::default()
+        };
+        state.set_clip_pending_confirmation(Some(pending.clone()));
+
+        store
+            .save_for_session(&session, &state)
+            .expect("save clip confirmation");
+
+        let loaded = store
+            .load_for_session("sess-clip", Some("chat-clip"))
+            .expect("load")
+            .expect("state");
+
+        assert_eq!(loaded.clip_pending_confirmation(), Some(pending));
+        let _ = fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn save_for_session_round_trips_recent_clip_playback_state() {
+        let path = unique_store_path("harborbeacon-task-session-recent-clip-playback");
+        let store = TaskConversationStore::new(&path);
+        let session = ConversationSession {
+            session_id: "sess-recent-clip".to_string(),
+            workspace_id: "home-1".to_string(),
+            channel: "weixin".to_string(),
+            surface: "harborgate".to_string(),
+            conversation_id: "chat-recent-clip".to_string(),
+            user_id: "user-1".to_string(),
+            route_key: "gw_route_recent_clip".to_string(),
+            last_message_id: "om_recent_clip".to_string(),
+            chat_type: "p2p".to_string(),
+            state: Value::Null,
+            resume_token: None,
+            expires_at: None,
+        };
+        let recent_clip = RecentClipPlaybackState {
+            clip_media_asset_id: "asset-clip-recent-1".to_string(),
+            clip_path: "captures/clip-recent-1.mp4".to_string(),
+            clip_mime_type: "video/mp4".to_string(),
+            cover_path: "captures/keyframes/clip-recent-1/frame-1.jpg".to_string(),
+            display_name: "门口摄像头".to_string(),
+            captured_at_epoch_ms: 1_710_000_000_000,
+        };
+        let mut state = TaskConversationState {
+            key: "chat-recent-clip".to_string(),
+            ..Default::default()
+        };
+        state.set_recent_clip_playback(Some(recent_clip.clone()));
+
+        store
+            .save_for_session(&session, &state)
+            .expect("save recent clip playback");
+
+        let loaded = store
+            .load_for_session("sess-recent-clip", Some("chat-recent-clip"))
+            .expect("load")
+            .expect("state");
+
+        assert_eq!(loaded.recent_clip_playback(), Some(recent_clip));
+        let _ = fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn save_for_session_round_trips_general_message_loop_pending_resume() {
+        let path = unique_store_path("harborbeacon-task-session-general-message-loop");
+        let store = TaskConversationStore::new(&path);
+        let session = ConversationSession {
+            session_id: "sess-general".to_string(),
+            workspace_id: "home-1".to_string(),
+            channel: "weixin".to_string(),
+            surface: "harborgate".to_string(),
+            conversation_id: "chat-general".to_string(),
+            user_id: "user-1".to_string(),
+            route_key: "gw_route_general".to_string(),
+            last_message_id: "om_general".to_string(),
+            chat_type: "p2p".to_string(),
+            state: Value::Null,
+            resume_token: None,
+            expires_at: None,
+        };
+        let pending = PendingTaskGeneralMessageLoop {
+            resume_token: "resume-general-1".to_string(),
+            original_goal: "帮我看一下门口".to_string(),
+            latest_user_intent_text: "帮我看一下门口".to_string(),
+            last_clarification_prompt: "你是想拍一张，还是录一段门口摄像头？".to_string(),
+            selected_candidate_action: None,
+            camera_hint: Some("front-door".to_string()),
+            query: None,
+        };
+        let mut state = TaskConversationState {
+            key: "chat-general".to_string(),
+            ..Default::default()
+        };
+        state.set_general_message_loop(Some(pending.clone()));
+
+        store
+            .save_for_session(&session, &state)
+            .expect("save general message loop");
+
+        let loaded = store
+            .load_for_session("sess-general", Some("chat-general"))
+            .expect("load")
+            .expect("state");
+
+        assert_eq!(loaded.general_message_loop(), Some(pending));
+        let _ = fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn recent_task_runs_for_session_is_bounded_and_session_scoped() {
+        let path = unique_store_path("harborbeacon-task-session-recent-runs");
+        let store = TaskConversationStore::new(&path);
+
+        for (task_id, session_id, started_at) in [
+            ("task-1", "sess-a", "1710000001"),
+            ("task-2", "sess-a", "1710000003"),
+            ("task-3", "sess-b", "1710000004"),
+            ("task-4", "sess-a", "1710000002"),
+            ("task-5", "sess-a", "1710000005"),
+        ] {
+            store
+                .save_task_run(&TaskRun {
+                    task_id: task_id.to_string(),
+                    workspace_id: "home-1".to_string(),
+                    session_id: session_id.to_string(),
+                    source_channel: "weixin".to_string(),
+                    domain: "general".to_string(),
+                    action: "message".to_string(),
+                    intent_text: format!("intent-{task_id}"),
+                    entity_refs: Value::Null,
+                    args: Value::Null,
+                    autonomy_level: "supervised".to_string(),
+                    status: TaskRunStatus::Completed,
+                    risk_level: RiskLevel::Low,
+                    requires_approval: false,
+                    started_at: Some(started_at.to_string()),
+                    completed_at: Some(started_at.to_string()),
+                    metadata: Value::Null,
+                })
+                .expect("save task run");
+        }
+
+        let recent = store
+            .recent_task_runs_for_session("sess-a", 3)
+            .expect("recent task runs");
+
+        assert_eq!(
+            recent.iter().map(|run| run.task_id.as_str()).collect::<Vec<_>>(),
+            vec!["task-5", "task-2", "task-4"]
+        );
+        assert!(recent.iter().all(|run| run.session_id == "sess-a"));
         let _ = fs::remove_file(store.path());
     }
 
