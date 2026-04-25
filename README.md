@@ -180,6 +180,12 @@ Release/install note:
 - the HarborOS mutation root / writable root can still remain `/mnt/software/harborbeacon-agent-ci`
 - installer env now exposes that writable path explicitly through `HARBOR_HARBOROS_WRITABLE_ROOT`
 
+HarborOS `.182` resident stack checks:
+
+- after install, use `/var/lib/harborbeacon-agent-ci/bin/harbor-agent-hub-helper status`
+- use `/var/lib/harborbeacon-agent-ci/bin/harbor-agent-hub-helper health` to probe `4174/4175/4176/8787` plus `GET /api/gateway/status`
+- use `sudo /var/lib/harborbeacon-agent-ci/bin/harbor-agent-hub-helper logs gateway --lines 120` for the HarborGate journal when `.182` keeps journald access restricted
+
 Typical usage:
 
 - `./target/release/validate-contract-schemas --require-live`

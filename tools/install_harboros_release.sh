@@ -261,6 +261,7 @@ CAPTURES_DIR="${INSTALL_ROOT}/captures"
 LOGS_DIR="${INSTALL_ROOT}/logs"
 CURRENT_LINK="${INSTALL_ROOT}/current"
 RELEASE_DIR="${RELEASES_DIR}/${VERSION}"
+STATUS_HELPER_LINK="${INSTALL_ROOT}/bin/harbor-agent-hub-helper"
 
 mkdir -p \
   "${RELEASES_DIR}" \
@@ -268,13 +269,15 @@ mkdir -p \
   "${CAPTURES_DIR}" \
   "${LOGS_DIR}" \
   "${WRITABLE_ROOT}" \
-  "$(dirname "${ENV_FILE}")"
+  "$(dirname "${ENV_FILE}")" \
+  "$(dirname "${STATUS_HELPER_LINK}")"
 rm -rf "${RELEASE_DIR}"
 mkdir -p "${RELEASE_DIR}"
 cp -R "${BUNDLE_DIR}/." "${RELEASE_DIR}/"
 
 rm -f "${CURRENT_LINK}"
 ln -sfn "${RELEASE_DIR}" "${CURRENT_LINK}"
+ln -sfn "${CURRENT_LINK}/templates/bin/harbor-agent-hub-helper" "${STATUS_HELPER_LINK}"
 
 mkdir -p "${RUNTIME_DIR}/harborgate" "${RUNTIME_DIR}/models"
 chown -R "${SERVICE_USER}:${SERVICE_USER}" "${RUNTIME_DIR}" "${CAPTURES_DIR}" "${LOGS_DIR}" "${WRITABLE_ROOT}"
@@ -417,3 +420,5 @@ echo "Env file     : ${ENV_FILE}"
 echo "Service user : ${SERVICE_USER}"
 echo "Core services: ${CORE_SERVICE_STATUS}"
 echo "Optional     : harborgate-weixin-runner -> ${WEIXIN_RUNNER_STATUS}"
+echo "Helper       : ${STATUS_HELPER_LINK}"
+echo "Quick checks : ${STATUS_HELPER_LINK} status | ${STATUS_HELPER_LINK} health | ${STATUS_HELPER_LINK} logs gateway"

@@ -60,6 +60,7 @@ harbor-release-<version>/
     rollback_harboros_release.sh
   templates/
     bin/
+      harbor-agent-hub-helper
     systemd/
     harborbeacon-agent-hub.env.template
   manifest.json
@@ -216,8 +217,9 @@ sudo bash ./install_harboros_release.sh \
 - 显式写入 `HARBOR_MODEL_API_TOKEN=<service-token>`
 - 写入 `HARBOR_HARBOROS_WRITABLE_ROOT=<writable-root>`
 - 安装/更新 5 个 systemd 服务单元
+- 更新 `${install-root}/bin/harbor-agent-hub-helper -> current/templates/bin/harbor-agent-hub-helper`
 - `daemon-reload`
-- 默认 enable/start 3 个 core services
+- 默认 enable/start 4 个 core services
 - 仅在已有 Weixin account config 时 enable/start `harborgate-weixin-runner`
 - 若未配置 Weixin，则明确输出 `not configured, skipped`
 
@@ -236,6 +238,27 @@ clean install 的健康预期：
 - 默认活跃服务是 `harbor-model-api.service`
 - 默认活跃服务是 `harborgate.service`
 - `harborgate-weixin-runner.service` 在未配置 Weixin 凭据时允许保持 inactive/disabled
+
+## 5.1 `.182` 常驻测试状态助手
+
+安装完成后，`.182` 上固定通过同一个 helper 看 resident stack：
+
+- `/var/lib/harborbeacon-agent-ci/bin/harbor-agent-hub-helper status`
+- `/var/lib/harborbeacon-agent-ci/bin/harbor-agent-hub-helper health`
+- `sudo /var/lib/harborbeacon-agent-ci/bin/harbor-agent-hub-helper logs gateway --lines 120`
+
+约定：
+
+- `status` 输出 5 个 unit 的 `is-enabled / is-active / MainPID` 风格摘要 JSON
+- `health` 顺序检查 `127.0.0.1:4174/4175/4176/8787` 的 loopback health
+- `health` 还会带 service auth + `X-Contract-Version: 1.5` 调 `GET /api/gateway/status`
+- Weixin 摘要优先读 gateway redacted truth；如果 gateway 暂时不可读，再回退到 `WEIXIN_STATE_DIR/accounts/<account>.runtime.json`
+- Weixin 观测至少包含：
+  - `last_poll_at`
+  - `last_getupdates_error`
+  - `last_private_text_message_at`
+- `logs` 不起新 daemon，只是展开 `journalctl -u ...`
+- `.182` 如果保留默认 journald 权限，`logs` 需要 `sudo` 或 `systemd-journal` 组权限
 
 ## 6. 回滚
 

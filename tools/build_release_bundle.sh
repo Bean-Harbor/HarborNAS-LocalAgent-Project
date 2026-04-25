@@ -311,6 +311,9 @@ payload = {
         "rollback_script": "install/rollback_harboros_release.sh",
         "install_root_default": sys.argv[9],
         "writable_root_default": sys.argv[10],
+        "helper_scripts": [
+            "templates/bin/harbor-agent-hub-helper",
+        ],
         "service_names": [
             "harbor-model-api.service",
             "assistant-task-api.service",

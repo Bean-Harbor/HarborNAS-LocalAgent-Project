@@ -15,6 +15,7 @@ def test_release_packaging_scripts_and_templates_exist() -> None:
         "tools/release_templates/bin/run-harbor-model-api",
         "tools/release_templates/bin/run-assistant-task-api",
         "tools/release_templates/bin/run-agent-hub-admin-api",
+        "tools/release_templates/bin/harbor-agent-hub-helper",
         "tools/release_templates/bin/harborgate",
         "tools/release_templates/bin/harborgate-weixin-runner",
         "tools/release_templates/systemd/harbor-model-api.service.template",
@@ -49,6 +50,8 @@ def test_release_bundle_builder_covers_expected_artifacts() -> None:
         "frontend/harbordesk",
         "harborgate/site-packages",
         "manifest.json",
+        '"helper_scripts"',
+        "harbor-agent-hub-helper",
         '"rust_target"',
         '"linkage"',
         "writable_root_default",
@@ -91,6 +94,7 @@ def test_harboros_installer_manages_release_layout_and_services() -> None:
         "systemctl enable",
         "systemctl disable",
         "systemctl stop",
+        '${INSTALL_ROOT}/bin/harbor-agent-hub-helper',
         "ln -sfn",
         "HARBOR_HARBOROS_USER",
         "WEIXIN_ACCOUNT_ID",
@@ -99,6 +103,26 @@ def test_harboros_installer_manages_release_layout_and_services() -> None:
         "HARBORBEACON_ADMIN_API_TOKEN",
         "not configured, skipped",
         "append_optional_env",
+    ]
+    assert all(phrase in content for phrase in required_phrases)
+
+
+def test_resident_stack_helper_exposes_status_health_and_logs() -> None:
+    content = read_text("tools/release_templates/bin/harbor-agent-hub-helper")
+    required_phrases = [
+        'subparsers.add_parser("status"',
+        'subparsers.add_parser("health"',
+        'subparsers.add_parser("logs"',
+        "harbor-model-api.service",
+        "assistant-task-api.service",
+        "agent-hub-admin-api.service",
+        "harborgate.service",
+        "harborgate-weixin-runner.service",
+        "/api/gateway/status",
+        "X-Contract-Version",
+        "WEIXIN_STATE_DIR",
+        "last_private_text_message_at",
+        "journalctl",
     ]
     assert all(phrase in content for phrase in required_phrases)
 
@@ -149,6 +173,10 @@ def test_release_packaging_runbook_records_builder_target_and_install_shape() ->
         "HarborGate admin sync 依赖 `:4174`",
         "HARBOR_MODEL_API_BASE_URL=http://127.0.0.1:4176/v1",
         "本地 OpenAI-compatible 模型服务",
+        "harbor-agent-hub-helper status",
+        "harbor-agent-hub-helper health",
+        "harbor-agent-hub-helper logs gateway",
+        "last_private_text_message_at",
         "HARBOR_MODEL_API_CANDLE_CHAT_MODEL_ID",
         "HARBOR_MODEL_API_CANDLE_EMBEDDING_MODEL_ID",
         "Qwen/Qwen3-1.7B",
