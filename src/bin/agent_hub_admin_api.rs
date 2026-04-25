@@ -4422,12 +4422,28 @@ fn policy_status_value(policy: Option<&ModelRoutePolicy>) -> String {
 }
 
 fn gateway_platform_blocker(payload: Option<&Value>, platform: &str) -> Option<String> {
-    let platform_value = payload.and_then(|value| value.get(platform))?;
-    platform_value
-        .get("blocker_category")
+    let from_platform_summary = payload
+        .and_then(|value| value.get(platform))
+        .and_then(|platform_value| {
+            platform_value
+                .get("blocker_category")
+                .and_then(Value::as_str)
+                .or_else(|| platform_value.get("blocker").and_then(Value::as_str))
+                .or_else(|| platform_value.get("error").and_then(Value::as_str))
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if from_platform_summary.is_some() {
+        return from_platform_summary;
+    }
+
+    let release_v1_key = format!("{platform}_blocker_category");
+    payload
+        .and_then(|value| value.get("release_v1"))
+        .and_then(|value| value.get(release_v1_key.as_str()))
         .and_then(Value::as_str)
-        .or_else(|| platform_value.get("blocker").and_then(Value::as_str))
-        .or_else(|| platform_value.get("error").and_then(Value::as_str))
+        .or_else(|| payload.and_then(|value| value.get(release_v1_key.as_str())).and_then(Value::as_str))
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
@@ -5534,9 +5550,31 @@ mod tests {
                 Some("http://harborbeacon.local:4174"),
             );
         let gateway_payload = json!({
+            "ok": true,
+            "channels": [
+                {
+                    "platform": "weixin",
+                    "connected": false,
+                    "transport": {
+                        "status": "error"
+                    }
+                }
+            ],
             "weixin": {
                 "blocker_category": "weixin_dns_resolution",
+                "ingress_blocker_category": "getupdates",
+                "status": "error",
+                "poll": {
+                    "status": "error",
+                    "error": "<urlopen error [Errno 11001] getaddrinfo failed>"
+                },
+                "delivery_observability": {
+                    "last_send_status": ""
+                },
                 "app_secret": "should-not-leak"
+            },
+            "release_v1": {
+                "weixin_blocker_category": "getupdates"
             },
             "delivery_observability": {
                 "record_count": 0
@@ -5603,8 +5641,27 @@ mod tests {
         };
         let overlayed = overlay_model_endpoints_with_runtime_truth(&state.models.endpoints, &runtime);
         let gateway_payload = json!({
+            "ok": true,
+            "channels": [
+                {
+                    "platform": "weixin",
+                    "connected": false,
+                    "transport": {
+                        "status": "error"
+                    }
+                }
+            ],
             "weixin": {
-                "blocker_category": "weixin_dns_resolution"
+                "blocker_category": "weixin_dns_resolution",
+                "ingress_blocker_category": "getupdates",
+                "status": "error",
+                "poll": {
+                    "status": "error",
+                    "error": "<urlopen error [Errno 11001] getaddrinfo failed>"
+                }
+            },
+            "release_v1": {
+                "weixin_blocker_category": "getupdates"
             },
             "delivery_observability": {
                 "record_count": 0
@@ -5640,6 +5697,58 @@ mod tests {
             .expect("proactive delivery");
         assert_eq!(proactive.status, "blocked");
         assert_eq!(proactive.blocker, "weixin_dns_resolution");
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn feature_availability_falls_back_to_release_v1_weixin_blocker_category() {
+        let registry_path = unique_store_path("harborbeacon-feature-release-v1-weixin-registry");
+        let admin_path = unique_store_path("harborbeacon-feature-release-v1-weixin-state");
+        let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
+        let state = admin_store.load_or_create_state().expect("state");
+        let account_management =
+            harborbeacon_local_agent::runtime::admin_console::account_management_snapshot(
+                &state,
+                Some("http://harborbeacon.local:4174"),
+            );
+        let gateway_payload = json!({
+            "ok": true,
+            "channels": [
+                {
+                    "platform": "weixin",
+                    "connected": false,
+                    "transport": {
+                        "status": "error"
+                    }
+                }
+            ],
+            "release_v1": {
+                "weixin_blocker_category": "getupdates"
+            },
+            "delivery_observability": {
+                "record_count": 0
+            }
+        });
+
+        let response = build_feature_availability_response(
+            &state.models.endpoints,
+            &state.models.route_policies,
+            &account_management,
+            Some(&gateway_payload),
+            &LocalModelRuntimeProjection::default(),
+        );
+
+        let proactive = response
+            .groups
+            .iter()
+            .flat_map(|group| group.items.iter())
+            .find(|item| item.feature_id == "proactive_delivery")
+            .expect("proactive delivery");
+        assert_eq!(proactive.status, "blocked");
+        assert_eq!(proactive.blocker, "getupdates");
 
         let _ = fs::remove_file(admin_path);
         let _ = fs::remove_file(registry_path);

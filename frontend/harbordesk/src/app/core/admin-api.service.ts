@@ -879,7 +879,7 @@ export class HarborDeskAdminApiService {
     const blockers: string[] = [];
     const weixinBlocker = this.weixinBlocker(gateway);
     if (weixinBlocker) {
-      blockers.push(`Weixin parity blocker: ${weixinBlocker}`);
+      blockers.push(`Weixin blocker: ${weixinBlocker}`);
     }
     return blockers;
   }

@@ -133,6 +133,9 @@ def test_runtime_truth_closeout_tracks_verification_matrix_and_blocker_owner() -
         "projection_mismatch",
         "4176=candle",
         "weixin_dns_resolution",
+        "weixin.blocker_category",
+        "weixin.ingress_blocker_category",
+        "release_v1.weixin_blocker_category",
         "harbor-im-gateway",
         "environment/network",
         "cargo test --bin agent-hub-admin-api --quiet",
@@ -171,5 +174,7 @@ def test_runtime_truth_handoff_splits_closeout_docs_and_live_blocker_threads() -
         "GET /api/feature-availability",
         "projection_mismatch",
         "weixin_dns_resolution",
+        "weixin.blocker_category",
+        "release_v1.weixin_blocker_category",
     ]
     assert all(phrase in content for phrase in required_phrases)

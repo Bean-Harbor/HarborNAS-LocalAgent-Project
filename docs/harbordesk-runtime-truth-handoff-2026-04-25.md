@@ -30,6 +30,7 @@
 - The verification matrix from `docs/harbordesk-runtime-truth-closeout-2026-04-25.md` stays green.
 - `projection_mismatch` remains visible in backend and UI surfaces.
 - `weixin_dns_resolution` remains isolated as an IM blocker.
+- HarborGate exports the specific blocker through `weixin.blocker_category`, while `release_v1.weixin_blocker_category` stays coarse.
 - No frozen cross-repo seam is widened.
 
 ## Thread B - Docs/Tooling Walkthrough Follow-Up
@@ -61,6 +62,10 @@
   - `GET /api/feature-availability`
   - HarborDesk System Settings / Feature availability
   - the runtime-truth closeout notes
+- HarborBeacon now reads the real redacted gateway blocker payload in this order:
+  - `weixin.blocker_category`
+  - `release_v1.weixin_blocker_category`
+  - legacy `weixin_blocker_category` when present
 - No additional HarborBeacon business-core changes are required before DNS/platform recovery.
 
 ### Expected Next Action After Recovery

@@ -30,11 +30,18 @@
 
 - The remaining live blocker is still `weixin_dns_resolution`.
 - This blocker stays in the `harbor-im-gateway` lane plus environment/network ownership.
+- HarborGate now exports two layers of Weixin blocker state:
+  - `weixin.blocker_category` for the specific redacted transport blocker
+  - `weixin.ingress_blocker_category` and `release_v1.weixin_blocker_category` for the coarse release-v1 parity bucket
 - HarborBeacon must only project the blocker as an IM delivery/binding issue.
 - HarborBeacon must not reinterpret `weixin_dns_resolution` as:
   - a task/business-core failure
   - a model-runtime failure
   - a HarborOS system-domain failure
+- HarborBeacon reads the real `GET /api/gateway/status` payload in this order:
+  - `weixin.blocker_category`
+  - `release_v1.weixin_blocker_category`
+  - legacy top-level `weixin_blocker_category` if present
 
 ## Verification Matrix
 
@@ -52,6 +59,7 @@ The expected acceptance signal is:
 - model runtime rows can show `projection_mismatch` while remaining readable and reviewable
 - `retrieval.embed` / `retrieval.answer` stay green when `4176 /healthz` is healthy
 - `weixin_dns_resolution` stays isolated as an IM blocker in feature availability and system settings
+- `weixin.blocker_category` and `release_v1.weixin_blocker_category` stay semantically distinct in docs and UI copy
 - no frozen northbound or cross-repo contract semantics are widened
 
 ## Explicit Non-Scope For This Code Closeout

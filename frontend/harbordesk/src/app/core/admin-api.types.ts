@@ -234,8 +234,13 @@ export interface GatewayStatusResponse {
   parity_ready?: boolean;
   feishu?: { rehearsal_ready?: boolean };
   weixin?: {
+    configured?: boolean;
+    connected?: boolean;
+    status?: string;
     rehearsal_ready?: boolean;
     blocker_category?: string;
+    ingress_blocker_category?: string;
+    poll?: Record<string, unknown>;
     ingress_observability?: Record<string, unknown>;
     delivery_observability?: Record<string, unknown>;
   };
