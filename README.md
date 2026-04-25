@@ -1,12 +1,12 @@
-# HarborNAS Local Agent Planning Package
+# HarborBeacon Local Agent Planning Package
 
-This repository contains the completed planning deliverables for a HarborNAS local-first AI agent project, including architecture, roadmap, quick reference, meeting guide, launch checklist, and document index.
+This repository contains the completed planning deliverables for a HarborBeacon local-first AI agent project, including architecture, roadmap, quick reference, meeting guide, launch checklist, and document index.
 
 ## Rust Runtime (New)
 
 The project now includes a Rust runtime that compiles into a standalone binary for easier HarborOS integration.
 
-- Binary name: `harbornas-agent`
+- Binary name: `harborbeacon-agent`
 - Entry point: `src/main.rs`
 - Core modules: `src/orchestrator/` and `src/skills/`
 - Planner module: `src/planner/`
@@ -16,7 +16,7 @@ The project now includes a Rust runtime that compiles into a standalone binary f
 Build and run:
 
 - `cargo build --release`
-- `./target/release/harbornas-agent --plan examples/plan_service_status.json`
+- `./target/release/harborbeacon-agent --plan examples/plan_service_status.json`
 
 Additional migrated script binaries:
 
@@ -34,31 +34,31 @@ Useful flags:
 - `--force-dry-run`: force all actions into dry-run mode
 
 ## Documents
-- HarborNAS-LocalAgent-Plan.md
-- HarborNAS-LocalAgent-Roadmap.md
-- HarborNAS-LocalAgent-QuickRef.md
-- HarborNAS-LocalAgent-MeetingGuide.md
-- HarborNAS-LocalAgent-LaunchChecklist.md
-- HarborNAS-LocalAgent-DocumentIndex.md
-- HarborNAS-LocalAgent-V2-Assistant-Skills-Roadmap.md
-- HarborNAS-Skill-Spec-v1.md
-- HarborNAS-Middleware-Endpoint-Contract-v1.md
-- HarborNAS-Files-BatchOps-Contract-v1.md
-- HarborNAS-Planner-TaskDecompose-Contract-v1.md
-- HarborNAS-Contract-E2E-Test-Plan-v1.md
-- HarborNAS-CI-Contract-Pipeline-Checklist-v1.md
-- HarborNAS-GitHub-Actions-Workflow-Draft-v1.md
+- HarborBeacon-LocalAgent-Plan.md
+- HarborBeacon-LocalAgent-Roadmap.md
+- HarborBeacon-LocalAgent-QuickRef.md
+- HarborBeacon-LocalAgent-MeetingGuide.md
+- HarborBeacon-LocalAgent-LaunchChecklist.md
+- HarborBeacon-LocalAgent-DocumentIndex.md
+- HarborBeacon-LocalAgent-V2-Assistant-Skills-Roadmap.md
+- HarborBeacon-Skill-Spec-v1.md
+- HarborBeacon-Middleware-Endpoint-Contract-v1.md
+- HarborBeacon-Files-BatchOps-Contract-v1.md
+- HarborBeacon-Planner-TaskDecompose-Contract-v1.md
+- HarborBeacon-Contract-E2E-Test-Plan-v1.md
+- HarborBeacon-CI-Contract-Pipeline-Checklist-v1.md
+- HarborBeacon-GitHub-Actions-Workflow-Draft-v1.md
 
 ## V2 Additions
 
-- `HarborNAS-LocalAgent-V2-Assistant-Skills-Roadmap.md`: assistant + skills integration roadmap with HarborOS control-plane-first policy (`middleware API > midcli > browser > MCP`).
-- `HarborNAS-Skill-Spec-v1.md`: standard skill contract (manifest schema, runtime envelope, routing, risk and test requirements), including HarborOS `middleware` API binding and `midcli` fallback rules.
-- `HarborNAS-Middleware-Endpoint-Contract-v1.md`: executable endpoint contract for `system.harbor_ops`, including action normalization, API/CLI mapping, error model, and compatibility matrix template.
-- `HarborNAS-Files-BatchOps-Contract-v1.md`: executable endpoint contract for `files.batch_ops`, including path policy, route fallback chain, CLI template constraints, and compatibility matrix template.
-- `HarborNAS-Planner-TaskDecompose-Contract-v1.md`: executable planner contract for `planner.task_decompose`, including step schema, dependency rules, route-candidate policy, and release gates.
-- `HarborNAS-Contract-E2E-Test-Plan-v1.md`: end-to-end validation plan across planner + execution contracts, including environment matrix, fallback checks, drift checks, and release exit criteria.
-- `HarborNAS-CI-Contract-Pipeline-Checklist-v1.md`: CI job checklist that maps all contract governance to merge, nightly, and pre-release pipeline stages.
-- `HarborNAS-GitHub-Actions-Workflow-Draft-v1.md`: initial GitHub Actions workflow draft mapping contract governance into concrete PR, nightly, and release workflows.
+- `HarborBeacon-LocalAgent-V2-Assistant-Skills-Roadmap.md`: assistant + skills integration roadmap with HarborOS control-plane-first policy (`middleware API > midcli > browser > MCP`).
+- `HarborBeacon-Skill-Spec-v1.md`: standard skill contract (manifest schema, runtime envelope, routing, risk and test requirements), including HarborOS `middleware` API binding and `midcli` fallback rules.
+- `HarborBeacon-Middleware-Endpoint-Contract-v1.md`: executable endpoint contract for `system.harbor_ops`, including action normalization, API/CLI mapping, error model, and compatibility matrix template.
+- `HarborBeacon-Files-BatchOps-Contract-v1.md`: executable endpoint contract for `files.batch_ops`, including path policy, route fallback chain, CLI template constraints, and compatibility matrix template.
+- `HarborBeacon-Planner-TaskDecompose-Contract-v1.md`: executable planner contract for `planner.task_decompose`, including step schema, dependency rules, route-candidate policy, and release gates.
+- `HarborBeacon-Contract-E2E-Test-Plan-v1.md`: end-to-end validation plan across planner + execution contracts, including environment matrix, fallback checks, drift checks, and release exit criteria.
+- `HarborBeacon-CI-Contract-Pipeline-Checklist-v1.md`: CI job checklist that maps all contract governance to merge, nightly, and pre-release pipeline stages.
+- `HarborBeacon-GitHub-Actions-Workflow-Draft-v1.md`: initial GitHub Actions workflow draft mapping contract governance into concrete PR, nightly, and release workflows.
 
 ## HarborBeacon — IM 接入与用户交互层
 
@@ -101,6 +101,44 @@ HarborBeacon 是基于 [ZeroClaw](https://github.com/punkpeye/zeroclaw) 二次�
 - `autonomy.py`: 自主级别与风险等级映射
 - `tool_descriptions.py`: skill manifest → MCP/TOML 工具描述转换
 
+## Model Center And Multimodal RAG v1
+
+HarborBeacon 现在已经把“模型能力可配置”作为 framework 层的一部分接进来，而不是把 OCR 或后续 RAG 依赖写死在代码里。
+
+Current scope:
+
+- retrieval 继续由 HarborBeacon 自己生成 citations / reply pack
+- `document + image + OCR` 已进入同一条检索主线
+- `audio / video / VLM` 仍保持 pending，不抢第一阶段交付
+
+Admin surfaces:
+
+- `GET/POST /api/models/endpoints`
+- `PATCH /api/models/endpoints/:id`
+- `POST /api/models/endpoints/:id/test`
+- `GET/PUT /api/models/policies`
+- `GET /api/feature-availability`
+- `GET /admin/models`
+
+Current provider model:
+
+- local: `tesseract`, Ollama, vLLM, llama.cpp, LM Studio, other OpenAI-compatible endpoints
+- cloud: any OpenAI-compatible `base_url + api_key + model`
+- secrets are persisted server-side and returned through the admin API in redacted form
+
+Current defaults:
+
+- `retrieval.ocr` prefers a local `tesseract` slot
+- `retrieval.embed` prefers local OpenAI-compatible endpoints
+- `retrieval.answer` supports local-first with cloud fallback
+- `retrieval.vision_summary` is present in policy but still degraded until a VLM is configured
+
+Runtime-truth rule:
+
+- `GET /api/feature-availability` is the grouped read-model for runtime truth, route policy, account management, and gateway status
+- local runtime truth from `4176 /healthz` may override stale stored endpoint projection for the built-in LLM/embedder rows
+- HarborDesk keeps `projection_mismatch` visible instead of silently flattening runtime truth back into stored admin state
+
 ## Executable CI Scaffold
 
 - `.github/workflows/contract-pr-check.yml`: PR and branch validation for contract schema checks plus contract, fallback, and policy test suites.
@@ -112,11 +150,11 @@ HarborBeacon 是基于 [ZeroClaw](https://github.com/punkpeye/zeroclaw) 二次�
 - `target/release/evaluate-release-gate`: converts drift output into a blocking/non-blocking release decision.
 - `tests/contracts`, `tests/fallback`, `tests/policy`: minimal pytest suites that keep the documented routing, fallback, and governance rules from regressing.
 
-Current scope note: the default CI path runs Rust binaries in documentation-only mode, and the same binaries can switch into live HarborNAS integration mode when `midclt` and/or `cli` are available.
+Current scope note: the default CI path runs Rust binaries in documentation-only mode, and the same binaries can switch into live HarborBeacon integration mode when `midclt` and/or `cli` are available.
 
 ## Live Integration Mode
 
-The four Rust binaries now support live HarborNAS probing through `middleware` and `midcli`.
+The four Rust binaries now support live HarborBeacon probing through `middleware` and `midcli`.
 
 - Middleware transport: local `midclt call ...`
 - MidCLI transport: non-interactive `cli -m csv -c ...`
@@ -134,7 +172,19 @@ Key environment variables:
 - `HARBOR_APPROVAL_TOKEN`: approval token passed into HIGH-risk operations such as service restart and file move
 - `HARBOR_REQUIRED_APPROVAL_TOKEN`: optional expected token value for the local script gate
 - `HARBOR_APPROVER_ID`: approver identity written into mutation results for audit correlation
-- `HARBOR_MUTATION_ROOT`: sandbox root for mutation fixtures, default `/mnt/agent-ci`
+- `HARBOR_MUTATION_ROOT`: sandbox root for mutation fixtures, default `/mnt/software/harborbeacon-agent-ci`
+
+Release/install note:
+
+- the exec-capable release root may live under `/var/lib/harborbeacon-agent-ci`
+- the HarborOS mutation root / writable root can still remain `/mnt/software/harborbeacon-agent-ci`
+- installer env now exposes that writable path explicitly through `HARBOR_HARBOROS_WRITABLE_ROOT`
+
+HarborOS `.182` resident stack checks:
+
+- after install, use `/var/lib/harborbeacon-agent-ci/bin/harbor-agent-hub-helper status`
+- use `/var/lib/harborbeacon-agent-ci/bin/harbor-agent-hub-helper health` to probe `4174/4175/4176/8787` plus `GET /api/gateway/status`
+- use `sudo /var/lib/harborbeacon-agent-ci/bin/harbor-agent-hub-helper logs gateway --lines 120` for the HarborGate journal when `.182` keeps journald access restricted
 
 Typical usage:
 
@@ -145,7 +195,7 @@ Typical usage:
 
 Controlled mutation example:
 
-- `HARBOR_ALLOW_MUTATIONS=1 HARBOR_APPROVAL_TOKEN=approved HARBOR_REQUIRED_APPROVAL_TOKEN=approved HARBOR_MUTATION_ROOT=/mnt/tank/agent-ci ./target/release/run-e2e-suite --env env-a --require-live`
+- `HARBOR_ALLOW_MUTATIONS=1 HARBOR_APPROVAL_TOKEN=approved HARBOR_REQUIRED_APPROVAL_TOKEN=approved HARBOR_MUTATION_ROOT=/mnt/software/harborbeacon-agent-ci ./target/release/run-e2e-suite --env env-a --require-live`
 
 ### Windows Remote MidCLI Shim
 
@@ -168,3 +218,12 @@ Example (PowerShell):
 - `$env:HARBOR_MIDCLI_USER = '<username>'`
 - `$env:HARBOR_MIDCLI_PASSWORD = '<password>'`
 - `./target/release/run-e2e-suite.exe --env env-a --require-live --report rust-live-e2e-report.json`
+
+For reviewable smoke runs, the repo now ships both verifier entrypoints:
+
+- Windows: `.\tools\run_harboros_vm_smoke.ps1`
+- Debian/Linux: `bash ./tools/run_harboros_vm_smoke.sh`
+
+Current live policy note: the verified HarborOS mutation sandbox on `192.168.3.182`
+is `/mnt/software/harborbeacon-agent-ci`; do not assume `/data` is writable on
+that target unless operators explicitly provision and validate it.

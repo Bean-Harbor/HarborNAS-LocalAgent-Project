@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal local HTTP sidecar for HarborNAS vision detection."""
+"""Minimal local HTTP sidecar for HarborBeacon vision detection."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ BRIDGE_SCRIPT = ROOT_DIR / "tools" / "vision_detect_bridge.sh"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="HarborNAS vision sidecar")
+    parser = argparse.ArgumentParser(description="HarborBeacon vision sidecar")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18080)
     return parser.parse_args()

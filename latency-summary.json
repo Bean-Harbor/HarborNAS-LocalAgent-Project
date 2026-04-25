@@ -1,7 +1,7 @@
 {
   "mode": "live-integration",
-  "env_profile": "env-a",
-  "p50_ms": 490,
-  "p95_ms": 490,
-  "fallback_penalty_ms": 0
+  "env_profile": "env-b",
+  "p50_ms": 532,
+  "p95_ms": 532,
+  "fallback_penalty_ms": 532
 }

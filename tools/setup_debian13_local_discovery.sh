@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HOSTNAME_VALUE="${1:-harbornas}"
+HOSTNAME_VALUE="${1:-harborbeacon}"
 HTTP_PORT="${HARBOR_HTTP_PORT:-4174}"
 SERVICE_DIR="/etc/avahi/services"
-SERVICE_FILE="${SERVICE_DIR}/harbornas-http.service"
+SERVICE_FILE="${SERVICE_DIR}/harborbeacon-http.service"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Please run as root: sudo $0 [hostname]"
@@ -26,7 +26,7 @@ cat > "${SERVICE_FILE}" <<EOF
     <type>_http._tcp</type>
     <port>${HTTP_PORT}</port>
     <txt-record>path=/setup/mobile</txt-record>
-    <txt-record>product=HarborNAS Agent Hub</txt-record>
+    <txt-record>product=HarborBeacon</txt-record>
   </service>
 </service-group>
 EOF

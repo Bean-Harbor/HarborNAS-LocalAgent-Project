@@ -2,6 +2,7 @@
 
 pub mod automation;
 pub mod device;
+pub mod knowledge;
 pub mod media;
 pub mod scene;
 pub mod system;

@@ -1,6 +1,6 @@
 {
   "mode": "live-integration",
-  "env_profile": "env-a",
+  "env_profile": "env-b",
   "coverage": 1.0,
   "required_fields": [
     "executor_used",

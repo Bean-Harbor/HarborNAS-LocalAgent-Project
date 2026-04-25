@@ -14,6 +14,12 @@ pub struct ConversationSession {
     pub conversation_id: String,
     pub user_id: String,
     #[serde(default)]
+    pub route_key: String,
+    #[serde(default)]
+    pub last_message_id: String,
+    #[serde(default)]
+    pub chat_type: String,
+    #[serde(default)]
     pub state: Value,
     #[serde(default)]
     pub resume_token: Option<String>,
@@ -90,6 +96,10 @@ pub enum TaskStepRunStatus {
 pub struct TaskStepRun {
     pub step_id: String,
     pub task_id: String,
+    #[serde(default)]
+    pub trace_id: String,
+    #[serde(default)]
+    pub route_key: String,
     pub domain: String,
     pub operation: String,
     pub route: ExecutionRoute,
@@ -128,7 +138,11 @@ pub struct ArtifactRecord {
     pub artifact_id: String,
     pub task_id: String,
     #[serde(default)]
+    pub trace_id: String,
+    #[serde(default)]
     pub step_id: Option<String>,
+    #[serde(default)]
+    pub route_key: String,
     pub artifact_kind: ArtifactKind,
     #[serde(default)]
     pub label: String,
@@ -181,6 +195,9 @@ mod tests {
             surface: "im".to_string(),
             conversation_id: "conv-1".to_string(),
             user_id: "user-1".to_string(),
+            route_key: "gw_route_1".to_string(),
+            last_message_id: "om_1".to_string(),
+            chat_type: "p2p".to_string(),
             state: json!({"pending": true}),
             resume_token: Some("resume-1".to_string()),
             expires_at: None,
@@ -189,6 +206,8 @@ mod tests {
         let step = TaskStepRun {
             step_id: "step-1".to_string(),
             task_id: "task-1".to_string(),
+            trace_id: "trace-1".to_string(),
+            route_key: "gw_route_1".to_string(),
             domain: "vision".to_string(),
             operation: "analyze".to_string(),
             route: ExecutionRoute::Local,
@@ -205,6 +224,10 @@ mod tests {
 
         assert_eq!(task.entity_refs["device_id"], "cam-1");
         assert_eq!(session.resume_token.as_deref(), Some("resume-1"));
+        assert_eq!(session.route_key, "gw_route_1");
+        assert_eq!(session.last_message_id, "om_1");
+        assert_eq!(step.trace_id, "trace-1");
+        assert_eq!(step.route_key, "gw_route_1");
         assert_eq!(step.route, ExecutionRoute::Local);
     }
 }

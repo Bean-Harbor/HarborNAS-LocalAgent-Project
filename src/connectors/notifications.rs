@@ -1,22 +1,18 @@
-//! Outbound notification contract for IM, webhook, and local alert delivery.
+//! Outbound notification contract for HarborGate delivery and local UI alerts.
 
+use std::env;
 use std::time::Duration;
 
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NotificationChannel {
-    #[serde(alias = "feishu")]
-    ImBridge,
-    Wecom,
-    Telegram,
-    Webhook,
-    LocalUi,
-}
+pub const CONTRACT_VERSION: &str = "1.5";
+const IM_GATEWAY_BASE_URL_ENV: &str = "HARBORGATE_BASE_URL";
+const IM_GATEWAY_BEARER_TOKEN_ENV: &str = "HARBORGATE_BEARER_TOKEN";
+const LEGACY_IM_GATEWAY_BASE_URL_ENV: &str = "HARBOR_IM_GATEWAY_BASE_URL";
+const LEGACY_IM_GATEWAY_BEARER_TOKEN_ENV: &str = "HARBOR_IM_GATEWAY_BEARER_TOKEN";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,7 +32,44 @@ pub enum NotificationAttachmentKind {
     Json,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationDestinationKind {
+    Conversation,
+    Recipient,
+    LocalUi,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationDeliveryMode {
+    Send,
+    Reply,
+    Update,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationRecipientIdType {
+    ChatId,
+    OpenId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationDeliveryStatus {
+    Sent,
+    Failed,
+    Skipped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationRecipient {
+    pub recipient_id: String,
+    pub recipient_type: NotificationRecipientIdType,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NotificationAttachment {
     pub kind: NotificationAttachmentKind,
     pub label: String,
@@ -50,10 +83,28 @@ pub struct NotificationAttachment {
     pub metadata: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct NotificationRequest {
-    pub channel: NotificationChannel,
-    pub destination: String,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationSource {
+    pub service: String,
+    pub module: String,
+    pub event_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationDestination {
+    pub kind: NotificationDestinationKind,
+    #[serde(default)]
+    pub route_key: String,
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub platform: String,
+    #[serde(default)]
+    pub recipient: Option<NotificationRecipient>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NotificationContent {
     pub title: String,
     pub body: String,
     #[serde(default = "default_payload_format")]
@@ -62,205 +113,240 @@ pub struct NotificationRequest {
     pub structured_payload: Value,
     #[serde(default)]
     pub attachments: Vec<NotificationAttachment>,
-    #[serde(default)]
-    pub correlation_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NotificationRecipientIdType {
-    ChatId,
-    OpenId,
-}
-
-impl NotificationRecipientIdType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::ChatId => "chat_id",
-            Self::OpenId => "open_id",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NotificationRecipient {
-    pub receive_id_type: NotificationRecipientIdType,
-    pub receive_id: String,
-    pub label: String,
+pub struct NotificationDelivery {
+    pub mode: NotificationDeliveryMode,
+    #[serde(default)]
+    pub reply_to_message_id: String,
+    #[serde(default)]
+    pub update_message_id: String,
+    pub idempotency_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct NotificationBridgeConfig {
+pub struct NotificationMetadata {
     #[serde(default)]
-    pub app_id: String,
-    #[serde(default)]
-    pub app_secret: String,
-    #[serde(default)]
-    pub bot_open_id: String,
+    pub correlation_id: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NotificationDeliveryStatus {
-    Sent,
-    Failed,
-    Skipped,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NotificationRequest {
+    pub notification_id: String,
+    pub trace_id: String,
+    pub source: NotificationSource,
+    pub destination: NotificationDestination,
+    pub content: NotificationContent,
+    pub delivery: NotificationDelivery,
+    #[serde(default)]
+    pub metadata: NotificationMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationErrorDetail {
+    pub code: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NotificationDeliveryRecord {
     pub delivery_id: String,
-    pub channel: NotificationChannel,
-    pub destination: String,
+    pub notification_id: String,
+    pub trace_id: String,
+    pub ok: bool,
     pub status: NotificationDeliveryStatus,
+    #[serde(default)]
+    pub platform: String,
     #[serde(default)]
     pub provider_message_id: Option<String>,
     #[serde(default)]
-    pub recipient: Option<NotificationRecipient>,
+    pub retryable: bool,
     #[serde(default)]
-    pub provider_payload: Value,
-    #[serde(default)]
-    pub delivered_at: Option<String>,
-    #[serde(default)]
-    pub correlation_id: Option<String>,
+    pub error: Option<NotificationErrorDetail>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedHttpErrorDetail {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedHttpErrorEnvelope {
+    pub ok: bool,
+    pub error: SharedHttpErrorDetail,
+    #[serde(default)]
+    pub trace_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationGatewayConfig {
+    pub base_url: String,
+    pub bearer_token: String,
+}
+
+impl NotificationGatewayConfig {
+    pub fn from_env() -> Result<Self, String> {
+        let base_url =
+            env_var_with_legacy_alias(IM_GATEWAY_BASE_URL_ENV, LEGACY_IM_GATEWAY_BASE_URL_ENV)
+                .ok_or_else(|| format!("missing required env var {IM_GATEWAY_BASE_URL_ENV}"))?;
+        let bearer_token = env_var_with_legacy_alias(
+            IM_GATEWAY_BEARER_TOKEN_ENV,
+            LEGACY_IM_GATEWAY_BEARER_TOKEN_ENV,
+        )
+        .ok_or_else(|| format!("missing required env var {IM_GATEWAY_BEARER_TOKEN_ENV}"))?;
+        Self::new(base_url, bearer_token)
+    }
+
+    pub fn new(
+        base_url: impl Into<String>,
+        bearer_token: impl Into<String>,
+    ) -> Result<Self, String> {
+        let base_url = base_url.into().trim().to_string();
+        if base_url.is_empty() {
+            return Err("HarborGate base URL cannot be empty".to_string());
+        }
+        let bearer_token = bearer_token.into().trim().to_string();
+        if bearer_token.is_empty() {
+            return Err("HarborGate bearer token cannot be empty".to_string());
+        }
+        Ok(Self {
+            base_url,
+            bearer_token,
+        })
+    }
+}
+
+fn env_var_with_legacy_alias(primary: &str, legacy: &str) -> Option<String> {
+    if let Some(value) = env::var(primary)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(value);
+    }
+
+    env::var(legacy)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .inspect(|_| {
+            eprintln!("warning: {legacy} is deprecated; prefer {primary}");
+        })
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum NotificationDeliveryError {
+    MissingConfiguration(String),
+    Transport(String),
+    InvalidResponse(String),
+    RequestRejected {
+        status_code: u16,
+        envelope: SharedHttpErrorEnvelope,
+    },
+}
+
+impl std::fmt::Display for NotificationDeliveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingConfiguration(message)
+            | Self::Transport(message)
+            | Self::InvalidResponse(message) => f.write_str(message),
+            Self::RequestRejected {
+                status_code,
+                envelope,
+            } => write!(
+                f,
+                "notification request rejected with HTTP {status_code}: {} ({})",
+                envelope.error.message, envelope.error.code
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NotificationDeliveryError {}
 
 pub struct NotificationDeliveryService {
     client: Client,
+    config: NotificationGatewayConfig,
 }
 
 impl NotificationDeliveryService {
     pub fn new() -> Result<Self, String> {
+        let config = NotificationGatewayConfig::from_env()
+            .map_err(|error| format!("notification delivery configuration error: {error}"))?;
+        Self::from_config(config)
+    }
+
+    pub fn from_config(config: NotificationGatewayConfig) -> Result<Self, String> {
         let client = Client::builder()
-            .timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(10))
             .build()
             .map_err(|error| format!("failed to build notification delivery client: {error}"))?;
-        Ok(Self { client })
+        Ok(Self { client, config })
     }
 
     pub fn deliver(
         &self,
         request: &NotificationRequest,
-        bridge_provider: Option<&NotificationBridgeConfig>,
-        recipient: Option<&NotificationRecipient>,
-    ) -> Result<NotificationDeliveryRecord, String> {
-        match request.channel {
-            NotificationChannel::ImBridge => {
-                self.deliver_im_bridge(request, bridge_provider, recipient)
-            }
-            NotificationChannel::LocalUi => Ok(NotificationDeliveryRecord {
+    ) -> Result<NotificationDeliveryRecord, NotificationDeliveryError> {
+        if request.destination.kind == NotificationDestinationKind::LocalUi {
+            return Ok(NotificationDeliveryRecord {
                 delivery_id: new_delivery_id(),
-                channel: request.channel,
-                destination: request.destination.clone(),
+                notification_id: request.notification_id.clone(),
+                trace_id: request.trace_id.clone(),
+                ok: true,
                 status: NotificationDeliveryStatus::Sent,
+                platform: "local_ui".to_string(),
                 provider_message_id: None,
-                recipient: recipient.cloned(),
-                provider_payload: json!({
-                    "delivery_mode": "local_ui",
-                    "request": request,
-                }),
-                delivered_at: Some(current_timestamp()),
-                correlation_id: request.correlation_id.clone(),
-            }),
-            NotificationChannel::Webhook
-            | NotificationChannel::Telegram
-            | NotificationChannel::Wecom => Err(format!(
-                "notification delivery for channel {:?} 尚未实现",
-                request.channel
-            )),
-        }
-    }
-
-    fn deliver_im_bridge(
-        &self,
-        request: &NotificationRequest,
-        bridge_provider: Option<&NotificationBridgeConfig>,
-        recipient: Option<&NotificationRecipient>,
-    ) -> Result<NotificationDeliveryRecord, String> {
-        let bridge_provider = bridge_provider
-            .ok_or_else(|| "bridge provider 未配置，无法发送 IM 通知".to_string())?;
-        if bridge_provider.app_id.trim().is_empty() || bridge_provider.app_secret.trim().is_empty()
-        {
-            return Err("bridge provider 凭证不完整，无法发送 IM 通知".to_string());
-        }
-        let recipient =
-            recipient.ok_or_else(|| "通知目的地未映射到可投递的 IM 收件人".to_string())?;
-        if recipient.receive_id.trim().is_empty() {
-            return Err("通知收件人为空，无法发送 IM 通知".to_string());
+                retryable: false,
+                error: None,
+            });
         }
 
-        let token = self.fetch_bridge_provider_token(bridge_provider)?;
-        let (msg_type, content) = build_im_bridge_message(request)?;
-        let response: Value = self
+        let endpoint = notification_endpoint(&self.config.base_url);
+        let response = self
             .client
-            .post(format!(
-                "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={}",
-                recipient.receive_id_type.as_str()
+            .post(endpoint)
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.config.bearer_token),
+            )
+            .header("X-Contract-Version", CONTRACT_VERSION)
+            .json(request)
+            .send()
+            .map_err(|error| {
+                NotificationDeliveryError::Transport(format!(
+                    "notification delivery request failed: {error}"
+                ))
+            })?;
+        let status_code = response.status().as_u16();
+        let response_body = response.text().map_err(|error| {
+            NotificationDeliveryError::InvalidResponse(format!(
+                "failed to read notification delivery response: {error}"
             ))
-            .header("Authorization", format!("Bearer {token}"))
-            .json(&json!({
-                "receive_id": recipient.receive_id,
-                "msg_type": msg_type,
-                "content": content,
-            }))
-            .send()
-            .map_err(|error| format!("bridge provider send request failed: {error}"))?
-            .json()
-            .map_err(|error| format!("bridge provider send response parse failed: {error}"))?;
-        if response.get("code").and_then(Value::as_i64) != Some(0) {
-            let msg = response
-                .get("msg")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error");
-            return Err(format!("bridge provider 发送通知失败: {msg}"));
+        })?;
+
+        if (200..300).contains(&status_code) {
+            return serde_json::from_str::<NotificationDeliveryRecord>(&response_body).map_err(
+                |error| {
+                    NotificationDeliveryError::InvalidResponse(format!(
+                        "invalid notification delivery response body: {error}"
+                    ))
+                },
+            );
         }
 
-        let provider_message_id = response
-            .pointer("/data/message_id")
-            .and_then(Value::as_str)
-            .map(|value| value.to_string());
-        Ok(NotificationDeliveryRecord {
-            delivery_id: new_delivery_id(),
-            channel: request.channel,
-            destination: request.destination.clone(),
-            status: NotificationDeliveryStatus::Sent,
-            provider_message_id,
-            recipient: Some(recipient.clone()),
-            provider_payload: response,
-            delivered_at: Some(current_timestamp()),
-            correlation_id: request.correlation_id.clone(),
-        })
-    }
-
-    fn fetch_bridge_provider_token(
-        &self,
-        bridge_provider: &NotificationBridgeConfig,
-    ) -> Result<String, String> {
-        let token_resp: Value = self
-            .client
-            .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
-            .json(&json!({
-                "app_id": bridge_provider.app_id,
-                "app_secret": bridge_provider.app_secret,
-            }))
-            .send()
-            .map_err(|error| format!("bridge provider token request failed: {error}"))?
-            .json()
-            .map_err(|error| format!("bridge provider token response parse failed: {error}"))?;
-        if token_resp.get("code").and_then(Value::as_i64) != Some(0) {
-            let msg = token_resp
-                .get("msg")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error");
-            return Err(format!("bridge provider token request rejected: {msg}"));
+        match serde_json::from_str::<SharedHttpErrorEnvelope>(&response_body) {
+            Ok(envelope) => Err(NotificationDeliveryError::RequestRejected {
+                status_code,
+                envelope,
+            }),
+            Err(error) => Err(NotificationDeliveryError::InvalidResponse(format!(
+                "notification delivery rejected with HTTP {status_code}, but body was not a shared error envelope: {error}"
+            ))),
         }
-        token_resp
-            .get("tenant_access_token")
-            .and_then(Value::as_str)
-            .map(|value| value.to_string())
-            .ok_or_else(|| {
-                "bridge provider token request succeeded but tenant_access_token 缺失".to_string()
-            })
     }
 }
 
@@ -268,146 +354,299 @@ fn default_payload_format() -> NotificationPayloadFormat {
     NotificationPayloadFormat::PlainText
 }
 
-fn build_im_bridge_message(request: &NotificationRequest) -> Result<(String, String), String> {
-    match request.payload_format {
-        NotificationPayloadFormat::LarkCard => {
-            if request.structured_payload.is_null() {
-                return Err("interactive notification 缺少 structured_payload".to_string());
-            }
-            Ok((
-                "interactive".to_string(),
-                serde_json::to_string(&request.structured_payload).map_err(|error| {
-                    format!("failed to encode interactive card payload: {error}")
-                })?,
-            ))
-        }
-        NotificationPayloadFormat::Json => Ok((
-            "interactive".to_string(),
-            serde_json::to_string(&request.structured_payload)
-                .map_err(|error| format!("failed to encode JSON payload: {error}"))?,
-        )),
-        NotificationPayloadFormat::PlainText | NotificationPayloadFormat::Markdown => Ok((
-            "text".to_string(),
-            serde_json::to_string(&json!({ "text": request.body }))
-                .map_err(|error| format!("failed to encode text payload: {error}"))?,
-        )),
+fn notification_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.ends_with("/api/notifications/deliveries") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/api/notifications/deliveries")
     }
 }
 
 fn new_delivery_id() -> String {
-    Uuid::new_v4().as_simple().to_string()
-}
-
-fn current_timestamp() -> String {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string()
+    format!("delivery_{}", Uuid::new_v4().as_simple())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
     use serde_json::{json, Value};
 
     use super::{
-        build_im_bridge_message, NotificationAttachment, NotificationAttachmentKind,
-        NotificationChannel, NotificationDeliveryService, NotificationPayloadFormat,
-        NotificationRecipient, NotificationRecipientIdType, NotificationRequest,
+        NotificationAttachment, NotificationAttachmentKind, NotificationContent,
+        NotificationDelivery, NotificationDeliveryError, NotificationDeliveryMode,
+        NotificationDeliveryService, NotificationDeliveryStatus, NotificationDestination,
+        NotificationDestinationKind, NotificationErrorDetail, NotificationGatewayConfig,
+        NotificationMetadata, NotificationPayloadFormat, NotificationRequest, NotificationSource,
+        SharedHttpErrorDetail, SharedHttpErrorEnvelope, CONTRACT_VERSION,
     };
 
-    #[test]
-    fn legacy_feishu_channel_deserializes_as_im_bridge() {
-        let request: NotificationRequest = serde_json::from_value(json!({
-            "channel": "feishu",
-            "destination": "chat-1",
-            "title": "AI 分析",
-            "body": "检测到人员活动",
-            "structured_payload": {"header": {"title": {"content": "Front Door AI 分析"}}}
-        }))
-        .expect("request");
-
-        assert_eq!(request.channel, NotificationChannel::ImBridge);
-        assert_eq!(request.payload_format, NotificationPayloadFormat::PlainText);
+    fn sample_request() -> NotificationRequest {
+        NotificationRequest {
+            notification_id: "notif_01JABC".to_string(),
+            trace_id: "trace_01JABC".to_string(),
+            source: NotificationSource {
+                service: "harborbeacon".to_string(),
+                module: "task_api".to_string(),
+                event_type: "task.completed".to_string(),
+            },
+            destination: NotificationDestination {
+                kind: NotificationDestinationKind::Conversation,
+                route_key: "gw_route_01JABC".to_string(),
+                id: String::new(),
+                platform: String::new(),
+                recipient: None,
+            },
+            content: NotificationContent {
+                title: "Front Door AI Analysis".to_string(),
+                body: "1 person detected.".to_string(),
+                payload_format: NotificationPayloadFormat::LarkCard,
+                structured_payload: json!({
+                    "header": {"title": {"content": "Front Door AI Analysis"}}
+                }),
+                attachments: vec![NotificationAttachment {
+                    kind: NotificationAttachmentKind::Image,
+                    label: "snapshot".to_string(),
+                    mime_type: "image/jpeg".to_string(),
+                    path: Some(".harborbeacon/vision/snapshot.jpg".to_string()),
+                    url: None,
+                    metadata: Value::Null,
+                }],
+            },
+            delivery: NotificationDelivery {
+                mode: NotificationDeliveryMode::Send,
+                reply_to_message_id: String::new(),
+                update_message_id: String::new(),
+                idempotency_key: "idem_01JABC".to_string(),
+            },
+            metadata: NotificationMetadata {
+                correlation_id: "trace_01JABC".to_string(),
+            },
+        }
     }
 
     #[test]
-    fn request_round_trips_card_payload_and_attachments() {
-        let request = NotificationRequest {
-            channel: NotificationChannel::ImBridge,
-            destination: "home-default".to_string(),
-            title: "AI 分析".to_string(),
-            body: "检测到人员活动".to_string(),
-            payload_format: NotificationPayloadFormat::LarkCard,
-            structured_payload: json!({
-                "header": {"title": {"content": "Front Door AI 分析"}}
-            }),
-            attachments: vec![NotificationAttachment {
-                kind: NotificationAttachmentKind::Image,
-                label: "抓拍图".to_string(),
-                mime_type: "image/jpeg".to_string(),
-                path: Some(".harbornas/vision/snapshots/front-door.jpg".to_string()),
-                url: None,
-                metadata: Value::Null,
-            }],
-            correlation_id: Some("audit-1".to_string()),
-        };
+    fn request_round_trips_contract_shape() {
+        let request = sample_request();
 
         let encoded = serde_json::to_value(&request).expect("encode");
-        assert_eq!(encoded["channel"], "im_bridge");
-        assert_eq!(encoded["payload_format"], "lark_card");
-        assert_eq!(encoded["attachments"][0]["kind"], "image");
-    }
 
-    #[test]
-    fn card_payload_encodes_as_interactive_message() {
-        let request = NotificationRequest {
-            channel: NotificationChannel::ImBridge,
-            destination: "chat-1".to_string(),
-            title: "AI 分析".to_string(),
-            body: "检测到人员活动".to_string(),
-            payload_format: NotificationPayloadFormat::LarkCard,
-            structured_payload: json!({
-                "header": {"title": {"content": "Front Door AI 分析"}}
-            }),
-            attachments: Vec::new(),
-            correlation_id: Some("trace-1".to_string()),
-        };
-
-        let (msg_type, content) = build_im_bridge_message(&request).expect("message");
-
-        assert_eq!(msg_type, "interactive");
-        assert!(content.contains("Front Door AI 分析"));
+        assert_eq!(encoded["notification_id"], "notif_01JABC");
+        assert_eq!(encoded["destination"]["route_key"], "gw_route_01JABC");
+        assert_eq!(encoded["content"]["payload_format"], "lark_card");
+        assert_eq!(encoded["delivery"]["mode"], "send");
+        assert_eq!(encoded["metadata"]["correlation_id"], "trace_01JABC");
     }
 
     #[test]
     fn local_ui_delivery_returns_sent_record_without_network() {
-        let service = NotificationDeliveryService::new().expect("service");
-        let request = NotificationRequest {
-            channel: NotificationChannel::LocalUi,
-            destination: "dashboard".to_string(),
-            title: "AI 分析".to_string(),
-            body: "检测到人员活动".to_string(),
-            payload_format: NotificationPayloadFormat::PlainText,
-            structured_payload: Value::Null,
-            attachments: Vec::new(),
-            correlation_id: Some("trace-1".to_string()),
-        };
+        let service = NotificationDeliveryService::from_config(
+            NotificationGatewayConfig::new("http://127.0.0.1:9", "test-token").expect("config"),
+        )
+        .expect("service");
+        let mut request = sample_request();
+        request.destination.kind = NotificationDestinationKind::LocalUi;
+        request.destination.route_key.clear();
 
-        let record = service
-            .deliver(
-                &request,
-                None,
-                Some(&NotificationRecipient {
-                    receive_id_type: NotificationRecipientIdType::ChatId,
-                    receive_id: "chat-1".to_string(),
-                    label: "家庭通知频道".to_string(),
-                }),
-            )
-            .expect("delivery");
+        let record = service.deliver(&request).expect("delivery");
 
-        assert_eq!(record.channel, NotificationChannel::LocalUi);
-        assert!(record.delivered_at.is_some());
-        assert_eq!(record.provider_payload["delivery_mode"], "local_ui");
+        assert_eq!(record.notification_id, request.notification_id);
+        assert!(record.ok);
+        assert_eq!(record.status, NotificationDeliveryStatus::Sent);
+        assert_eq!(record.platform, "local_ui");
+        assert!(record.provider_message_id.is_none());
+    }
+
+    #[test]
+    fn accepted_delivery_request_posts_contract_headers_and_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = thread::spawn(move || -> (String, String) {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let (request_head, body) = read_http_request(&mut stream);
+            let response_body = json!({
+                "delivery_id": "delivery_01JABC",
+                "notification_id": "notif_01JABC",
+                "trace_id": "trace_01JABC",
+                "ok": true,
+                "status": "sent",
+                "platform": "feishu",
+                "provider_message_id": "om_01JABC",
+                "retryable": false,
+                "error": null
+            })
+            .to_string();
+            write_http_response(&mut stream, 200, "OK", &response_body);
+            (request_head, body)
+        });
+
+        let service = NotificationDeliveryService::from_config(
+            NotificationGatewayConfig::new(format!("http://{address}"), "test-token")
+                .expect("config"),
+        )
+        .expect("service");
+        let request = sample_request();
+
+        let record = service.deliver(&request).expect("delivery");
+        let (request_head, body) = server.join().expect("server thread");
+        let request_head_lower = request_head.to_lowercase();
+        let body_json: Value = serde_json::from_str(&body).expect("body json");
+
+        assert!(request_head.starts_with("POST /api/notifications/deliveries HTTP/1.1"));
+        assert!(request_head_lower.contains("authorization: bearer test-token"));
+        assert!(request_head_lower.contains(&format!(
+            "x-contract-version: {}",
+            CONTRACT_VERSION.to_lowercase()
+        )));
+        assert_eq!(body_json["destination"]["route_key"], "gw_route_01JABC");
+        assert_eq!(record.delivery_id, "delivery_01JABC");
+        assert_eq!(record.provider_message_id.as_deref(), Some("om_01JABC"));
+        assert!(record.ok);
+    }
+
+    #[test]
+    fn rejected_delivery_request_returns_shared_error_envelope() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let _ = read_http_request(&mut stream);
+            let response_body = serde_json::to_string(&SharedHttpErrorEnvelope {
+                ok: false,
+                error: SharedHttpErrorDetail {
+                    code: "ROUTE_NOT_FOUND".to_string(),
+                    message: "route key not found".to_string(),
+                },
+                trace_id: Some("trace_01JABC".to_string()),
+            })
+            .expect("encode shared error");
+            write_http_response(&mut stream, 404, "Not Found", &response_body);
+        });
+
+        let service = NotificationDeliveryService::from_config(
+            NotificationGatewayConfig::new(format!("http://{address}"), "test-token")
+                .expect("config"),
+        )
+        .expect("service");
+
+        let result = service.deliver(&sample_request());
+        server.join().expect("server thread");
+
+        match result {
+            Err(NotificationDeliveryError::RequestRejected {
+                status_code,
+                envelope,
+            }) => {
+                assert_eq!(status_code, 404);
+                assert_eq!(envelope.error.code, "ROUTE_NOT_FOUND");
+                assert_eq!(envelope.trace_id.as_deref(), Some("trace_01JABC"));
+            }
+            other => panic!("expected request rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gateway_config_requires_non_empty_values() {
+        assert!(NotificationGatewayConfig::new("", "token").is_err());
+        assert!(NotificationGatewayConfig::new("http://127.0.0.1:4176", "").is_err());
+    }
+
+    #[test]
+    fn delivery_record_round_trips_failure_payload() {
+        let record = serde_json::from_value::<super::NotificationDeliveryRecord>(json!({
+            "delivery_id": "delivery_01JABC",
+            "notification_id": "notif_01JABC",
+            "trace_id": "trace_01JABC",
+            "ok": false,
+            "status": "failed",
+            "platform": "feishu",
+            "provider_message_id": null,
+            "retryable": true,
+            "error": {
+                "code": "PLATFORM_UNAVAILABLE",
+                "message": "upstream timeout"
+            }
+        }))
+        .expect("record");
+
+        assert_eq!(record.status, NotificationDeliveryStatus::Failed);
+        assert_eq!(
+            record.error,
+            Some(NotificationErrorDetail {
+                code: "PLATFORM_UNAVAILABLE".to_string(),
+                message: "upstream timeout".to_string(),
+            })
+        );
+        assert!(record.retryable);
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> (String, String) {
+        let mut buffer = [0_u8; 4096];
+        let mut request_bytes = Vec::new();
+        let mut content_length = 0_usize;
+        let mut header_end = None;
+
+        loop {
+            let bytes_read = stream.read(&mut buffer).expect("read request");
+            if bytes_read == 0 {
+                break;
+            }
+            request_bytes.extend_from_slice(&buffer[..bytes_read]);
+            if header_end.is_none() {
+                if let Some(end) = request_bytes
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                {
+                    header_end = Some(end + 4);
+                    let headers = String::from_utf8_lossy(&request_bytes[..end + 4]).to_string();
+                    content_length = content_length_from_headers(&headers);
+                }
+            }
+            if let Some(end) = header_end {
+                if request_bytes.len() >= end + content_length {
+                    break;
+                }
+            }
+        }
+
+        let header_end = header_end.expect("header end");
+        let head = String::from_utf8_lossy(&request_bytes[..header_end]).to_string();
+        let body = String::from_utf8_lossy(&request_bytes[header_end..header_end + content_length])
+            .to_string();
+        (head, body)
+    }
+
+    fn content_length_from_headers(headers: &str) -> usize {
+        headers
+            .lines()
+            .find_map(|line| {
+                let mut parts = line.splitn(2, ':');
+                let name = parts.next()?.trim();
+                let value = parts.next()?.trim();
+                name.eq_ignore_ascii_case("Content-Length")
+                    .then(|| value.parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0)
+    }
+
+    fn write_http_response(
+        stream: &mut std::net::TcpStream,
+        status_code: u16,
+        reason: &str,
+        body: &str,
+    ) {
+        let response = format!(
+            "HTTP/1.1 {status_code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write response");
+        stream.flush().expect("flush response");
     }
 }

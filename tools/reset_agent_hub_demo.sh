@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-STATE_DIR="${ROOT_DIR}/.harbornas"
+STATE_DIR="${ROOT_DIR}/.harborbeacon"
 ADMIN_STATE="${STATE_DIR}/admin-console.json"
 DEVICE_REGISTRY="${STATE_DIR}/device-registry.json"
 
@@ -14,7 +14,7 @@ cat > "${ADMIN_STATE}" <<'JSON'
     "status": "等待扫码",
     "metric": "等待绑定",
     "bound_user": null,
-    "channel": "飞书 HarborNAS Bot",
+    "channel": "飞书 HarborBeacon Bot",
     "session_code": "",
     "qr_token": ""
   },

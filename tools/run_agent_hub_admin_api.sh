@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-ENV_FILE="${HARBOR_ENV_FILE:-/etc/default/harbornas-agent-hub}"
+ENV_FILE="${HARBOR_ENV_FILE:-/etc/default/harborbeacon-agent-hub}"
 
 if [[ -f "${ENV_FILE}" ]]; then
   set -a
@@ -25,5 +25,6 @@ fi
 
 exec "${BIN_PATH}" \
   --bind "${HARBOR_HTTP_BIND:-0.0.0.0:4174}" \
-  --public-origin "${HARBOR_PUBLIC_ORIGIN:-http://harbornas.local:4174}" \
+  --public-origin "${HARBOR_PUBLIC_ORIGIN:-http://harborbeacon.local:4174}" \
+  --harbordesk-dist "${HARBORDESK_DIST:-${WORKSPACE_ROOT}/frontend/harbordesk/dist/harbordesk}" \
   "$@"

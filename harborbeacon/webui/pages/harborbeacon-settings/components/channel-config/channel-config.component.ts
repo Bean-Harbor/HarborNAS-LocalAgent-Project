@@ -42,12 +42,10 @@ import {
 })
 export class ChannelConfigComponent {
   @Input() channels: ChannelConfig[] = [];
-  @Input() oneClickSetupRunning = false;
-  @Input() browserSetupRunning = false;
+  @Input() feishuConfigRunning = false;
   @Output() channelsChange = new EventEmitter<ChannelConfig[]>();
   @Output() testChannel = new EventEmitter<{ channel: Channel; config: ChannelConfig }>();
-  @Output() oneClickSetupFeishu = new EventEmitter<ChannelConfig>();
-  @Output() browserSetupFeishuStart = new EventEmitter<void>();
+  @Output() applyFeishuConfig = new EventEmitter<ChannelConfig>();
 
   readonly meta: ChannelMeta[] = CHANNEL_META;
   readonly Channel = Channel;
@@ -80,15 +78,11 @@ export class ChannelConfigComponent {
     this.testChannel.emit({ channel, config: this.getConfig(channel) });
   }
 
-  onOneClickSetupFeishu(): void {
-    this.oneClickSetupFeishu.emit(this.getConfig(Channel.FEISHU));
+  onApplyFeishuConfig(): void {
+    this.applyFeishuConfig.emit(this.getConfig(Channel.FEISHU));
   }
 
-  onBrowserSetupFeishu(): void {
-    this.browserSetupFeishuStart.emit();
-  }
-
-  canOneClickSetupFeishu(config: ChannelConfig): boolean {
+  canApplyFeishuConfig(config: ChannelConfig): boolean {
     return Boolean(config.enabled && config.app_id && config.app_secret);
   }
 

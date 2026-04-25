@@ -1,7 +1,7 @@
 """Canonical data contracts for the assistant runtime.
 
 Action envelope and ExecutionResult follow the schema defined in
-HarborNAS-Middleware-Endpoint-Contract-v1.md and the SKILL.md
+HarborBeacon-Middleware-Endpoint-Contract-v1.md and the SKILL.md
 harboros-assistant-v2 spec.
 """
 from __future__ import annotations

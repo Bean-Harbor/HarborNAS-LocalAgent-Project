@@ -194,6 +194,46 @@ mod tests {
     }
 
     #[test]
+    fn readonly_files_stay_on_middleware_then_midcli() {
+        let action = Action {
+            domain: "files".to_string(),
+            operation: "read_text".to_string(),
+            resource: json!({"path": "/mnt/notes/brief.txt"}),
+            args: json!({"max_bytes": 4096}),
+            risk_level: RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+
+        let routes = allowed_routes(&action);
+        assert_eq!(routes, vec![Route::MiddlewareApi, Route::Midcli]);
+    }
+
+    #[test]
+    fn non_system_domains_keep_browser_and_mcp_in_priority() {
+        let action = Action {
+            domain: "device".to_string(),
+            operation: "inspect".to_string(),
+            resource: json!({"device_id": "cam-1"}),
+            args: json!({}),
+            risk_level: RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+
+        let routes = allowed_routes(&action);
+        assert_eq!(
+            routes,
+            vec![
+                Route::MiddlewareApi,
+                Route::Midcli,
+                Route::Browser,
+                Route::Mcp
+            ]
+        );
+    }
+
+    #[test]
     fn multiple_executors_can_share_same_route() {
         let mut router = Router::new();
         router.register(Box::new(MockExecutor {

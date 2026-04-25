@@ -2,7 +2,7 @@
 set -eu
 
 ROOT_DIR="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
-DEFAULT_VENV_PY="$ROOT_DIR/.harbornas/.venv-vision/bin/python"
+DEFAULT_VENV_PY="$ROOT_DIR/.harborbeacon/.venv-vision/bin/python"
 DETECTOR="$ROOT_DIR/tools/detect_person_yolo.py"
 
 if [ -n "${HARBOR_VISION_PYTHON:-}" ]; then

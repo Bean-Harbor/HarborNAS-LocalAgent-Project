@@ -1,6 +1,6 @@
 ---
 name: harboros-assistant-v2
-description: "Use when implementing HarborNAS personal assistant capabilities, HarborOS control operations, skill/plugin architecture, API-to-midcli fallback routing, and command-line-first execution. Keywords: assistant runtime, planner, router, midcli, middleware, skills, HarborOS."
+description: "Use when implementing HarborBeacon personal assistant capabilities, HarborOS control operations, skill/plugin architecture, API-to-midcli fallback routing, and command-line-first execution. Keywords: assistant runtime, planner, router, midcli, middleware, skills, HarborOS."
 ---
 
 # HarborOS Assistant V2 Implementation Skill

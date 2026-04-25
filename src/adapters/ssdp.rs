@@ -39,7 +39,7 @@ impl UdpSsdpAdapter {
     fn build_msearch(st: &str) -> String {
         // https://datatracker.ietf.org/doc/html/draft-cai-ssdp-v1-03 (legacy formatting)
         format!(
-            "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: {st}\r\nUSER-AGENT: harbornas-agent-hub/0.1\r\n\r\n"
+            "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: {st}\r\nUSER-AGENT: harborbeacon-agent-hub/0.1\r\n\r\n"
         )
     }
 

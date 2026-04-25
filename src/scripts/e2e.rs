@@ -3,11 +3,12 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use crate::scripts::integration::{
     default_midcli_filesystem_command, default_midcli_service_query, ensure_directory,
-    ensure_mutation_fixture, execute_file_action, execute_service_action, IntegrationConfig,
-    MidcliClient, MiddlewareClient,
+    ensure_mutation_fixture, execute_file_action, execute_service_action,
+    should_use_remote_mutation_seed, IntegrationConfig, MidcliClient, MiddlewareClient,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,10 +78,10 @@ pub fn run_e2e(
     require_live: bool,
 ) -> (E2ePayload, LatencyPayload, AuditPayload) {
     let required_docs = [
-        "HarborNAS-Contract-E2E-Test-Plan-v1.md",
-        "HarborNAS-Middleware-Endpoint-Contract-v1.md",
-        "HarborNAS-Files-BatchOps-Contract-v1.md",
-        "HarborNAS-Planner-TaskDecompose-Contract-v1.md",
+        "HarborBeacon-Contract-E2E-Test-Plan-v1.md",
+        "HarborBeacon-Middleware-Endpoint-Contract-v1.md",
+        "HarborBeacon-Files-BatchOps-Contract-v1.md",
+        "HarborBeacon-Planner-TaskDecompose-Contract-v1.md",
     ];
     let missing_docs = required_docs
         .iter()
@@ -233,20 +234,48 @@ pub fn run_e2e(
         ));
     }
 
+    let mutation_suffix = Uuid::new_v4().simple().to_string();
+    let copy_source_name = format!("copy-source-{mutation_suffix}.txt");
+    let copy_destination_name = format!("copy-destination-{mutation_suffix}.txt");
+    let move_source_name = format!("move-source-{mutation_suffix}.txt");
+    let move_destination_dir_name = format!("move-destination-{mutation_suffix}");
     let mut mutation_root = config.mutation_root.clone();
-    let mut copy_src = format!("{mutation_root}/copy-source.txt");
-    let copy_dst = format!("{mutation_root}/copy-destination.txt");
-    let mut move_src = format!("{mutation_root}/move-source.txt");
-    let mut move_dst_dir = format!("{mutation_root}/move-destination");
+    let stable_copy_seed = format!("{mutation_root}/copy-source.txt");
+    let stable_move_destination_dir = format!("{mutation_root}/move-destination");
+    let remote_seed_mode = should_use_remote_mutation_seed(config, &mutation_root);
+    let mut copy_src = if remote_seed_mode {
+        stable_copy_seed.clone()
+    } else {
+        format!("{mutation_root}/{copy_source_name}")
+    };
+    let mut copy_dst = format!("{mutation_root}/{copy_destination_name}");
+    let mut move_src = if remote_seed_mode {
+        copy_dst.clone()
+    } else {
+        format!("{mutation_root}/{move_source_name}")
+    };
+    let mut move_dst_dir = if remote_seed_mode {
+        stable_move_destination_dir.clone()
+    } else {
+        format!("{mutation_root}/{move_destination_dir_name}")
+    };
 
     if config.allow_mutations {
         mutation_root =
             ensure_directory(&config.mutation_root).unwrap_or(config.mutation_root.clone());
-        move_dst_dir = ensure_directory(&move_dst_dir).unwrap_or(move_dst_dir);
-        copy_src = ensure_mutation_fixture(&mutation_root, "copy-source.txt", "copy payload\n")
-            .unwrap_or(copy_src);
-        move_src = ensure_mutation_fixture(&mutation_root, "move-source.txt", "move payload\n")
-            .unwrap_or(move_src);
+        copy_dst = format!("{mutation_root}/{copy_destination_name}");
+        if remote_seed_mode {
+            copy_src = format!("{mutation_root}/copy-source.txt");
+            move_src = copy_dst.clone();
+            move_dst_dir = format!("{mutation_root}/move-destination");
+        } else {
+            move_dst_dir = format!("{mutation_root}/{move_destination_dir_name}");
+            move_dst_dir = ensure_directory(&move_dst_dir).unwrap_or(move_dst_dir);
+            copy_src = ensure_mutation_fixture(&mutation_root, &copy_source_name, "copy payload\n")
+                .unwrap_or(copy_src);
+            move_src = ensure_mutation_fixture(&mutation_root, &move_source_name, "move payload\n")
+                .unwrap_or(move_src);
+        }
     }
 
     let service_restart = execute_service_action(

@@ -63,3 +63,37 @@ def test_execute_action_raises_on_http_error():
         assert "camera connect failed" in str(exc)
     else:
         raise AssertionError("expected RuntimeError")
+
+
+def test_execute_action_keeps_legacy_payload_shape_without_route_key():
+    captured = {}
+
+    def fake_request(url, payload, timeout_s):
+        captured["url"] = url
+        captured["payload"] = payload
+        captured["timeout_s"] = timeout_s
+        return 200, {"status": "completed", "result": {"message": "ok"}}
+
+    client = TaskApiClient(base_url="http://127.0.0.1:4175", request_fn=fake_request)
+    client.execute_action(
+        Action(
+            domain="camera",
+            operation="snapshot",
+            resource={"device_id": "cam-1"},
+            args={
+                "_source": {
+                    "channel": "feishu",
+                    "conversation_id": "chat-1",
+                    "user_id": "user-1",
+                    "session_id": "sess-1",
+                    "raw_text": "截图",
+                },
+            },
+        ),
+        "task-2",
+        "step-1",
+    )
+
+    assert captured["payload"]["source"]["surface"] == "harborbeacon"
+    assert "route_key" not in captured["payload"]["source"]
+    assert captured["payload"]["entity_refs"]["device_id"] == "cam-1"

@@ -1,0 +1,16 @@
+[Unit]
+Description=HarborBeacon Admin API
+After=network-online.target harbor-model-api.service
+Wants=network-online.target harbor-model-api.service
+
+[Service]
+Type=simple
+User=__SERVICE_USER__
+WorkingDirectory=__INSTALL_ROOT__/current
+EnvironmentFile=-__ENV_FILE__
+ExecStart=__INSTALL_ROOT__/current/templates/bin/run-agent-hub-admin-api
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

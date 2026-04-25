@@ -1,0 +1,72 @@
+:root {
+  color-scheme: dark;
+  --bg: #08101b;
+  --bg-soft: #0c1725;
+  --surface: rgba(12, 23, 37, 0.84);
+  --surface-strong: rgba(18, 33, 52, 0.94);
+  --border: rgba(166, 195, 224, 0.16);
+  --text: #e7f0fb;
+  --muted: #98acc3;
+  --accent: #4dd6c4;
+  --accent-2: #f6b54c;
+  --danger: #ff7b72;
+  --success: #7ee28c;
+  --warning: #ffd56a;
+  --shadow: 0 28px 70px rgba(0, 0, 0, 0.32);
+  --radius-xl: 28px;
+  --radius-lg: 20px;
+  --radius-md: 14px;
+  --radius-sm: 10px;
+  --max-width: 1320px;
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: "Aptos", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  background:
+    radial-gradient(circle at top left, rgba(77, 214, 196, 0.16), transparent 32%),
+    radial-gradient(circle at top right, rgba(246, 181, 76, 0.14), transparent 30%),
+    linear-gradient(180deg, #07111a 0%, #091523 50%, #060c14 100%);
+  color: var(--text);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.tone-success {
+  color: var(--success);
+}
+
+.tone-warning {
+  color: var(--warning);
+}
+
+.tone-danger {
+  color: var(--danger);
+}
+
+.tone-accent {
+  color: var(--accent);
+}
