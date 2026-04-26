@@ -1575,7 +1575,8 @@ impl TaskApiService {
         let (plan, trace) = match self.general_message_plan(request, None) {
             Ok(plan) => plan,
             Err(error) => {
-                let mut response = self.preserve_clip_confirmation_frame_response(request, pending);
+                let mut response =
+                    self.preserve_clip_confirmation_frame_response(request, pending, None);
                 attach_general_message_controller_trace(
                     &mut response,
                     &GeneralMessageControllerTrace {
@@ -1605,7 +1606,8 @@ impl TaskApiService {
                 response
             }
             ActiveFrameDecision::Preserve => {
-                let mut response = self.preserve_clip_confirmation_frame_response(request, pending);
+                let mut response =
+                    self.preserve_clip_confirmation_frame_response(request, pending, Some(&plan));
                 attach_general_message_controller_trace(
                     &mut response,
                     &trace,
@@ -2342,13 +2344,14 @@ impl TaskApiService {
         &self,
         request: &TaskRequest,
         pending: &PendingTaskClipConfirmation,
+        plan: Option<&GeneralMessagePlan>,
     ) -> TaskResponse {
-        let prompt = clip_confirmation_prompt(&pending.display_name);
+        let summary = clip_confirmation_preserve_summary(request, pending, plan);
         let mut response = self.completed(
             request,
             "camera_hub_service",
             RiskLevel::Low,
-            prompt.clone(),
+            summary.clone(),
             json!({
                 "clip_confirmation": {
                     "kind": "clip_confirmation",
@@ -2358,7 +2361,7 @@ impl TaskApiService {
                 },
                 "reply_pack": {
                     "kind": "active_frame_preserve",
-                    "summary": prompt,
+                    "summary": summary,
                 }
             }),
             Vec::new(),
@@ -4215,6 +4218,107 @@ fn clip_confirmation_prompt(display_name: &str) -> String {
     } else {
         format!("已录制 {display_name} 的短视频片段。是否看完整回放？回复：要 / 不要")
     }
+}
+
+fn clip_confirmation_reanchor_prompt(display_name: &str) -> String {
+    let display_name = display_name.trim();
+    if display_name.is_empty() {
+        "刚才那段短视频已经录好，要发完整回放吗？回复：要 / 不要".to_string()
+    } else {
+        format!("刚才 {display_name} 那段短视频已经录好，要发完整回放吗？回复：要 / 不要")
+    }
+}
+
+fn clip_confirmation_preserve_summary(
+    request: &TaskRequest,
+    pending: &PendingTaskClipConfirmation,
+    plan: Option<&GeneralMessagePlan>,
+) -> String {
+    let reanchor = clip_confirmation_reanchor_prompt(&pending.display_name);
+    let Some(plan) = plan else {
+        return reanchor;
+    };
+    let intro = match plan.kind {
+        GeneralMessagePlanKind::CapabilitySummary => {
+            "我可以抓拍最新画面、录短视频，也能搜索已经保存的内容。".to_string()
+        }
+        GeneralMessagePlanKind::Clarify => "我明白你可能想切到别的事；先把这段确认完。".to_string(),
+        GeneralMessagePlanKind::ConversationAct => {
+            let act = plan.conversation_act.unwrap_or_else(|| {
+                infer_general_message_conversation_act(request.intent.raw_text.as_str(), None)
+            });
+            clip_confirmation_preserve_conversation_intro(request, act)
+        }
+        GeneralMessagePlanKind::Unsupported => "这句话我没有当作新的工具动作。".to_string(),
+        _ => String::new(),
+    };
+    join_short_reply(&intro, &reanchor)
+}
+
+fn clip_confirmation_preserve_conversation_intro(
+    request: &TaskRequest,
+    act: GeneralMessageConversationAct,
+) -> String {
+    match act {
+        GeneralMessageConversationAct::Continue => {
+            active_frame_continue_ack(request.intent.raw_text.as_str())
+        }
+        GeneralMessageConversationAct::Boundary => {
+            let normalized = normalize_command_text(request.intent.raw_text.as_str());
+            if matches_any(&normalized, &["天气", "温度", "下雨"]) {
+                "天气这类实时信息我现在不处理；先把当前回放确认完。".to_string()
+            } else {
+                "这类事我现在不直接处理；先把当前回放确认完。".to_string()
+            }
+        }
+        GeneralMessageConversationAct::Repair => {
+            "明白，我先不把这句话当作新的工具动作。".to_string()
+        }
+        GeneralMessageConversationAct::Cancel => String::new(),
+        GeneralMessageConversationAct::ClarifyContinue => {
+            "收到，我们先把当前回放确认完。".to_string()
+        }
+    }
+}
+
+fn active_frame_continue_ack(raw_text: &str) -> String {
+    let normalized = normalize_command_text(raw_text);
+    if matches_any(
+        &normalized,
+        &[
+            "谢谢",
+            "辛苦",
+            "真棒",
+            "很好",
+            "非常好",
+            "不错",
+            "厉害",
+            "太好了",
+            "干得好",
+            "靠谱",
+        ],
+    ) {
+        return "谢谢认可。".to_string();
+    }
+    if matches_any(
+        &normalized,
+        &["收到", "明白", "好的", "好", "嗯", "可以", "ok", "OK"],
+    ) {
+        return "好，我们继续当前这件事。".to_string();
+    }
+    "收到，我们继续当前这件事。".to_string()
+}
+
+fn join_short_reply(intro: &str, reanchor: &str) -> String {
+    let intro = intro.trim();
+    let reanchor = reanchor.trim();
+    if intro.is_empty() {
+        return reanchor.to_string();
+    }
+    if reanchor.is_empty() {
+        return intro.to_string();
+    }
+    format!("{intro}{reanchor}")
 }
 
 fn clip_confirmation_active_frame_decision(plan: &GeneralMessagePlan) -> ActiveFrameDecision {
@@ -11722,7 +11826,9 @@ mod tests {
 
         assert_eq!(feedback.turn.status, TaskStatus::Completed);
         assert_eq!(feedback.reply.kind, "frame_prompt");
-        assert!(feedback.reply.text.contains("是否看完整回放"));
+        assert!(feedback.reply.text.contains("谢谢认可"));
+        assert!(feedback.reply.text.contains("刚才 Tapo 231 那段短视频已经录好"));
+        assert!(feedback.reply.text.contains("要发完整回放吗"));
         let feedback_frame = feedback.active_frame.expect("active clip frame");
         assert_eq!(feedback_frame.kind, "camera.clip_confirmation");
         assert_eq!(feedback_frame.continuation_token, token);
@@ -11764,7 +11870,16 @@ mod tests {
         let token = "cont-clip-no-tool";
         seed_clip_confirmation_turn_state(&conversation_store, handle, token);
 
-        for (index, text) in ["今天天气怎么样", "你能干什么", "不对"].iter().enumerate() {
+        for (index, (text, expected_intro)) in [
+            ("谢谢你", "谢谢认可"),
+            ("你真棒", "谢谢认可"),
+            ("今天天气怎么样", "天气这类实时信息我现在不处理"),
+            ("你能干什么", "我可以抓拍最新画面"),
+            ("不对", "明白，我先不把这句话当作新的工具动作"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let response = service.handle_turn(general_message_turn_envelope(
                 &format!("clip_no_tool_{index}"),
                 text,
@@ -11773,7 +11888,9 @@ mod tests {
             ));
             assert_eq!(response.turn.status, TaskStatus::Completed);
             assert_eq!(response.reply.kind, "frame_prompt");
-            assert!(response.reply.text.contains("是否看完整回放"));
+            assert!(response.reply.text.contains(expected_intro));
+            assert!(response.reply.text.contains("刚才 Tapo 231 那段短视频已经录好"));
+            assert!(response.reply.text.contains("要发完整回放吗"));
             let frame = response.active_frame.expect("active clip frame");
             assert_eq!(frame.kind, "camera.clip_confirmation");
             assert_eq!(frame.continuation_token, token);
