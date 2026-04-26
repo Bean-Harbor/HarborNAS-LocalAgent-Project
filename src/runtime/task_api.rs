@@ -1696,7 +1696,7 @@ impl TaskApiService {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| general_message_conversation_summary(request, prior_pending, act));
-        self.completed(
+        let mut response = self.completed(
             request,
             "agentic_interpreter",
             RiskLevel::Low,
@@ -1710,7 +1710,18 @@ impl TaskApiService {
             }),
             Vec::new(),
             Vec::new(),
-        )
+        );
+        if act == GeneralMessageConversationAct::ClarifyContinue {
+            if let Some(pending) = prior_pending {
+                response.resume_token = Some(pending.resume_token.clone());
+                response.result.next_actions = vec![
+                    "拍一张".to_string(),
+                    "录一段".to_string(),
+                    "搜索已有内容".to_string(),
+                ];
+            }
+        }
+        response
     }
 
     fn general_message_clarification_response(
@@ -4899,9 +4910,6 @@ fn active_frame_from_task_response(response: &TaskResponse) -> Option<ActiveDial
 }
 
 fn turn_reply_kind(response: &TaskResponse, active_frame: Option<&ActiveDialogueFrame>) -> String {
-    if active_frame.is_some() {
-        return "frame_prompt".to_string();
-    }
     let reply_pack_kind = response
         .result
         .data
@@ -4912,8 +4920,9 @@ fn turn_reply_kind(response: &TaskResponse, active_frame: Option<&ActiveDialogue
         "conversation_boundary" => "boundary",
         "conversation_repair" => "repair",
         "conversation_cancel" => "cancel",
-        "clarify_continue" => "clarify",
+        "clarify_continue" | "conversation_clarify_continue" => "clarify",
         "conversation_continue" => "conversation",
+        _ if active_frame.is_some() => "frame_prompt",
         _ => "tool_result",
     }
     .to_string()
@@ -7568,7 +7577,9 @@ mod tests {
         should_route_general_message_to_knowledge, general_message_requests_capability_summary,
         parse_general_message_plan, GeneralMessageConversationAct, GeneralMessagePlanKind,
         PendingTaskCandidate, TaskApiService, TaskArtifact, TaskIntent, TaskMessage,
-        TaskRequest, TaskRequestAcceptance, TaskSource, TaskStatus,
+        TaskRequest, TaskRequestAcceptance, TaskSource, TaskStatus, TaskTurnActor,
+        TaskTurnBlock, TaskTurnContinuation, TaskTurnConversation, TaskTurnEnvelope,
+        TaskTurnInput, TaskTurnTransport,
         ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV,
     };
     use crate::connectors::notifications::{
@@ -7728,6 +7739,51 @@ mod tests {
                 mentions: Vec::new(),
                 attachments: Vec::new(),
             }),
+        }
+    }
+
+    fn general_message_turn_envelope(
+        prefix: &str,
+        raw_text: &str,
+        handle: Option<String>,
+        continuation: Option<TaskTurnContinuation>,
+    ) -> TaskTurnEnvelope {
+        TaskTurnEnvelope {
+            turn: TaskTurnBlock {
+                turn_id: format!("turn-{prefix}"),
+                trace_id: format!("trace-{prefix}"),
+                occurred_at: "2026-04-26T00:00:00Z".to_string(),
+                retry_of: None,
+            },
+            actor: TaskTurnActor {
+                user_id: "user-1".to_string(),
+                workspace_id: "home-1".to_string(),
+                account_id: None,
+            },
+            conversation: TaskTurnConversation {
+                handle,
+                channel: "weixin".to_string(),
+                surface: "harborgate".to_string(),
+                thread_id: "thread-general-turn".to_string(),
+                chat_type: "p2p".to_string(),
+            },
+            transport: TaskTurnTransport {
+                route_key: "gw_route_general_turn".to_string(),
+                message_id: format!("om_{prefix}"),
+                capabilities: json!({
+                    "text": true,
+                    "image": true,
+                    "file": true,
+                    "video": true,
+                }),
+                metadata: Value::Null,
+            },
+            input: TaskTurnInput {
+                text: raw_text.to_string(),
+                parts: Vec::new(),
+            },
+            continuation,
+            autonomy: Default::default(),
         }
     }
 
@@ -11315,6 +11371,48 @@ mod tests {
                 "session-general_pending_feedback",
                 Some("chat-general_pending_feedback"),
             )
+            .expect("load conversation")
+            .expect("conversation");
+        assert!(loaded.general_message_loop().is_some());
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+    }
+
+    #[test]
+    fn general_message_turn_feedback_keeps_active_clarify_frame() {
+        let (service, conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-turn-pending-feedback");
+        let first_response = service.handle_turn(general_message_turn_envelope(
+            "general_turn_pending_feedback",
+            "帮我看一下门口",
+            None,
+            None,
+        ));
+        assert_eq!(first_response.turn.status, TaskStatus::NeedsInput);
+        assert_eq!(first_response.reply.kind, "frame_prompt");
+        let first_frame = first_response.active_frame.expect("active frame");
+        assert_eq!(first_frame.kind, "conversation.clarify");
+
+        let second_response = service.handle_turn(general_message_turn_envelope(
+            "general_turn_pending_feedback_followup",
+            "非常好",
+            Some(first_response.conversation.handle.clone()),
+            Some(TaskTurnContinuation {
+                token: first_frame.continuation_token.clone(),
+                frame_id: first_frame.frame_id.clone(),
+                reply_to_turn_id: first_response.turn.turn_id.clone(),
+                expires_at: None,
+            }),
+        ));
+
+        assert_eq!(second_response.turn.status, TaskStatus::Completed);
+        assert_eq!(second_response.reply.kind, "clarify");
+        assert!(second_response.reply.text.contains("拍一张"));
+        let second_frame = second_response.active_frame.expect("active frame");
+        assert_eq!(second_frame.kind, "conversation.clarify");
+        assert_eq!(second_frame.continuation_token, first_frame.continuation_token);
+        let loaded = conversation_store
+            .load_for_session("", Some(&first_response.conversation.handle))
             .expect("load conversation")
             .expect("conversation");
         assert!(loaded.general_message_loop().is_some());
