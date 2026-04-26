@@ -99,3 +99,19 @@ Every day ends with:
 - next exact step
 
 Do not report a release-ready state while any drift guard still fails.
+
+## 2026-04-26 Closeout
+
+- Completed: v2.0 turn core and active `/api/turns` ingress are implemented
+  locally; assistant task API tests now use turn envelopes.
+- Changed files: `src/runtime/task_api.rs`,
+  `src/bin/assistant_task_api.rs`, and
+  `worklogs/2026-04-26-v20-upgrade.md`.
+- Tests run: `python -m pytest tests/contracts/test_im_v20_control_pack.py -q`,
+  `cargo test --bin assistant-task-api`, `cargo test`, `python -m pytest`,
+  and `git diff --check`.
+- Drift check: Beacon v2.0 guard passed; active assistant task API no longer
+  exposes the v1.5 task ingress.
+- Blockers: `cargo fmt` is unavailable because `rustfmt` is not installed;
+  `.182` live Weixin validation is still pending target-registry confirmation.
+- Next exact step: confirm `.182`, then run the Weixin private-DM v2.0 matrix.
