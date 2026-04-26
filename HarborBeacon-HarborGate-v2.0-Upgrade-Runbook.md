@@ -112,9 +112,10 @@ Do not report a release-ready state while any drift guard still fails.
   pending `conversation.clarify` active frame; clip-confirmation feedback now
   goes through frame-first policy, so no-tool turns preserve
   `camera.clip_confirmation` until explicit playback, cancel, or superseding
-  tool intent; `.197` previously built
-  `harbor-release-20260426-v20-clarify-r1.tar.gz`; `.182` still needs a fresh
-  deploy before Weixin evidence can cover this frame-first fix.
+  tool intent; `.197` built
+  `harbor-release-20260426-v20-frame-first-r1.tar.gz`; `.182` is deployed on
+  that bundle and passes the direct v2 `/api/turns` frame-first matrix through
+  native-video playback hints.
 - Changed files: `src/runtime/task_api.rs`,
   `src/bin/assistant_task_api.rs`, contract default sources/templates/tests,
   v2.0 observability docs, and
@@ -123,15 +124,13 @@ Do not report a release-ready state while any drift guard still fails.
   release-packaging contract tests, `cargo test --bin assistant-task-api`,
   targeted general.message turn tests, targeted clip-confirmation frame tests,
   `cargo test`, `python -m pytest -q`, `git diff --check`, `gh pr checks 3`,
-  and the earlier `.182` direct `/api/turns` matrix before the
+  and the `.182` direct `/api/turns` frame-first matrix after the
   clip-confirmation persistence fix.
 - Drift check: Beacon v2.0 guard passed; active assistant task API no longer
   exposes the v1.5 task ingress; packaged env uses
   `IM_AGENT_CONTRACT_VERSION=2.0`; Gateway accepts contract `2.0` and rejects
   `1.5`.
 - Blockers: `cargo fmt` is unavailable because `rustfmt` is not installed;
-  real Weixin private-DM evidence still requires a fresh `.197` build, `.182`
-  deploy, and a user-side message run.
-- Next exact step: build the frame-first bundle on `.197`, deploy it to `.182`,
-  run the direct `/api/turns` matrix, then run the Weixin private-DM v2.0
-  matrix before merge readiness.
+  real Weixin private-DM evidence still requires a user-side message run.
+- Next exact step: run the Weixin private-DM v2.0 matrix before merge
+  readiness.
