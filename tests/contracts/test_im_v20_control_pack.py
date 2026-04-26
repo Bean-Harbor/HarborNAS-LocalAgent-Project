@@ -72,11 +72,26 @@ def test_beacon_active_sources_have_no_v15_contract_version() -> None:
     active_sources = [
         ROOT / "src" / "runtime" / "task_api.rs",
         ROOT / "src" / "bin" / "assistant_task_api.rs",
+        ROOT / "src" / "bin" / "agent_hub_admin_api.rs",
+        ROOT / "src" / "connectors" / "im_gateway.rs",
+        ROOT / "src" / "connectors" / "notifications.rs",
+        ROOT / "src" / "scripts" / "validate.rs",
+        ROOT / "tools" / "install_harboros_release.sh",
+        ROOT / "tools" / "release_templates" / "harborbeacon-agent-hub.env.template",
+        ROOT / "tools" / "release_templates" / "bin" / "harbor-agent-hub-helper",
+    ]
+    forbidden = [
+        "X-Contract-Version: 1.5",
+        '"X-Contract-Version", "1.5"',
+        'CONTRACT_VERSION: &str = "1.5"',
+        "IM_AGENT_CONTRACT_VERSION=1.5",
+        'DEFAULT_CONTRACT_VERSION = "1.5"',
     ]
     offenders = [
-        str(path)
+        f"{path}:{pattern}"
         for path in active_sources
-        if path.exists() and "X-Contract-Version: 1.5" in _read(path)
+        for pattern in forbidden
+        if path.exists() and pattern in _read(path)
     ]
     assert not offenders
 

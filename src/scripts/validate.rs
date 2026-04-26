@@ -7,7 +7,7 @@ use crate::scripts::integration::{
     default_midcli_service_query, IntegrationConfig, MidcliClient, MiddlewareClient,
 };
 
-const REQUIRED_FILES: [&str; 15] = [
+const REQUIRED_FILES: [&str; 16] = [
     "HarborBeacon-LocalAgent-V2-Assistant-Skills-Roadmap.md",
     "HarborBeacon-Middleware-Endpoint-Contract-v1.md",
     "HarborBeacon-Files-BatchOps-Contract-v1.md",
@@ -15,7 +15,8 @@ const REQUIRED_FILES: [&str; 15] = [
     "HarborBeacon-Contract-E2E-Test-Plan-v1.md",
     "HarborBeacon-CI-Contract-Pipeline-Checklist-v1.md",
     "HarborBeacon-GitHub-Actions-Workflow-Draft-v1.md",
-    "HarborBeacon-HarborGate-v1.5-Cutover-Evidence.md",
+    "HarborBeacon-HarborGate-v2.0-Upgrade-Runbook.md",
+    "docs/im-v2.0-cutover-rollback-observability-gates.md",
     "docs/hos-system-domain-cutover-smoke.md",
     "docs/cited-retrieval-reply-pack.md",
     "docs/knowledge-indexing-pack.md",
@@ -71,8 +72,11 @@ pub fn build_checks(root: &Path) -> Vec<CheckResult> {
     let planner_doc =
         fs::read_to_string(root.join("HarborBeacon-Planner-TaskDecompose-Contract-v1.md"))
             .unwrap_or_default();
-    let cutover_doc =
-        fs::read_to_string(root.join("HarborBeacon-HarborGate-v1.5-Cutover-Evidence.md"))
+    let v20_upgrade_doc =
+        fs::read_to_string(root.join("HarborBeacon-HarborGate-v2.0-Upgrade-Runbook.md"))
+            .unwrap_or_default();
+    let v20_gates_doc =
+        fs::read_to_string(root.join("docs/im-v2.0-cutover-rollback-observability-gates.md"))
             .unwrap_or_default();
     let rollback_doc =
         fs::read_to_string(root.join("docs/im-v1.5-cutover-rollback-observability-gates.md"))
@@ -131,22 +135,21 @@ pub fn build_checks(root: &Path) -> Vec<CheckResult> {
     });
 
     checks.push(CheckResult {
-        name: "cutover-evidence:frozen-seam-coverage".to_string(),
+        name: "v20-upgrade-control-pack:active-seam-coverage".to_string(),
         passed: [
-            "POST /api/tasks",
+            "POST /api/turns",
             "POST /api/notifications/deliveries",
             "GET /api/gateway/status",
-            "X-Contract-Version: 1.5",
-            "resume_token",
-            "accepted-request delivery failures remain `HTTP 200` with `ok=false`",
-            "direct platform delivery count is `0`",
-            "must not reintroduce legacy recipient fallback",
-            "Rollback must preserve the frozen boundary",
-            "external IM repo",
+            "X-Contract-Version: 2.0",
+            "conversation.handle",
+            "active_frame",
+            "continuation",
+            "delivery_hints",
+            "v1.5 documents are historical",
         ]
         .iter()
-        .all(|item| cutover_doc.contains(item)),
-        details: "HarborBeacon cutover evidence must cover the frozen endpoints, rollback constraints, and remaining external dependencies.".to_string(),
+        .all(|item| v20_upgrade_doc.contains(item) || v20_gates_doc.contains(item)),
+        details: "HarborBeacon v2.0 control pack must cover active endpoints, conversation state, delivery hints, and historical v1.5 status.".to_string(),
         skipped: None,
     });
 

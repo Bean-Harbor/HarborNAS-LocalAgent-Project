@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-pub const CONTRACT_VERSION: &str = "1.5";
+pub const CONTRACT_VERSION: &str = "2.0";
 const IM_GATEWAY_BASE_URL_ENV: &str = "HARBORGATE_BASE_URL";
 const IM_GATEWAY_BEARER_TOKEN_ENV: &str = "HARBORGATE_BEARER_TOKEN";
 const LEGACY_IM_GATEWAY_BASE_URL_ENV: &str = "HARBOR_IM_GATEWAY_BASE_URL";

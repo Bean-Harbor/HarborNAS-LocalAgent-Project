@@ -12,7 +12,7 @@ from urllib import error, request
 
 
 DEFAULT_ENV_FILE = "/etc/default/harborbeacon-agent-hub"
-DEFAULT_CONTRACT_VERSION = "1.5"
+DEFAULT_CONTRACT_VERSION = "2.0"
 DEFAULT_HTTP_TIMEOUT_SECONDS = 5
 SERVICE_ORDER = [
     "harbor-model-api.service",

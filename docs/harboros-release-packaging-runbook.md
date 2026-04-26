@@ -251,7 +251,7 @@ clean install 的健康预期：
 
 - `status` 输出 5 个 unit 的 `is-enabled / is-active / MainPID` 风格摘要 JSON
 - `health` 顺序检查 `127.0.0.1:4174/4175/4176/8787` 的 loopback health
-- `health` 还会带 service auth + `X-Contract-Version: 1.5` 调 `GET /api/gateway/status`
+- `health` 还会带 service auth + `X-Contract-Version: 2.0` 调 `GET /api/gateway/status`
 - Weixin 摘要优先读 gateway redacted truth；如果 gateway 暂时不可读，再回退到 `WEIXIN_STATE_DIR/accounts/<account>.runtime.json`
 - Weixin 观测至少包含：
   - `last_poll_at`

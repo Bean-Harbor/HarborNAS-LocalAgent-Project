@@ -101,6 +101,7 @@ def test_harboros_installer_manages_release_layout_and_services() -> None:
         "EXISTING_WRITABLE_ROOT",
         "HARBORBEACON_ADMIN_API_URL=http://127.0.0.1:4174",
         "HARBORBEACON_ADMIN_API_TOKEN",
+        "IM_AGENT_CONTRACT_VERSION=2.0",
         "not configured, skipped",
         "append_optional_env",
     ]
@@ -120,6 +121,7 @@ def test_resident_stack_helper_exposes_status_health_and_logs() -> None:
         "harborgate-weixin-runner.service",
         "/api/gateway/status",
         "X-Contract-Version",
+        'DEFAULT_CONTRACT_VERSION = "2.0"',
         "WEIXIN_STATE_DIR",
         "last_private_text_message_at",
         "journalctl",

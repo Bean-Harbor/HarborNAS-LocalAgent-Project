@@ -3581,7 +3581,7 @@ fn fetch_remote_gateway_status() -> Result<Value, String> {
         .build()
         .map_err(|error| format!("failed to build HarborGate status client: {error}"))?;
 
-    let mut request = client.get(endpoint).header("X-Contract-Version", "1.5");
+    let mut request = client.get(endpoint).header("X-Contract-Version", "2.0");
     if let Some(token) = env_var_with_legacy_alias(PRIMARY_TOKEN, LEGACY_TOKEN) {
         request = request.header("Authorization", format!("Bearer {token}"));
     }

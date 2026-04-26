@@ -6,7 +6,7 @@ use std::time::Duration;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 
-pub const CONTRACT_VERSION: &str = "1.5";
+pub const CONTRACT_VERSION: &str = "2.0";
 pub const IM_GATEWAY_BASE_URL_ENV: &str = "HARBORGATE_BASE_URL";
 pub const IM_GATEWAY_BEARER_TOKEN_ENV: &str = "HARBORGATE_BEARER_TOKEN";
 pub const LEGACY_IM_GATEWAY_BASE_URL_ENV: &str = "HARBOR_IM_GATEWAY_BASE_URL";
