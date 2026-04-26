@@ -13,6 +13,10 @@ Cutover is allowed only when all are true:
 - HarborGate sends `POST /api/turns` for inbound IM turns.
 - Active service-to-service requests use `X-Contract-Version: 2.0`.
 - No active HarborGate path posts `/api/tasks`.
+- HarborBeacon notification intents still target
+  `POST /api/notifications/deliveries` on HarborGate.
+- HarborBeacon admin/status probes still consume HarborGate redacted status via
+  `GET /api/gateway/status`.
 - No active request builder emits `args.resume_token`.
 - HarborBeacon keys business conversation state by Beacon-owned
   `conversation.handle`.
