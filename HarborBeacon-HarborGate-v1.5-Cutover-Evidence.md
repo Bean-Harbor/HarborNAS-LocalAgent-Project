@@ -1,5 +1,16 @@
 # HarborBeacon HarborGate v1.5 Cutover Evidence Checklist
 
+## Historical Status
+
+This document is historical after the 2026-04-26 decision to move the active
+HarborBeacon <-> HarborGate seam to Contract v2.0.
+
+Do not use this file as the current release gate. The active control pack is:
+
+- `C:\Users\beanw\OpenSource\HarborGate\HarborBeacon-HarborGate-Agent-Contract-v2.0.md`
+- `HarborBeacon-HarborGate-v2.0-Upgrade-Runbook.md`
+- `docs/im-v2.0-cutover-rollback-observability-gates.md`
+
 ## Purpose
 
 This document is the HarborBeacon-side evidence package for the frozen HarborGate

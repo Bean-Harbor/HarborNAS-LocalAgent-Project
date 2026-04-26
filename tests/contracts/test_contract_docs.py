@@ -8,6 +8,8 @@ def test_required_contract_documents_exist() -> None:
         "HarborBeacon-Planner-TaskDecompose-Contract-v1.md",
         "HarborBeacon-Contract-E2E-Test-Plan-v1.md",
         "HarborBeacon-HarborGate-v1.5-Cutover-Evidence.md",
+        "HarborBeacon-HarborGate-v2.0-Upgrade-Runbook.md",
+        "docs/im-v2.0-cutover-rollback-observability-gates.md",
         "docs/harboros-real-integration-parity-note.md",
     ]
     missing = [name for name in required if not (ROOT / name).exists()]

@@ -1,16 +1,19 @@
 # HarborBeacon Local Agent V2 路线图与任务分配
 
-> 当前定位说明（2026-04-18）  
-> 本文档当前执行线切换为 `HarborBeacon x HarborGate v1.5 cutover`。  
-> 双仓边界已经明确：IM 仓库负责 `adapter/gateway/route/平台凭据`，HarborBeacon 负责 `task/business state/approval/artifact/audit`。  
+> 当前定位说明（2026-04-26）
+> 本文档当前执行线切换为 `HarborBeacon x HarborGate Contract v2.0 upgrade`。
+> 双仓边界已经明确：IM 仓库负责 `adapter/gateway/route/平台凭据/delivery`，HarborBeacon 负责 `conversation turn/business state/active frame/approval/artifact/audit`。
 > 两边只通过 HTTP/JSON contract 通信，不互相 import，也不共享 `.harborbeacon/*.json`。  
 > 本仓库只负责 HarborBeacon 侧工作项；IM 仓库能力只作为外部依赖与联调对象跟踪。  
 > 协作术语统一以 `HarborBeacon-Harbor-Collaboration-Contract-v2` 与 `harbor-*` lane 命名为准。
 >
-> 当前进展快照（2026-04-18）  
-> 已完成：`/api/tasks` v1.5 入站对齐、`route_key/message` 持久化、审批 / artifact / audit 关联补齐、附件 transport metadata opaque 持久化、通知出站切到 HarborGate、管理面去凭据化与 redacted status 接入。  
-> 进行中：跨仓 contract / integration / E2E 联调。  
-> 待完成：迁移期开关、回滚清单、旧路径彻底下线。
+> 当前进展快照（2026-04-26）
+> 已批准：直接升级到 v2.0，不做 v1.5/v2.0 runtime 双栈兼容。
+> 进行中：control pack、v2.0 contract、runbook、drift guard。
+> 待完成：Beacon `/api/turns`、`TaskTurnEnvelope`、`ActiveDialogueFrame`、Gate v2 turn client、Weixin live matrix。
+>
+> 本文后续早期 v1.5 phase 描述保留为历史上下文；当前执行、验收与回滚以
+> `HarborBeacon-HarborGate-v2.0-Upgrade-Runbook.md` 和外部 v2.0 contract 为准。
 
 ## 1. 目标重申（真实北极星）
 

@@ -1,11 +1,14 @@
 # HarborBeacon 本地智能体规划文档
 
-> 当前执行更新（2026-04-18）  
-> 当前落地重点不是继续扩张单仓 IM 能力，而是按 `HarborBeacon-HarborGate-Agent-Contract-v1.5` 完成双仓边界。
-> IM 仓库负责 `adapter/gateway/route/平台凭据`；HarborBeacon 负责 `task/business state/approval/artifact/audit`。  
+> 当前执行更新（2026-04-26）
+> 当前落地重点不是继续收口 v1.5，而是按 `HarborBeacon-HarborGate-Agent-Contract-v2.0` 直接升级双仓边界。
+> IM 仓库负责 `adapter/gateway/route/平台凭据/delivery`；HarborBeacon 负责 `conversation turn/business state/active frame/approval/artifact/audit`。
 > 两边只通过 HTTP/JSON contract 通信，不互相 import，也不共享 `.harborbeacon/*.json`。  
 > 本文档以下实施阶段与近期行动，均以 HarborBeacon 侧可执行工作为准。  
 > 协作术语统一以 `HarborBeacon-Harbor-Collaboration-Contract-v2` 与 `harbor-*` lane 命名为准。
+>
+> 本文后续早期 v1.5 task-contract 描述保留为历史上下文；当前执行、验收与回滚以
+> `HarborBeacon-HarborGate-v2.0-Upgrade-Runbook.md` 和外部 v2.0 contract 为准。
 
 ## 0. 当前协作口径
 
@@ -50,7 +53,7 @@
 │  platform credentials / outbound delivery / attachment proxy │
 └──────────────────────┬───────────────────────────────────────┘
                        │  HTTP/JSON contract only
-                       │  POST /api/tasks
+                       │  POST /api/turns
                        │  POST /api/notifications/deliveries
                        │  GET  /api/gateway/status (optional)
 ┌──────────────────────▼───────────────────────────────────────┐

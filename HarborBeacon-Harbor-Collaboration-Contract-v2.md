@@ -12,13 +12,17 @@ development model across:
 It supersedes the narrower HarborOS-control-only collaboration model as the
 primary coordination document for the current phase.
 
-This document does not replace or reinterpret the external IM contract.
+This document does not replace or reinterpret the external IM contract. For the
+current phase, the active external IM contract is v2.0.
 
 ## Normative References
 
 The authoritative cross-repo IM boundary remains:
 
-- `C:\Users\beanw\OpenSource\IM\HarborBeacon-HarborGate-Agent-Contract-v1.5.md`
+- `C:\Users\beanw\OpenSource\HarborGate\HarborBeacon-HarborGate-Agent-Contract-v2.0.md`
+
+The previous v1.5 contract is historical reference only during the v2.0
+upgrade.
 
 Execution planning references:
 
@@ -29,8 +33,8 @@ Historical same-repo HarborOS-only collaboration context:
 
 - `C:\Users\beanw\HarborBeacon-LocalAgent-Project-git\HarborBeacon-HarborOS-Control-Collaboration-Contract-v1.md`
 
-If this document conflicts with the IM contract v1.5 on cross-repo interface
-semantics, the IM contract v1.5 wins.
+If this document conflicts with the IM contract v2.0 on cross-repo interface
+semantics, the IM contract v2.0 wins.
 
 ## Purpose
 
@@ -183,14 +187,16 @@ Meaning:
 
 ## Frozen Interfaces
 
-The following are frozen by the external IM contract and MUST NOT change
+The following are frozen by the active external IM contract and MUST NOT change
 without explicit multi-lane sign-off:
 
-- `POST /api/tasks`
-- `TaskRequest` and `TaskResponse` semantics visible to IM callers
-- top-level `message` block semantics
-- `source.route_key`
-- resumed-turn behavior using `args.resume_token`
+- `POST /api/turns`
+- `TaskTurnEnvelope` and turn response semantics visible to IM callers
+- `conversation.handle`
+- `transport.route_key`
+- `active_frame`
+- `continuation`
+- `delivery_hints`
 - outbound notification request and response semantics
 - `X-Contract-Version`
 - shared HTTP auth and non-200 error-envelope rules

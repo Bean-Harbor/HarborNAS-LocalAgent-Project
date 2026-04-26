@@ -1,5 +1,12 @@
 # IM v1.5 Cutover Rollback and Observability Gates
 
+## Historical Status
+
+This document is historical after the 2026-04-26 decision to move the active
+HarborBeacon <-> HarborGate seam to Contract v2.0.
+
+Use `docs/im-v2.0-cutover-rollback-observability-gates.md` for current work.
+
 ## Purpose
 
 This gate package is for HarborBeacon IM v1.5 cutover operations only.
