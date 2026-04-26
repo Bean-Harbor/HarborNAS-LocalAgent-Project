@@ -103,15 +103,26 @@ Do not report a release-ready state while any drift guard still fails.
 ## 2026-04-26 Closeout
 
 - Completed: v2.0 turn core and active `/api/turns` ingress are implemented
-  locally; assistant task API tests now use turn envelopes.
+  locally; assistant task API tests now use turn envelopes; active
+  Beacon/Gate defaults now use contract `2.0`; clarification feedback now keeps
+  a pending `conversation.clarify` active frame; `.197` built
+  `harbor-release-20260426-v20-clarify-r1.tar.gz`; `.182` is deployed on that
+  bundle and passes the direct v2 `/api/turns` matrix through native-video
+  playback hints.
 - Changed files: `src/runtime/task_api.rs`,
-  `src/bin/assistant_task_api.rs`, and
+  `src/bin/assistant_task_api.rs`, contract default sources/templates/tests,
+  v2.0 observability docs, and
   `worklogs/2026-04-26-v20-upgrade.md`.
 - Tests run: `python -m pytest tests/contracts/test_im_v20_control_pack.py -q`,
-  `cargo test --bin assistant-task-api`, `cargo test`, `python -m pytest`,
-  and `git diff --check`.
+  release-packaging contract tests, `cargo test --bin assistant-task-api`,
+  targeted general.message turn tests, `cargo test`, `python -m pytest -q`,
+  `git diff --check`, `gh pr checks 3`, and the `.182` direct `/api/turns`
+  matrix.
 - Drift check: Beacon v2.0 guard passed; active assistant task API no longer
-  exposes the v1.5 task ingress.
+  exposes the v1.5 task ingress; packaged env uses
+  `IM_AGENT_CONTRACT_VERSION=2.0`; Gateway accepts contract `2.0` and rejects
+  `1.5`.
 - Blockers: `cargo fmt` is unavailable because `rustfmt` is not installed;
-  `.182` live Weixin validation is still pending target-registry confirmation.
-- Next exact step: confirm `.182`, then run the Weixin private-DM v2.0 matrix.
+  real Weixin private-DM evidence still requires a user-side message run.
+- Next exact step: run the Weixin private-DM v2.0 matrix on `.182`, then decide
+  Gate/Beacon merge readiness from the live evidence.
