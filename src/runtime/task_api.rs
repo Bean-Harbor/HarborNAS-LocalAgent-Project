@@ -541,6 +541,14 @@ enum ClipConfirmationReplyDecision {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveFrameDecision {
+    Preserve,
+    Supersede,
+    Deliver,
+    Cancel,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct GeneralMessageControllerTrace {
     controller_stage: String,
@@ -1407,18 +1415,8 @@ impl TaskApiService {
 
     fn handle_general_message(&self, request: &TaskRequest) -> TaskResponse {
         let turn_started = Instant::now();
-        if let Some(resume_token) = continuation_token_from_request(request) {
-            let conversation = self.load_or_create_conversation(request);
-            if conversation.clip_pending_confirmation().is_some() {
-                return self.resume_camera_record_clip_confirmation(request, &resume_token);
-            }
-            if conversation.camera_pending_connect().is_some() {
-                let routed = inject_password_arg_from_raw_text(request);
-                return self.resume_camera_connect(&routed, &resume_token);
-            }
-            if conversation.general_message_loop().is_some() {
-                return self.resume_general_message_loop(request, &resume_token);
-            }
+        if let Some(response) = self.handle_general_message_active_frame(request, turn_started) {
+            return response;
         }
 
         let (plan, trace) = match self.general_message_plan(request, None) {
@@ -1441,6 +1439,181 @@ impl TaskApiService {
         let mut response = self.execute_general_message_plan(request, plan, None);
         attach_general_message_controller_trace(&mut response, &trace, turn_started.elapsed());
         response
+    }
+
+    fn handle_general_message_active_frame(
+        &self,
+        request: &TaskRequest,
+        turn_started: Instant,
+    ) -> Option<TaskResponse> {
+        let conversation = self.load_or_create_conversation(request);
+        let continuation_token = continuation_token_from_request(request);
+        let continuation_token = continuation_token.as_deref();
+
+        if let Some(pending) = conversation.clip_pending_confirmation() {
+            return Some(self.handle_clip_confirmation_frame(
+                request,
+                &pending,
+                continuation_token,
+                turn_started,
+            ));
+        }
+        if let Some(pending) = conversation.camera_pending_connect() {
+            return Some(self.handle_camera_connect_frame(request, &pending, continuation_token));
+        }
+        if let Some(pending) = conversation.general_message_loop() {
+            return Some(self.handle_general_message_loop_frame(
+                request,
+                &pending,
+                continuation_token,
+            ));
+        }
+        None
+    }
+
+    fn handle_general_message_loop_frame(
+        &self,
+        request: &TaskRequest,
+        pending: &PendingTaskGeneralMessageLoop,
+        continuation_token: Option<&str>,
+    ) -> TaskResponse {
+        if !active_frame_token_matches(continuation_token, &pending.resume_token) {
+            return self.failed(
+                request,
+                "agentic_interpreter",
+                RiskLevel::Low,
+                "这次补充说明的令牌已失效，请重新描述你的需求。".to_string(),
+            );
+        }
+        self.resume_general_message_loop(request, &pending.resume_token)
+    }
+
+    fn handle_camera_connect_frame(
+        &self,
+        request: &TaskRequest,
+        pending: &PendingTaskConnect,
+        continuation_token: Option<&str>,
+    ) -> TaskResponse {
+        if !active_frame_token_matches(continuation_token, &pending.resume_token) {
+            return self.failed(
+                request,
+                "camera_hub_service",
+                RiskLevel::Medium,
+                "接入令牌已失效，请重新发送“扫描摄像头”。".to_string(),
+            );
+        }
+
+        let routed = inject_password_arg_from_raw_text(request);
+        if string_at_paths(&routed.args, &["/password"]).is_some() {
+            return self.resume_camera_connect(&routed, &pending.resume_token);
+        }
+
+        if active_frame_cancel_requested(request.intent.raw_text.as_str()) {
+            let mut conversation = self.load_or_create_conversation(request);
+            conversation.set_camera_pending_connect(None);
+            if let Err(error) = self.save_conversation(request, &conversation) {
+                return self.failed(
+                    request,
+                    "camera_hub_service",
+                    RiskLevel::Medium,
+                    format!("无法更新摄像头接入状态: {error}"),
+                );
+            }
+            return self.completed(
+                request,
+                "camera_hub_service",
+                RiskLevel::Medium,
+                "好的，先不继续接入这台摄像头。".to_string(),
+                json!({
+                    "reply_pack": {
+                        "kind": "conversation_cancel",
+                        "summary": "好的，先不继续接入这台摄像头。",
+                        "conversation_act": "cancel",
+                    }
+                }),
+                Vec::new(),
+                Vec::new(),
+            );
+        }
+
+        self.needs_input(
+            request,
+            "camera_hub_service",
+            RiskLevel::Medium,
+            "这台摄像头需要密码，请回复：密码 xxxxxx".to_string(),
+            vec!["password".to_string()],
+            pending.resume_token.clone(),
+        )
+    }
+
+    fn handle_clip_confirmation_frame(
+        &self,
+        request: &TaskRequest,
+        pending: &PendingTaskClipConfirmation,
+        continuation_token: Option<&str>,
+        turn_started: Instant,
+    ) -> TaskResponse {
+        if !active_frame_token_matches(continuation_token, &pending.resume_token) {
+            return self.failed(
+                request,
+                "camera_hub_service",
+                RiskLevel::Low,
+                "回放确认令牌已失效，请重新发送“录一段”。".to_string(),
+            );
+        }
+
+        match clip_confirmation_reply_decision(request.intent.raw_text.as_str()) {
+            ClipConfirmationReplyDecision::Deliver => {
+                return self.complete_clip_confirmation_delivery(request, pending);
+            }
+            ClipConfirmationReplyDecision::Decline => {
+                return self.decline_clip_confirmation(request, pending);
+            }
+            ClipConfirmationReplyDecision::Unknown => {}
+        }
+
+        let (plan, trace) = match self.general_message_plan(request, None) {
+            Ok(plan) => plan,
+            Err(error) => {
+                let mut response = self.preserve_clip_confirmation_frame_response(request, pending);
+                attach_general_message_controller_trace(
+                    &mut response,
+                    &GeneralMessageControllerTrace {
+                        controller_stage: "controller_error".to_string(),
+                        fallback_reason: Some(error),
+                        ..Default::default()
+                    },
+                    turn_started.elapsed(),
+                );
+                return response;
+            }
+        };
+
+        match clip_confirmation_active_frame_decision(&plan) {
+            ActiveFrameDecision::Deliver => self.complete_clip_confirmation_delivery(request, pending),
+            ActiveFrameDecision::Cancel => self.decline_clip_confirmation(request, pending),
+            ActiveFrameDecision::Supersede => {
+                if let Err(response) = self.clear_clip_confirmation_if_matches(request, pending) {
+                    return response;
+                }
+                let mut response = self.execute_general_message_plan(request, plan, None);
+                attach_general_message_controller_trace(
+                    &mut response,
+                    &trace,
+                    turn_started.elapsed(),
+                );
+                response
+            }
+            ActiveFrameDecision::Preserve => {
+                let mut response = self.preserve_clip_confirmation_frame_response(request, pending);
+                attach_general_message_controller_trace(
+                    &mut response,
+                    &trace,
+                    turn_started.elapsed(),
+                );
+                response
+            }
+        }
     }
 
     fn resume_general_message_loop(
@@ -2105,10 +2278,7 @@ impl TaskApiService {
             );
         }
 
-        let prompt = format!(
-            "已录制 {} 的短视频片段。是否看完整回放？回复：要 / 不要",
-            target.display_name
-        );
+        let prompt = clip_confirmation_prompt(&target.display_name);
         self.needs_input_with_artifacts_context(
             request,
             "camera_hub_service",
@@ -2123,89 +2293,103 @@ impl TaskApiService {
         )
     }
 
-    fn resume_camera_record_clip_confirmation(
+    fn complete_clip_confirmation_delivery(
         &self,
         request: &TaskRequest,
-        resume_token: &str,
+        pending: &PendingTaskClipConfirmation,
     ) -> TaskResponse {
-        let turn_started = Instant::now();
-        let mut conversation = self.load_or_create_conversation(request);
-        let Some(pending) = conversation.clip_pending_confirmation() else {
-            return self.failed(
-                request,
-                "camera_hub_service",
-                RiskLevel::Low,
-                "当前没有待确认的回放，请重新发送“录一段”。".to_string(),
-            );
-        };
-        if pending.resume_token != resume_token {
-            return self.failed(
-                request,
-                "camera_hub_service",
-                RiskLevel::Low,
-                "回放确认令牌已失效，请重新发送“录一段”。".to_string(),
-            );
-        }
-
-        let decision = clip_confirmation_reply_decision(request.intent.raw_text.as_str());
-        conversation.set_clip_pending_confirmation(None);
-        if let Err(error) = self.save_conversation(request, &conversation) {
-            return self.failed(
-                request,
-                "camera_hub_service",
-                RiskLevel::Low,
-                format!("无法更新回放确认状态: {error}"),
-            );
-        }
-
+        let conversation = self.load_or_create_conversation(request);
         let recent_clip = conversation
             .recent_clip_playback()
-            .unwrap_or_else(|| recent_clip_playback_from_pending(&pending, current_epoch_ms()));
-        match decision {
-            ClipConfirmationReplyDecision::Deliver => {
-                self.complete_recent_clip_playback(request, &recent_clip)
-            }
-            ClipConfirmationReplyDecision::Decline => self.completed(
-                request,
-                "camera_hub_service",
-                RiskLevel::Low,
-                "好的，这段回放先不发。".to_string(),
-                json!({
-                    "clip_confirmation": {
-                        "kind": "clip_confirmation",
-                        "clip_media_asset_id": pending.clip_media_asset_id,
-                        "decision": "declined",
-                    }
-                }),
-                Vec::new(),
-                Vec::new(),
-            ),
-            ClipConfirmationReplyDecision::Unknown => {
-                let (plan, trace) = match self.general_message_plan(request, None) {
-                    Ok(plan) => plan,
-                    Err(error) => {
-                        let mut response = self.general_message_unsupported_response(request, None);
-                        attach_general_message_controller_trace(
-                            &mut response,
-                            &GeneralMessageControllerTrace {
-                                controller_stage: "controller_error".to_string(),
-                                fallback_reason: Some(error),
-                                ..Default::default()
-                            },
-                            turn_started.elapsed(),
-                        );
-                        return response;
-                    }
-                };
-                let mut response = self.execute_general_message_plan(request, plan, None);
-                attach_general_message_controller_trace(
-                    &mut response,
-                    &trace,
-                    turn_started.elapsed(),
-                );
-                response
-            }
+            .unwrap_or_else(|| recent_clip_playback_from_pending(pending, current_epoch_ms()));
+        if let Err(response) = self.clear_clip_confirmation_if_matches(request, pending) {
+            return response;
         }
+        self.complete_recent_clip_playback(request, &recent_clip)
+    }
+
+    fn decline_clip_confirmation(
+        &self,
+        request: &TaskRequest,
+        pending: &PendingTaskClipConfirmation,
+    ) -> TaskResponse {
+        if let Err(response) = self.clear_clip_confirmation_if_matches(request, pending) {
+            return response;
+        }
+        self.completed(
+            request,
+            "camera_hub_service",
+            RiskLevel::Low,
+            "好的，这段回放先不发。".to_string(),
+            json!({
+                "clip_confirmation": {
+                    "kind": "clip_confirmation",
+                    "clip_media_asset_id": pending.clip_media_asset_id.clone(),
+                    "decision": "declined",
+                },
+                "reply_pack": {
+                    "kind": "conversation_cancel",
+                    "summary": "好的，这段回放先不发。",
+                    "conversation_act": "cancel",
+                }
+            }),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    fn preserve_clip_confirmation_frame_response(
+        &self,
+        request: &TaskRequest,
+        pending: &PendingTaskClipConfirmation,
+    ) -> TaskResponse {
+        let prompt = clip_confirmation_prompt(&pending.display_name);
+        let mut response = self.completed(
+            request,
+            "camera_hub_service",
+            RiskLevel::Low,
+            prompt.clone(),
+            json!({
+                "clip_confirmation": {
+                    "kind": "clip_confirmation",
+                    "clip_media_asset_id": pending.clip_media_asset_id.clone(),
+                    "decision": "pending",
+                    "preserved": true,
+                },
+                "reply_pack": {
+                    "kind": "active_frame_preserve",
+                    "summary": prompt,
+                }
+            }),
+            Vec::new(),
+            vec!["要".to_string(), "不要".to_string()],
+        );
+        response.resume_token = Some(pending.resume_token.clone());
+        response
+    }
+
+    fn clear_clip_confirmation_if_matches(
+        &self,
+        request: &TaskRequest,
+        pending: &PendingTaskClipConfirmation,
+    ) -> Result<(), TaskResponse> {
+        let mut conversation = self.load_or_create_conversation(request);
+        if conversation
+            .clip_pending_confirmation()
+            .is_some_and(|current| current.resume_token == pending.resume_token)
+        {
+            conversation.set_clip_pending_confirmation(None);
+            self.save_conversation(request, &conversation)
+                .map_err(|error| {
+                    self.failed(
+                        request,
+                        "camera_hub_service",
+                        RiskLevel::Low,
+                        format!("无法更新回放确认状态: {error}"),
+                    )
+                })?;
+        }
+        Ok(())
     }
 
     fn handle_camera_snapshot(&self, request: &TaskRequest) -> TaskResponse {
@@ -4005,6 +4189,49 @@ fn build_clip_delivery_artifact(recent_clip: &RecentClipPlaybackState) -> TaskAr
     }
 }
 
+fn active_frame_token_matches(provided: Option<&str>, expected: &str) -> bool {
+    let expected = expected.trim();
+    if expected.is_empty() {
+        return false;
+    }
+    match provided.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => value == expected,
+        None => true,
+    }
+}
+
+fn active_frame_cancel_requested(raw_text: &str) -> bool {
+    let normalized = normalize_command_text(raw_text);
+    matches_any(
+        &normalized,
+        &["算了", "不用了", "先不用", "不要了", "别处理", "取消"],
+    ) || normalized == normalize_command_text("不要")
+}
+
+fn clip_confirmation_prompt(display_name: &str) -> String {
+    let display_name = display_name.trim();
+    if display_name.is_empty() {
+        "已录制短视频片段。是否看完整回放？回复：要 / 不要".to_string()
+    } else {
+        format!("已录制 {display_name} 的短视频片段。是否看完整回放？回复：要 / 不要")
+    }
+}
+
+fn clip_confirmation_active_frame_decision(plan: &GeneralMessagePlan) -> ActiveFrameDecision {
+    match plan.kind {
+        GeneralMessagePlanKind::CameraReplayRecentClip => ActiveFrameDecision::Deliver,
+        GeneralMessagePlanKind::CameraSnapshot
+        | GeneralMessagePlanKind::CameraRecordClip
+        | GeneralMessagePlanKind::KnowledgeSearch => ActiveFrameDecision::Supersede,
+        GeneralMessagePlanKind::ConversationAct
+            if plan.conversation_act == Some(GeneralMessageConversationAct::Cancel) =>
+        {
+            ActiveFrameDecision::Cancel
+        }
+        _ => ActiveFrameDecision::Preserve,
+    }
+}
+
 fn clip_confirmation_reply_decision(raw_text: &str) -> ClipConfirmationReplyDecision {
     let normalized = normalize_command_text(raw_text);
     if normalized.is_empty() {
@@ -4024,8 +4251,15 @@ fn clip_confirmation_reply_decision(raw_text: &str) -> ClipConfirmationReplyDeci
 fn clip_confirmation_reply_is_affirmative(normalized: &str) -> bool {
     matches!(
         normalized,
-        "要" | "要看" | "看" | "发我" | "发出来" | "给我看" | "给我看完整回放" | "好" | "好的"
-            | "行" | "可以" | "好的发我" | "可以发我"
+        "要"
+            | "要看"
+            | "看"
+            | "发我"
+            | "发出来"
+            | "给我看"
+            | "给我看完整回放"
+            | "好的发我"
+            | "可以发我"
     )
 }
 
@@ -4044,6 +4278,8 @@ fn clip_confirmation_reply_is_negative(normalized: &str) -> bool {
             | "不用发"
             | "不要发"
             | "算了"
+            | "取消"
+            | "别处理"
     )
 }
 
@@ -7787,6 +8023,50 @@ mod tests {
         }
     }
 
+    fn seed_clip_confirmation_turn_state(
+        conversation_store: &TaskConversationStore,
+        handle: &str,
+        token: &str,
+    ) {
+        let session = ConversationSession {
+            session_id: handle.to_string(),
+            workspace_id: "home-1".to_string(),
+            channel: "weixin".to_string(),
+            surface: "harborgate".to_string(),
+            conversation_id: handle.to_string(),
+            user_id: "user-1".to_string(),
+            route_key: "gw_route_clip_frame".to_string(),
+            last_message_id: "om_clip_frame".to_string(),
+            chat_type: "p2p".to_string(),
+            state: Value::Null,
+            resume_token: None,
+            expires_at: None,
+        };
+        let mut conversation = TaskConversationState {
+            key: handle.to_string(),
+            ..Default::default()
+        };
+        conversation.set_clip_pending_confirmation(Some(PendingTaskClipConfirmation {
+            resume_token: token.to_string(),
+            clip_media_asset_id: format!("asset-{token}"),
+            clip_path: format!("captures/clips/{token}.mp4"),
+            clip_mime_type: "video/mp4".to_string(),
+            cover_path: format!("captures/keyframes/{token}.jpg"),
+            display_name: "Tapo 231".to_string(),
+        }));
+        conversation.set_recent_clip_playback(Some(RecentClipPlaybackState {
+            clip_media_asset_id: format!("asset-{token}"),
+            clip_path: format!("captures/clips/{token}.mp4"),
+            clip_mime_type: "video/mp4".to_string(),
+            cover_path: format!("captures/keyframes/{token}.jpg"),
+            display_name: "Tapo 231".to_string(),
+            captured_at_epoch_ms: super::current_epoch_ms(),
+        }));
+        conversation_store
+            .save_for_session(&session, &conversation)
+            .expect("save clip confirmation state");
+    }
+
     #[test]
     fn conversation_key_prefers_conversation_id() {
         let request = TaskRequest {
@@ -11416,6 +11696,150 @@ mod tests {
             .expect("load conversation")
             .expect("conversation");
         assert!(loaded.general_message_loop().is_some());
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+    }
+
+    #[test]
+    fn clip_confirmation_turn_feedback_preserves_frame_until_playback() {
+        let (service, conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("clip-confirmation-turn-feedback");
+        let handle = "conv-clip-confirmation-feedback";
+        let token = "cont-clip-feedback";
+        seed_clip_confirmation_turn_state(&conversation_store, handle, token);
+
+        let feedback = service.handle_turn(general_message_turn_envelope(
+            "clip_feedback",
+            "非常好",
+            Some(handle.to_string()),
+            Some(TaskTurnContinuation {
+                token: token.to_string(),
+                frame_id: "frame-clip-feedback".to_string(),
+                reply_to_turn_id: "turn-record".to_string(),
+                expires_at: None,
+            }),
+        ));
+
+        assert_eq!(feedback.turn.status, TaskStatus::Completed);
+        assert_eq!(feedback.reply.kind, "frame_prompt");
+        assert!(feedback.reply.text.contains("是否看完整回放"));
+        let feedback_frame = feedback.active_frame.expect("active clip frame");
+        assert_eq!(feedback_frame.kind, "camera.clip_confirmation");
+        assert_eq!(feedback_frame.continuation_token, token);
+
+        let playback = service.handle_turn(general_message_turn_envelope(
+            "clip_feedback_playback",
+            "回放一下刚刚录的短视频",
+            Some(handle.to_string()),
+            Some(TaskTurnContinuation {
+                token: feedback_frame.continuation_token.clone(),
+                frame_id: feedback_frame.frame_id.clone(),
+                reply_to_turn_id: feedback.turn.turn_id.clone(),
+                expires_at: None,
+            }),
+        ));
+
+        assert_eq!(playback.turn.status, TaskStatus::Completed);
+        assert_eq!(playback.reply.kind, "tool_result");
+        assert_eq!(playback.reply.text, "完整回放如下");
+        assert!(playback.active_frame.is_none());
+        assert_eq!(playback.artifacts.len(), 1);
+        assert_eq!(playback.artifacts[0].kind, "video");
+        assert_eq!(playback.delivery_hints.len(), 1);
+        assert_eq!(playback.delivery_hints[0].kind, "native_video");
+        let loaded = conversation_store
+            .load_for_session(handle, Some(handle))
+            .expect("load conversation")
+            .expect("conversation");
+        assert!(loaded.clip_pending_confirmation().is_none());
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+    }
+
+    #[test]
+    fn clip_confirmation_turn_no_tool_inputs_preserve_frame_without_continuation() {
+        let (service, conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("clip-confirmation-turn-no-tool-preserve");
+        let handle = "conv-clip-confirmation-no-tool";
+        let token = "cont-clip-no-tool";
+        seed_clip_confirmation_turn_state(&conversation_store, handle, token);
+
+        for (index, text) in ["今天天气怎么样", "你能干什么", "不对"].iter().enumerate() {
+            let response = service.handle_turn(general_message_turn_envelope(
+                &format!("clip_no_tool_{index}"),
+                text,
+                Some(handle.to_string()),
+                None,
+            ));
+            assert_eq!(response.turn.status, TaskStatus::Completed);
+            assert_eq!(response.reply.kind, "frame_prompt");
+            assert!(response.reply.text.contains("是否看完整回放"));
+            let frame = response.active_frame.expect("active clip frame");
+            assert_eq!(frame.kind, "camera.clip_confirmation");
+            assert_eq!(frame.continuation_token, token);
+        }
+
+        let playback = service.handle_turn(general_message_turn_envelope(
+            "clip_no_tool_playback",
+            "要",
+            Some(handle.to_string()),
+            None,
+        ));
+        assert_eq!(playback.turn.status, TaskStatus::Completed);
+        assert_eq!(playback.reply.text, "完整回放如下");
+        assert!(playback.active_frame.is_none());
+        assert_eq!(playback.delivery_hints[0].kind, "native_video");
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+    }
+
+    #[test]
+    fn clip_confirmation_turn_cancel_clears_frame_without_continuation() {
+        let (service, conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("clip-confirmation-turn-cancel");
+        let handle = "conv-clip-confirmation-cancel";
+        seed_clip_confirmation_turn_state(&conversation_store, handle, "cont-clip-cancel");
+
+        let response = service.handle_turn(general_message_turn_envelope(
+            "clip_cancel",
+            "算了",
+            Some(handle.to_string()),
+            None,
+        ));
+
+        assert_eq!(response.turn.status, TaskStatus::Completed);
+        assert_eq!(response.reply.kind, "cancel");
+        assert!(response.active_frame.is_none());
+        let loaded = conversation_store
+            .load_for_session(handle, Some(handle))
+            .expect("load conversation")
+            .expect("conversation");
+        assert!(loaded.clip_pending_confirmation().is_none());
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+    }
+
+    #[test]
+    fn clip_confirmation_turn_explicit_tool_supersedes_frame() {
+        let (service, conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("clip-confirmation-turn-supersede");
+        let handle = "conv-clip-confirmation-supersede";
+        seed_clip_confirmation_turn_state(&conversation_store, handle, "cont-clip-supersede");
+
+        let response = service.handle_turn(general_message_turn_envelope(
+            "clip_supersede",
+            "拍一张",
+            Some(handle.to_string()),
+            None,
+        ));
+
+        assert_eq!(response.turn.status, TaskStatus::Failed);
+        assert!(response.active_frame.is_none());
+        let loaded = conversation_store
+            .load_for_session(handle, Some(handle))
+            .expect("load conversation")
+            .expect("conversation");
+        assert!(loaded.clip_pending_confirmation().is_none());
 
         cleanup_task_api_service(admin_path, registry_path, conversation_path);
     }

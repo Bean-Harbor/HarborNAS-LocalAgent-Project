@@ -22,6 +22,8 @@ Cutover is allowed only when all are true:
   `conversation.handle`.
 - HarborGate stores `conversation.handle` and continuation values opaquely.
 - HarborGate does not route on Beacon business `active_frame.kind`.
+- Pending Beacon active frames persist across no-tool conversation acts and
+  clear only on explicit resolve, cancel, or superseding tool intent.
 - Notification delivery stays in HarborGate.
 - HarborBeacon still owns approvals, artifacts, audit, and business state.
 - Group chat remains out of scope.
@@ -53,6 +55,8 @@ Each v2.0 evidence bundle should capture:
 - `transport.route_key`
 - `transport.message_id`
 - `active_frame.frame_id`
+- `active_frame.kind`
+- `continuation_present`
 - `reply.kind`
 - `artifact_count`
 - `delivery.idempotency_key`

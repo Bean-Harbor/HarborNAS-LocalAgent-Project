@@ -37,6 +37,8 @@ At the start of each session:
 - Add `POST /api/turns`.
 - Normalize turn identity around Beacon-owned `conversation.handle`.
 - Introduce `ActiveDialogueFrame` and `ConversationAct`.
+- Route `general.message` through active-frame policy before ordinary
+  conversation acts whenever a pending frame exists.
 - Preserve approvals, artifacts, audit, and media records.
 
 ### Phase 3: Gate Turn Client
@@ -72,6 +74,8 @@ Guard conditions:
 - HarborBeacon must not treat `source.session_id` as business conversation
   truth.
 - HarborGate must not parse Beacon active-frame business semantics.
+- Active frames must persist across no-tool conversation acts until explicit
+  resolve, cancel, or superseding tool intent.
 - Group chat remains out of scope.
 
 The first control-pack commit may intentionally introduce failing guard tests.
@@ -104,25 +108,30 @@ Do not report a release-ready state while any drift guard still fails.
 
 - Completed: v2.0 turn core and active `/api/turns` ingress are implemented
   locally; assistant task API tests now use turn envelopes; active
-  Beacon/Gate defaults now use contract `2.0`; clarification feedback now keeps
-  a pending `conversation.clarify` active frame; `.197` built
-  `harbor-release-20260426-v20-clarify-r1.tar.gz`; `.182` is deployed on that
-  bundle and passes the direct v2 `/api/turns` matrix through native-video
-  playback hints.
+  Beacon/Gate defaults now use contract `2.0`; clarification feedback keeps a
+  pending `conversation.clarify` active frame; clip-confirmation feedback now
+  goes through frame-first policy, so no-tool turns preserve
+  `camera.clip_confirmation` until explicit playback, cancel, or superseding
+  tool intent; `.197` previously built
+  `harbor-release-20260426-v20-clarify-r1.tar.gz`; `.182` still needs a fresh
+  deploy before Weixin evidence can cover this frame-first fix.
 - Changed files: `src/runtime/task_api.rs`,
   `src/bin/assistant_task_api.rs`, contract default sources/templates/tests,
   v2.0 observability docs, and
   `worklogs/2026-04-26-v20-upgrade.md`.
 - Tests run: `python -m pytest tests/contracts/test_im_v20_control_pack.py -q`,
   release-packaging contract tests, `cargo test --bin assistant-task-api`,
-  targeted general.message turn tests, `cargo test`, `python -m pytest -q`,
-  `git diff --check`, `gh pr checks 3`, and the `.182` direct `/api/turns`
-  matrix.
+  targeted general.message turn tests, targeted clip-confirmation frame tests,
+  `cargo test`, `python -m pytest -q`, `git diff --check`, `gh pr checks 3`,
+  and the earlier `.182` direct `/api/turns` matrix before the
+  clip-confirmation persistence fix.
 - Drift check: Beacon v2.0 guard passed; active assistant task API no longer
   exposes the v1.5 task ingress; packaged env uses
   `IM_AGENT_CONTRACT_VERSION=2.0`; Gateway accepts contract `2.0` and rejects
   `1.5`.
 - Blockers: `cargo fmt` is unavailable because `rustfmt` is not installed;
-  real Weixin private-DM evidence still requires a user-side message run.
-- Next exact step: run the Weixin private-DM v2.0 matrix on `.182`, then decide
-  Gate/Beacon merge readiness from the live evidence.
+  real Weixin private-DM evidence still requires a fresh `.197` build, `.182`
+  deploy, and a user-side message run.
+- Next exact step: build the frame-first bundle on `.197`, deploy it to `.182`,
+  run the direct `/api/turns` matrix, then run the Weixin private-DM v2.0
+  matrix before merge readiness.
