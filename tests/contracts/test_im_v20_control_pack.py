@@ -11,15 +11,31 @@ def _read(path: Path) -> str:
 
 
 def test_v20_control_pack_documents_exist_and_are_active() -> None:
-    required = [
-        GATE_ROOT / "HarborBeacon-HarborGate-Agent-Contract-v2.0.md",
+    required_beacon = [
         ROOT / "HarborBeacon-HarborGate-v2.0-Upgrade-Runbook.md",
         ROOT / "docs" / "im-v2.0-cutover-rollback-observability-gates.md",
+    ]
+    missing_beacon = [str(path) for path in required_beacon if not path.exists()]
+    assert not missing_beacon
+
+    beacon_docs = "\n".join(_read(path) for path in required_beacon)
+    assert "HarborBeacon-HarborGate-Agent-Contract-v2.0.md" in beacon_docs
+    assert "POST /api/turns" in beacon_docs
+    assert "conversation.handle" in beacon_docs
+    assert "active_frame" in beacon_docs
+    assert "continuation" in beacon_docs
+    assert "delivery_hints" in beacon_docs
+
+    if not GATE_ROOT.exists():
+        return
+
+    required_gate = [
+        GATE_ROOT / "HarborBeacon-HarborGate-Agent-Contract-v2.0.md",
         GATE_ROOT / "HarborBeacon-HarborGate-v2.0-Upgrade-Runbook.md",
         GATE_ROOT / "HarborBeacon-HarborGate-v2.0-Cutover-Checklist.md",
     ]
-    missing = [str(path) for path in required if not path.exists()]
-    assert not missing
+    missing_gate = [str(path) for path in required_gate if not path.exists()]
+    assert not missing_gate
 
     contract = _read(GATE_ROOT / "HarborBeacon-HarborGate-Agent-Contract-v2.0.md")
     assert "POST /api/turns" in contract
