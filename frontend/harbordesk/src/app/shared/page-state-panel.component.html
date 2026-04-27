@@ -11,7 +11,7 @@
 
     <div class="state-detail">{{ state.detail }}</div>
 
-    @if (saveError || saveSuccess || testingEndpointId) {
+    @if (saveError || saveSuccess || testingEndpointId || deviceActionBusyKey || releaseReadinessBusy || knowledgeIndexBusy) {
       <div class="action-status-rail">
         @if (saveSuccess) {
           <div class="action-status tone-good">{{ saveSuccess }}</div>
@@ -20,7 +20,16 @@
           <div class="action-status tone-danger">{{ saveError }}</div>
         }
         @if (testingEndpointId) {
-          <div class="action-status tone-warn">Testing model endpoint <code>{{ testingEndpointId }}</code>...</div>
+          <div class="action-status tone-warn">{{ text('Testing model endpoint', '正在测试模型端点') }} <code>{{ testingEndpointId }}</code>...</div>
+        }
+        @if (deviceActionBusyKey) {
+          <div class="action-status tone-warn">{{ text('Running device action', '正在执行设备操作') }} <code>{{ deviceActionBusyKey }}</code>...</div>
+        }
+        @if (releaseReadinessBusy) {
+          <div class="action-status tone-warn">{{ text('Running release readiness', '正在运行发布 readiness') }} <code>POST /api/release/readiness/run</code>...</div>
+        }
+        @if (knowledgeIndexBusy) {
+          <div class="action-status tone-warn">{{ text('Queueing knowledge index refresh', '正在提交知识库索引刷新任务') }} <code>POST /api/knowledge/index/run</code>...</div>
         }
       </div>
     }
@@ -29,7 +38,7 @@
       <article class="content-card expanded-card setup-flow-card">
         <div class="section-head">
           <div>
-            <p class="content-label">Release-v1 setup flow</p>
+            <p class="content-label">{{ text('Release-v1 setup flow', '发布前配置流程') }}</p>
             <p class="table-copy">{{ state.data.setupFlow.summary }}</p>
           </div>
           <div class="inline-badge tone-accent">{{ state.data.setupFlow.title }}</div>
@@ -56,6 +65,209 @@
       </article>
     }
 
+    @if (state.data.releaseReadiness; as readiness) {
+      <article class="content-card expanded-card readiness-card">
+        <div class="section-head">
+          <div>
+            <p class="content-label">{{ text('Release readiness', '发布 readiness') }}</p>
+            <p class="table-copy">{{ readiness.summary }}</p>
+          </div>
+          <div class="readiness-action-row">
+            <div class="inline-badge" [ngClass]="readinessToneClass(readiness.status)">
+              {{ readiness.status }}
+            </div>
+            <button type="button" class="action-button" [disabled]="releaseReadinessBusy" (click)="requestReleaseReadinessRun()">
+              {{ releaseReadinessBusy ? text('Running...', '运行中...') : text('Run readiness', '运行 readiness') }}
+            </button>
+          </div>
+        </div>
+
+        @if (readiness.checked_at) {
+          <p class="readiness-meta">{{ text('Checked at', '检查时间') }}: {{ readiness.checked_at }}</p>
+        }
+
+        @if (readiness.domainCards.length) {
+          <section class="readiness-block">
+            <div class="section-head compact-head">
+              <div>
+                <p class="content-label">{{ text('Release domains', '发布域状态') }}</p>
+                <p class="table-copy">{{ text('IM, models, hardware, HarborOS, and AIoT stay visible on the first screen with status, next action, action path, and recent validation time.', '首屏直接展示 IM、模型、硬件、HarborOS 和 AIoT 的状态、下一步、action_path 与最近验收时间。') }}</p>
+              </div>
+            </div>
+            <div class="release-domain-grid">
+              @for (domain of readiness.domainCards; track domain.id) {
+                <section class="release-domain-card" [ngClass]="toneClass(domain.tone)">
+                  <div class="detail-row-head">
+                    <strong>{{ domain.label }}</strong>
+                    <span class="status-pill" [ngClass]="readinessToneClass(domain.status)">{{ domain.status }}</span>
+                  </div>
+                  <p class="feature-copy">{{ domain.current_status }}</p>
+                  <ul class="detail-meta">
+                    <li>{{ text('Next action', '下一步') }}: {{ domain.next_action }}</li>
+                    <li>action_path: <a [href]="domain.action_path">{{ domain.action_path }}</a></li>
+                    <li>{{ text('Recent validation', '最近验收') }}: {{ domain.recent_at || text('not available', '暂无') }}</li>
+                    @if (domain.endpoint) {
+                      <li>{{ text('Endpoint', '接口') }}: <code>{{ domain.endpoint }}</code></li>
+                    }
+                    @if (domain.detail) {
+                      <li>{{ text('Detail', '详情') }}: {{ domain.detail }}</li>
+                    }
+                    @if (domain.evidence.length) {
+                      <li>{{ text('Evidence', '证据') }}: {{ domain.evidence.join(' | ') }}</li>
+                    }
+                    @if (domain.blockers.length) {
+                      <li class="tone-danger">{{ text('Blockers', '阻塞项') }}: {{ domain.blockers.join(' | ') }}</li>
+                    }
+                  </ul>
+                </section>
+              }
+            </div>
+          </section>
+        }
+
+        <div class="readiness-status-grid">
+          @for (card of readiness.statusCards; track card.id) {
+            <section class="readiness-status-card" [ngClass]="card.tone ? toneClass(card.tone) : readinessToneClass(card.status)">
+              <div class="detail-row-head">
+                <strong>{{ card.label }}</strong>
+                <span>{{ card.value }}</span>
+              </div>
+              <p class="feature-copy">{{ card.detail }}</p>
+              <ul class="detail-meta">
+                <li>{{ text('Status', '状态') }}: {{ card.status }}</li>
+                @if (card.endpoint) {
+                  <li>{{ text('Endpoint', '接口') }}: <code>{{ card.endpoint }}</code></li>
+                }
+                @if (card.deep_link) {
+                  <li>{{ text('Deep link', '深链接') }}: <a [href]="card.deep_link">{{ card.deep_link }}</a></li>
+                }
+              </ul>
+            </section>
+          }
+        </div>
+
+        @if (readiness.empty) {
+          <p class="empty-copy">
+            {{ text('Release readiness API returned no checklist or status cards yet. The shell is ready for the backend projection.', 'Release readiness API 尚未返回 checklist 或状态卡；前端 shell 已准备好接入后端投影。') }}
+          </p>
+        }
+
+        <div class="readiness-split-grid">
+          <section class="readiness-block">
+            <div class="section-head compact-head">
+              <p class="content-label">{{ text('Checklist', '检查清单') }}</p>
+              <span class="cell-note">{{ readiness.checklist.length }}</span>
+            </div>
+            <div class="readiness-list">
+              @for (item of readiness.checklist; track item.id) {
+                <section class="readiness-list-item" [ngClass]="readinessToneClass(item.status)">
+                  <div class="detail-row-head">
+                    <strong>{{ item.label }}</strong>
+                    <span class="status-pill" [ngClass]="readinessToneClass(item.status)">{{ item.status }}</span>
+                  </div>
+                  @if (item.summary) {
+                    <p class="feature-copy">{{ item.summary }}</p>
+                  }
+                  @if (item.detail) {
+                    <p class="table-copy">{{ item.detail }}</p>
+                  }
+                  <ul class="detail-meta">
+                    @if (item.endpoint) {
+                      <li>{{ text('Endpoint', '接口') }}: <code>{{ item.endpoint }}</code></li>
+                    }
+                    @if (item.owner_lane) {
+                      <li>{{ text('Owner lane', '归属 lane') }}: {{ item.owner_lane }}</li>
+                    }
+                    @if (item.deep_link) {
+                      <li>{{ text('Deep link', '深链接') }}: <a [href]="item.deep_link">{{ item.deep_link }}</a></li>
+                    }
+                    @if (item.blockers?.length) {
+                      <li class="tone-danger">{{ text('Blockers', '阻塞项') }}: {{ item.blockers?.join(' | ') }}</li>
+                    }
+                    @if (item.evidence?.length) {
+                      <li>{{ text('Evidence', '证据') }}: {{ item.evidence?.join(' | ') }}</li>
+                    }
+                  </ul>
+                </section>
+              }
+            </div>
+          </section>
+
+          <section class="readiness-block">
+            <div class="section-head compact-head">
+              <p class="content-label">{{ text('Deep links', '深链接') }}</p>
+              <span class="cell-note">{{ readiness.deepLinks.length }}</span>
+            </div>
+            <div class="deep-link-grid">
+              @for (link of readiness.deepLinks; track link.label + link.href) {
+                <a class="deep-link-card" [href]="link.href">
+                  <strong>{{ link.label }}</strong>
+                  <span>{{ link.detail }}</span>
+                  @if (link.endpoint) {
+                    <code>{{ link.endpoint }}</code>
+                  }
+                </a>
+              }
+            </div>
+          </section>
+        </div>
+
+        @if (readiness.endpointStates.length) {
+          <section class="readiness-block">
+            <p class="content-label">{{ text('Endpoint states', '接口状态') }}</p>
+            <div class="endpoint-state-grid">
+              @for (endpoint of readiness.endpointStates; track endpoint.endpoint) {
+                <div class="endpoint-state" [ngClass]="endpoint.state === 'error' ? 'tone-danger' : endpoint.state === 'empty' ? 'tone-warn' : 'tone-good'">
+                  <code>{{ endpoint.endpoint }}</code>
+                  <span>{{ endpoint.state }}</span>
+                  <p>{{ endpoint.detail }}</p>
+                </div>
+              }
+            </div>
+          </section>
+        }
+
+        @if (readiness.history.length) {
+          <section class="readiness-block">
+            <p class="content-label">{{ text('Recent readiness history', '最近 readiness 历史') }}</p>
+            <div class="history-grid">
+              @for (entry of readiness.history; track entry.run_id || entry.generated_at || entry.checked_at || entry.summary) {
+                <section class="history-item" [ngClass]="readinessToneClass(entry.status)">
+                  <div class="detail-row-head">
+                    <strong>{{ entry.run_id || text('readiness run', 'readiness 运行') }}</strong>
+                    <span class="status-pill" [ngClass]="readinessToneClass(entry.status)">{{ entry.status }}</span>
+                  </div>
+                  @if (entry.summary) {
+                    <p class="feature-copy">{{ entry.summary }}</p>
+                  }
+                  <ul class="detail-meta">
+                    <li>{{ text('Generated', '生成时间') }}: {{ entry.generated_at || entry.checked_at || entry.completed_at || text('not available', '暂无') }}</li>
+                    @if (entry.action_path) {
+                      <li>action_path: <a [href]="entry.action_path">{{ entry.action_path }}</a></li>
+                    }
+                  </ul>
+                </section>
+              }
+            </div>
+          </section>
+        }
+
+        @if (readiness.warnings.length || readiness.blockers.length) {
+          <section class="readiness-block">
+            <p class="content-label">{{ text('Readiness signals', 'Readiness 信号') }}</p>
+            <ul class="signal-list">
+              @for (warning of readiness.warnings; track warning) {
+                <li class="tone-warning">{{ warning }}</li>
+              }
+              @for (blocker of readiness.blockers; track blocker) {
+                <li class="tone-danger">{{ blocker }}</li>
+              }
+            </ul>
+          </section>
+        }
+      </article>
+    }
+
     @if (state.kind === 'loading') {
       <div class="skeleton-grid" aria-hidden="true">
         <div class="skeleton-card"></div>
@@ -75,7 +287,7 @@
 
       <div class="content-grid">
         <article class="content-card">
-          <p class="content-label">Highlights</p>
+          <p class="content-label">{{ text('Highlights', '重点') }}</p>
           <ul>
             @for (highlight of state.data.highlights; track highlight) {
               <li>{{ highlight }}</li>
@@ -84,7 +296,7 @@
         </article>
 
         <article class="content-card">
-          <p class="content-label">Signals</p>
+          <p class="content-label">{{ text('Signals', '信号') }}</p>
           @if (state.data.blockers.length > 0) {
             <ul class="signal-list">
               @for (blocker of state.data.blockers; track blocker) {
@@ -96,8 +308,8 @@
           } @else {
             <ul class="signal-list">
               <li class="tone-success">{{ state.data.nextStep }}</li>
-              <li class="muted">Endpoint: <code>{{ state.data.endpoint }}</code></li>
-              <li class="muted">Output: <code>{{ state.data.outputDirectory }}</code></li>
+              <li class="muted">{{ text('Endpoint', '接口') }}: <code>{{ state.data.endpoint }}</code></li>
+              <li class="muted">{{ text('Output', '输出目录') }}: <code>{{ state.data.outputDirectory }}</code></li>
             </ul>
           }
           </article>
@@ -107,7 +319,7 @@
         <article class="content-card expanded-card">
           <div class="section-head">
             <div>
-              <p class="content-label">Runtime alignment</p>
+              <p class="content-label">{{ text('Runtime alignment', '运行时对齐') }}</p>
               <p class="table-copy">{{ state.data.runtimeAlignment.detail }}</p>
             </div>
             <div class="inline-badge" [ngClass]="toneClass(state.data.runtimeAlignment.tone)">
@@ -136,12 +348,333 @@
         </article>
       }
 
+      @if (state.data.pageId === 'models-policies' && hydrateKnowledgeForm(state.data.knowledgeSettings)) {
+        <article class="content-card expanded-card">
+          <div class="section-head">
+            <div>
+              <p class="content-label">{{ text('Knowledge & Multimodal', '知识库与多模态') }}</p>
+              <p class="table-copy">{{ text('Configure source folders and the separate local index root used for manifests, chunks, embeddings, vector cache, and reports.', '配置业务源目录，以及用于 manifest、chunk、embedding、向量缓存和报告的独立本地索引目录。') }}</p>
+            </div>
+            <div class="readiness-action-row">
+              <button type="button" class="action-button" [disabled]="knowledgeIndexBusy" (click)="requestKnowledgeIndexRun()">
+                {{ knowledgeIndexBusy ? text('Queueing...', '提交中...') : text('Run index', '运行索引') }}
+              </button>
+            </div>
+          </div>
+
+          @if (state.data.ragReadiness; as rag) {
+            <section class="readiness-block">
+              <div class="section-head compact-head">
+                <div>
+                  <p class="content-label">{{ text('RAG readiness', 'RAG readiness') }}</p>
+                  <p class="table-copy">{{ rag.summary || text('Readiness is composed from source roots, index storage, model endpoints, resource profile, privacy policy, and recent jobs.', 'Readiness 由源目录、索引存储、模型端点、资源策略、隐私策略和最近任务组成。') }}</p>
+                </div>
+                <span class="status-pill" [ngClass]="readinessToneClass(rag.status)">{{ rag.status }}</span>
+              </div>
+              @if (rag.blockers?.length || rag.warnings?.length) {
+                <ul class="signal-list">
+                  @for (blocker of rag.blockers ?? []; track blocker) {
+                    <li class="tone-danger">{{ blocker }}</li>
+                  }
+                  @for (warning of rag.warnings ?? []; track warning) {
+                    <li class="tone-warning">{{ warning }}</li>
+                  }
+                </ul>
+              }
+            </section>
+
+            <div class="readiness-status-grid">
+              @for (component of [rag.source_roots, rag.index_directory, rag.privacy_policy, rag.embedding_model, rag.media_parser, rag.storage_writable]; track component?.summary) {
+                @if (component) {
+                  <section class="readiness-status-card" [ngClass]="readinessToneClass(component.status)">
+                    <div class="detail-row-head">
+                      <strong>{{ component.summary }}</strong>
+                      <span class="status-pill" [ngClass]="readinessToneClass(component.status)">{{ component.status }}</span>
+                    </div>
+                    <p class="feature-copy">{{ component.detail }}</p>
+                  </section>
+                }
+              }
+            </div>
+
+            @if (rag.model_readiness?.length) {
+              <section class="readiness-block">
+                <p class="content-label">{{ text('Model readiness cards', '模型 readiness 卡片') }}</p>
+                <div class="readiness-status-grid">
+                  @for (model of rag.model_readiness ?? []; track model.model_kind) {
+                    <section class="readiness-status-card" [ngClass]="readinessToneClass(model.status)">
+                      <div class="detail-row-head">
+                        <strong>{{ model.label }}</strong>
+                        <span class="status-pill" [ngClass]="readinessToneClass(model.status)">{{ model.status }}</span>
+                      </div>
+                      <p class="feature-copy">{{ model.detail }}</p>
+                      <ul class="detail-meta">
+                        <li>{{ text('Endpoint', '端点') }}: <code>{{ model.endpoint_id || text('not selected', '未选择') }}</code></li>
+                        <li>{{ text('Kind', '类型') }}: {{ model.endpoint_kind || text('pending', '待配置') }}</li>
+                        <li>{{ text('Provider', '提供方') }}: {{ model.provider_key || text('pending', '待配置') }}</li>
+                        @if (model.blocker) {
+                          <li class="tone-danger">{{ model.blocker }}</li>
+                        }
+                      </ul>
+                    </section>
+                  }
+                </div>
+              </section>
+            }
+
+            @if (rag.resource_profiles?.length) {
+              <section class="readiness-block">
+                <p class="content-label">{{ text('Resource profiles', '资源策略') }}</p>
+                <div class="readiness-status-grid">
+                  @for (profile of rag.resource_profiles ?? []; track profile.profile) {
+                    <section class="readiness-status-card" [ngClass]="readinessToneClass(profile.status)">
+                      <div class="detail-row-head">
+                        <strong>{{ profile.label }}</strong>
+                        <span class="status-pill" [ngClass]="readinessToneClass(profile.status)">{{ profile.status }}</span>
+                      </div>
+                      <p class="feature-copy">{{ profile.detail }}</p>
+                      @if (profile.blockers.length || profile.warnings.length) {
+                        <ul class="detail-meta">
+                          @for (blocker of profile.blockers; track blocker) {
+                            <li class="tone-danger">{{ blocker }}</li>
+                          }
+                          @for (warning of profile.warnings; track warning) {
+                            <li class="tone-warning">{{ warning }}</li>
+                          }
+                        </ul>
+                      }
+                    </section>
+                  }
+                </div>
+              </section>
+            }
+          }
+
+          <div class="device-admin-grid">
+            <section class="device-admin-block">
+              <p class="content-label">{{ text('Source roots', '业务源目录') }}</p>
+              <div class="form-grid compact-form single-column-form">
+                <label>
+                  <span>{{ text('Enabled folders', '启用目录') }}</span>
+                  <textarea name="knowledge-source-roots" rows="5" [(ngModel)]="knowledgeSourceRootsText" placeholder="/mnt/MM-test"></textarea>
+                </label>
+                <button type="button" class="action-button" (click)="requestFilesBrowse(null)">
+                  {{ text('Browse HarborOS files', '浏览 HarborOS 文件') }}
+                </button>
+              </div>
+              @if (state.data.knowledgeIndexStatus?.source_roots?.length) {
+                <div class="detail-grid">
+                  @for (root of state.data.knowledgeIndexStatus?.source_roots ?? []; track root.root_id) {
+                    <section class="detail-row" [ngClass]="knowledgeSourceEnabled(root.path, root.enabled) && root.exists ? 'tone-good' : knowledgeSourceEnabled(root.path, root.enabled) ? 'tone-warn' : 'tone-neutral'">
+                      <div class="detail-row-head">
+                        <strong>{{ root.label || root.root_id }}</strong>
+                        <span class="status-pill">{{ root.status }}</span>
+                      </div>
+                      <p class="table-copy">{{ root.path }}</p>
+                      <ul class="detail-meta">
+                        <li>{{ text('Exists', '存在') }}: {{ root.exists }}</li>
+                        <li>{{ text('Enabled', '启用') }}: {{ knowledgeSourceEnabled(root.path, root.enabled) }}</li>
+                        <li>{{ text('Last indexed', '最近索引') }}: {{ root.last_indexed_at || text('never', '从未') }}</li>
+                        <li>{{ root.detail }}</li>
+                      </ul>
+                      <div class="inline-action">
+                        <button type="button" class="action-button" [disabled]="knowledgeSourceEnabled(root.path, root.enabled)" (click)="setKnowledgeSourceEnabled(root.path, true)">
+                          {{ text('Enable', '启用') }}
+                        </button>
+                        <button type="button" class="action-button" [disabled]="!knowledgeSourceEnabled(root.path, root.enabled)" (click)="setKnowledgeSourceEnabled(root.path, false)">
+                          {{ text('Disable', '停用') }}
+                        </button>
+                      </div>
+                    </section>
+                  }
+                </div>
+              }
+            </section>
+
+            <section class="device-admin-block">
+              <p class="content-label">{{ text('Index root', '索引目录') }}</p>
+              <div class="form-grid compact-form single-column-form">
+                <label>
+                  <span>{{ text('Vector and report storage', '向量与报告存储') }}</span>
+                  <input name="knowledge-index-root" [(ngModel)]="knowledgeIndexRoot" placeholder="/mnt/software/harborbeacon-agent-ci/knowledge-index" />
+                </label>
+                <label>
+                  <span>{{ text('Cloud policy', '云端策略') }}</span>
+                  <select name="knowledge-privacy-level" [(ngModel)]="knowledgePrivacyLevel">
+                    @for (option of knowledgePrivacyOptions; track option.value) {
+                      <option [value]="option.value">{{ option.label }}</option>
+                    }
+                  </select>
+                </label>
+                <label>
+                  <span>{{ text('Default resource profile', '默认资源策略') }}</span>
+                  <select name="knowledge-resource-profile" [(ngModel)]="knowledgeResourceProfile">
+                    @for (option of knowledgeResourceOptions; track option.value) {
+                      <option [value]="option.value">{{ option.label }}</option>
+                    }
+                  </select>
+                </label>
+                <ul class="detail-meta">
+                  @for (option of knowledgePrivacyOptions; track option.value) {
+                    @if (option.value === knowledgePrivacyLevel) {
+                      <li>{{ option.detail }}</li>
+                    }
+                  }
+                  @for (option of knowledgeResourceOptions; track option.value) {
+                    @if (option.value === knowledgeResourceProfile) {
+                      <li>{{ option.detail }}</li>
+                    }
+                  }
+                </ul>
+                <button type="button" class="action-button" (click)="requestKnowledgeSettingsSave(state.data.knowledgeSettings)">
+                  {{ text('Save knowledge settings', '保存知识库配置') }}
+                </button>
+              </div>
+            </section>
+          </div>
+
+          @if (state.data.knowledgeIndexStatus; as indexStatus) {
+            <section class="readiness-block">
+              <div class="section-head compact-head">
+                <div>
+                  <p class="content-label">{{ text('Index root and storage status', '索引目录与存储状态') }}</p>
+                  <p class="table-copy"><code>{{ state.data.knowledgeSettings?.index_root }}</code></p>
+                </div>
+                <span class="status-pill" [ngClass]="readinessToneClass(indexStatus.status)">{{ indexStatus.status }}</span>
+              </div>
+              <div class="readiness-status-grid">
+                <section class="readiness-status-card" [ngClass]="indexStatus.index_root_writable ? 'tone-good' : 'tone-warn'">
+                  <div class="detail-row-head">
+                    <strong>{{ text('Writable', '可写') }}</strong>
+                    <span>{{ indexStatus.index_root_writable }}</span>
+                  </div>
+                  <p class="feature-copy">{{ text('Configured index root is checked by HarborBeacon admin API.', '配置的索引目录由 HarborBeacon admin API 检查。') }}</p>
+                </section>
+                <section class="readiness-status-card">
+                  <div class="detail-row-head">
+                    <strong>{{ text('Manifest entries', 'Manifest 条目') }}</strong>
+                    <span>{{ indexStatus.manifest_entry_count }}</span>
+                  </div>
+                  <p class="feature-copy">{{ text('Manifest files', 'Manifest 文件') }}: {{ indexStatus.manifest_count }}</p>
+                </section>
+                <section class="readiness-status-card">
+                  <div class="detail-row-head">
+                    <strong>{{ text('Embedding cache', 'Embedding 缓存') }}</strong>
+                    <span>{{ indexStatus.embedding_entry_count }}</span>
+                  </div>
+                  <p class="feature-copy">{{ text('Cache files', '缓存文件') }}: {{ indexStatus.embedding_cache_count }}</p>
+                </section>
+                <section class="readiness-status-card">
+                  <div class="detail-row-head">
+                    <strong>{{ text('Storage usage', '存储占用') }}</strong>
+                    <span>{{ bytesLabel(indexStatus.storage_usage_bytes) }}</span>
+                  </div>
+                  <p class="feature-copy">{{ text('Last indexed', '最近索引') }}: {{ indexStatus.last_indexed_at || text('never', '从未') }}</p>
+                </section>
+              </div>
+            </section>
+          }
+
+          <section class="readiness-block">
+            <div class="section-head compact-head">
+              <div>
+                <p class="content-label">{{ text('Index jobs', '索引任务') }}</p>
+                <p class="table-copy">{{ text('Background job visibility is shown now; heavy multimodal processors remain degraded until later phases.', '现在展示后台任务可见性；重型多模态处理器会在后续阶段前保持 degraded。') }}</p>
+              </div>
+              <span class="cell-note">{{ state.data.knowledgeIndexJobs?.length ?? 0 }}</span>
+            </div>
+            @if (state.data.knowledgeIndexJobs?.length) {
+              <div class="table-wrap">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>{{ text('Job', '任务') }}</th>
+                      <th>{{ text('Source root', '源目录') }}</th>
+                      <th>{{ text('Status', '状态') }}</th>
+                      <th>{{ text('Timing', '时间') }}</th>
+                      <th>{{ text('Action', '操作') }}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    @for (job of state.data.knowledgeIndexJobs ?? []; track job.job_id) {
+                      <tr [ngClass]="knowledgeJobToneClass(job.status)">
+                        <td>
+                          <strong>{{ job.job_id }}</strong>
+                          <span class="cell-note">{{ job.resource_profile }} / {{ job.modalities.join(', ') }}</span>
+                        </td>
+                        <td>
+                          {{ job.source_root_label || job.source_root_id }}
+                          <span class="cell-note">{{ job.source_root_path }}</span>
+                        </td>
+                        <td>
+                          {{ job.status }}
+                          <span class="cell-note">{{ text('Progress', '进度') }}: {{ job.progress_percent ?? 0 }}%</span>
+                          @if (job.error_message) {
+                            <span class="cell-note tone-danger">{{ job.error_message }}</span>
+                          }
+                        </td>
+                        <td>
+                          <span class="cell-note">{{ text('Requested', '请求') }}: {{ job.requested_at || text('n/a', '暂无') }}</span>
+                          <span class="cell-note">{{ text('Started', '开始') }}: {{ job.started_at || text('n/a', '暂无') }}</span>
+                          <span class="cell-note">{{ text('Completed', '完成') }}: {{ job.completed_at || text('n/a', '暂无') }}</span>
+                        </td>
+                        <td>
+                          <button type="button" class="action-button" [disabled]="!canCancelKnowledgeIndexJob(job.status) || knowledgeIndexJobBusyId === job.job_id" (click)="requestKnowledgeIndexJobCancel(job.job_id)">
+                            {{ knowledgeIndexJobBusyId === job.job_id ? text('Canceling...', '取消中...') : text('Cancel', '取消') }}
+                          </button>
+                        </td>
+                      </tr>
+                    }
+                  </tbody>
+                </table>
+              </div>
+            } @else {
+              <p class="empty-copy">{{ text('No knowledge index jobs have been recorded yet.', '暂无知识库索引任务记录。') }}</p>
+            }
+          </section>
+
+          @if (filesBrowse) {
+            <section class="readiness-block">
+              <div class="section-head compact-head">
+                <div>
+                  <p class="content-label">{{ text('Read-only folder picker', '只读目录选择器') }}</p>
+                  <p class="table-copy"><code>{{ filesBrowse.path }}</code></p>
+                </div>
+                @if (filesBrowse.parent) {
+                  <button type="button" class="action-button" (click)="requestFilesBrowse(filesBrowse.parent)">
+                    {{ text('Up', '上级') }}
+                  </button>
+                }
+              </div>
+              <div class="detail-grid">
+                @for (entry of filesBrowse.entries; track entry.path) {
+                  @if (entry.is_dir) {
+                    <section class="detail-row">
+                      <div class="detail-row-head">
+                        <strong>{{ entry.name }}</strong>
+                        <span>{{ text('folder', '文件夹') }}</span>
+                      </div>
+                      <p class="table-copy">{{ entry.path }}</p>
+                      <div class="inline-action">
+                        <button type="button" class="action-button" (click)="requestFilesBrowse(entry.path)">{{ text('Open', '打开') }}</button>
+                        <button type="button" class="action-button" (click)="addKnowledgeSourcePath(entry.path)">{{ text('Add source', '加入源目录') }}</button>
+                        <button type="button" class="action-button" (click)="useKnowledgeIndexPath(entry.path)">{{ text('Use as index', '用作索引目录') }}</button>
+                      </div>
+                    </section>
+                  }
+                }
+              </div>
+            </section>
+          }
+        </article>
+      }
+
       @if (state.data.featureGroups?.length) {
         <article class="content-card expanded-card">
           <div class="section-head">
             <div>
-              <p class="content-label">Feature availability</p>
-              <p class="table-copy">Live runtime, route policy, account management, and gateway status are merged into a grouped read-model here.</p>
+              <p class="content-label">{{ text('Feature availability', '功能可用性') }}</p>
+              <p class="table-copy">{{ text('Live runtime, route policy, account management, and gateway status are merged into a grouped read-model here.', '这里把实时运行时、路由策略、账号管理和网关状态合并为分组 read-model。') }}</p>
             </div>
           </div>
           <div class="feature-group-stack">
@@ -160,16 +693,16 @@
                       </div>
                       <p class="feature-copy">{{ item.current_option }}</p>
                       <ul class="detail-meta">
-                        <li>Feature ID: {{ item.feature_id }}</li>
-                        <li>Owner lane: {{ item.owner_lane }}</li>
-                        <li>Source of truth: {{ item.source_of_truth }}</li>
+                        <li>{{ text('Feature ID', '功能 ID') }}: {{ item.feature_id }}</li>
+                        <li>{{ text('Owner lane', '归属 lane') }}: {{ item.owner_lane }}</li>
+                        <li>{{ text('Source of truth', '事实来源') }}: {{ item.source_of_truth }}</li>
                         <li>Fallback: {{ featureFallbackLabel(item.fallback_order) }}</li>
-                        <li>Where to edit: {{ featureWhereToEdit(item.feature_id) }}</li>
+                        <li>{{ text('Where to edit', '配置位置') }}: {{ featureWhereToEdit(item.feature_id) }}</li>
                         @if (item.blocker) {
-                          <li class="tone-danger">Blocker: {{ item.blocker }}</li>
+                          <li class="tone-danger">{{ text('Blocker', '阻塞项') }}: {{ item.blocker }}</li>
                         }
                         @if (item.evidence.length) {
-                          <li>Evidence: {{ item.evidence.join(' | ') }}</li>
+                          <li>{{ text('Evidence', '证据') }}: {{ item.evidence.join(' | ') }}</li>
                         }
                       </ul>
                     </section>
@@ -183,7 +716,7 @@
 
       @if (state.data.detailRows?.length) {
         <article class="content-card expanded-card">
-          <p class="content-label">Live details</p>
+          <p class="content-label">{{ text('Live details', '实时详情') }}</p>
           <div class="detail-grid">
             @for (row of state.data.detailRows; track row.title + row.subtitle) {
               <section class="detail-row" [ngClass]="row.tone ? toneClass(row.tone) : ''">
@@ -203,6 +736,229 @@
               </section>
             }
           </div>
+        </article>
+      }
+
+      @if (state.data.pageId === 'devices-aiot') {
+        <article class="content-card expanded-card">
+          <div class="section-head">
+            <div>
+              <p class="content-label">{{ text('Device management', '设备管理') }}</p>
+              <p class="table-copy">{{ text('Discovery, manual add, default camera, credentials, RTSP, snapshots, and share links are managed here.', '发现扫描、手动添加、默认摄像头、凭据、RTSP、快照和分享链接都在这里管理。') }}</p>
+            </div>
+          </div>
+
+          <div class="device-admin-grid">
+            <section class="device-admin-block">
+              <p class="content-label">{{ text('Discovery scan', '发现扫描') }}</p>
+              <div class="form-grid compact-form">
+                <label>
+                  <span>CIDR</span>
+                  <input name="scan-cidr" [(ngModel)]="scanForm.cidr" placeholder="192.168.3.0/24" />
+                </label>
+                <label>
+                  <span>{{ text('Protocol', '协议') }}</span>
+                  <select name="scan-protocol" [(ngModel)]="scanForm.protocol">
+                    <option value="">{{ text('default', '默认') }}</option>
+                    <option value="ONVIF + RTSP">ONVIF + RTSP</option>
+                    <option value="RTSP Probe">RTSP Probe</option>
+                  </select>
+                </label>
+                <button type="button" class="action-button" [disabled]="deviceActionBusyKey === 'scan'" (click)="requestDeviceScan()">
+                  {{ deviceActionBusyKey === 'scan' ? text('Scanning...', '扫描中...') : text('Scan', '扫描') }}
+                </button>
+              </div>
+            </section>
+
+            <section class="device-admin-block">
+              <p class="content-label">{{ text('Manual add', '手动添加') }}</p>
+              <div class="form-grid compact-form">
+                <label>
+                  <span>{{ text('Name', '名称') }}</span>
+                  <input name="manual-name" [(ngModel)]="manualForm.name" [placeholder]="text('Living Room Camera', '客厅摄像头')" />
+                </label>
+                <label>
+                  <span>{{ text('Room', '房间') }}</span>
+                  <input name="manual-room" [(ngModel)]="manualForm.room" [placeholder]="text('Living room', '客厅')" />
+                </label>
+                <label>
+                  <span>IP</span>
+                  <input name="manual-ip" [(ngModel)]="manualForm.ip" placeholder="192.168.3.73" />
+                </label>
+                <label>
+                  <span>{{ text('RTSP path', 'RTSP 路径') }}</span>
+                  <input name="manual-path" [(ngModel)]="manualForm.path" placeholder="/Streaming/Channels/101" />
+                </label>
+                <label>
+                  <span>{{ text('Snapshot URL', '快照 URL') }}</span>
+                  <input name="manual-snapshot" [(ngModel)]="manualForm.snapshot_url" placeholder="http://camera/snapshot.jpg" />
+                </label>
+                <label>
+                  <span>{{ text('Username', '用户名') }}</span>
+                  <input name="manual-username" [(ngModel)]="manualForm.username" placeholder="admin" />
+                </label>
+                <label>
+                  <span>{{ text('Password', '密码') }}</span>
+                  <input name="manual-password" type="password" [(ngModel)]="manualForm.password" [placeholder]="text('optional', '可选')" />
+                </label>
+                <label>
+                  <span>{{ text('Port', '端口') }}</span>
+                  <input name="manual-port" type="number" [(ngModel)]="manualForm.port" placeholder="554" />
+                </label>
+                <button type="button" class="action-button" [disabled]="deviceActionBusyKey === 'manual-add'" (click)="requestManualDeviceAdd()">
+                  {{ deviceActionBusyKey === 'manual-add' ? text('Adding...', '添加中...') : text('Add device', '添加设备') }}
+                </button>
+              </div>
+            </section>
+          </div>
+
+          @if (state.data.devices?.length) {
+            <div class="table-wrap device-table-wrap">
+              <table class="data-table device-table">
+                <thead>
+                  <tr>
+                    <th>{{ text('Device', '设备') }}</th>
+                    <th>Readiness</th>
+                    <th>{{ text('Credentials', '凭据') }}</th>
+                    <th>{{ text('Evidence', '证据') }}</th>
+                    <th>{{ text('Actions', '操作') }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  @for (device of state.data.devices; track device.device_id) {
+                    <tr>
+                      <td>
+                        <strong>{{ device.name }}</strong>
+                        <span class="cell-note">{{ device.device_id }}</span>
+                        <span class="cell-note">{{ device.ip_address || text('ip pending', 'IP 待配置') }} / {{ device.room || text('unassigned', '未分配') }}</span>
+                      </td>
+                      <td>
+                        <span [ngClass]="state.data.defaults?.selected_camera_device_id === device.device_id ? 'tone-success' : 'muted'">
+                          {{ text('default', '默认') }}: {{ state.data.defaults?.selected_camera_device_id === device.device_id ? text('yes', '是') : text('no', '否') }}
+                        </span>
+                        <span class="cell-note">RTSP: {{ device.primary_stream?.url || device.profile?.rtsp_url ? text('configured', '已配置') : text('pending', '待配置') }}</span>
+                        <span class="cell-note">{{ text('snapshot', '快照') }}: {{ device.snapshot_url || device.profile?.snapshot_url || device.capabilities?.snapshot ? 'ready' : text('fallback/pending', 'fallback/待配置') }}</span>
+                        <span class="cell-note">{{ text('share links', '分享链接') }}: {{ activeShareLinks(device.device_id) }}</span>
+                        @if (rtspCheckResults[device.device_id]) {
+                          <span class="cell-note" [ngClass]="rtspCheckResults[device.device_id].reachable ? 'tone-success' : 'tone-danger'">
+                            RTSP {{ text('check', '检查') }}: {{ rtspCheckResults[device.device_id].reachable ? text('reachable', '可达') : text('failed', '失败') }}
+                          </span>
+                        }
+                        @if (deviceStatus(device.device_id)) {
+                          <span class="cell-note tone-success">{{ deviceStatus(device.device_id) }}</span>
+                        }
+                      </td>
+                      <td>
+                        <span>{{ credentialStatus(device.device_id) }}</span>
+                        <div class="credential-grid">
+                          <input [name]="'cred-user-' + device.device_id" [(ngModel)]="credentialForm(device.device_id).username" [placeholder]="text('username', '用户名')" />
+                          <input [name]="'cred-pass-' + device.device_id" type="password" [(ngModel)]="credentialForm(device.device_id).password" [placeholder]="text('new password', '新密码')" />
+                          <input [name]="'cred-port-' + device.device_id" type="number" [(ngModel)]="credentialForm(device.device_id).rtsp_port" placeholder="554" />
+                          <input [name]="'cred-paths-' + device.device_id" [(ngModel)]="credentialForm(device.device_id).rtsp_paths_text" placeholder="/stream1, /stream2" />
+                        </div>
+                      </td>
+                      <td>
+                        @if (deviceEvidence(device.device_id); as evidence) {
+                          <div class="device-evidence-panel">
+                            <div class="device-evidence-head">
+                              <span [ngClass]="evidence.state === 'available' ? 'tone-success' : evidence.state === 'error' ? 'tone-danger' : 'muted'">
+                                {{ evidence.state }}
+                              </span>
+                              @if (evidence.generated_at) {
+                                <span class="cell-note">{{ text('generated', '生成') }}: {{ evidence.generated_at }}</span>
+                              }
+                            </div>
+                            <p class="table-copy">{{ evidence.summary }}</p>
+                            @for (field of evidence.fields; track field.key) {
+                              <div class="device-evidence-field" [ngClass]="toneClass(field.tone)">
+                                <div class="detail-row-head">
+                                  <strong>{{ field.label }}</strong>
+                                  <span>{{ field.status }}</span>
+                                </div>
+                                <p>{{ field.detail }}</p>
+                                <ul class="detail-meta">
+                                  <li>{{ text('Recent result', '最近结果') }}: {{ field.checked_at || text('not available', '暂无') }}</li>
+                                  @if (field.action_path) {
+                                    <li>action_path: <a [href]="field.action_path">{{ field.action_path }}</a></li>
+                                  }
+                                </ul>
+                              </div>
+                            }
+                            @if (evidence.warnings.length || evidence.blockers.length) {
+                              <ul class="signal-list">
+                                @for (warning of evidence.warnings; track warning) {
+                                  <li class="tone-warning">{{ warning }}</li>
+                                }
+                                @for (blocker of evidence.blockers; track blocker) {
+                                  <li class="tone-danger">{{ blocker }}</li>
+                                }
+                              </ul>
+                            }
+                          </div>
+                        }
+                      </td>
+                      <td>
+                        <div class="device-action-stack">
+                          <button type="button" class="action-button" [disabled]="state.data.defaults?.selected_camera_device_id === device.device_id || isDeviceBusy(device.device_id, 'default')" (click)="requestDefaultCameraChange(device.device_id)">
+                            {{ isDeviceBusy(device.device_id, 'default') ? text('Saving...', '保存中...') : text('Set default', '设为默认') }}
+                          </button>
+                          <button type="button" class="action-button" [disabled]="isDeviceBusy(device.device_id, 'credentials')" (click)="requestDeviceCredentialsSave(device.device_id)">
+                            {{ isDeviceBusy(device.device_id, 'credentials') ? text('Saving...', '保存中...') : text('Save credentials', '保存凭据') }}
+                          </button>
+                          <button type="button" class="action-button" [disabled]="isDeviceBusy(device.device_id, 'rtsp')" (click)="requestDeviceRtspCheck(device.device_id)">
+                            {{ isDeviceBusy(device.device_id, 'rtsp') ? text('Checking...', '检查中...') : text('Check RTSP', '检查 RTSP') }}
+                          </button>
+                          <button type="button" class="action-button" [disabled]="isDeviceBusy(device.device_id, 'snapshot')" (click)="requestCameraSnapshot(device.device_id)">
+                            {{ isDeviceBusy(device.device_id, 'snapshot') ? text('Testing...', '测试中...') : text('Snapshot test', '快照测试') }}
+                          </button>
+                          <button type="button" class="action-button" [disabled]="isDeviceBusy(device.device_id, 'share')" (click)="requestCameraShareLink(device.device_id)">
+                            {{ isDeviceBusy(device.device_id, 'share') ? text('Creating...', '创建中...') : text('Create share link', '创建分享链接') }}
+                          </button>
+                          <button type="button" class="action-button" [disabled]="isDeviceBusy(device.device_id, 'validation')" (click)="requestDeviceValidation(device.device_id)">
+                            {{ isDeviceBusy(device.device_id, 'validation') ? text('Validating...', '验收中...') : text('Run validation', '运行验收') }}
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  }
+                </tbody>
+              </table>
+            </div>
+          }
+
+          @if (state.data.shareLinks?.length) {
+            <div class="table-wrap share-table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>{{ text('Share link', '分享链接') }}</th>
+                    <th>{{ text('Device', '设备') }}</th>
+                    <th>{{ text('Status', '状态') }}</th>
+                    <th>{{ text('Expires', '过期时间') }}</th>
+                    <th>{{ text('Action', '操作') }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  @for (link of state.data.shareLinks; track link.share_link_id) {
+                    <tr>
+                      <td>
+                        <strong>{{ link.share_link_id }}</strong>
+                        <span class="cell-note">{{ link.media_session_id }}</span>
+                      </td>
+                      <td>{{ link.device_name || link.device_id }}</td>
+                      <td>{{ link.status }} / {{ link.session_status }}</td>
+                      <td>{{ link.expires_at || 'n/a' }}</td>
+                      <td>
+                        <button type="button" class="action-button" [disabled]="!link.can_revoke || deviceActionBusyKey === link.share_link_id + ':revoke'" (click)="requestShareLinkRevoke(link.share_link_id)">
+                          {{ deviceActionBusyKey === link.share_link_id + ':revoke' ? text('Revoking...', '撤销中...') : text('Revoke', '撤销') }}
+                        </button>
+                      </td>
+                    </tr>
+                  }
+                </tbody>
+              </table>
+            </div>
+          }
         </article>
       }
 
