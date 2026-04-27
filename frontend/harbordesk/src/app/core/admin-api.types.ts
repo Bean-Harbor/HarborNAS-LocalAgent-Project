@@ -4,6 +4,10 @@ export type PageKind = 'loading' | 'empty' | 'blocker' | 'success';
 export type MetricTone = 'neutral' | 'good' | 'warn' | 'danger';
 export type DeliverySurface = 'feishu' | 'weixin';
 export type SetupStepState = 'ready' | 'needs-config' | 'read-only' | 'blocked';
+export type ReleaseReadinessStatus = 'ready' | 'needs-config' | 'blocked' | 'running' | 'unknown';
+export type ReleaseReadinessEndpointState = 'available' | 'empty' | 'error';
+export type RagPrivacyLevel = 'strict_local' | 'allow_redacted_cloud' | 'allow_cloud';
+export type RagResourceProfile = 'cpu_only' | 'local_gpu' | 'sidecar_gpu' | 'cloud_allowed';
 
 export interface MetricCard {
   label: string;
@@ -31,6 +35,292 @@ export interface SetupFlowSection {
   title: string;
   summary: string;
   steps: SetupFlowStep[];
+}
+
+export interface ReleaseReadinessChecklistItem {
+  id: string;
+  label: string;
+  status: ReleaseReadinessStatus;
+  summary?: string;
+  detail?: string;
+  owner_lane?: string;
+  endpoint?: string;
+  deep_link?: string;
+  blockers?: string[];
+  evidence?: string[];
+}
+
+export interface ReleaseReadinessStatusCard {
+  id: string;
+  label: string;
+  value: string;
+  status: ReleaseReadinessStatus;
+  detail: string;
+  endpoint?: string;
+  deep_link?: string;
+  tone?: MetricTone;
+}
+
+export interface ReleaseReadinessDeepLink {
+  label: string;
+  href: string;
+  detail: string;
+  endpoint?: string;
+}
+
+export interface ReleaseDomainReadiness {
+  id: string;
+  label?: string;
+  status?: ReleaseReadinessStatus;
+  current_status?: string;
+  next_action?: string;
+  action_path?: string;
+  recent_validation_at?: string | null;
+  generated_at?: string | null;
+  checked_at?: string | null;
+  endpoint?: string;
+  detail?: string;
+  evidence?: string[];
+  blockers?: string[];
+  warnings?: string[];
+}
+
+export interface ReleaseDomainReadinessCard {
+  id: string;
+  label: string;
+  status: ReleaseReadinessStatus;
+  current_status: string;
+  next_action: string;
+  action_path: string;
+  recent_at?: string | null;
+  endpoint?: string;
+  detail?: string;
+  evidence: string[];
+  blockers: string[];
+  warnings: string[];
+  tone: MetricTone;
+}
+
+export interface ReleaseReadinessRunRequest {
+  scope?: 'all' | 'release' | 'hardware' | 'harboros' | 'models' | 'im';
+  reason?: string;
+}
+
+export interface ReleaseReadinessRunResponse {
+  run_id?: string;
+  job_id?: string;
+  status: ReleaseReadinessStatus | 'accepted' | 'queued';
+  summary?: string;
+  started_at?: string;
+  completed_at?: string | null;
+  checklist?: ReleaseReadinessChecklistItem[];
+  blockers?: string[];
+  warnings?: string[];
+}
+
+export interface ReleaseReadinessResponse {
+  status: ReleaseReadinessStatus;
+  summary?: string;
+  generated_at?: string;
+  checked_at?: string;
+  domains?: ReleaseDomainReadiness[];
+  domain_cards?: ReleaseDomainReadiness[];
+  checklist?: ReleaseReadinessChecklistItem[];
+  status_cards?: ReleaseReadinessStatusCard[];
+  deep_links?: ReleaseReadinessDeepLink[];
+  blockers?: string[];
+  warnings?: string[];
+  last_run?: ReleaseReadinessRunResponse | null;
+}
+
+export interface ReleaseReadinessHistoryEntry {
+  run_id?: string;
+  status: ReleaseReadinessStatus;
+  summary?: string;
+  generated_at?: string | null;
+  checked_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  action_path?: string;
+  actor?: string;
+  domains?: ReleaseDomainReadiness[];
+  blockers?: string[];
+  warnings?: string[];
+}
+
+export interface ReleaseReadinessHistoryResponse {
+  generated_at?: string | null;
+  history: ReleaseReadinessHistoryEntry[];
+}
+
+export interface RagReadinessResponse {
+  status: ReleaseReadinessStatus;
+  summary?: string;
+  generated_at?: string | null;
+  checked_at?: string | null;
+  source_roots?: RagReadinessComponent;
+  index_directory?: RagReadinessComponent;
+  embedding_model?: RagReadinessComponent;
+  model_readiness?: RagModelReadinessCard[];
+  resource_profiles?: RagResourceProfileStatus[];
+  privacy_policy?: RagReadinessComponent;
+  media_parser?: RagReadinessComponent;
+  storage_writable?: RagReadinessComponent;
+  index_jobs?: KnowledgeIndexJobRecord[];
+  evidence?: string[];
+  next_action?: string;
+  action_path?: string;
+  checklist?: ReleaseReadinessChecklistItem[];
+  blockers?: string[];
+  warnings?: string[];
+}
+
+export interface RagReadinessComponent {
+  status: ReleaseReadinessStatus;
+  summary: string;
+  detail: string;
+  evidence: string[];
+}
+
+export interface RagModelReadinessCard {
+  model_kind: string;
+  label: string;
+  status: ReleaseReadinessStatus;
+  endpoint_id?: string | null;
+  endpoint_kind?: string | null;
+  provider_key?: string | null;
+  model_name?: string | null;
+  detail: string;
+  blocker?: string | null;
+}
+
+export interface RagResourceProfileStatus {
+  profile: RagResourceProfile;
+  label: string;
+  status: ReleaseReadinessStatus;
+  detail: string;
+  blockers: string[];
+  warnings: string[];
+}
+
+export interface HardwareReadinessDevice {
+  device_id: string;
+  label?: string;
+  kind?: string;
+  status: ReleaseReadinessStatus;
+  detail?: string;
+  evidence?: string[];
+  blockers?: string[];
+}
+
+export interface HardwareReadinessResponse {
+  status: ReleaseReadinessStatus;
+  summary?: string;
+  checked_at?: string;
+  devices?: HardwareReadinessDevice[];
+  checklist?: ReleaseReadinessChecklistItem[];
+  status_cards?: ReleaseReadinessStatusCard[];
+  blockers?: string[];
+  warnings?: string[];
+}
+
+export interface HarborOsServiceStatus {
+  service_id: string;
+  label?: string;
+  status: ReleaseReadinessStatus;
+  detail?: string;
+}
+
+export interface HarborOsStatusResponse {
+  status: ReleaseReadinessStatus;
+  summary?: string;
+  checked_at?: string;
+  version?: string;
+  webui_url?: string;
+  admin_origin?: string;
+  services?: HarborOsServiceStatus[];
+  blockers?: string[];
+  warnings?: string[];
+}
+
+export interface HarborOsImCapability {
+  capability_id: string;
+  label?: string;
+  status: ReleaseReadinessStatus;
+  surface?: string;
+  detail?: string;
+  endpoint?: string;
+}
+
+export interface HarborOsImCapabilityMapResponse {
+  status: ReleaseReadinessStatus;
+  summary?: string;
+  checked_at?: string;
+  capabilities?: HarborOsImCapability[];
+  blockers?: string[];
+  warnings?: string[];
+}
+
+export interface LocalModelCatalogItem {
+  model_id: string;
+  label?: string;
+  provider?: string;
+  model_kind?: string;
+  status: ReleaseReadinessStatus;
+  size_bytes?: number | null;
+  installed?: boolean;
+  download_job_id?: string | null;
+  detail?: string;
+}
+
+export interface LocalModelCatalogResponse {
+  status?: ReleaseReadinessStatus;
+  checked_at?: string;
+  models: LocalModelCatalogItem[];
+  blockers?: string[];
+  warnings?: string[];
+}
+
+export interface LocalModelDownloadStatusResponse {
+  job_id: string;
+  model_id?: string;
+  status: ReleaseReadinessStatus | 'queued' | 'downloading' | 'completed' | 'failed';
+  progress_percent?: number | null;
+  bytes_downloaded?: number | null;
+  total_bytes?: number | null;
+  error_message?: string | null;
+  started_at?: string;
+  updated_at?: string;
+}
+
+export interface LocalModelDownloadsResponse {
+  status?: ReleaseReadinessStatus;
+  generated_at?: string | null;
+  checked_at?: string | null;
+  downloads: LocalModelDownloadStatusResponse[];
+  blockers?: string[];
+  warnings?: string[];
+}
+
+export interface ReleaseReadinessEndpointStatus {
+  endpoint: string;
+  state: ReleaseReadinessEndpointState;
+  detail: string;
+}
+
+export interface ReleaseReadinessPanel {
+  status: ReleaseReadinessStatus;
+  summary: string;
+  checked_at?: string | null;
+  checklist: ReleaseReadinessChecklistItem[];
+  statusCards: ReleaseReadinessStatusCard[];
+  domainCards: ReleaseDomainReadinessCard[];
+  deepLinks: ReleaseReadinessDeepLink[];
+  history: ReleaseReadinessHistoryEntry[];
+  blockers: string[];
+  warnings: string[];
+  endpointStates: ReleaseReadinessEndpointStatus[];
+  empty: boolean;
 }
 
 export interface AccessMemberSummary {
@@ -164,14 +454,103 @@ export interface CameraProfile {
   path_candidates?: string[];
 }
 
+export interface CameraStreamRef {
+  transport?: string;
+  url?: string;
+  requires_auth?: boolean;
+}
+
+export interface CameraCapabilities {
+  snapshot?: boolean;
+  stream?: boolean;
+  ptz?: boolean;
+  audio?: boolean;
+}
+
 export interface CameraDevice {
   device_id: string;
   name: string;
-  room: string;
+  room?: string | null;
   status?: string;
+  kind?: string;
+  vendor?: string | null;
+  model?: string | null;
+  ip_address?: string | null;
+  discovery_source?: string;
+  primary_stream?: CameraStreamRef;
+  snapshot_url?: string | null;
+  capabilities?: CameraCapabilities;
   provider?: string;
   profile?: CameraProfile;
   metadata?: Record<string, unknown>;
+}
+
+export interface DeviceCredentialStatus {
+  device_id: string;
+  configured: boolean;
+  redacted: boolean;
+  username?: string | null;
+  rtsp_port?: number | null;
+  path_count: number;
+  source: string;
+  updated_at?: string | null;
+  last_verified_at?: string | null;
+}
+
+export interface DeviceEvidenceResult {
+  id?: string;
+  kind: 'rtsp_check' | 'snapshot' | 'share_link' | 'credential_status' | string;
+  status?: ReleaseReadinessStatus | 'passed' | 'failed' | 'pending' | 'skipped' | string;
+  summary?: string;
+  detail?: string;
+  checked_at?: string | null;
+  generated_at?: string | null;
+  action_path?: string;
+  endpoint?: string;
+  artifact_path?: string | null;
+  share_link_id?: string | null;
+  redacted?: boolean;
+  expires_at?: string | null;
+  error_message?: string | null;
+}
+
+export interface DeviceEvidenceResponse {
+  device_id: string;
+  status?: ReleaseReadinessStatus;
+  summary?: string;
+  generated_at?: string | null;
+  checked_at?: string | null;
+  next_action?: string;
+  action_path?: string;
+  results?: DeviceEvidenceResult[];
+  rtsp_check?: DeviceEvidenceResult;
+  snapshot?: DeviceEvidenceResult;
+  share_link?: DeviceEvidenceResult;
+  credential_status?: DeviceEvidenceResult;
+  blockers?: string[];
+  warnings?: string[];
+}
+
+export interface DeviceEvidenceField {
+  key: 'rtsp_check' | 'snapshot' | 'share_link' | 'credential_status';
+  label: string;
+  status: string;
+  detail: string;
+  tone: MetricTone;
+  checked_at?: string | null;
+  action_path?: string;
+  endpoint?: string;
+}
+
+export interface DeviceEvidencePanel {
+  device_id: string;
+  endpoint: string;
+  state: ReleaseReadinessEndpointState;
+  summary: string;
+  generated_at?: string | null;
+  fields: DeviceEvidenceField[];
+  blockers: string[];
+  warnings: string[];
 }
 
 export interface AdminBindingState {
@@ -212,6 +591,168 @@ export interface AdminStateResponse {
   current_principal_display_name?: string;
   devices: CameraDevice[];
   account_management: AccountManagementSnapshot;
+  device_credential_statuses?: DeviceCredentialStatus[];
+}
+
+export interface KnowledgeSourceRoot {
+  root_id: string;
+  label: string;
+  path: string;
+  enabled: boolean;
+  include: string[];
+  exclude: string[];
+  last_indexed_at?: string | null;
+}
+
+export interface KnowledgeSettings {
+  source_roots: KnowledgeSourceRoot[];
+  index_root: string;
+  privacy_level: RagPrivacyLevel;
+  default_resource_profile: RagResourceProfile;
+}
+
+export interface KnowledgeIndexRootStatus {
+  root_id: string;
+  label: string;
+  path: string;
+  enabled: boolean;
+  exists: boolean;
+  last_indexed_at?: string | null;
+  status: string;
+  detail: string;
+}
+
+export interface KnowledgeIndexStatusResponse {
+  generated_at: string;
+  status: ReleaseReadinessStatus | string;
+  settings: KnowledgeSettings;
+  index_root_exists: boolean;
+  index_root_writable: boolean;
+  manifest_count: number;
+  manifest_entry_count: number;
+  embedding_cache_count: number;
+  embedding_entry_count: number;
+  storage_usage_bytes: number;
+  last_indexed_at?: string | null;
+  source_roots: KnowledgeIndexRootStatus[];
+  blockers: string[];
+}
+
+export interface KnowledgeIndexRunResponse {
+  generated_at: string;
+  job_ids?: string[];
+  status: string;
+  index_root: string;
+  root_count: number;
+  indexed_roots: KnowledgeIndexRootStatus[];
+  errors: string[];
+}
+
+export interface KnowledgeIndexJobRecord {
+  job_id: string;
+  source_root_id: string;
+  source_root_label: string;
+  source_root_path: string;
+  modalities: string[];
+  status: string;
+  progress_percent?: number | null;
+  requested_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  error_message?: string | null;
+  retry_count: number;
+  checkpoint: Record<string, unknown>;
+  resource_profile: RagResourceProfile;
+  cancel_requested: boolean;
+}
+
+export interface KnowledgeIndexJobsResponse {
+  generated_at: string;
+  jobs: KnowledgeIndexJobRecord[];
+}
+
+export interface FileBrowseEntry {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  size_bytes?: number | null;
+}
+
+export interface FilesBrowseResponse {
+  path: string;
+  parent?: string | null;
+  readonly: boolean;
+  allowed_roots: string[];
+  entries: FileBrowseEntry[];
+}
+
+export interface ShareLinkSummary {
+  share_link_id: string;
+  media_session_id: string;
+  device_id: string;
+  device_name: string;
+  opened_by_user_id?: string | null;
+  access_scope: string;
+  session_status: string;
+  status: string;
+  expires_at?: string | null;
+  revoked_at?: string | null;
+  started_at?: string | null;
+  ended_at?: string | null;
+  can_revoke: boolean;
+}
+
+export interface DeviceCredentialsPayload {
+  username?: string | null;
+  password?: string | null;
+  rtsp_port?: number | null;
+  rtsp_paths?: string[];
+}
+
+export interface RtspCheckPayload extends DeviceCredentialsPayload {}
+
+export interface RtspCheckResult {
+  device_id: string;
+  reachable: boolean;
+  stream_url?: string | null;
+  transport: string;
+  requires_auth: boolean;
+  capabilities: CameraCapabilities;
+  error_message?: string | null;
+  checked_at: string;
+}
+
+export interface DeviceValidationRunRequest {
+  scope?: 'all' | 'rtsp' | 'snapshot' | 'share-link' | 'credentials';
+  reason?: string;
+}
+
+export interface DeviceValidationRunResponse {
+  run_id?: string;
+  device_id: string;
+  status: ReleaseReadinessStatus | 'accepted' | 'queued';
+  summary?: string;
+  started_at?: string;
+  completed_at?: string | null;
+  evidence?: DeviceEvidenceResponse;
+  blockers?: string[];
+  warnings?: string[];
+}
+
+export interface ManualDevicePayload {
+  name: string;
+  room?: string | null;
+  ip: string;
+  path?: string | null;
+  snapshot_url?: string | null;
+  username?: string | null;
+  password?: string | null;
+  port?: number | null;
+}
+
+export interface DiscoveryScanPayload {
+  cidr?: string | null;
+  protocol?: string | null;
 }
 
 export interface GatewayPlatformStatus {
@@ -359,10 +900,20 @@ export interface DeskPageModel {
   detailRows?: DeskRow[];
   members?: AccessMemberSummary[];
   notificationTargets?: NotificationTargetRecord[];
+  devices?: CameraDevice[];
+  defaults?: AdminDefaults;
+  deviceCredentialStatuses?: DeviceCredentialStatus[];
+  deviceEvidence?: Record<string, DeviceEvidencePanel>;
+  shareLinks?: ShareLinkSummary[];
   modelEndpoints?: ModelEndpointRecord[];
   modelPolicies?: ModelRoutePolicyRecord[];
+  knowledgeSettings?: KnowledgeSettings;
+  knowledgeIndexStatus?: KnowledgeIndexStatusResponse;
+  knowledgeIndexJobs?: KnowledgeIndexJobRecord[];
+  ragReadiness?: RagReadinessResponse;
   featureGroups?: FeatureAvailabilityGroup[];
   runtimeAlignment?: RuntimeAlignmentSummary;
+  releaseReadiness?: ReleaseReadinessPanel;
 }
 
 export interface PageState<T> {

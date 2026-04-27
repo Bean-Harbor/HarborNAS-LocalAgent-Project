@@ -1,7 +1,8 @@
 import { Component } from '@angular/core';
 import { RouterLink, RouterLinkActive, RouterOutlet } from '@angular/router';
 
-import { HARBORDESK_PAGES } from './core/page-registry';
+import { localizedHarborDeskPages } from './core/page-registry';
+import { prefersChineseUi, uiText } from './core/ui-locale';
 
 @Component({
   selector: 'hd-root',
@@ -11,5 +12,14 @@ import { HARBORDESK_PAGES } from './core/page-registry';
   styleUrl: './app.component.css'
 })
 export class AppComponent {
-  protected readonly pages = HARBORDESK_PAGES;
+  protected readonly isChineseUi = prefersChineseUi();
+  protected readonly pages = localizedHarborDeskPages();
+
+  constructor() {
+    document.documentElement.lang = this.isChineseUi ? 'zh-CN' : 'en';
+  }
+
+  protected text(english: string, chinese: string): string {
+    return uiText(english, chinese);
+  }
 }

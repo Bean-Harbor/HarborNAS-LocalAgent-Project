@@ -3,10 +3,10 @@
     <div class="brand-card">
       <p class="brand-kicker">HarborBeacon</p>
       <h1>HarborDesk</h1>
-      <p class="brand-copy">A wiring-ready Angular shell for the formal admin workspace.</p>
+      <p class="brand-copy">{{ text('A wiring-ready Angular shell for the formal admin workspace.', '发布前统一配置后台。') }}</p>
     </div>
 
-    <nav class="page-nav" aria-label="HarborDesk primary navigation">
+    <nav class="page-nav" [attr.aria-label]="text('HarborDesk primary navigation', 'HarborDesk 主导航')">
       @for (page of pages; track page.id) {
         <a
           class="nav-item"
@@ -21,19 +21,19 @@
     </nav>
 
     <div class="build-card">
-      <p class="build-label">Build output</p>
+      <p class="build-label">{{ text('Build output', '构建产物') }}</p>
       <p class="build-path">dist/harbordesk</p>
-      <p class="build-copy">Use the Angular build artifact for deployment packaging.</p>
+      <p class="build-copy">{{ text('Use the Angular build artifact for deployment packaging.', '使用 Angular 构建产物进入 HarborOS 部署包。') }}</p>
     </div>
   </aside>
 
   <main class="workspace">
     <header class="workspace-header">
       <div>
-        <p class="workspace-kicker">Same-origin admin UI</p>
-        <h2>Loading, empty, blocker, and success are all first-class states.</h2>
+        <p class="workspace-kicker">{{ text('Same-origin admin UI', '同源后台配置页') }}</p>
+        <h2>{{ text('HarborDesk runs as the admin shell; HarborOS WebUI remains separate.', 'HarborDesk 是后台 shell；HarborOS WebUI 保持独立。') }}</h2>
       </div>
-      <div class="workspace-badge">Proxy: /api -> 127.0.0.1:8080</div>
+      <div class="workspace-badge">{{ text('HarborDesk :4174 | HarborOS /ui/ 80/443', 'HarborDesk :4174 | HarborOS /ui/ 80/443') }}</div>
     </header>
 
     <section class="workspace-body">
