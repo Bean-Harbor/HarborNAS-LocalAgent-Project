@@ -1,41 +1,55 @@
 //! HarborBeacon-local knowledge retrieval over NAS-backed documents and images.
 
 use std::collections::HashSet;
-use std::env;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::control_plane::models::{ModelEndpointStatus, ModelKind};
+use crate::control_plane::models::{
+    ModelEndpointKind, ModelEndpointStatus, ModelKind, PrivacyLevel,
+};
+use crate::runtime::admin_console::{
+    path_is_same_or_inside, AdminModelCenterState, RagResourceProfile,
+};
 use crate::runtime::knowledge_index::{
     load_embedding_store, save_embedding_store, KnowledgeEmbeddingEntry, KnowledgeEmbeddingStore,
-    KnowledgeIndexChunk, KnowledgeIndexEntry, KnowledgeIndexService, KnowledgeModality,
+    KnowledgeIndexChunk, KnowledgeIndexConfig, KnowledgeIndexEntry, KnowledgeIndexService,
+    KnowledgeModality,
 };
 use crate::runtime::model_center;
 
-pub const KNOWLEDGE_ROOTS_ENV: &str = "HARBOR_KNOWLEDGE_ROOTS";
-
 const DEFAULT_LIMIT: usize = 5;
-const DEFAULT_KNOWLEDGE_DIR: &str = "knowledge";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnowledgeSearchRequest {
     pub query: String,
+    pub configured_roots: Vec<String>,
+    pub index_root: Option<String>,
     pub roots: Vec<String>,
     pub include_documents: bool,
     pub include_images: bool,
     pub limit: usize,
+    pub privacy_level: PrivacyLevel,
+    pub resource_profile: RagResourceProfile,
+    pub require_embeddings: bool,
+    pub latency_budget_ms: Option<u64>,
 }
 
 impl KnowledgeSearchRequest {
     pub fn new(query: impl Into<String>) -> Self {
         Self {
             query: query.into(),
+            configured_roots: Vec::new(),
+            index_root: None,
             roots: Vec::new(),
             include_documents: true,
             include_images: true,
             limit: DEFAULT_LIMIT,
+            privacy_level: PrivacyLevel::StrictLocal,
+            resource_profile: RagResourceProfile::CpuOnly,
+            require_embeddings: false,
+            latency_budget_ms: None,
         }
     }
 }
@@ -118,6 +132,60 @@ pub struct KnowledgeSearchResponse {
     pub supported_modalities: Vec<String>,
     #[serde(default)]
     pub pending_modalities: Vec<String>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub degraded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<String>,
+    #[serde(default)]
+    pub blockers: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub source_scope: Vec<String>,
+    #[serde(default)]
+    pub privacy_level: String,
+    #[serde(default)]
+    pub resource_profile: String,
+}
+
+impl KnowledgeSearchResponse {
+    pub fn degraded(
+        query: impl Into<String>,
+        roots: Vec<String>,
+        privacy_level: PrivacyLevel,
+        resource_profile: RagResourceProfile,
+        reason: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        let query = query.into();
+        let roots = normalize_scope_strings(roots);
+        let reason = reason.into();
+        let message = message.into();
+        let (supported_modalities, pending_modalities) = modality_support_matrix();
+        Self {
+            query,
+            roots: roots.clone(),
+            total_matches: 0,
+            documents: Vec::new(),
+            images: Vec::new(),
+            reply_pack: KnowledgeSearchReplyPack {
+                summary: message.clone(),
+                citations: Vec::new(),
+            },
+            supported_modalities,
+            pending_modalities,
+            status: "degraded".to_string(),
+            degraded: true,
+            degraded_reason: Some(reason),
+            blockers: vec![message],
+            warnings: Vec::new(),
+            source_scope: roots,
+            privacy_level: privacy_level_as_str(privacy_level).to_string(),
+            resource_profile: resource_profile.as_str().to_string(),
+        }
+    }
 }
 
 pub struct KnowledgeSearchService;
@@ -137,26 +205,126 @@ impl KnowledgeSearchService {
             );
         }
         if !request.include_documents && !request.include_images {
-            return Err("当前检索请求没有启用可支持的模态，至少需要文档或图片之一。".to_string());
+            return Ok(KnowledgeSearchResponse::degraded(
+                query,
+                Vec::new(),
+                request.privacy_level,
+                request.resource_profile,
+                "unsupported_modalities",
+                "当前检索请求没有启用可支持的模态，至少需要文档或图片之一。",
+            ));
         }
 
-        let roots = resolve_roots(&request.roots)?;
+        if let Some(blocker) = request_policy_blocker(&request) {
+            return Ok(KnowledgeSearchResponse::degraded(
+                query,
+                Vec::new(),
+                request.privacy_level,
+                request.resource_profile,
+                "blocked_resource_profile",
+                blocker,
+            ));
+        }
+
+        let roots = match resolve_roots(&request.configured_roots, &request.roots) {
+            Ok(roots) => roots,
+            Err(error) => {
+                return Ok(KnowledgeSearchResponse::degraded(
+                    query,
+                    Vec::new(),
+                    request.privacy_level,
+                    request.resource_profile,
+                    "source_scope_blocked",
+                    error,
+                ))
+            }
+        };
+        let root_strings = roots
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
         let query_terms = build_query_terms(&query);
-        let index_service = KnowledgeIndexService::new()?;
+        let index_service = match knowledge_index_service(request.index_root.as_deref()) {
+            Ok(service) => service,
+            Err(error) => {
+                return Ok(KnowledgeSearchResponse::degraded(
+                    query,
+                    root_strings,
+                    request.privacy_level,
+                    request.resource_profile,
+                    "index_root_unavailable",
+                    error,
+                ))
+            }
+        };
         let model_center_state = model_center::load_model_center_state();
+        if let Some(blocker) = resource_profile_runtime_blocker(
+            request.resource_profile,
+            request.privacy_level,
+            &model_center_state,
+        ) {
+            return Ok(KnowledgeSearchResponse::degraded(
+                query,
+                root_strings,
+                request.privacy_level,
+                request.resource_profile,
+                "blocked_resource_profile",
+                blocker,
+            ));
+        }
         let query_embedding = model_center::run_embedding_with_state(&query, &model_center_state);
         let query_embedding_vector =
             (!query_embedding.vector.is_empty() && query_embedding.available)
                 .then_some(query_embedding.vector.clone());
+        if request.require_embeddings && query_embedding_vector.is_none() {
+            return Ok(KnowledgeSearchResponse::degraded(
+                query,
+                root_strings,
+                request.privacy_level,
+                request.resource_profile,
+                "embedding_unavailable",
+                format!(
+                    "当前检索要求 embedding，但 embedding 模型不可用：{}",
+                    query_embedding.summary
+                ),
+            ));
+        }
+        let mut warnings = Vec::new();
+        if query_embedding_vector.is_none() {
+            warnings.push(format!(
+                "Embedding 模型不可用，已降级为本地词法检索：{}",
+                query_embedding.summary
+            ));
+        }
         let mut seen_hits = HashSet::new();
 
         let mut documents = Vec::new();
         let mut images = Vec::new();
         for root in &roots {
-            let snapshot = index_service.load_or_refresh(root)?;
+            let snapshot = match index_service.load_existing(root) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return Ok(KnowledgeSearchResponse::degraded(
+                        query,
+                        root_strings,
+                        request.privacy_level,
+                        request.resource_profile,
+                        "index_manifest_unavailable",
+                        error,
+                    ))
+                }
+            };
             let embedding_store_path = index_service.embedding_store_path_for_root(root);
             let mut embedding_store = if query_embedding_vector.is_some() {
-                load_embedding_store(&embedding_store_path)?
+                match load_embedding_store(&embedding_store_path) {
+                    Ok(store) => store,
+                    Err(error) => {
+                        warnings.push(format!(
+                            "Embedding cache 读取失败，已继续使用词法分数：{error}"
+                        ));
+                        KnowledgeEmbeddingStore::default()
+                    }
+                }
             } else {
                 KnowledgeEmbeddingStore::default()
             };
@@ -218,7 +386,16 @@ impl KnowledgeSearchService {
                 }
             }
             if embedding_store_dirty {
-                save_embedding_store(&embedding_store_path, &embedding_store)?;
+                if let Err(error) = save_embedding_store(&embedding_store_path, &embedding_store) {
+                    return Ok(KnowledgeSearchResponse::degraded(
+                        query,
+                        root_strings,
+                        request.privacy_level,
+                        request.resource_profile,
+                        "embedding_cache_write_failed",
+                        error,
+                    ));
+                }
             }
         }
 
@@ -234,18 +411,108 @@ impl KnowledgeSearchService {
 
         Ok(KnowledgeSearchResponse {
             query,
-            roots: roots
-                .iter()
-                .map(|path| path.to_string_lossy().into_owned())
-                .collect(),
+            roots: root_strings.clone(),
             total_matches,
             documents,
             images,
             reply_pack,
             supported_modalities,
             pending_modalities,
+            status: if warnings.is_empty() {
+                "completed".to_string()
+            } else {
+                "degraded".to_string()
+            },
+            degraded: !warnings.is_empty(),
+            degraded_reason: (!warnings.is_empty()).then(|| "embedding_unavailable".to_string()),
+            blockers: Vec::new(),
+            warnings,
+            source_scope: root_strings,
+            privacy_level: privacy_level_as_str(request.privacy_level).to_string(),
+            resource_profile: request.resource_profile.as_str().to_string(),
         })
     }
+}
+
+fn request_policy_blocker(request: &KnowledgeSearchRequest) -> Option<String> {
+    if request.resource_profile == RagResourceProfile::CloudAllowed
+        && request.privacy_level == PrivacyLevel::StrictLocal
+    {
+        return Some(
+            "resource_profile=cloud_allowed 与 workspace strict_local 隐私策略冲突；请先在 HarborDesk 明确启用可审计的云策略。"
+                .to_string(),
+        );
+    }
+    if let Some(budget) = request.latency_budget_ms {
+        if budget == 0 {
+            return Some("latency_budget_ms 必须大于 0，不能静默回退到无预算检索。".to_string());
+        }
+    }
+    None
+}
+
+fn resource_profile_runtime_blocker(
+    resource_profile: RagResourceProfile,
+    privacy_level: PrivacyLevel,
+    model_center_state: &AdminModelCenterState,
+) -> Option<String> {
+    match resource_profile {
+        RagResourceProfile::CpuOnly | RagResourceProfile::LocalGpu => None,
+        RagResourceProfile::SidecarGpu => {
+            if endpoint_kind_available(model_center_state, ModelEndpointKind::Sidecar) {
+                None
+            } else {
+                Some(
+                    "resource_profile=sidecar_gpu 需要可用的 sidecar 模型端点；当前模型设置未通过 readiness。"
+                        .to_string(),
+                )
+            }
+        }
+        RagResourceProfile::CloudAllowed => {
+            if privacy_level == PrivacyLevel::StrictLocal {
+                Some(
+                    "resource_profile=cloud_allowed 与 strict_local 隐私策略冲突。".to_string(),
+                )
+            } else if endpoint_kind_available(model_center_state, ModelEndpointKind::Cloud) {
+                None
+            } else {
+                Some(
+                    "resource_profile=cloud_allowed 需要可用的 cloud 模型端点；当前模型设置未通过 readiness。"
+                        .to_string(),
+                )
+            }
+        }
+    }
+}
+
+fn endpoint_kind_available(
+    model_center_state: &AdminModelCenterState,
+    endpoint_kind: ModelEndpointKind,
+) -> bool {
+    model_center_state.endpoints.iter().any(|endpoint| {
+        endpoint.endpoint_kind == endpoint_kind
+            && endpoint.status != ModelEndpointStatus::Disabled
+            && matches!(
+                endpoint.model_kind,
+                ModelKind::Embedder | ModelKind::Llm | ModelKind::Ocr | ModelKind::Vlm
+            )
+    })
+}
+
+fn privacy_level_as_str(level: PrivacyLevel) -> &'static str {
+    match level {
+        PrivacyLevel::StrictLocal => "strict_local",
+        PrivacyLevel::AllowRedactedCloud => "allow_redacted_cloud",
+        PrivacyLevel::AllowCloud => "allow_cloud",
+    }
+}
+
+fn normalize_scope_strings(mut roots: Vec<String>) -> Vec<String> {
+    roots.iter_mut().for_each(|root| *root = root.trim().to_string());
+    roots.retain(|root| !root.is_empty());
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 fn modality_support_matrix() -> (Vec<String>, Vec<String>) {
@@ -280,53 +547,71 @@ fn modality_support_matrix() -> (Vec<String>, Vec<String>) {
     (supported, pending)
 }
 
-fn resolve_roots(request_roots: &[String]) -> Result<Vec<PathBuf>, String> {
-    let raw_roots = if request_roots.is_empty() {
-        default_roots()
+fn knowledge_index_service(index_root: Option<&str>) -> Result<KnowledgeIndexService, String> {
+    let Some(index_root) = index_root.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    }) else {
+        return Err("请先在 HarborDesk 配置 knowledge.index_root，再运行知识库检索。".to_string());
+    };
+    KnowledgeIndexService::from_config(KnowledgeIndexConfig::new(PathBuf::from(index_root))?)
+}
+
+fn resolve_roots(configured_roots: &[String], request_roots: &[String]) -> Result<Vec<PathBuf>, String> {
+    let configured = configured_roots
+        .iter()
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    if configured.is_empty() {
+        return Err("请先在 HarborDesk 配置并启用至少一个知识源目录。".to_string());
+    }
+
+    let requested = request_roots
+        .iter()
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    let raw_roots = if requested.is_empty() {
+        configured.clone()
     } else {
-        request_roots
-            .iter()
-            .map(|item| PathBuf::from(item.trim()))
-            .collect()
+        let mut allowed = Vec::new();
+        for requested_root in requested {
+            let inside_configured = configured
+                .iter()
+                .any(|configured_root| path_is_same_or_inside(&requested_root, configured_root));
+            if !inside_configured {
+                return Err(format!(
+                    "请求的知识源目录未在 HarborDesk 启用，不能扩权检索：{requested_root}"
+                ));
+            }
+            allowed.push(requested_root);
+        }
+        allowed
     };
 
     let mut roots = Vec::new();
     for root in raw_roots {
+        let root = PathBuf::from(root);
         if root.as_os_str().is_empty() {
             continue;
         }
         if root.exists() {
-            roots.push(root);
+            roots.push(root.canonicalize().unwrap_or(root));
         }
     }
 
     if roots.is_empty() {
-        return Err(format!(
-            "未找到可检索的知识库目录；请通过请求参数 roots 或环境变量 {KNOWLEDGE_ROOTS_ENV} 配置 NAS 检索根目录。"
-        ));
+        return Err("未找到可检索的已配置知识源目录；请先通过 HarborDesk 配置并确认目录存在。".to_string());
     }
 
     roots.sort();
     roots.dedup();
     Ok(roots)
-}
-
-fn default_roots() -> Vec<PathBuf> {
-    if let Ok(value) = env::var(KNOWLEDGE_ROOTS_ENV) {
-        let paths = env::split_paths(&value)
-            .filter(|path| !path.as_os_str().is_empty())
-            .collect::<Vec<_>>();
-        if !paths.is_empty() {
-            return paths;
-        }
-    }
-
-    let default_dir = PathBuf::from(DEFAULT_KNOWLEDGE_DIR);
-    default_dir
-        .exists()
-        .then_some(default_dir)
-        .into_iter()
-        .collect()
 }
 
 /// Build a HarborBeacon-owned hit from an indexed entry, preserving the stable
@@ -460,6 +745,8 @@ fn build_hit_candidate(
                 score += match modality {
                     KnowledgeModality::Document => 24,
                     KnowledgeModality::Image => 20,
+                    KnowledgeModality::Audio => 18,
+                    KnowledgeModality::Video => 18,
                 };
                 matched = true;
             }
@@ -503,7 +790,7 @@ fn build_hit_candidate(
 fn apply_hybrid_scores(
     candidate: &mut SearchCandidate,
     query_embedding: Option<&[f32]>,
-    model_center_state: &crate::runtime::admin_console::AdminModelCenterState,
+    model_center_state: &AdminModelCenterState,
     embedding_store: &mut KnowledgeEmbeddingStore,
     embedding_store_dirty: &mut bool,
 ) {
@@ -533,7 +820,7 @@ fn apply_hybrid_scores(
 
 fn embedding_vector_for_candidate(
     candidate: &SearchCandidate,
-    model_center_state: &crate::runtime::admin_console::AdminModelCenterState,
+    model_center_state: &AdminModelCenterState,
     embedding_store: &mut KnowledgeEmbeddingStore,
     embedding_store_dirty: &mut bool,
 ) -> Option<Vec<f32>> {
@@ -775,7 +1062,9 @@ mod tests {
     };
     use crate::runtime::admin_console::{AdminConsoleState, AdminModelCenterState};
 
-    use super::{KnowledgeSearchRequest, KnowledgeSearchService};
+    use super::{
+        KnowledgeIndexConfig, KnowledgeIndexService, KnowledgeSearchRequest, KnowledgeSearchService,
+    };
 
     static INDEX_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -791,6 +1080,56 @@ mod tests {
         if path.exists() {
             let _ = fs::remove_dir_all(path);
         }
+    }
+
+    fn build_search_index(root: &Path, index_root: &Path) {
+        KnowledgeIndexService::from_config(
+            KnowledgeIndexConfig::new(index_root.to_path_buf()).expect("knowledge index config"),
+        )
+        .expect("knowledge index service")
+        .load_or_refresh(root)
+        .expect("build knowledge index");
+    }
+
+    #[test]
+    fn search_requires_existing_index_manifest_instead_of_refreshing() {
+        let _guard = INDEX_TEST_LOCK.lock().expect("lock");
+        let root = unique_dir("harborbeacon-knowledge-no-manifest");
+        let index_root = unique_dir("harborbeacon-knowledge-index-no-manifest");
+        fs::create_dir_all(root.join("docs")).expect("create docs");
+        fs::create_dir_all(&index_root).expect("create index root");
+        fs::write(root.join("docs").join("sakura.md"), "樱花计划").expect("write doc");
+
+        let response = KnowledgeSearchService::search(KnowledgeSearchRequest {
+            query: "樱花".to_string(),
+            configured_roots: vec![root.to_string_lossy().into_owned()],
+            index_root: Some(index_root.to_string_lossy().into_owned()),
+            roots: vec![root.to_string_lossy().into_owned()],
+            include_documents: true,
+            include_images: false,
+            limit: 5,
+            ..KnowledgeSearchRequest::new("")
+        })
+        .expect("knowledge search");
+
+        assert!(response.degraded);
+        assert_eq!(
+            response.degraded_reason.as_deref(),
+            Some("index_manifest_unavailable")
+        );
+        assert_eq!(response.total_matches, 0);
+        assert!(response
+            .blockers
+            .iter()
+            .any(|item| item.contains("/api/knowledge/index/run")));
+        assert!(!index_root
+            .read_dir()
+            .expect("list index root")
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".json")));
+
+        cleanup_dir(&root);
+        cleanup_dir(&index_root);
     }
 
     fn write_mock_model_center_state(
@@ -931,17 +1270,19 @@ mod tests {
             r#"{"caption":"花园里的樱花树","tags":["spring","sakura"]}"#,
         )
         .expect("write sidecar");
+        build_search_index(&root, &index_root);
 
-        std::env::set_var("HARBOR_KNOWLEDGE_INDEX_ROOT", &index_root);
         let response = KnowledgeSearchService::search(KnowledgeSearchRequest {
             query: "樱花".to_string(),
+            configured_roots: vec![root.to_string_lossy().into_owned()],
+            index_root: Some(index_root.to_string_lossy().into_owned()),
             roots: vec![root.to_string_lossy().into_owned()],
             include_documents: true,
             include_images: true,
             limit: 5,
+            ..KnowledgeSearchRequest::new("")
         })
         .expect("knowledge search");
-        std::env::remove_var("HARBOR_KNOWLEDGE_INDEX_ROOT");
 
         assert_eq!(response.total_matches, 2);
         assert_eq!(response.documents.len(), 1);
@@ -978,17 +1319,19 @@ mod tests {
             "第一段是背景介绍。\n第二段仍然是背景。\n第三段继续铺垫。\n第四段保持上下文。\n第五段明确提到樱花季文档整理与引用。\n第六段补充引用来源。",
         )
         .expect("write doc");
+        build_search_index(&root, &index_root);
 
-        std::env::set_var("HARBOR_KNOWLEDGE_INDEX_ROOT", &index_root);
         let response = KnowledgeSearchService::search(KnowledgeSearchRequest {
             query: "樱花".to_string(),
+            configured_roots: vec![root.to_string_lossy().into_owned()],
+            index_root: Some(index_root.to_string_lossy().into_owned()),
             roots: vec![root.to_string_lossy().into_owned()],
             include_documents: true,
             include_images: false,
             limit: 5,
+            ..KnowledgeSearchRequest::new("")
         })
         .expect("knowledge search");
-        std::env::remove_var("HARBOR_KNOWLEDGE_INDEX_ROOT");
 
         assert_eq!(response.documents.len(), 1);
         let hit = &response.documents[0];
@@ -1042,10 +1385,12 @@ mod tests {
             r#"{"caption":"alpha spring view"}"#,
         )
         .expect("sidecar");
+        build_search_index(&root, &index_root);
 
-        std::env::set_var("HARBOR_KNOWLEDGE_INDEX_ROOT", &index_root);
         let response = KnowledgeSearchService::search(KnowledgeSearchRequest {
             query: "spring".to_string(),
+            configured_roots: vec![root.to_string_lossy().into_owned()],
+            index_root: Some(index_root.to_string_lossy().into_owned()),
             roots: vec![
                 root.to_string_lossy().into_owned(),
                 root.to_string_lossy().into_owned(),
@@ -1053,9 +1398,9 @@ mod tests {
             include_documents: true,
             include_images: true,
             limit: 10,
+            ..KnowledgeSearchRequest::new("")
         })
         .expect("knowledge search");
-        std::env::remove_var("HARBOR_KNOWLEDGE_INDEX_ROOT");
 
         assert_eq!(response.documents.len(), 2);
         assert_eq!(response.images.len(), 1);
@@ -1088,6 +1433,7 @@ mod tests {
         .expect("create admin state dir");
         fs::write(root.join("docs").join("a-note.md"), "樱花 会议 纪要").expect("doc a");
         fs::write(root.join("docs").join("b-note.md"), "整理 计划 清单").expect("doc b");
+        build_search_index(&root, &index_root);
 
         write_mock_model_center_state_with_embed(
             &admin_state_path,
@@ -1098,17 +1444,18 @@ mod tests {
             }),
         );
 
-        std::env::set_var("HARBOR_KNOWLEDGE_INDEX_ROOT", &index_root);
         std::env::set_var("HARBOR_ADMIN_STATE_PATH", &admin_state_path);
         let response = KnowledgeSearchService::search(KnowledgeSearchRequest {
             query: "樱花整理".to_string(),
+            configured_roots: vec![root.to_string_lossy().into_owned()],
+            index_root: Some(index_root.to_string_lossy().into_owned()),
             roots: vec![root.to_string_lossy().into_owned()],
             include_documents: true,
             include_images: false,
             limit: 10,
+            ..KnowledgeSearchRequest::new("")
         })
         .expect("hybrid search");
-        std::env::remove_var("HARBOR_KNOWLEDGE_INDEX_ROOT");
         std::env::remove_var("HARBOR_ADMIN_STATE_PATH");
 
         assert_eq!(response.documents.len(), 2);
@@ -1163,25 +1510,30 @@ mod tests {
         .expect("write sidecar");
         write_mock_model_center_state(&admin_state_path, "plate ABC123 from OCR", None);
 
-        std::env::set_var("HARBOR_KNOWLEDGE_INDEX_ROOT", &index_root);
         std::env::set_var("HARBOR_ADMIN_STATE_PATH", &admin_state_path);
+        build_search_index(&root, &index_root);
         let sidecar_response = KnowledgeSearchService::search(KnowledgeSearchRequest {
             query: "front".to_string(),
+            configured_roots: vec![root.to_string_lossy().into_owned()],
+            index_root: Some(index_root.to_string_lossy().into_owned()),
             roots: vec![root.to_string_lossy().into_owned()],
             include_documents: false,
             include_images: true,
             limit: 5,
+            ..KnowledgeSearchRequest::new("")
         })
         .expect("sidecar search");
         let ocr_response = KnowledgeSearchService::search(KnowledgeSearchRequest {
             query: "ABC123".to_string(),
+            configured_roots: vec![root.to_string_lossy().into_owned()],
+            index_root: Some(index_root.to_string_lossy().into_owned()),
             roots: vec![root.to_string_lossy().into_owned()],
             include_documents: false,
             include_images: true,
             limit: 5,
+            ..KnowledgeSearchRequest::new("")
         })
         .expect("ocr search");
-        std::env::remove_var("HARBOR_KNOWLEDGE_INDEX_ROOT");
         std::env::remove_var("HARBOR_ADMIN_STATE_PATH");
 
         assert_eq!(sidecar_response.images.len(), 1);
@@ -1247,17 +1599,19 @@ mod tests {
             Some("门口地面有一个快递箱和一把折叠雨伞"),
         );
 
-        std::env::set_var("HARBOR_KNOWLEDGE_INDEX_ROOT", &index_root);
         std::env::set_var("HARBOR_ADMIN_STATE_PATH", &admin_state_path);
+        build_search_index(&root, &index_root);
         let response = KnowledgeSearchService::search(KnowledgeSearchRequest {
             query: "快递箱".to_string(),
+            configured_roots: vec![root.to_string_lossy().into_owned()],
+            index_root: Some(index_root.to_string_lossy().into_owned()),
             roots: vec![root.to_string_lossy().into_owned()],
             include_documents: false,
             include_images: true,
             limit: 5,
+            ..KnowledgeSearchRequest::new("")
         })
         .expect("vlm search");
-        std::env::remove_var("HARBOR_KNOWLEDGE_INDEX_ROOT");
         std::env::remove_var("HARBOR_ADMIN_STATE_PATH");
 
         assert_eq!(response.images.len(), 1);

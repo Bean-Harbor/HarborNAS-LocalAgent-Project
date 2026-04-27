@@ -42,6 +42,8 @@ const DOCUMENT_EXTENSIONS: &[&str] = &[
     "zip",
 ];
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp"];
+const AUDIO_EXTENSIONS: &[&str] = &["mp3", "wav", "m4a", "flac", "aac", "ogg", "opus"];
+const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv", "webm", "avi", "m4v"];
 const SIDECAR_EXTENSIONS: &[&str] = &["txt", "md", "markdown", "json", "csv", "yaml", "yml"];
 const MARKITDOWN_EXTENSIONS: &[&str] = &[
     "html", "htm", "xml", "rss", "atom", "pdf", "docx", "pptx", "xlsx", "zip",
@@ -52,6 +54,8 @@ const MARKITDOWN_EXTENSIONS: &[&str] = &[
 pub enum KnowledgeModality {
     Document,
     Image,
+    Audio,
+    Video,
 }
 
 impl KnowledgeModality {
@@ -59,6 +63,8 @@ impl KnowledgeModality {
         match self {
             Self::Document => "document",
             Self::Image => "image",
+            Self::Audio => "audio",
+            Self::Video => "video",
         }
     }
 }
@@ -226,7 +232,7 @@ impl KnowledgeIndexService {
             manifest_path.clone(),
             current_root_signature.clone(),
         );
-        refresh_directory(&root, true, &old_state, &mut new_state, &mut stats)?;
+        refresh_directory(&root, &old_state, &mut new_state, &mut stats)?;
 
         new_state.manifest.generated_at = current_timestamp();
         new_state.manifest.root = root.to_string_lossy().into_owned();
@@ -259,6 +265,36 @@ impl KnowledgeIndexService {
             manifest_path,
             manifest,
             stats,
+        })
+    }
+
+    pub fn load_existing(&self, root: &Path) -> Result<KnowledgeIndexSnapshot, String> {
+        if !root.exists() {
+            return Err(format!("knowledge root not found: {}", root.display()));
+        }
+
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let manifest_path = self.manifest_path_for_root(&root);
+        if !manifest_path.exists() {
+            return Err(format!(
+                "knowledge index manifest is missing for {}; queue /api/knowledge/index/run and follow Index jobs before searching",
+                root.display()
+            ));
+        }
+
+        let state = load_manifest_state(&manifest_path)?;
+        if state.manifest.root.trim().is_empty() {
+            return Err(format!(
+                "knowledge index manifest is empty or incompatible for {}; queue /api/knowledge/index/run before searching",
+                root.display()
+            ));
+        }
+
+        Ok(KnowledgeIndexSnapshot {
+            root,
+            manifest_path,
+            manifest: state.manifest,
+            stats: KnowledgeIndexRefreshStats::default(),
         })
     }
 
@@ -325,7 +361,6 @@ impl KnowledgeIndexState {
 #[derive(Debug, Clone, Default)]
 struct LoadedManifestState {
     manifest: KnowledgeIndexManifest,
-    directories: HashMap<String, KnowledgeFileSignature>,
     entries: HashMap<String, KnowledgeIndexEntry>,
 }
 
@@ -350,11 +385,6 @@ fn load_manifest_state(path: &Path) -> Result<LoadedManifestState, String> {
         return Ok(LoadedManifestState::default());
     }
 
-    let directories = manifest
-        .directories
-        .iter()
-        .map(|directory| (directory.path.clone(), directory.signature.clone()))
-        .collect::<HashMap<_, _>>();
     let entries = manifest
         .entries
         .iter()
@@ -362,7 +392,6 @@ fn load_manifest_state(path: &Path) -> Result<LoadedManifestState, String> {
         .collect::<HashMap<_, _>>();
     Ok(LoadedManifestState {
         manifest,
-        directories,
         entries,
     })
 }
@@ -444,7 +473,6 @@ pub fn save_embedding_store(path: &Path, store: &KnowledgeEmbeddingStore) -> Res
 
 fn refresh_directory(
     path: &Path,
-    is_root: bool,
     old_state: &LoadedManifestState,
     new_state: &mut KnowledgeIndexState,
     stats: &mut KnowledgeIndexRefreshStats,
@@ -459,18 +487,6 @@ fn refresh_directory(
             signature: current_signature.clone(),
         });
 
-    if !is_root {
-        if old_state
-            .directories
-            .get(&path_key)
-            .is_some_and(|signature| signature == &current_signature)
-        {
-            reuse_directory(path, old_state, new_state, stats);
-            stats.skipped_directories += 1;
-            return Ok(());
-        }
-    }
-
     let entries = fs::read_dir(path).map_err(|error| {
         format!(
             "failed to read knowledge directory {}: {error}",
@@ -483,7 +499,7 @@ fn refresh_directory(
             if should_skip_directory(&child) {
                 continue;
             }
-            refresh_directory(&child, false, old_state, new_state, stats)?;
+            refresh_directory(&child, old_state, new_state, stats)?;
             continue;
         }
 
@@ -498,30 +514,6 @@ fn refresh_directory(
 
     Ok(())
 }
-
-fn reuse_directory(
-    path: &Path,
-    old_state: &LoadedManifestState,
-    new_state: &mut KnowledgeIndexState,
-    stats: &mut KnowledgeIndexRefreshStats,
-) {
-    let prefix = path.to_path_buf();
-    for directory in &old_state.manifest.directories {
-        let directory_path = PathBuf::from(&directory.path);
-        if directory_path.starts_with(&prefix) && directory_path != prefix {
-            new_state.manifest.directories.push(directory.clone());
-        }
-    }
-
-    for entry in old_state.manifest.entries.iter() {
-        let entry_path = PathBuf::from(&entry.path);
-        if entry_path.starts_with(&prefix) {
-            new_state.manifest.entries.push(entry.clone());
-            stats.reused += 1;
-        }
-    }
-}
-
 fn refresh_entry(
     path: &Path,
     modality: KnowledgeModality,
@@ -601,6 +593,40 @@ fn refresh_entry(
                 sidecar_signature,
             }))
         }
+        KnowledgeModality::Audio | KnowledgeModality::Video => {
+            let (sidecar_path, sidecar_signature, text_sources) =
+                media_text_sources(path, modality)?;
+            if text_sources.is_empty() {
+                return Ok(None);
+            }
+            let searchable_text = join_text_sources(&text_sources);
+            let chunks = build_text_chunks(&text_sources);
+            if let Some(old_entry) = old_state.entries.get(&path_key) {
+                if old_entry.file_signature == file_signature
+                    && old_entry.sidecar_signature == sidecar_signature
+                    && old_entry.text_sources == text_sources
+                {
+                    stats.reused += 1;
+                    return Ok(Some(old_entry.clone()));
+                }
+            }
+            if old_state.entries.contains_key(&path_key) {
+                stats.updated += 1;
+            } else {
+                stats.added += 1;
+            }
+            Ok(Some(KnowledgeIndexEntry {
+                modality,
+                path: path_key,
+                title,
+                searchable_text,
+                chunks,
+                text_sources,
+                sidecar_path,
+                file_signature,
+                sidecar_signature,
+            }))
+        }
     }
 }
 
@@ -648,13 +674,48 @@ fn image_text_sources(
     Ok((sidecar_path, sidecar_signature, text_sources))
 }
 
+fn media_text_sources(
+    media_path: &Path,
+    modality: KnowledgeModality,
+) -> Result<
+    (
+        Option<String>,
+        Option<KnowledgeFileSignature>,
+        Vec<KnowledgeIndexTextSource>,
+    ),
+    String,
+> {
+    let (sidecar_path, sidecar_signature, sidecar_text) = media_sidecar_state(media_path)?;
+    let mut text_sources = Vec::new();
+    if !sidecar_text.is_empty() {
+        text_sources.push(KnowledgeIndexTextSource {
+            source_kind: match modality {
+                KnowledgeModality::Audio => "transcript",
+                KnowledgeModality::Video => "video_sidecar",
+                _ => "sidecar",
+            }
+            .to_string(),
+            source_path: sidecar_path.clone(),
+            provider_key: None,
+            text: sidecar_text,
+        });
+    }
+    Ok((sidecar_path, sidecar_signature, text_sources))
+}
+
 fn image_sidecar_state(
     image_path: &Path,
 ) -> Result<(Option<String>, Option<KnowledgeFileSignature>, String), String> {
-    let Some(stem) = image_path.file_stem().and_then(|item| item.to_str()) else {
+    media_sidecar_state(image_path)
+}
+
+fn media_sidecar_state(
+    media_path: &Path,
+) -> Result<(Option<String>, Option<KnowledgeFileSignature>, String), String> {
+    let Some(stem) = media_path.file_stem().and_then(|item| item.to_str()) else {
         return Ok((None, None, String::new()));
     };
-    let Some(parent) = image_path.parent() else {
+    let Some(parent) = media_path.parent() else {
         return Ok((None, None, String::new()));
     };
 
@@ -873,16 +934,22 @@ fn directory_signature(path: &Path) -> Result<KnowledgeFileSignature, String> {
 
 fn classify_path(path: &Path) -> Option<KnowledgeModality> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    if DOCUMENT_EXTENSIONS.contains(&extension.as_str()) && !is_image_sidecar(path) {
+    if DOCUMENT_EXTENSIONS.contains(&extension.as_str()) && !is_media_sidecar(path) {
         return Some(KnowledgeModality::Document);
     }
     if IMAGE_EXTENSIONS.contains(&extension.as_str()) {
         return Some(KnowledgeModality::Image);
     }
+    if AUDIO_EXTENSIONS.contains(&extension.as_str()) {
+        return Some(KnowledgeModality::Audio);
+    }
+    if VIDEO_EXTENSIONS.contains(&extension.as_str()) {
+        return Some(KnowledgeModality::Video);
+    }
     None
 }
 
-fn is_image_sidecar(path: &Path) -> bool {
+fn is_media_sidecar(path: &Path) -> bool {
     let Some(stem) = path.file_stem().and_then(|item| item.to_str()) else {
         return false;
     };
@@ -891,6 +958,8 @@ fn is_image_sidecar(path: &Path) -> bool {
     };
     IMAGE_EXTENSIONS
         .iter()
+        .chain(AUDIO_EXTENSIONS.iter())
+        .chain(VIDEO_EXTENSIONS.iter())
         .any(|extension| parent.join(format!("{stem}.{extension}")).exists())
 }
 
@@ -1074,6 +1143,75 @@ mod tests {
         );
         assert!(image.searchable_text.contains("front gate"));
         assert!(image.searchable_text.contains("entry"));
+
+        cleanup_dir(&knowledge_root);
+        cleanup_dir(&index_root);
+    }
+
+    #[test]
+    fn media_sidecars_index_audio_and_video_without_indexing_sidecars_as_documents() {
+        let knowledge_root = unique_dir("harborbeacon-knowledge-index-media-sidecar");
+        let index_root = unique_dir("harborbeacon-knowledge-index-store");
+        fs::create_dir_all(knowledge_root.join("media")).expect("create media");
+        fs::create_dir_all(&index_root).expect("create index root");
+        fs::write(
+            knowledge_root.join("media").join("doorbell.mp3"),
+            b"fake-audio",
+        )
+        .expect("write audio");
+        fs::write(
+            knowledge_root.join("media").join("doorbell.txt"),
+            "front door audio transcript: courier arrived at 09:15",
+        )
+        .expect("write audio transcript");
+        fs::write(knowledge_root.join("media").join("clip.mp4"), b"fake-video")
+            .expect("write video");
+        fs::write(
+            knowledge_root.join("media").join("clip.json"),
+            r#"{"summary":"garage video sidecar","timestamp":"00:00:12","frame":"car entered"}"#,
+        )
+        .expect("write video sidecar");
+        fs::write(knowledge_root.join("media").join("opaque.wav"), b"no-sidecar")
+            .expect("write opaque audio");
+
+        let service = KnowledgeIndexService::from_config(
+            KnowledgeIndexConfig::new(index_root.clone()).expect("config"),
+        )
+        .expect("service");
+        let snapshot = service
+            .load_or_refresh(&knowledge_root)
+            .expect("index refresh");
+
+        assert_eq!(snapshot.manifest.entries.len(), 2);
+        assert!(snapshot
+            .manifest
+            .entries
+            .iter()
+            .all(|entry| !entry.path.ends_with("doorbell.txt")
+                && !entry.path.ends_with("clip.json")
+                && !entry.path.ends_with("opaque.wav")));
+
+        let audio = snapshot
+            .manifest
+            .entries
+            .iter()
+            .find(|entry| entry.modality == KnowledgeModality::Audio)
+            .expect("audio entry");
+        assert!(audio.searchable_text.contains("courier arrived"));
+        assert_eq!(audio.text_sources[0].source_kind, "transcript");
+        assert!(audio.sidecar_path.as_deref().is_some_and(|path| path.ends_with("doorbell.txt")));
+        assert!(!audio.chunks.is_empty());
+
+        let video = snapshot
+            .manifest
+            .entries
+            .iter()
+            .find(|entry| entry.modality == KnowledgeModality::Video)
+            .expect("video entry");
+        assert!(video.searchable_text.contains("garage video sidecar"));
+        assert_eq!(video.text_sources[0].source_kind, "video_sidecar");
+        assert!(video.sidecar_path.as_deref().is_some_and(|path| path.ends_with("clip.json")));
+        assert!(!video.chunks.is_empty());
 
         cleanup_dir(&knowledge_root);
         cleanup_dir(&index_root);
