@@ -11,7 +11,7 @@
 
     <div class="state-detail">{{ state.detail }}</div>
 
-    @if (saveError || saveSuccess || testingEndpointId || deviceActionBusyKey || releaseReadinessBusy || knowledgeIndexBusy) {
+    @if (saveError || saveSuccess || testingEndpointId || deviceActionBusyKey || releaseReadinessBusy || knowledgeIndexBusy || modelDownloadBusyId) {
       <div class="action-status-rail">
         @if (saveSuccess) {
           <div class="action-status tone-good">{{ saveSuccess }}</div>
@@ -30,6 +30,9 @@
         }
         @if (knowledgeIndexBusy) {
           <div class="action-status tone-warn">{{ text('Queueing knowledge index refresh', '正在提交知识库索引刷新任务') }} <code>POST /api/knowledge/index/run</code>...</div>
+        }
+        @if (modelDownloadBusyId) {
+          <div class="action-status tone-warn">{{ text('Updating model download', '正在更新模型下载任务') }} <code>{{ modelDownloadBusyId }}</code>...</div>
         }
       </div>
     }
@@ -345,6 +348,97 @@
               </section>
             }
           </div>
+        </article>
+      }
+
+      @if (state.data.pageId === 'models-policies' && state.data.localModelCatalog; as catalog) {
+        <article class="content-card expanded-card">
+          <div class="section-head">
+            <div>
+              <p class="content-label">{{ text('Local model downloads', '本地模型下载') }}</p>
+              <p class="table-copy">{{ text('Catalog entries create HarborBeacon download jobs; runtime endpoints are configured separately after the snapshot lands.', '清单条目会创建 HarborBeacon 下载任务；snapshot 落盘后再单独配置运行时端点。') }}</p>
+            </div>
+            <span class="setup-step-state" [ngClass]="readinessToneClass(catalog.status)">{{ catalog.status || 'unknown' }}</span>
+          </div>
+
+          @if (catalog.cache_roots?.length) {
+            <div class="detail-meta compact-meta">
+              <span>{{ text('Cache roots', '缓存目录') }}</span>
+              @for (root of catalog.cache_roots; track root) {
+                <code>{{ root }}</code>
+              }
+            </div>
+          }
+
+          @if (catalog.models.length) {
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>{{ text('Model', '模型') }}</th>
+                    <th>{{ text('Source', '来源') }}</th>
+                    <th>{{ text('Status', '状态') }}</th>
+                    <th>{{ text('Download', '下载') }}</th>
+                    <th>{{ text('Action', '操作') }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  @for (model of catalog.models; track model.model_id) {
+                    <tr [ngClass]="modelDownloadToneClass(downloadForModel(model)?.status || model.status)">
+                      <td>
+                        <strong>{{ model.display_name || model.label || model.model_id }}</strong>
+                        <span class="cell-note">{{ model.model_id }}</span>
+                        <span class="cell-note">{{ model.recommended_hardware || text('hardware not specified', '未指定硬件') }}</span>
+                      </td>
+                      <td>
+                        {{ model.source_kind || 'local' }}
+                        <span class="cell-note">{{ model.repo_id || model.provider_key || model.provider || 'n/a' }}</span>
+                        <span class="cell-note">{{ text('Revision', '版本') }}: {{ model.revision || 'main' }} / {{ model.file_policy || 'runtime_snapshot' }}</span>
+                      </td>
+                      <td>
+                        {{ downloadForModel(model)?.status || model.status }}
+                        <span class="cell-note">{{ model.acceptance_note || model.detail }}</span>
+                        @if (model.local_path || downloadForModel(model)?.target_path) {
+                          <span class="cell-note">{{ model.local_path || downloadForModel(model)?.target_path }}</span>
+                        }
+                      </td>
+                      <td>
+                        <strong>{{ downloadForModel(model)?.progress_percent ?? (model.installed ? 100 : 0) }}%</strong>
+                        <span class="cell-note">{{ bytesLabel(downloadForModel(model)?.bytes_downloaded ?? model.size_bytes ?? 0) }} / {{ downloadForModel(model)?.total_bytes ? bytesLabel(downloadForModel(model)?.total_bytes) : model.download_size_hint || text('unknown', '未知') }}</span>
+                        <span class="cell-note">{{ downloadForModel(model)?.message || downloadForModel(model)?.error_message || model.detail }}</span>
+                      </td>
+                      <td>
+                        <div class="inline-action">
+                          <button
+                            type="button"
+                            class="action-button"
+                            [disabled]="!canStartLocalModelDownload(model) || modelDownloadBusyId === model.model_id"
+                            (click)="requestLocalModelDownload(model)"
+                          >
+                            {{ modelDownloadBusyId === model.model_id ? text('Starting...', '提交中...') : text('Download', '下载') }}
+                          </button>
+                          @if (downloadForModel(model); as download) {
+                            @if (canCancelLocalModelDownload(download.status)) {
+                            <button
+                              type="button"
+                              class="action-button"
+                              [disabled]="modelDownloadBusyId === download.job_id"
+                              (click)="requestLocalModelDownloadCancel(download.job_id)"
+                            >
+                              {{ modelDownloadBusyId === download.job_id ? text('Canceling...', '取消中...') : text('Cancel', '取消') }}
+                            </button>
+                            }
+                          }
+                        </div>
+                      </td>
+                    </tr>
+                  }
+                </tbody>
+              </table>
+            </div>
+          } @else {
+            <p class="empty-copy">{{ text('No local model catalog entries were returned.', '本地模型清单暂无条目。') }}</p>
+          }
         </article>
       }
 

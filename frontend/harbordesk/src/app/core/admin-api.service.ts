@@ -36,6 +36,7 @@ import {
   KnowledgeIndexStatusResponse,
   KnowledgeSettings,
   LocalModelCatalogResponse,
+  LocalModelDownloadJobResponse,
   LocalModelDownloadsResponse,
   LocalModelDownloadStatusResponse,
   ManualDevicePayload,
@@ -66,6 +67,7 @@ import {
   SetupFlowSection,
   SetupFlowStep,
   ShareLinkSummary,
+  StartLocalModelDownloadRequest,
   TaskApprovalSummary
 } from './admin-api.types';
 import { HarborDeskPageId } from './page-registry';
@@ -238,6 +240,17 @@ export class HarborDeskAdminApiService {
     return this.http.get<LocalModelDownloadStatusResponse>(`/api/models/local-downloads/${encodeURIComponent(jobId)}`);
   }
 
+  startLocalModelDownload(payload: StartLocalModelDownloadRequest): Observable<LocalModelDownloadJobResponse> {
+    return this.http.post<LocalModelDownloadJobResponse>('/api/models/local-downloads', payload);
+  }
+
+  cancelLocalModelDownload(jobId: string): Observable<LocalModelDownloadJobResponse> {
+    return this.http.post<LocalModelDownloadJobResponse>(
+      `/api/models/local-downloads/${encodeURIComponent(jobId)}/cancel`,
+      {}
+    );
+  }
+
   private pageRequest(pageId: HarborDeskPageId): Observable<PageState<DeskPageModel>> {
     switch (pageId) {
       case 'overview':
@@ -304,15 +317,19 @@ export class HarborDeskAdminApiService {
           ragReadiness: this.readProjection('GET /api/rag/readiness', this.getRagReadiness()),
           knowledgeSettings: this.getKnowledgeSettings(),
           knowledgeIndexStatus: this.getKnowledgeIndexStatus(),
-          knowledgeIndexJobs: this.readProjection('GET /api/knowledge/index/jobs', this.getKnowledgeIndexJobs())
-        }).pipe(map(({ endpoints, policies, availability, ragReadiness, knowledgeSettings, knowledgeIndexStatus, knowledgeIndexJobs }) => this.buildModelsState(
+          knowledgeIndexJobs: this.readProjection('GET /api/knowledge/index/jobs', this.getKnowledgeIndexJobs()),
+          localCatalog: this.readProjection('GET /api/models/local-catalog', this.getLocalModelCatalog()),
+          localDownloads: this.readProjection('GET /api/models/local-downloads', this.getLocalModelDownloads())
+        }).pipe(map(({ endpoints, policies, availability, ragReadiness, knowledgeSettings, knowledgeIndexStatus, knowledgeIndexJobs, localCatalog, localDownloads }) => this.buildModelsState(
           endpoints,
           policies,
           availability,
           ragReadiness,
           knowledgeSettings,
           knowledgeIndexStatus,
-          knowledgeIndexJobs
+          knowledgeIndexJobs,
+          localCatalog,
+          localDownloads
         )));
       case 'system-settings':
         return forkJoin({
@@ -1769,7 +1786,9 @@ export class HarborDeskAdminApiService {
     ragReadiness: EndpointProjection<RagReadinessResponse>,
     knowledgeSettings: KnowledgeSettings,
     knowledgeIndexStatus: KnowledgeIndexStatusResponse,
-    knowledgeIndexJobs: EndpointProjection<KnowledgeIndexJobsResponse>
+    knowledgeIndexJobs: EndpointProjection<KnowledgeIndexJobsResponse>,
+    localCatalog: EndpointProjection<LocalModelCatalogResponse>,
+    localDownloads: EndpointProjection<LocalModelDownloadsResponse>
   ): PageState<DeskPageModel> {
     const endpointRows = endpoints.endpoints ?? [];
     const featureGroups = availability.groups ?? [];
@@ -1780,6 +1799,8 @@ export class HarborDeskAdminApiService {
     const existingRoots = (knowledgeIndexStatus.source_roots ?? []).filter((root) => root.enabled && root.exists).length;
     const rag = ragReadiness.data;
     const jobs = knowledgeIndexJobs.data?.jobs ?? rag?.index_jobs ?? [];
+    const modelDownloads = localDownloads.data?.downloads ?? localDownloads.data?.jobs ?? localCatalog.data?.downloads ?? [];
+    const activeDownloads = modelDownloads.filter((job) => ['queued', 'running', 'downloading'].includes(String(job.status))).length;
     const activeJobs = jobs.filter((job) => ['queued', 'running'].includes(String(job.status))).length;
     const kind = endpointRows.length === 0 ? 'empty' : 'success';
     return {
@@ -1789,7 +1810,7 @@ export class HarborDeskAdminApiService {
         ...this.baseModel('models-policies'),
         eyebrow: 'Model center and retrieval operations',
         summary: 'Runtime alignment, multimodal readiness, knowledge roots, endpoint state, and route-policy control now share the same HarborDesk page.',
-        endpoint: 'GET /api/models/endpoints + /api/models/policies + /api/feature-availability + /api/knowledge/settings + /api/rag/readiness',
+        endpoint: 'GET /api/models/endpoints + /api/models/policies + /api/models/local-catalog + /api/models/local-downloads + /api/knowledge/settings + /api/rag/readiness',
         setupFlow: this.setupFlow(
           'Knowledge & multimodal setup flow',
           'The setup flow exposes OCR, VLM, embedding, source roots, and local index storage using persisted HarborDesk settings.',
@@ -1869,6 +1890,14 @@ export class HarborDeskAdminApiService {
             knowledgeIndexStatus.index_root_writable ? 'good' : 'warn'
           ),
           this.metric(
+            'Model downloads',
+            `${activeDownloads}/${modelDownloads.length}`,
+            localCatalog.data
+              ? `Catalog entries: ${localCatalog.data.models?.length ?? 0}; cache roots: ${(localCatalog.data.cache_roots ?? []).join(', ') || 'none'}.`
+              : `Catalog endpoint: ${localCatalog.state}.`,
+            activeDownloads > 0 ? 'warn' : modelDownloads.length > 0 ? 'neutral' : 'warn'
+          ),
+          this.metric(
             'Index jobs',
             `${activeJobs}/${jobs.length}`,
             jobs.length > 0 ? `Recent index jobs visible from HarborBeacon admin API. Last indexed: ${knowledgeIndexStatus.last_indexed_at || 'never'}.` : 'No index jobs have been recorded yet.',
@@ -1884,13 +1913,17 @@ export class HarborDeskAdminApiService {
         blockers: [
           ...this.featureBlockers(featureGroups),
           ...(knowledgeIndexStatus.blockers ?? []),
-          ...(rag?.blockers ?? [])
+          ...(rag?.blockers ?? []),
+          ...(localCatalog.data?.blockers ?? []),
+          ...(localDownloads.data?.blockers ?? [])
         ],
         modelEndpoints: endpointRows,
         modelPolicies: policies.route_policies,
         knowledgeSettings,
         knowledgeIndexStatus,
         knowledgeIndexJobs: jobs,
+        localModelCatalog: localCatalog.data,
+        localModelDownloads: modelDownloads,
         ragReadiness: rag,
         featureGroups,
         runtimeAlignment,

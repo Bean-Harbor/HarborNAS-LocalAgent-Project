@@ -12,6 +12,8 @@ import {
   FeatureAvailabilityStatus,
   KnowledgeSettings,
   KnowledgeSourceRoot,
+  LocalModelCatalogItem,
+  LocalModelDownloadStatusResponse,
   ManualDevicePayload,
   MetricTone,
   ModelEndpointTestResult,
@@ -47,6 +49,7 @@ export class PageStatePanelComponent {
   @Input() releaseReadinessBusy = false;
   @Input() knowledgeIndexBusy = false;
   @Input() knowledgeIndexJobBusyId: string | null = null;
+  @Input() modelDownloadBusyId: string | null = null;
   @Input() filesBrowse: FilesBrowseResponse | null = null;
 
   @Output() readonly defaultDeliverySurfaceChange = new EventEmitter<{
@@ -75,6 +78,8 @@ export class PageStatePanelComponent {
   @Output() readonly knowledgeSettingsSave = new EventEmitter<KnowledgeSettings>();
   @Output() readonly knowledgeIndexRunRequested = new EventEmitter<void>();
   @Output() readonly knowledgeIndexJobCancelRequested = new EventEmitter<string>();
+  @Output() readonly localModelDownloadRequested = new EventEmitter<LocalModelCatalogItem>();
+  @Output() readonly localModelDownloadCancelRequested = new EventEmitter<string>();
   @Output() readonly filesBrowseRequested = new EventEmitter<string | null>();
 
   protected scanForm: Required<DiscoveryScanPayload> = {
@@ -333,6 +338,54 @@ export class PageStatePanelComponent {
 
   protected requestKnowledgeIndexJobCancel(jobId: string): void {
     this.knowledgeIndexJobCancelRequested.emit(jobId);
+  }
+
+  protected requestLocalModelDownload(model: LocalModelCatalogItem): void {
+    this.localModelDownloadRequested.emit(model);
+  }
+
+  protected requestLocalModelDownloadCancel(jobId: string): void {
+    this.localModelDownloadCancelRequested.emit(jobId);
+  }
+
+  protected downloadForModel(model: LocalModelCatalogItem): LocalModelDownloadStatusResponse | undefined {
+    const downloads = this.state?.data.localModelDownloads ?? [];
+    return downloads
+      .filter((download) => download.model_id === model.model_id || download.job_id === model.download_job_id)
+      .sort((left, right) => String(right.updated_at ?? '').localeCompare(String(left.updated_at ?? '')))[0];
+  }
+
+  protected canStartLocalModelDownload(model: LocalModelCatalogItem): boolean {
+    if (model.installed || model.status === 'ready') {
+      return false;
+    }
+    const download = this.downloadForModel(model);
+    if (download && this.canCancelLocalModelDownload(download.status)) {
+      return false;
+    }
+    return !this.modelDownloadBusyId || this.modelDownloadBusyId !== model.model_id;
+  }
+
+  protected canCancelLocalModelDownload(status: string | undefined | null): boolean {
+    return ['queued', 'running', 'downloading'].includes(String(status ?? '').trim().toLowerCase());
+  }
+
+  protected modelDownloadToneClass(status: string | undefined | null): string {
+    switch (String(status ?? '').trim().toLowerCase()) {
+      case 'ready':
+      case 'completed':
+        return 'tone-good';
+      case 'failed':
+      case 'blocked':
+        return 'tone-danger';
+      case 'queued':
+      case 'running':
+      case 'downloading':
+      case 'needs-config':
+        return 'tone-warn';
+      default:
+        return 'tone-neutral';
+    }
   }
 
   protected requestFilesBrowse(path?: string | null): void {
