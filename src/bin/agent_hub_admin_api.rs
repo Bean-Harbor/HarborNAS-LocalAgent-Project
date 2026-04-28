@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -9,6 +9,10 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+use hf_hub::{
+    api::{sync::ApiBuilder as HfApiBuilder, Progress as HfProgress},
+    Cache as HfCache, Repo, RepoType,
+};
 use reqwest::blocking::Client;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -46,10 +50,11 @@ use harborbeacon_local_agent::runtime::hub::{
 };
 use harborbeacon_local_agent::runtime::knowledge_index::{
     load_embedding_store, KnowledgeIndexConfig, KnowledgeIndexManifest, KnowledgeIndexService,
+    KnowledgeModality,
 };
 use harborbeacon_local_agent::runtime::media_tools::{ffmpeg_resolution_hint, resolve_ffmpeg_bin};
 use harborbeacon_local_agent::runtime::model_center::{
-    redact_model_endpoint, test_model_endpoint, ModelEndpointTestResult,
+    redact_model_endpoint, test_model_endpoint, ModelEndpointTestResult, ADMIN_STATE_PATH_ENV,
 };
 use harborbeacon_local_agent::runtime::registry::{
     CameraCapabilities, CameraDevice, DeviceRegistryStore,
@@ -514,6 +519,7 @@ struct RagReadinessResponse {
     embedding_model: RagReadinessComponent,
     model_readiness: Vec<RagModelReadinessCard>,
     resource_profiles: Vec<RagResourceProfileStatus>,
+    capability_profiles: Vec<RagCapabilityReadinessCard>,
     privacy_policy: RagReadinessComponent,
     media_parser: RagReadinessComponent,
     storage_writable: RagReadinessComponent,
@@ -555,6 +561,17 @@ struct RagResourceProfileStatus {
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct RagCapabilityReadinessCard {
+    capability_id: String,
+    label: String,
+    status: String,
+    summary: String,
+    blockers: Vec<String>,
+    warnings: Vec<String>,
+    evidence: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 struct KnowledgeIndexRunResponse {
     generated_at: String,
     job_ids: Vec<String>,
@@ -574,6 +591,15 @@ struct KnowledgeIndexStatusResponse {
     index_root_writable: bool,
     manifest_count: usize,
     manifest_entry_count: usize,
+    document_count: usize,
+    image_count: usize,
+    audio_count: usize,
+    video_count: usize,
+    content_indexed_image_count: usize,
+    vlm_indexed_image_count: usize,
+    ocr_indexed_image_count: usize,
+    image_content_missing_count: usize,
+    image_text_source_counts: BTreeMap<String, usize>,
     embedding_cache_count: usize,
     embedding_entry_count: usize,
     storage_usage_bytes: u64,
@@ -598,6 +624,15 @@ struct KnowledgeIndexRootStatus {
 struct KnowledgeIndexStorageSummary {
     manifest_count: usize,
     manifest_entry_count: usize,
+    document_count: usize,
+    image_count: usize,
+    audio_count: usize,
+    video_count: usize,
+    content_indexed_image_count: usize,
+    vlm_indexed_image_count: usize,
+    ocr_indexed_image_count: usize,
+    image_content_missing_count: usize,
+    image_text_source_counts: BTreeMap<String, usize>,
     embedding_cache_count: usize,
     embedding_entry_count: usize,
     storage_usage_bytes: u64,
@@ -624,33 +659,67 @@ struct FileBrowseEntry {
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 struct LocalModelCatalogResponse {
     generated_at: String,
+    checked_at: String,
+    status: String,
     cache_roots: Vec<String>,
     models: Vec<LocalModelCatalogItem>,
     download_jobs: Vec<ModelDownloadJobRecord>,
+    downloads: Vec<ModelDownloadJobRecord>,
+    blockers: Vec<String>,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 struct LocalModelCatalogItem {
     model_id: String,
+    label: String,
     display_name: String,
+    provider: String,
     provider_key: String,
     model_kind: String,
     recommended_hardware: String,
     status: String,
+    installed: bool,
     local_path: Option<String>,
+    size_bytes: Option<u64>,
+    download_job_id: Option<String>,
     download_size_hint: String,
+    detail: String,
+    source_kind: String,
+    repo_id: Option<String>,
+    revision: Option<String>,
+    file_policy: String,
+    runtime_profiles: Vec<String>,
+    expected_capabilities: Vec<String>,
+    acceptance_note: Option<String>,
     evidence: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 struct ModelDownloadJobResponse {
+    #[serde(flatten)]
+    record: ModelDownloadJobRecord,
     job: ModelDownloadJobRecord,
+}
+
+impl ModelDownloadJobResponse {
+    fn new(job: ModelDownloadJobRecord) -> Self {
+        Self {
+            record: job.clone(),
+            job,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 struct ModelDownloadJobsResponse {
     generated_at: String,
+    checked_at: String,
+    status: String,
     jobs: Vec<ModelDownloadJobRecord>,
+    downloads: Vec<ModelDownloadJobRecord>,
+    blockers: Vec<String>,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1496,11 +1565,8 @@ impl AdminApi {
         let mut indexed_roots = Vec::new();
         let mut jobs = Vec::new();
         for root in &enabled_roots {
-            let job = build_knowledge_index_job(
-                root,
-                &generated_at,
-                settings.default_resource_profile,
-            );
+            let job =
+                build_knowledge_index_job(root, &generated_at, settings.default_resource_profile);
             job_ids.push(job.job_id.clone());
             if let Err(error) = self.admin_store.save_knowledge_index_job(job.clone()) {
                 return error_json(StatusCode(500), &error);
@@ -1512,7 +1578,8 @@ impl AdminApi {
             self.admin_store.path().to_path_buf(),
             self.admin_store.registry_store().clone(),
         );
-        if let Err(error) = spawn_knowledge_index_worker(worker_store, settings.clone(), jobs.clone())
+        if let Err(error) =
+            spawn_knowledge_index_worker(worker_store, settings.clone(), jobs.clone())
         {
             for mut job in jobs {
                 job.status = "failed".to_string();
@@ -1674,7 +1741,12 @@ impl AdminApi {
         match self.admin_store.list_model_download_jobs() {
             Ok(jobs) => ok_json(&ModelDownloadJobsResponse {
                 generated_at: now_unix_string(),
-                jobs,
+                checked_at: now_unix_string(),
+                status: model_download_jobs_status(&jobs).to_string(),
+                jobs: jobs.clone(),
+                downloads: jobs,
+                blockers: Vec::new(),
+                warnings: Vec::new(),
             }),
             Err(error) => error_json(StatusCode(500), &error),
         }
@@ -1693,7 +1765,7 @@ impl AdminApi {
             None => return error_json(StatusCode(400), "invalid model download job path"),
         };
         match self.admin_store.model_download_job(&job_id) {
-            Ok(Some(job)) => ok_json(&ModelDownloadJobResponse { job }),
+            Ok(Some(job)) => ok_json(&ModelDownloadJobResponse::new(job)),
             Ok(None) => error_json(StatusCode(404), "model download job not found"),
             Err(error) => error_json(StatusCode(500), &error),
         }
@@ -1889,11 +1961,14 @@ impl AdminApi {
             .and_then(non_empty_string)
             .or_else(|| catalog_item.and_then(|item| item.local_path.clone()))
             .or_else(|| Some(default_model_download_target_path(&body.model_id)));
-        let metadata = if body.metadata.is_null() {
+        let mut metadata = if body.metadata.is_null() {
             json!({})
         } else {
             body.metadata
         };
+        if let Some(catalog_item) = catalog_item {
+            enrich_model_download_metadata(&mut metadata, catalog_item);
+        }
         match self.admin_store.create_model_download_job(
             &body.model_id,
             &display_name,
@@ -1901,9 +1976,20 @@ impl AdminApi {
             target_path,
             redact_secret_json_value(metadata),
         ) {
-            Ok(job) => ok_json(&ModelDownloadJobResponse {
-                job: self.execute_model_download_job(job),
-            }),
+            Ok(job) => {
+                let worker_store = AdminConsoleStore::new(
+                    self.admin_store.path().to_path_buf(),
+                    self.admin_store.registry_store().clone(),
+                );
+                match spawn_model_download_worker(worker_store, job.clone()) {
+                    Ok(()) => ok_json(&ModelDownloadJobResponse::new(job)),
+                    Err(error) => {
+                        let _ =
+                            mark_model_download_spawn_failed(&self.admin_store, job, error.clone());
+                        error_json(StatusCode(500), &error)
+                    }
+                }
+            }
             Err(error) => error_json(StatusCode(422), &error),
         }
     }
@@ -1921,50 +2007,10 @@ impl AdminApi {
             None => return error_json(StatusCode(400), "invalid model download cancel path"),
         };
         match self.admin_store.cancel_model_download_job(&job_id) {
-            Ok(Some(job)) => ok_json(&ModelDownloadJobResponse { job }),
+            Ok(Some(job)) => ok_json(&ModelDownloadJobResponse::new(job)),
             Ok(None) => error_json(StatusCode(404), "model download job not found"),
             Err(error) => error_json(StatusCode(500), &error),
         }
-    }
-
-    fn execute_model_download_job(
-        &self,
-        mut job: ModelDownloadJobRecord,
-    ) -> ModelDownloadJobRecord {
-        let started_at = now_unix_string();
-        job.status = "running".to_string();
-        job.started_at = Some(started_at.clone());
-        job.updated_at = started_at;
-        job.progress_percent = Some(0);
-        job.error_message = None;
-        job.message = "download job started by explicit admin action".to_string();
-        let _ = self.admin_store.save_model_download_job(job.clone());
-
-        let result = run_model_download_transfer(&job);
-        let finished_at = now_unix_string();
-        match result {
-            Ok(stats) => {
-                job.status = "completed".to_string();
-                job.progress_percent = Some(100);
-                job.bytes_downloaded = Some(stats.bytes_written);
-                job.total_bytes = stats.total_bytes.or(Some(stats.bytes_written));
-                job.completed_at = Some(finished_at.clone());
-                job.updated_at = finished_at;
-                job.error_message = None;
-                job.message = stats.message;
-            }
-            Err(error) => {
-                job.status = "failed".to_string();
-                job.completed_at = Some(finished_at.clone());
-                job.updated_at = finished_at;
-                job.error_message = Some(error.clone());
-                job.message = format!("download job failed: {error}");
-            }
-        }
-
-        self.admin_store
-            .save_model_download_job(job.clone())
-            .unwrap_or(job)
     }
 
     fn handle_save_model_policies(
@@ -3655,6 +3701,7 @@ fn main() {
     let cli = Cli::parse();
     let device_registry_path = resolve_state_path(&cli.device_registry);
     let admin_state_path = resolve_state_path(&cli.admin_state);
+    std::env::set_var(ADMIN_STATE_PATH_ENV, &admin_state_path);
     let conversation_path = resolve_state_path(&cli.conversations);
     let registry_store = DeviceRegistryStore::new(device_registry_path);
     let admin_store = AdminConsoleStore::new(admin_state_path, registry_store);
@@ -5846,8 +5893,7 @@ fn knowledge_index_job_cancel_requested(store: &AdminConsoleStore, job_id: &str)
         .list_knowledge_index_jobs()
         .map(|jobs| {
             jobs.into_iter().any(|job| {
-                job.job_id == job_id
-                    && (job.cancel_requested || job.status.as_str() == "canceled")
+                job.job_id == job_id && (job.cancel_requested || job.status.as_str() == "canceled")
             })
         })
         .unwrap_or(false)
@@ -5914,6 +5960,15 @@ fn build_knowledge_index_status_response(
         index_root_writable,
         manifest_count: storage_summary.manifest_count,
         manifest_entry_count: storage_summary.manifest_entry_count,
+        document_count: storage_summary.document_count,
+        image_count: storage_summary.image_count,
+        audio_count: storage_summary.audio_count,
+        video_count: storage_summary.video_count,
+        content_indexed_image_count: storage_summary.content_indexed_image_count,
+        vlm_indexed_image_count: storage_summary.vlm_indexed_image_count,
+        ocr_indexed_image_count: storage_summary.ocr_indexed_image_count,
+        image_content_missing_count: storage_summary.image_content_missing_count,
+        image_text_source_counts: storage_summary.image_text_source_counts,
         embedding_cache_count: storage_summary.embedding_cache_count,
         embedding_entry_count: storage_summary.embedding_entry_count,
         storage_usage_bytes: storage_summary.storage_usage_bytes,
@@ -5955,6 +6010,41 @@ fn knowledge_index_storage_summary(index_path: &Path) -> KnowledgeIndexStorageSu
         };
         summary.manifest_count += 1;
         summary.manifest_entry_count += manifest.entries.len();
+        for indexed_entry in &manifest.entries {
+            match indexed_entry.modality {
+                KnowledgeModality::Document => summary.document_count += 1,
+                KnowledgeModality::Image => {
+                    summary.image_count += 1;
+                    let mut has_vlm = false;
+                    let mut has_ocr = false;
+                    for source in &indexed_entry.text_sources {
+                        let source_kind = source.source_kind.trim().to_ascii_lowercase();
+                        if source_kind.is_empty() {
+                            continue;
+                        }
+                        *summary
+                            .image_text_source_counts
+                            .entry(source_kind.clone())
+                            .or_insert(0) += 1;
+                        has_vlm |= source_kind == "vlm";
+                        has_ocr |= source_kind == "ocr";
+                    }
+                    if has_vlm {
+                        summary.vlm_indexed_image_count += 1;
+                    }
+                    if has_ocr {
+                        summary.ocr_indexed_image_count += 1;
+                    }
+                    if has_vlm || has_ocr {
+                        summary.content_indexed_image_count += 1;
+                    } else {
+                        summary.image_content_missing_count += 1;
+                    }
+                }
+                KnowledgeModality::Audio => summary.audio_count += 1,
+                KnowledgeModality::Video => summary.video_count += 1,
+            }
+        }
         summary.last_indexed_at =
             max_unix_timestamp_string(summary.last_indexed_at.take(), Some(manifest.generated_at));
     }
@@ -6328,6 +6418,139 @@ fn rag_resource_profile_status(
     }
 }
 
+fn build_rag_capability_profiles(
+    storage_summary: &KnowledgeIndexStorageSummary,
+    model_readiness: &[RagModelReadinessCard],
+    storage_writable: bool,
+    embedding_ready: bool,
+    media_parser_ready: bool,
+    default_profile: RagResourceProfile,
+) -> Vec<RagCapabilityReadinessCard> {
+    let mut text_blockers = Vec::new();
+    if !storage_writable {
+        text_blockers.push("RAG index storage is not writable.".to_string());
+    }
+    if !embedding_ready {
+        text_blockers.push("Embedding runtime is not ready.".to_string());
+    }
+    let text_status = if text_blockers.is_empty() {
+        "ready"
+    } else if storage_summary.document_count > 0 {
+        "degraded"
+    } else {
+        "blocked"
+    };
+
+    let vlm_ready = rag_model_ready(model_readiness, ModelKind::Vlm);
+    let ocr_ready = rag_model_ready(model_readiness, ModelKind::Ocr);
+    let mut image_blockers = Vec::new();
+    let mut image_warnings = Vec::new();
+    if !vlm_ready {
+        image_blockers.push(
+            "VLM endpoint is required for content-level natural photo indexing.".to_string(),
+        );
+    }
+    if !storage_writable {
+        image_blockers.push("RAG index storage is not writable.".to_string());
+    }
+    if !embedding_ready {
+        image_warnings.push(
+            "Embedding runtime is not ready; image retrieval can only use content text lexical matching.".to_string(),
+        );
+    }
+    if !ocr_ready {
+        image_warnings.push("OCR endpoint is not ready; OCR can only be used as a supplement.".to_string());
+    }
+    if !media_parser_ready {
+        image_warnings.push("No local media parser binary was detected.".to_string());
+    }
+    if storage_summary.image_count == 0 {
+        image_warnings.push("No indexed image entries were found yet.".to_string());
+    } else if storage_summary.vlm_indexed_image_count == 0 {
+        image_warnings.push(
+            "Indexed images do not yet include VLM-derived content; do not treat photo RAG as ready.".to_string(),
+        );
+    }
+    if storage_summary.image_content_missing_count > 0 {
+        image_warnings.push(format!(
+            "{} indexed image(s) are missing VLM/OCR content text.",
+            storage_summary.image_content_missing_count
+        ));
+    }
+    if default_profile == RagResourceProfile::CpuOnly {
+        image_warnings.push("CPU-only VLM indexing may be slow, but it must still produce image-derived content.".to_string());
+    }
+    let image_status = if !image_blockers.is_empty() {
+        "blocked"
+    } else if embedding_ready && storage_summary.vlm_indexed_image_count > 0 {
+        "ready"
+    } else {
+        "degraded"
+    };
+
+    vec![
+        RagCapabilityReadinessCard {
+            capability_id: "text_rag".to_string(),
+            label: "Text RAG".to_string(),
+            status: text_status.to_string(),
+            summary: format!(
+                "{} document(s), {} embedding cache entrie(s)",
+                storage_summary.document_count, storage_summary.embedding_entry_count
+            ),
+            blockers: text_blockers,
+            warnings: Vec::new(),
+            evidence: vec![
+                format!("document_count={}", storage_summary.document_count),
+                format!("embedding_ready={embedding_ready}"),
+                format!("storage_writable={storage_writable}"),
+            ],
+        },
+        RagCapabilityReadinessCard {
+            capability_id: "image_rag".to_string(),
+            label: "Image RAG".to_string(),
+            status: image_status.to_string(),
+            summary: format!(
+                "{} image(s), {} content-indexed, {} with VLM, {} with OCR",
+                storage_summary.image_count,
+                storage_summary.content_indexed_image_count,
+                storage_summary.vlm_indexed_image_count,
+                storage_summary.ocr_indexed_image_count
+            ),
+            blockers: image_blockers,
+            warnings: image_warnings,
+            evidence: vec![
+                format!("image_count={}", storage_summary.image_count),
+                format!(
+                    "content_indexed_image_count={}",
+                    storage_summary.content_indexed_image_count
+                ),
+                format!(
+                    "vlm_indexed_image_count={}",
+                    storage_summary.vlm_indexed_image_count
+                ),
+                format!(
+                    "ocr_indexed_image_count={}",
+                    storage_summary.ocr_indexed_image_count
+                ),
+                format!(
+                    "image_content_missing_count={}",
+                    storage_summary.image_content_missing_count
+                ),
+                format!("vlm_endpoint_ready={vlm_ready}"),
+                format!("ocr_endpoint_ready={ocr_ready}"),
+                format!("embedding_ready={embedding_ready}"),
+                format!("storage_writable={storage_writable}"),
+            ],
+        },
+    ]
+}
+
+fn rag_model_ready(model_readiness: &[RagModelReadinessCard], kind: ModelKind) -> bool {
+    model_readiness
+        .iter()
+        .any(|card| card.model_kind == kind.as_str() && card.status == "ready")
+}
+
 fn has_active_endpoint_kind(
     model_endpoints: &[ModelEndpoint],
     endpoint_kind: ModelEndpointKind,
@@ -6381,6 +6604,7 @@ fn build_rag_readiness_response(
     let index_exists = index_path.exists();
     let index_parent_exists = index_path.parent().map(Path::exists).unwrap_or(false);
     let storage_writable = path_can_accept_write(index_path);
+    let storage_summary = knowledge_index_storage_summary(index_path);
     let embedding_ready = runtime.ready
         && runtime.backend_ready
         && runtime
@@ -6513,6 +6737,14 @@ fn build_rag_readiness_response(
         storage_writable,
         embedding_ready,
     );
+    let capability_profiles = build_rag_capability_profiles(
+        &storage_summary,
+        &model_readiness,
+        storage_writable,
+        embedding_ready,
+        media_parser_ready,
+        knowledge.default_resource_profile,
+    );
 
     let mut blockers = Vec::new();
     if !embedding_ready {
@@ -6539,6 +6771,16 @@ fn build_rag_readiness_response(
         warnings.push(
             "Cloud-capable privacy policy is configured; redaction and audit are required before cloud execution.".to_string(),
         );
+    }
+    for capability in &capability_profiles {
+        if capability.capability_id == "image_rag" && capability.status == "blocked" {
+            blockers.push(format!(
+                "Image RAG is blocked: {}",
+                capability.blockers.join("; ")
+            ));
+        } else if capability.capability_id == "image_rag" && capability.status == "degraded" {
+            warnings.push(format!("Image RAG is degraded: {}", capability.summary));
+        }
     }
     if knowledge.default_resource_profile == RagResourceProfile::CloudAllowed
         && knowledge.privacy_level == PrivacyLevel::StrictLocal
@@ -6599,6 +6841,7 @@ fn build_rag_readiness_response(
         embedding_model,
         model_readiness,
         resource_profiles,
+        capability_profiles,
         privacy_policy,
         media_parser,
         storage_writable: storage,
@@ -6885,104 +7128,544 @@ fn build_local_model_catalog(
     download_jobs: Vec<ModelDownloadJobRecord>,
 ) -> LocalModelCatalogResponse {
     let cache_roots = local_model_cache_roots();
-    let models = vec![
-        local_model_catalog_item(
-            &cache_roots,
-            "qwen2.5-1.5b-instruct",
-            "Qwen2.5 1.5B Instruct",
-            "qwen",
-            "llm",
-            "CPU 8GB+",
-            "1-2 GB",
-        ),
-        local_model_catalog_item(
-            &cache_roots,
-            "qwen2.5-7b-instruct",
-            "Qwen2.5 7B Instruct",
-            "qwen",
-            "llm",
-            "GPU 8GB+ or CPU 16GB+",
-            "4-5 GB",
-        ),
-        local_model_catalog_item(
-            &cache_roots,
-            "jina-embeddings-v2-base-zh",
-            "Jina Embeddings v2 zh",
-            "jina",
-            "embedder",
-            "CPU 4GB+",
-            "300-700 MB",
-        ),
-        local_model_catalog_item(
-            &cache_roots,
-            "bge-m3",
-            "BGE M3 Embedding",
-            "bge",
-            "embedder",
-            "CPU 4GB+",
-            "1-2 GB",
-        ),
-        local_model_catalog_item(
-            &cache_roots,
-            "minicpm-v-2.6",
-            "MiniCPM-V 2.6",
-            "minicpm",
-            "vlm",
-            "GPU recommended",
-            "4-8 GB",
-        ),
-    ];
+    let models = local_model_catalog_specs()
+        .into_iter()
+        .map(|spec| local_model_catalog_item(&cache_roots, &download_jobs, spec))
+        .collect::<Vec<_>>();
+    let generated_at = now_unix_string();
     LocalModelCatalogResponse {
-        generated_at: now_unix_string(),
+        generated_at: generated_at.clone(),
+        checked_at: generated_at,
+        status: if models.is_empty() {
+            "needs-config"
+        } else {
+            "ready"
+        }
+        .to_string(),
         cache_roots,
         models,
-        download_jobs,
+        download_jobs: download_jobs.clone(),
+        downloads: download_jobs,
+        blockers: Vec::new(),
+        warnings: Vec::new(),
     }
+}
+
+#[derive(Debug, Clone)]
+struct LocalModelCatalogSpec {
+    model_id: &'static str,
+    display_name: &'static str,
+    provider_key: &'static str,
+    model_kind: &'static str,
+    recommended_hardware: &'static str,
+    download_size_hint: &'static str,
+    source_kind: &'static str,
+    repo_id: Option<&'static str>,
+    revision: &'static str,
+    file_policy: &'static str,
+    runtime_profiles: &'static [&'static str],
+    expected_capabilities: &'static [&'static str],
+    acceptance_note: Option<&'static str>,
+}
+
+fn local_model_catalog_specs() -> Vec<LocalModelCatalogSpec> {
+    vec![
+        LocalModelCatalogSpec {
+            model_id: "Qwen/Qwen3.5-4B",
+            display_name: "Qwen3.5 4B",
+            provider_key: "qwen",
+            model_kind: "llm_vlm",
+            recommended_hardware: "GPU 16GB+; primary 182 live-test target",
+            download_size_hint: "10-15 GB",
+            source_kind: "huggingface",
+            repo_id: Some("Qwen/Qwen3.5-4B"),
+            revision: "main",
+            file_policy: "runtime_snapshot",
+            runtime_profiles: &["vllm-openai-compatible", "sglang-openai-compatible"],
+            expected_capabilities: &["llm", "vlm", "image_text_to_text"],
+            acceptance_note: Some("primary-live-test"),
+        },
+        LocalModelCatalogSpec {
+            model_id: "Qwen/Qwen3.5-9B",
+            display_name: "Qwen3.5 9B",
+            provider_key: "qwen",
+            model_kind: "llm_vlm",
+            recommended_hardware: "GPU 16GB+ only after 4B path is green",
+            download_size_hint: "20-30 GB",
+            source_kind: "huggingface",
+            repo_id: Some("Qwen/Qwen3.5-9B"),
+            revision: "main",
+            file_policy: "runtime_snapshot",
+            runtime_profiles: &["vllm-openai-compatible", "sglang-openai-compatible"],
+            expected_capabilities: &["llm", "vlm", "image_text_to_text"],
+            acceptance_note: Some("stretch-after-4b"),
+        },
+        LocalModelCatalogSpec {
+            model_id: "Qwen/Qwen3.6-35B-A3B",
+            display_name: "Qwen3.6 35B A3B",
+            provider_key: "qwen",
+            model_kind: "llm_vlm",
+            recommended_hardware: "multi-GPU recommended; not a 182 16GB acceptance target",
+            download_size_hint: "60+ GB",
+            source_kind: "huggingface",
+            repo_id: Some("Qwen/Qwen3.6-35B-A3B"),
+            revision: "main",
+            file_policy: "runtime_snapshot",
+            runtime_profiles: &["vllm-openai-compatible", "sglang-openai-compatible"],
+            expected_capabilities: &["llm", "vlm", "image_text_to_text"],
+            acceptance_note: Some("not-today-acceptance"),
+        },
+        LocalModelCatalogSpec {
+            model_id: "Qwen/Qwen3-Embedding-0.6B",
+            display_name: "Qwen3 Embedding 0.6B",
+            provider_key: "qwen",
+            model_kind: "embedder",
+            recommended_hardware: "CPU or GPU",
+            download_size_hint: "1-2 GB",
+            source_kind: "huggingface",
+            repo_id: Some("Qwen/Qwen3-Embedding-0.6B"),
+            revision: "main",
+            file_policy: "runtime_snapshot",
+            runtime_profiles: &["openai-compatible-embedding"],
+            expected_capabilities: &["embedding"],
+            acceptance_note: Some("retrieval-quality-upgrade"),
+        },
+        LocalModelCatalogSpec {
+            model_id: "qwen2.5-1.5b-instruct",
+            display_name: "Qwen2.5 1.5B Instruct",
+            provider_key: "qwen",
+            model_kind: "llm",
+            recommended_hardware: "CPU 8GB+",
+            download_size_hint: "1-2 GB",
+            source_kind: "manual_or_url",
+            repo_id: None,
+            revision: "main",
+            file_policy: "single_file_or_existing_cache",
+            runtime_profiles: &["harbor-model-api-candle"],
+            expected_capabilities: &["llm"],
+            acceptance_note: Some("legacy-catalog"),
+        },
+        LocalModelCatalogSpec {
+            model_id: "jina-embeddings-v2-base-zh",
+            display_name: "Jina Embeddings v2 zh",
+            provider_key: "jina",
+            model_kind: "embedder",
+            recommended_hardware: "CPU 4GB+",
+            download_size_hint: "300-700 MB",
+            source_kind: "manual_or_url",
+            repo_id: None,
+            revision: "main",
+            file_policy: "single_file_or_existing_cache",
+            runtime_profiles: &["harbor-model-api-candle"],
+            expected_capabilities: &["embedding"],
+            acceptance_note: Some("legacy-catalog"),
+        },
+        LocalModelCatalogSpec {
+            model_id: "bge-m3",
+            display_name: "BGE M3 Embedding",
+            provider_key: "bge",
+            model_kind: "embedder",
+            recommended_hardware: "CPU 4GB+",
+            download_size_hint: "1-2 GB",
+            source_kind: "manual_or_url",
+            repo_id: None,
+            revision: "main",
+            file_policy: "single_file_or_existing_cache",
+            runtime_profiles: &["openai-compatible-embedding"],
+            expected_capabilities: &["embedding"],
+            acceptance_note: Some("legacy-catalog"),
+        },
+        LocalModelCatalogSpec {
+            model_id: "minicpm-v-2.6",
+            display_name: "MiniCPM-V 2.6",
+            provider_key: "minicpm",
+            model_kind: "vlm",
+            recommended_hardware: "GPU recommended",
+            download_size_hint: "4-8 GB",
+            source_kind: "manual_or_url",
+            repo_id: None,
+            revision: "main",
+            file_policy: "single_file_or_existing_cache",
+            runtime_profiles: &["openai-compatible-vlm"],
+            expected_capabilities: &["vlm"],
+            acceptance_note: Some("legacy-catalog"),
+        },
+    ]
 }
 
 fn local_model_catalog_item(
     cache_roots: &[String],
-    model_id: &str,
-    display_name: &str,
-    provider_key: &str,
-    model_kind: &str,
-    recommended_hardware: &str,
-    download_size_hint: &str,
+    download_jobs: &[ModelDownloadJobRecord],
+    spec: LocalModelCatalogSpec,
 ) -> LocalModelCatalogItem {
-    let local_path = find_cached_model_path(cache_roots, model_id);
-    let status = if local_path.is_some() {
-        "cached"
+    let latest_job = latest_model_download_job(download_jobs, spec.model_id);
+    let candidate_path = find_cached_model_path(cache_roots, spec.model_id).or_else(|| {
+        latest_job
+            .and_then(|job| job.target_path.as_ref())
+            .filter(|path| Path::new(path).exists())
+            .cloned()
+    });
+    let candidate_size = candidate_path
+        .as_ref()
+        .and_then(|path| model_path_size(Path::new(path)).ok());
+    let local_path = candidate_path
+        .as_ref()
+        .zip(candidate_size)
+        .and_then(|(path, size)| (size > 0).then(|| path.clone()));
+    let installed = local_path.is_some();
+    let size_bytes = installed.then_some(candidate_size).flatten();
+    let status = if installed {
+        "ready"
+    } else if let Some(job) = latest_job {
+        match job.status.as_str() {
+            "queued" | "running" | "downloading" => "running",
+            "completed" | "failed" => "blocked",
+            "canceled" | "cancelled" => "needs-config",
+            _ => "needs-config",
+        }
     } else {
-        "not_downloaded"
+        "needs-config"
     }
     .to_string();
-    let mut evidence = vec![format!("model_id={model_id}")];
+    let mut evidence = vec![
+        format!("model_id={}", spec.model_id),
+        format!("source_kind={}", spec.source_kind),
+        format!("file_policy={}", spec.file_policy),
+    ];
+    if let Some(repo_id) = spec.repo_id {
+        evidence.push(format!("repo_id={repo_id}"));
+        evidence.push(format!("revision={}", spec.revision));
+    }
     if let Some(path) = local_path.as_ref() {
         evidence.push(format!("local_path={path}"));
+    } else if let Some(path) = candidate_path.as_ref() {
+        evidence.push(format!("ignored_incomplete_local_path={path}"));
+        if let Some(size) = candidate_size {
+            evidence.push(format!("ignored_incomplete_size_bytes={size}"));
+        }
     }
+    if let Some(job) = latest_job {
+        evidence.push(format!("latest_download_job={}", job.job_id));
+        evidence.push(format!("latest_download_status={}", job.status));
+    }
+    let detail = if installed {
+        format!(
+            "{} is installed at {}.",
+            spec.display_name,
+            local_path.clone().unwrap_or_default()
+        )
+    } else if let Some(job) = latest_job {
+        format!(
+            "{} latest download job is {} with status {}.",
+            spec.display_name, job.job_id, job.status
+        )
+    } else if spec.source_kind == "huggingface" {
+        format!(
+            "Direct Hugging Face snapshot download is available for {}.",
+            spec.repo_id.unwrap_or(spec.model_id)
+        )
+    } else {
+        "Configure a source_url or install into the model cache root.".to_string()
+    };
     LocalModelCatalogItem {
-        model_id: model_id.to_string(),
-        display_name: display_name.to_string(),
-        provider_key: provider_key.to_string(),
-        model_kind: model_kind.to_string(),
-        recommended_hardware: recommended_hardware.to_string(),
+        model_id: spec.model_id.to_string(),
+        label: spec.display_name.to_string(),
+        display_name: spec.display_name.to_string(),
+        provider: spec.provider_key.to_string(),
+        provider_key: spec.provider_key.to_string(),
+        model_kind: spec.model_kind.to_string(),
+        recommended_hardware: spec.recommended_hardware.to_string(),
         status,
+        installed,
         local_path,
-        download_size_hint: download_size_hint.to_string(),
+        size_bytes,
+        download_job_id: latest_job.map(|job| job.job_id.clone()),
+        download_size_hint: spec.download_size_hint.to_string(),
+        detail,
+        source_kind: spec.source_kind.to_string(),
+        repo_id: spec.repo_id.map(str::to_string),
+        revision: Some(spec.revision.to_string()),
+        file_policy: spec.file_policy.to_string(),
+        runtime_profiles: spec
+            .runtime_profiles
+            .iter()
+            .map(|item| item.to_string())
+            .collect(),
+        expected_capabilities: spec
+            .expected_capabilities
+            .iter()
+            .map(|item| item.to_string())
+            .collect(),
+        acceptance_note: spec.acceptance_note.map(str::to_string),
         evidence,
     }
+}
+
+fn latest_model_download_job<'a>(
+    jobs: &'a [ModelDownloadJobRecord],
+    model_id: &str,
+) -> Option<&'a ModelDownloadJobRecord> {
+    jobs.iter()
+        .filter(|job| job.model_id == model_id)
+        .max_by(|left, right| left.updated_at.cmp(&right.updated_at))
+}
+
+fn enrich_model_download_metadata(metadata: &mut Value, item: &LocalModelCatalogItem) {
+    if !metadata.is_object() {
+        *metadata = json!({});
+    }
+    let Some(object) = metadata.as_object_mut() else {
+        return;
+    };
+    object
+        .entry("source_kind".to_string())
+        .or_insert_with(|| json!(item.source_kind));
+    if let Some(repo_id) = item.repo_id.as_ref() {
+        object
+            .entry("repo_id".to_string())
+            .or_insert_with(|| json!(repo_id));
+    }
+    if let Some(revision) = item.revision.as_ref() {
+        object
+            .entry("revision".to_string())
+            .or_insert_with(|| json!(revision));
+    }
+    object
+        .entry("file_policy".to_string())
+        .or_insert_with(|| json!(item.file_policy));
+}
+
+fn model_download_jobs_status(jobs: &[ModelDownloadJobRecord]) -> &'static str {
+    let latest_jobs = latest_model_download_jobs_by_model(jobs);
+    if latest_jobs
+        .values()
+        .any(|job| matches!(job.status.as_str(), "queued" | "running" | "downloading"))
+    {
+        return "running";
+    }
+    if latest_jobs.values().any(|job| job.status == "failed") {
+        return "blocked";
+    }
+    "ready"
+}
+
+fn latest_model_download_jobs_by_model<'a>(
+    jobs: &'a [ModelDownloadJobRecord],
+) -> HashMap<&'a str, &'a ModelDownloadJobRecord> {
+    let mut latest_jobs: HashMap<&str, &ModelDownloadJobRecord> = HashMap::new();
+    for job in jobs {
+        let key = if job.model_id.trim().is_empty() {
+            job.job_id.as_str()
+        } else {
+            job.model_id.as_str()
+        };
+        match latest_jobs.get(key) {
+            Some(current) if !model_download_job_is_newer(job, current) => {}
+            _ => {
+                latest_jobs.insert(key, job);
+            }
+        }
+    }
+    latest_jobs
+}
+
+fn model_download_job_is_newer(
+    candidate: &ModelDownloadJobRecord,
+    current: &ModelDownloadJobRecord,
+) -> bool {
+    let candidate_key = (
+        model_download_job_timestamp(&candidate.updated_at),
+        model_download_job_timestamp(&candidate.requested_at),
+        candidate.job_id.as_str(),
+    );
+    let current_key = (
+        model_download_job_timestamp(&current.updated_at),
+        model_download_job_timestamp(&current.requested_at),
+        current.job_id.as_str(),
+    );
+    candidate_key > current_key
+}
+
+fn model_download_job_timestamp(value: &str) -> u64 {
+    value.trim().parse::<u64>().unwrap_or(0)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ModelDownloadTransferStats {
     bytes_written: u64,
     total_bytes: Option<u64>,
+    file_count: Option<usize>,
+    manifest_path: Option<String>,
     message: String,
+}
+
+const MODEL_DOWNLOAD_CANCELED: &str = "model download canceled";
+
+fn spawn_model_download_worker(
+    store: AdminConsoleStore,
+    job: ModelDownloadJobRecord,
+) -> Result<(), String> {
+    thread::Builder::new()
+        .name("harborbeacon-model-download".to_string())
+        .spawn(move || run_model_download_job(store, job))
+        .map(|_| ())
+        .map_err(|error| format!("failed to spawn model download worker: {error}"))
+}
+
+fn mark_model_download_spawn_failed(
+    store: &AdminConsoleStore,
+    mut job: ModelDownloadJobRecord,
+    error: String,
+) -> ModelDownloadJobRecord {
+    let now = now_unix_string();
+    job.status = "failed".to_string();
+    job.progress_percent = Some(100);
+    job.completed_at = Some(now.clone());
+    job.updated_at = now;
+    job.error_message = Some(error.clone());
+    job.message = format!("download worker failed to start: {error}");
+    store.save_model_download_job(job.clone()).unwrap_or(job)
+}
+
+fn run_model_download_job(store: AdminConsoleStore, mut job: ModelDownloadJobRecord) {
+    if model_download_job_cancel_requested(&store, &job.job_id) {
+        mark_model_download_canceled(&store, job, "canceled_before_start");
+        return;
+    }
+
+    let started_at = now_unix_string();
+    job.status = "downloading".to_string();
+    job.started_at = job.started_at.or_else(|| Some(started_at.clone()));
+    job.updated_at = started_at;
+    job.progress_percent = Some(0);
+    job.error_message = None;
+    job.message = "download job started by explicit admin action".to_string();
+    if let Err(error) = store.save_model_download_job(job.clone()) {
+        mark_model_download_failed(&store, job, "job_state_write_failed", error);
+        return;
+    }
+
+    let result = run_model_download_transfer_with_progress(&mut job, Some(&store));
+    if model_download_job_cancel_requested(&store, &job.job_id) {
+        mark_model_download_canceled(&store, job, "canceled_after_transfer");
+        return;
+    }
+
+    let finished_at = now_unix_string();
+    match result {
+        Ok(stats) => {
+            job.status = "completed".to_string();
+            job.progress_percent = Some(100);
+            job.bytes_downloaded = Some(stats.bytes_written);
+            job.total_bytes = stats.total_bytes.or(Some(stats.bytes_written));
+            job.completed_at = Some(finished_at.clone());
+            job.updated_at = finished_at;
+            job.error_message = None;
+            job.message = stats.message;
+            merge_model_download_metadata(
+                &mut job.metadata,
+                json!({
+                    "file_count": stats.file_count,
+                    "snapshot_manifest_path": stats.manifest_path,
+                }),
+            );
+            let _ = store.save_model_download_job(job);
+        }
+        Err(error) if error == MODEL_DOWNLOAD_CANCELED => {
+            mark_model_download_canceled(&store, job, "canceled_during_transfer");
+        }
+        Err(error) => mark_model_download_failed(&store, job, "transfer_failed", error),
+    }
+}
+
+fn mark_model_download_failed(
+    store: &AdminConsoleStore,
+    mut job: ModelDownloadJobRecord,
+    phase: &str,
+    error: String,
+) {
+    let now = now_unix_string();
+    job.status = "failed".to_string();
+    job.progress_percent = Some(100);
+    job.completed_at = Some(now.clone());
+    job.updated_at = now;
+    job.error_message = Some(error.clone());
+    job.message = format!("download job failed at {phase}: {error}");
+    let _ = store.save_model_download_job(job);
+}
+
+fn mark_model_download_canceled(
+    store: &AdminConsoleStore,
+    mut job: ModelDownloadJobRecord,
+    phase: &str,
+) {
+    let now = now_unix_string();
+    job.status = "canceled".to_string();
+    job.progress_percent = job.progress_percent.or(Some(0));
+    job.completed_at = Some(now.clone());
+    job.updated_at = now;
+    job.error_message = None;
+    job.message = format!("download job canceled: {phase}");
+    let _ = store.save_model_download_job(job);
+}
+
+fn model_download_job_cancel_requested(store: &AdminConsoleStore, job_id: &str) -> bool {
+    matches!(
+        store
+            .model_download_job(job_id)
+            .ok()
+            .flatten()
+            .map(|job| job.status),
+        Some(status) if status == "canceled" || status == "cancelled"
+    )
+}
+
+fn save_model_download_checkpoint(
+    store: Option<&AdminConsoleStore>,
+    job_id: &str,
+    progress_percent: Option<u8>,
+    bytes_downloaded: Option<u64>,
+    total_bytes: Option<u64>,
+    message: impl Into<String>,
+) {
+    let Some(store) = store else {
+        return;
+    };
+    let Ok(Some(mut job)) = store.model_download_job(job_id) else {
+        return;
+    };
+    if matches!(
+        job.status.as_str(),
+        "canceled" | "cancelled" | "completed" | "failed"
+    ) {
+        return;
+    }
+    job.status = "downloading".to_string();
+    job.progress_percent = progress_percent;
+    job.bytes_downloaded = bytes_downloaded;
+    if total_bytes.is_some() {
+        job.total_bytes = total_bytes;
+    }
+    job.updated_at = now_unix_string();
+    job.message = message.into();
+    let _ = store.save_model_download_job(job);
 }
 
 fn run_model_download_transfer(
     job: &ModelDownloadJobRecord,
 ) -> Result<ModelDownloadTransferStats, String> {
+    let mut job = job.clone();
+    run_model_download_transfer_with_progress(&mut job, None)
+}
+
+fn run_model_download_transfer_with_progress(
+    job: &mut ModelDownloadJobRecord,
+    store: Option<&AdminConsoleStore>,
+) -> Result<ModelDownloadTransferStats, String> {
+    if model_download_huggingface_repo_id(job).is_some() {
+        return run_huggingface_snapshot_download(job, store);
+    }
+
     let target_path = job
         .target_path
         .as_deref()
@@ -6990,13 +7673,12 @@ fn run_model_download_transfer(
         .unwrap_or_else(|| default_model_download_target_path(&job.model_id));
     let target = PathBuf::from(&target_path);
     if target.exists() {
-        let bytes = target
-            .metadata()
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
+        let bytes = model_path_size(&target)?;
         return Ok(ModelDownloadTransferStats {
             bytes_written: bytes,
             total_bytes: Some(bytes),
+            file_count: None,
+            manifest_path: None,
             message: format!("model already present at {}", target.display()),
         });
     }
@@ -7029,6 +7711,8 @@ fn run_model_download_transfer(
         return Ok(ModelDownloadTransferStats {
             bytes_written: bytes,
             total_bytes: Some(bytes),
+            file_count: Some(1),
+            manifest_path: None,
             message: format!("model copied to {}", target.display()),
         });
     }
@@ -7068,13 +7752,654 @@ fn run_model_download_transfer(
             format!("failed to write model target {}: {error}", target.display())
         })?;
         bytes_written += read as u64;
+        if let Some(total) = total_bytes {
+            let progress = ((bytes_written as f64 / total.max(1) as f64) * 100.0)
+                .floor()
+                .clamp(0.0, 99.0) as u8;
+            save_model_download_checkpoint(
+                store,
+                &job.job_id,
+                Some(progress),
+                Some(bytes_written),
+                Some(total),
+                format!(
+                    "downloading {} bytes to {}",
+                    bytes_written,
+                    target.display()
+                ),
+            );
+        }
     }
 
     Ok(ModelDownloadTransferStats {
         bytes_written,
         total_bytes,
+        file_count: Some(1),
+        manifest_path: None,
         message: format!("model downloaded to {}", target.display()),
     })
+}
+
+fn run_huggingface_snapshot_download(
+    job: &mut ModelDownloadJobRecord,
+    store: Option<&AdminConsoleStore>,
+) -> Result<ModelDownloadTransferStats, String> {
+    if store
+        .map(|store| model_download_job_cancel_requested(store, &job.job_id))
+        .unwrap_or(false)
+    {
+        return Err(MODEL_DOWNLOAD_CANCELED.to_string());
+    }
+
+    let repo_id = model_download_huggingface_repo_id(job)
+        .ok_or_else(|| "huggingface repo_id is required for snapshot download".to_string())?;
+    let revision = model_download_metadata_string(&job.metadata, "revision")
+        .unwrap_or_else(|| "main".to_string());
+    let file_policy = model_download_metadata_string(&job.metadata, "file_policy")
+        .unwrap_or_else(|| "runtime_snapshot".to_string());
+    let allow_patterns = model_download_allow_patterns(&job.metadata);
+    let target_path = job
+        .target_path
+        .as_deref()
+        .and_then(non_empty_string)
+        .unwrap_or_else(|| default_model_download_target_path(&job.model_id));
+    let target = PathBuf::from(&target_path);
+    let manifest_path = target.join("snapshot_manifest.json");
+    if manifest_path.exists() {
+        let bytes = model_path_size(&target)?;
+        return Ok(ModelDownloadTransferStats {
+            bytes_written: bytes,
+            total_bytes: Some(bytes),
+            file_count: None,
+            manifest_path: Some(manifest_path.display().to_string()),
+            message: format!(
+                "huggingface snapshot already present at {}",
+                target.display()
+            ),
+        });
+    }
+
+    fs::create_dir_all(&target).map_err(|error| {
+        format!(
+            "failed to create model snapshot directory {}: {error}",
+            target.display()
+        )
+    })?;
+    let hf_cache_dir = target.join(".hf-cache").join("hub");
+    fs::create_dir_all(&hf_cache_dir).map_err(|error| {
+        format!(
+            "failed to create huggingface cache directory {}: {error}",
+            hf_cache_dir.display()
+        )
+    })?;
+
+    save_model_download_checkpoint(
+        store,
+        &job.job_id,
+        Some(1),
+        Some(0),
+        None,
+        format!("resolving Hugging Face snapshot {repo_id}@{revision}"),
+    );
+
+    let mut builder = HfApiBuilder::from_cache(HfCache::new(hf_cache_dir))
+        .with_progress(false)
+        .with_retries(3);
+    if let Some(token) = huggingface_token_from_env() {
+        builder = builder.with_token(Some(token));
+    }
+    if let Ok(endpoint) = env::var("HF_ENDPOINT") {
+        if let Some(endpoint) = non_empty_string(&endpoint) {
+            builder = builder.with_endpoint(endpoint);
+        }
+    }
+    let api = builder
+        .build()
+        .map_err(|error| format!("failed to initialize Hugging Face client: {error}"))?;
+    let repo = api.repo(Repo::with_revision(
+        repo_id.clone(),
+        RepoType::Model,
+        revision.clone(),
+    ));
+    let info = repo
+        .info()
+        .map_err(|error| format!("failed to read Hugging Face repo info for {repo_id}: {error}"))?;
+    let resolved_sha = info.sha.clone();
+    let mut files = info
+        .siblings
+        .into_iter()
+        .map(|sibling| sibling.rfilename)
+        .filter(|filename| model_snapshot_file_allowed(filename, &allow_patterns))
+        .collect::<Vec<_>>();
+    files.sort();
+    if files.is_empty() {
+        return Err(format!(
+            "no downloadable files matched allow_patterns for Hugging Face repo {repo_id}"
+        ));
+    }
+
+    let mut downloaded_files = Vec::new();
+    let mut bytes_written = 0_u64;
+    for (index, filename) in files.iter().enumerate() {
+        if store
+            .map(|store| model_download_job_cancel_requested(store, &job.job_id))
+            .unwrap_or(false)
+        {
+            return Err(MODEL_DOWNLOAD_CANCELED.to_string());
+        }
+        let relative = safe_snapshot_relative_path(filename)?;
+        let progress = HfModelDownloadProgress::new(
+            store.cloned(),
+            job.job_id.clone(),
+            index,
+            files.len(),
+            bytes_written,
+            filename.clone(),
+        );
+        let destination = target.join(&relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "failed to create snapshot file directory {}: {error}",
+                    parent.display()
+                )
+            })?;
+        }
+        let cached = match repo.download_with_progress(filename, progress) {
+            Ok(cached) => Some(cached),
+            Err(error) => {
+                let error_message = error.to_string();
+                if !huggingface_download_should_fallback_to_plain_http(&error_message) {
+                    return Err(format!(
+                        "failed to download Hugging Face file {filename} from {repo_id}: {error_message}"
+                    ));
+                }
+                let fallback_progress = HfModelDownloadProgress::new(
+                    store.cloned(),
+                    job.job_id.clone(),
+                    index,
+                    files.len(),
+                    bytes_written,
+                    filename.clone(),
+                );
+                download_huggingface_file_via_plain_http(
+                    &repo_id,
+                    &revision,
+                    filename,
+                    &destination,
+                    fallback_progress,
+                )
+                .map_err(|fallback_error| {
+                    format!(
+                        "failed to download Hugging Face file {filename} from {repo_id}: {error_message}; plain HTTP fallback failed: {fallback_error}"
+                    )
+                })?;
+                None
+            }
+        };
+        if store
+            .map(|store| model_download_job_cancel_requested(store, &job.job_id))
+            .unwrap_or(false)
+        {
+            return Err(MODEL_DOWNLOAD_CANCELED.to_string());
+        }
+        if let Some(cached) = cached {
+            fs::copy(&cached, &destination).map_err(|error| {
+                format!(
+                    "failed to copy Hugging Face cache file {} to {}: {error}",
+                    cached.display(),
+                    destination.display()
+                )
+            })?;
+        }
+        let bytes = destination
+            .metadata()
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        bytes_written += bytes;
+        downloaded_files.push(json!({
+            "path": filename,
+            "bytes": bytes,
+        }));
+        let progress_percent = (((index + 1) as f64 / files.len() as f64) * 100.0)
+            .floor()
+            .clamp(1.0, 99.0) as u8;
+        save_model_download_checkpoint(
+            store,
+            &job.job_id,
+            Some(progress_percent),
+            Some(bytes_written),
+            None,
+            format!(
+                "downloaded {}/{} Hugging Face snapshot files",
+                index + 1,
+                files.len()
+            ),
+        );
+    }
+
+    let manifest = json!({
+        "source_kind": "huggingface",
+        "repo_id": repo_id,
+        "revision": revision,
+        "resolved_sha": resolved_sha,
+        "file_policy": file_policy,
+        "allow_patterns": allow_patterns,
+        "downloaded_at": now_unix_string(),
+        "file_count": downloaded_files.len(),
+        "bytes_written": bytes_written,
+        "files": downloaded_files,
+    });
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest)
+        .map_err(|error| format!("failed to serialize snapshot manifest: {error}"))?;
+    fs::write(&manifest_path, manifest_bytes).map_err(|error| {
+        format!(
+            "failed to write snapshot manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let total_bytes = model_path_size(&target).ok();
+
+    Ok(ModelDownloadTransferStats {
+        bytes_written,
+        total_bytes,
+        file_count: Some(files.len()),
+        manifest_path: Some(manifest_path.display().to_string()),
+        message: format!(
+            "huggingface snapshot downloaded to {} with manifest {}",
+            target.display(),
+            manifest_path.display()
+        ),
+    })
+}
+
+fn huggingface_download_should_fallback_to_plain_http(error_message: &str) -> bool {
+    error_message.contains("Header Content-Range is missing")
+}
+
+fn download_huggingface_file_via_plain_http(
+    repo_id: &str,
+    revision: &str,
+    filename: &str,
+    destination: &Path,
+    mut progress: HfModelDownloadProgress,
+) -> Result<(), String> {
+    let endpoint = env::var("HF_ENDPOINT")
+        .ok()
+        .and_then(|value| non_empty_string(&value))
+        .unwrap_or_else(|| "https://huggingface.co".to_string());
+    let url = huggingface_resolve_url(&endpoint, repo_id, revision, filename)?;
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("failed to build Hugging Face fallback client: {error}"))?;
+    let mut request = client
+        .get(url)
+        .header("User-Agent", "HarborBeacon model downloader");
+    if let Some(token) = huggingface_token_from_env() {
+        request = request.bearer_auth(token);
+    }
+    let mut response = request
+        .send()
+        .map_err(|error| format!("plain HTTP request failed: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("plain HTTP request failed with HTTP {}", status.as_u16()));
+    }
+
+    let total = response.content_length().unwrap_or(0);
+    progress.init(total.try_into().unwrap_or(usize::MAX), filename);
+    let partial = partial_snapshot_download_path(destination);
+    let _ = fs::remove_file(&partial);
+    let mut file = fs::File::create(&partial).map_err(|error| {
+        format!(
+            "failed to create temporary Hugging Face file {}: {error}",
+            partial.display()
+        )
+    })?;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = response
+            .read(&mut buffer)
+            .map_err(|error| format!("plain HTTP stream failed: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read]).map_err(|error| {
+            format!(
+                "failed to write temporary Hugging Face file {}: {error}",
+                partial.display()
+            )
+        })?;
+        progress.update(read);
+    }
+    drop(file);
+    fs::rename(&partial, destination).map_err(|error| {
+        let _ = fs::remove_file(&partial);
+        format!(
+            "failed to move temporary Hugging Face file {} to {}: {error}",
+            partial.display(),
+            destination.display()
+        )
+    })?;
+    progress.finish();
+    Ok(())
+}
+
+fn huggingface_resolve_url(
+    endpoint: &str,
+    repo_id: &str,
+    revision: &str,
+    filename: &str,
+) -> Result<Url, String> {
+    let base = format!("{}/", endpoint.trim_end_matches('/'));
+    let mut url =
+        Url::parse(&base).map_err(|error| format!("invalid Hugging Face endpoint {endpoint}: {error}"))?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| format!("invalid Hugging Face endpoint {endpoint}"))?;
+        for segment in repo_id.split('/') {
+            segments.push(segment);
+        }
+        segments.push("resolve");
+        segments.push(revision);
+        for segment in filename.split('/') {
+            segments.push(segment);
+        }
+    }
+    Ok(url)
+}
+
+fn partial_snapshot_download_path(destination: &Path) -> PathBuf {
+    let mut partial = destination.to_path_buf();
+    let file_name = destination
+        .file_name()
+        .map(|value| value.to_string_lossy())
+        .unwrap_or_else(|| "download".into());
+    partial.set_file_name(format!(".{file_name}.download"));
+    partial
+}
+
+#[derive(Debug, Clone)]
+struct HfModelDownloadProgress {
+    store: Option<AdminConsoleStore>,
+    job_id: String,
+    file_index: usize,
+    file_count: usize,
+    completed_bytes: u64,
+    filename: String,
+    current_file_size: u64,
+    current_file_bytes: u64,
+    last_saved_bytes: u64,
+    last_saved_percent: u8,
+}
+
+impl HfModelDownloadProgress {
+    fn new(
+        store: Option<AdminConsoleStore>,
+        job_id: String,
+        file_index: usize,
+        file_count: usize,
+        completed_bytes: u64,
+        filename: String,
+    ) -> Self {
+        Self {
+            store,
+            job_id,
+            file_index,
+            file_count: file_count.max(1),
+            completed_bytes,
+            filename,
+            current_file_size: 0,
+            current_file_bytes: 0,
+            last_saved_bytes: 0,
+            last_saved_percent: 0,
+        }
+    }
+
+    fn percent(&self) -> u8 {
+        let file_fraction = if self.current_file_size > 0 {
+            (self.current_file_bytes as f64 / self.current_file_size as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        (((self.file_index as f64 + file_fraction) / self.file_count as f64) * 100.0)
+            .floor()
+            .clamp(1.0, 99.0) as u8
+    }
+
+    fn checkpoint(&mut self, force: bool) {
+        let percent = self.percent();
+        let bytes = self.completed_bytes + self.current_file_bytes;
+        if !force
+            && bytes.saturating_sub(self.last_saved_bytes) < 16 * 1024 * 1024
+            && percent == self.last_saved_percent
+        {
+            return;
+        }
+        save_model_download_checkpoint(
+            self.store.as_ref(),
+            &self.job_id,
+            Some(percent),
+            Some(bytes),
+            None,
+            format!(
+                "downloading {} ({}/{})",
+                self.filename,
+                self.file_index + 1,
+                self.file_count
+            ),
+        );
+        self.last_saved_bytes = bytes;
+        self.last_saved_percent = percent;
+    }
+}
+
+impl HfProgress for HfModelDownloadProgress {
+    fn init(&mut self, size: usize, filename: &str) {
+        self.current_file_size = size as u64;
+        self.current_file_bytes = 0;
+        self.filename = filename.to_string();
+        self.checkpoint(true);
+    }
+
+    fn update(&mut self, size: usize) {
+        self.current_file_bytes = self.current_file_bytes.saturating_add(size as u64);
+        self.checkpoint(false);
+    }
+
+    fn finish(&mut self) {
+        if self.current_file_size > 0 {
+            self.current_file_bytes = self.current_file_size;
+        }
+        self.checkpoint(true);
+    }
+}
+
+fn model_download_huggingface_repo_id(job: &ModelDownloadJobRecord) -> Option<String> {
+    model_download_metadata_string(&job.metadata, "repo_id").or_else(|| {
+        let source_kind = model_download_metadata_string(&job.metadata, "source_kind")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        (source_kind == "huggingface" && job.model_id.contains('/')).then(|| job.model_id.clone())
+    })
+}
+
+fn model_download_metadata_string(metadata: &Value, key: &str) -> Option<String> {
+    metadata
+        .get(key)
+        .and_then(Value::as_str)
+        .and_then(non_empty_string)
+}
+
+fn model_download_allow_patterns(metadata: &Value) -> Vec<String> {
+    let configured = metadata
+        .get("allow_patterns")
+        .and_then(|value| {
+            if let Some(items) = value.as_array() {
+                Some(
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter_map(non_empty_string)
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                value.as_str().map(|text| {
+                    text.split(',')
+                        .filter_map(non_empty_string)
+                        .collect::<Vec<_>>()
+                })
+            }
+        })
+        .unwrap_or_default();
+    if !configured.is_empty() {
+        return configured;
+    }
+    [
+        ".gitattributes",
+        "*.json",
+        "*.safetensors",
+        "*.model",
+        "*.txt",
+        "*.tiktoken",
+        "*.jinja",
+        "*.md",
+        "tokenizer*",
+        "vocab.*",
+        "merges.txt",
+        "*.py",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn model_snapshot_file_allowed(filename: &str, allow_patterns: &[String]) -> bool {
+    if safe_snapshot_relative_path(filename).is_err() {
+        return false;
+    }
+    let normalized = filename.replace('\\', "/");
+    let lower = normalized.to_ascii_lowercase();
+    if lower.ends_with(".bin")
+        || lower.ends_with(".pt")
+        || lower.ends_with(".pth")
+        || lower.ends_with(".ckpt")
+        || lower.ends_with(".h5")
+        || lower.ends_with(".onnx")
+        || lower.ends_with(".pkl")
+        || lower.ends_with(".pickle")
+        || lower.ends_with(".msgpack")
+    {
+        return false;
+    }
+    allow_patterns
+        .iter()
+        .any(|pattern| wildcard_match(pattern, &normalized))
+}
+
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let value = value.as_bytes();
+    let (mut pattern_index, mut value_index) = (0_usize, 0_usize);
+    let mut star_index = None;
+    let mut retry_value_index = 0_usize;
+
+    while value_index < value.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == b'?' || pattern[pattern_index] == value[value_index])
+        {
+            pattern_index += 1;
+            value_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            star_index = Some(pattern_index);
+            retry_value_index = value_index;
+            pattern_index += 1;
+        } else if let Some(star) = star_index {
+            pattern_index = star + 1;
+            retry_value_index += 1;
+            value_index = retry_value_index;
+        } else {
+            return false;
+        }
+    }
+
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
+}
+
+fn safe_snapshot_relative_path(filename: &str) -> Result<PathBuf, String> {
+    let trimmed = filename.trim();
+    if trimmed.is_empty() {
+        return Err("snapshot filename is empty".to_string());
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return Err(format!("snapshot filename must be relative: {filename}"));
+    }
+    for component in path.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Err(format!("unsafe snapshot filename component in {filename}"));
+        }
+    }
+    Ok(path.to_path_buf())
+}
+
+fn huggingface_token_from_env() -> Option<String> {
+    ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"]
+        .into_iter()
+        .find_map(|key| {
+            env::var(key)
+                .ok()
+                .and_then(|value| non_empty_string(&value))
+        })
+}
+
+fn merge_model_download_metadata(metadata: &mut Value, patch: Value) {
+    if !metadata.is_object() {
+        *metadata = json!({});
+    }
+    let Some(object) = metadata.as_object_mut() else {
+        return;
+    };
+    if let Some(patch_object) = patch.as_object() {
+        for (key, value) in patch_object {
+            if !value.is_null() {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+fn model_path_size(path: &Path) -> Result<u64, String> {
+    let metadata = path
+        .metadata()
+        .map_err(|error| format!("failed to inspect model path {}: {error}", path.display()))?;
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    if !metadata.is_dir() {
+        return Ok(0);
+    }
+    let mut total = 0_u64;
+    for entry in fs::read_dir(path)
+        .map_err(|error| format!("failed to read model directory {}: {error}", path.display()))?
+    {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to read model directory entry under {}: {error}",
+                path.display()
+            )
+        })?;
+        if entry.file_name().to_string_lossy() == ".hf-cache" {
+            continue;
+        }
+        total = total.saturating_add(model_path_size(&entry.path())?);
+    }
+    Ok(total)
 }
 
 fn model_download_source_url(metadata: &Value) -> Option<String> {
@@ -7127,28 +8452,38 @@ fn default_model_download_target_path(model_id: &str) -> String {
         } else {
             slug.as_str()
         })
-        .join("model.bin")
         .display()
         .to_string()
 }
 
 fn local_model_cache_roots() -> Vec<String> {
     let mut roots = Vec::new();
-    for key in ["HARBOR_MODEL_CACHE_DIR", "HARBOR_MODEL_DIR"] {
+    for key in [
+        "HARBOR_MODEL_CACHE_DIR",
+        "HARBOR_MODEL_DIR",
+        "HARBOR_MODEL_STORE_DIR",
+    ] {
         if let Ok(value) = env::var(key) {
             if let Some(value) = non_empty_string(&value) {
-                roots.push(value);
+                push_unique_root(&mut roots, value);
             }
         }
     }
-    roots.extend([
-        "/models".to_string(),
+    for root in [
+        "/mnt/software/harborbeacon-models".to_string(),
         "/mnt/software/harborbeacon/models".to_string(),
+        "/models".to_string(),
         ".harborbeacon/models".to_string(),
-    ]);
-    roots.sort();
-    roots.dedup();
+    ] {
+        push_unique_root(&mut roots, root);
+    }
     roots
+}
+
+fn push_unique_root(roots: &mut Vec<String>, root: String) {
+    if !roots.iter().any(|existing| existing == &root) {
+        roots.push(root);
+    }
 }
 
 fn find_cached_model_path(cache_roots: &[String], model_id: &str) -> Option<String> {
@@ -9149,11 +10484,13 @@ mod tests {
         build_harboros_status_response, build_hardware_readiness_response,
         build_knowledge_index_job, build_knowledge_index_status_response,
         build_local_model_catalog, build_rag_readiness_response, build_release_readiness_response,
-        build_rtsp_url_from_patch, default_model_endpoints, ensure_local_admin_access,
-        ensure_local_camera_access,
-        harbordesk_build_missing_response, has_forwarding_headers, identity_query_suffix,
-        is_admin_surface_path, is_harbordesk_client_route, is_harbordesk_surface_path,
-        live_bridge_provider_from_setup_status, mime_type_for_path,
+        build_rtsp_url_from_patch, default_model_download_target_path, default_model_endpoints,
+        ensure_local_admin_access, ensure_local_camera_access, harbordesk_build_missing_response,
+        has_forwarding_headers, huggingface_download_should_fallback_to_plain_http,
+        huggingface_resolve_url, identity_query_suffix, is_admin_surface_path,
+        is_harbordesk_client_route, is_harbordesk_surface_path, local_model_catalog_item,
+        local_model_catalog_specs, live_bridge_provider_from_setup_status, mime_type_for_path,
+        model_download_jobs_status, model_snapshot_file_allowed,
         overlay_model_endpoints_with_runtime_truth, parse_approval_decision_path,
         parse_camera_analyze_path, parse_camera_live_page_path, parse_camera_live_stream_path,
         parse_camera_share_link_path, parse_camera_snapshot_path, parse_camera_task_snapshot_path,
@@ -9185,7 +10522,8 @@ mod tests {
     };
     use harborbeacon_local_agent::runtime::admin_console::{
         AdminConsoleState, AdminConsoleStore, BridgeProviderConfig, DeviceCredentialSecret,
-        DeviceEvidenceRecord, KnowledgeSettings, KnowledgeSourceRoot, RemoteViewConfig,
+        DeviceEvidenceRecord, KnowledgeSettings, KnowledgeSourceRoot, ModelDownloadJobRecord,
+        RemoteViewConfig,
     };
     use harborbeacon_local_agent::runtime::hub::CameraHubService;
     use harborbeacon_local_agent::runtime::registry::{CameraDevice, DeviceRegistryStore};
@@ -10017,7 +11355,7 @@ mod tests {
 
     #[test]
     fn local_model_catalog_surfaces_download_jobs_without_auto_download() {
-        let job = harborbeacon_local_agent::runtime::admin_console::ModelDownloadJobRecord {
+        let job = ModelDownloadJobRecord {
             job_id: "model-download-1".to_string(),
             model_id: "qwen2.5-1.5b-instruct".to_string(),
             display_name: "Qwen2.5 1.5B Instruct".to_string(),
@@ -10042,6 +11380,220 @@ mod tests {
             .iter()
             .any(|item| item.model_id == "qwen2.5-1.5b-instruct"));
         assert_eq!(catalog.download_jobs, vec![job]);
+    }
+
+    #[test]
+    fn model_download_status_uses_latest_job_per_model() {
+        let job = |job_id: &str,
+                   model_id: &str,
+                   status: &str,
+                   requested_at: &str,
+                   updated_at: &str| {
+            ModelDownloadJobRecord {
+                job_id: job_id.to_string(),
+                model_id: model_id.to_string(),
+                display_name: model_id.to_string(),
+                provider_key: "qwen".to_string(),
+                status: status.to_string(),
+                requested_at: requested_at.to_string(),
+                updated_at: updated_at.to_string(),
+                target_path: None,
+                progress_percent: None,
+                bytes_downloaded: None,
+                total_bytes: None,
+                started_at: None,
+                completed_at: None,
+                error_message: None,
+                message: String::new(),
+                metadata: json!({}),
+            }
+        };
+
+        let failed_old = job("job-1", "Qwen/Qwen3.5-4B", "failed", "1", "1");
+        let completed_new = job("job-2", "Qwen/Qwen3.5-4B", "completed", "2", "2");
+        assert_eq!(
+            model_download_jobs_status(&[failed_old.clone(), completed_new.clone()]),
+            "ready"
+        );
+
+        let running_other = job("job-3", "Qwen/Qwen3.5-9B", "running", "3", "3");
+        assert_eq!(
+            model_download_jobs_status(&[
+                failed_old.clone(),
+                completed_new.clone(),
+                running_other,
+            ]),
+            "running"
+        );
+
+        let failed_latest = job("job-4", "Qwen/Qwen3.5-9B", "failed", "4", "4");
+        assert_eq!(
+            model_download_jobs_status(&[failed_old, completed_new, failed_latest]),
+            "blocked"
+        );
+    }
+
+    #[test]
+    fn local_model_catalog_ignores_failed_huggingface_cache_only_directory() {
+        let root = unique_store_path("model-cache-root").with_extension("");
+        let target = root.join("qwen-qwen3.5-4b");
+        fs::create_dir_all(target.join(".hf-cache")).expect("create hf cache only target");
+        let job = ModelDownloadJobRecord {
+            job_id: "model-download-failed".to_string(),
+            model_id: "Qwen/Qwen3.5-4B".to_string(),
+            display_name: "Qwen3.5 4B".to_string(),
+            provider_key: "qwen".to_string(),
+            status: "failed".to_string(),
+            requested_at: "1".to_string(),
+            updated_at: "2".to_string(),
+            target_path: Some(target.display().to_string()),
+            progress_percent: Some(100),
+            bytes_downloaded: Some(0),
+            total_bytes: None,
+            started_at: Some("1".to_string()),
+            completed_at: Some("2".to_string()),
+            error_message: Some("dns failed".to_string()),
+            message: "download failed".to_string(),
+            metadata: json!({}),
+        };
+        let spec = local_model_catalog_specs()
+            .into_iter()
+            .find(|spec| spec.model_id == "Qwen/Qwen3.5-4B")
+            .expect("qwen live-test catalog spec");
+
+        let item = local_model_catalog_item(&[root.display().to_string()], &[job], spec);
+
+        assert!(!item.installed);
+        assert_eq!(item.status, "blocked");
+        assert!(item.local_path.is_none());
+        assert_eq!(item.size_bytes, None);
+        assert!(item
+            .evidence
+            .iter()
+            .any(|entry| entry.starts_with("ignored_incomplete_local_path=")));
+        assert!(item
+            .evidence
+            .iter()
+            .any(|entry| entry == "ignored_incomplete_size_bytes=0"));
+        assert!(item
+            .evidence
+            .iter()
+            .any(|entry| entry == "latest_download_status=failed"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_model_catalog_marks_nonempty_cache_directory_installed() {
+        let root = unique_store_path("model-cache-root").with_extension("");
+        let target = root.join("qwen-qwen3.5-4b");
+        fs::create_dir_all(&target).expect("create model target");
+        fs::write(target.join("config.json"), b"{}").expect("write model payload");
+        let spec = local_model_catalog_specs()
+            .into_iter()
+            .find(|spec| spec.model_id == "Qwen/Qwen3.5-4B")
+            .expect("qwen live-test catalog spec");
+
+        let item = local_model_catalog_item(&[root.display().to_string()], &[], spec);
+
+        assert!(item.installed);
+        assert_eq!(item.status, "ready");
+        let expected_path = target.display().to_string();
+        assert_eq!(item.local_path.as_deref(), Some(expected_path.as_str()));
+        assert_eq!(item.size_bytes, Some(2));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_model_catalog_surfaces_huggingface_qwen_live_test_models() {
+        let catalog = build_local_model_catalog(Vec::new());
+
+        let primary = catalog
+            .models
+            .iter()
+            .find(|item| item.model_id == "Qwen/Qwen3.5-4B")
+            .expect("primary qwen model");
+        assert_eq!(primary.source_kind, "huggingface");
+        assert_eq!(primary.repo_id.as_deref(), Some("Qwen/Qwen3.5-4B"));
+        assert_eq!(primary.file_policy, "runtime_snapshot");
+        assert!(primary
+            .runtime_profiles
+            .iter()
+            .any(|profile| profile == "vllm-openai-compatible"));
+        assert_eq!(
+            primary.acceptance_note.as_deref(),
+            Some("primary-live-test")
+        );
+
+        let stretch = catalog
+            .models
+            .iter()
+            .find(|item| item.model_id == "Qwen/Qwen3.5-9B")
+            .expect("stretch qwen model");
+        assert_eq!(stretch.acceptance_note.as_deref(), Some("stretch-after-4b"));
+
+        let not_today = catalog
+            .models
+            .iter()
+            .find(|item| item.model_id == "Qwen/Qwen3.6-35B-A3B")
+            .expect("not today qwen model");
+        assert_eq!(
+            not_today.acceptance_note.as_deref(),
+            Some("not-today-acceptance")
+        );
+    }
+
+    #[test]
+    fn huggingface_snapshot_allow_patterns_keep_runtime_files_only() {
+        let patterns = vec![
+            "*.json".to_string(),
+            "*.safetensors".to_string(),
+            "tokenizer*".to_string(),
+        ];
+
+        assert!(model_snapshot_file_allowed("config.json", &patterns));
+        assert!(model_snapshot_file_allowed(
+            "model-00001-of-00002.safetensors",
+            &patterns
+        ));
+        assert!(model_snapshot_file_allowed("tokenizer.model", &patterns));
+        assert!(!model_snapshot_file_allowed("pytorch_model.bin", &patterns));
+        assert!(!model_snapshot_file_allowed("../escape.json", &patterns));
+    }
+
+    #[test]
+    fn huggingface_plain_http_fallback_handles_mirror_content_range_gap() {
+        assert!(huggingface_download_should_fallback_to_plain_http(
+            "Header Content-Range is missing"
+        ));
+        assert!(!huggingface_download_should_fallback_to_plain_http(
+            "HTTP status client error"
+        ));
+    }
+
+    #[test]
+    fn huggingface_resolve_url_uses_endpoint_repo_revision_and_file_path() {
+        let url = huggingface_resolve_url(
+            "https://hf-mirror.com/",
+            "Qwen/Qwen3.5-4B",
+            "main",
+            "nested/config.json",
+        )
+        .expect("resolve url");
+
+        assert_eq!(
+            url.as_str(),
+            "https://hf-mirror.com/Qwen/Qwen3.5-4B/resolve/main/nested/config.json"
+        );
+    }
+
+    #[test]
+    fn default_model_download_target_path_is_snapshot_directory() {
+        let target = default_model_download_target_path("Qwen/Qwen3.5-4B");
+
+        assert!(target.ends_with("qwen-qwen3.5-4b"));
+        assert!(!target.ends_with("model.bin"));
     }
 
     #[test]
@@ -10165,6 +11717,104 @@ mod tests {
     }
 
     #[test]
+    fn rag_readiness_image_capability_is_not_ready_without_vlm_content_index() {
+        let source_root = unique_store_path("harborbeacon-rag-source-image-content");
+        let index_root = unique_store_path("harborbeacon-rag-index-image-content");
+        fs::create_dir_all(&source_root).expect("create rag source root");
+        fs::create_dir_all(&index_root).expect("create rag index root");
+        fs::write(
+            index_root.join("root-a.json"),
+            serde_json::to_string(&json!({
+                "schema_version": 1,
+                "root": source_root.to_string_lossy(),
+                "root_signature": {
+                    "modified_unix_millis": 0,
+                    "size_bytes": 0
+                },
+                "generated_at": "200",
+                "directories": [],
+                "entries": [{
+                    "modality": "image",
+                    "path": source_root.join("spring.jpg").to_string_lossy(),
+                    "title": "spring.jpg",
+                    "searchable_text": "user sidecar only",
+                    "text_sources": [{
+                        "source_kind": "sidecar",
+                        "text": "user sidecar only"
+                    }],
+                    "file_signature": {
+                        "modified_unix_millis": 0,
+                        "size_bytes": 9
+                    }
+                }]
+            }))
+            .expect("serialize manifest"),
+        )
+        .expect("write manifest");
+        let settings = KnowledgeSettings {
+            source_roots: vec![KnowledgeSourceRoot {
+                root_id: "test-root".to_string(),
+                label: "Test root".to_string(),
+                path: source_root.to_string_lossy().into_owned(),
+                enabled: true,
+                include: Vec::new(),
+                exclude: Vec::new(),
+                last_indexed_at: None,
+            }],
+            index_root: index_root.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let endpoint = |model_kind: ModelKind, model_endpoint_id: &str, model_name: &str| {
+            ModelEndpoint {
+                model_endpoint_id: model_endpoint_id.to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "openai_compatible".to_string(),
+                model_name: model_name.to_string(),
+                capability_tags: Vec::new(),
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({}),
+            }
+        };
+        let response = build_rag_readiness_response(
+            &LocalModelRuntimeProjection {
+                ready: true,
+                backend_ready: true,
+                embedding_model: Some("jina".to_string()),
+                ..Default::default()
+            },
+            &settings,
+            &[
+                endpoint(ModelKind::Embedder, "embedder-local", "jina"),
+                endpoint(ModelKind::Vlm, "vlm-local", "cpu-vlm"),
+                endpoint(ModelKind::Ocr, "ocr-local", "tesseract"),
+            ],
+            &[],
+        );
+
+        let image_rag = response
+            .capability_profiles
+            .iter()
+            .find(|profile| profile.capability_id == "image_rag")
+            .expect("image rag profile");
+        assert_eq!(image_rag.status, "degraded");
+        assert!(image_rag
+            .evidence
+            .iter()
+            .any(|entry| entry == "vlm_indexed_image_count=0"));
+        assert!(response
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Image RAG is degraded")));
+
+        let _ = fs::remove_dir_all(source_root);
+        let _ = fs::remove_dir_all(index_root);
+    }
+
+    #[test]
     fn knowledge_index_status_counts_manifest_cache_and_storage() {
         let index_root = unique_store_path("harborbeacon-knowledge-index-status");
         fs::create_dir_all(&index_root).expect("create index root");
@@ -10179,7 +11829,39 @@ mod tests {
                 },
                 "generated_at": "200",
                 "directories": [],
-                "entries": []
+                "entries": [{
+                    "modality": "document",
+                    "path": "/tmp/root-a/doc.md",
+                    "title": "doc.md",
+                    "searchable_text": "hello",
+                    "file_signature": {
+                        "modified_unix_millis": 0,
+                        "size_bytes": 5
+                    }
+                }, {
+                    "modality": "image",
+                    "path": "/tmp/root-a/spring.jpg",
+                    "title": "spring.jpg",
+                    "searchable_text": "春天的公园",
+                    "text_sources": [{
+                        "source_kind": "vlm",
+                        "provider_key": "mock-vlm",
+                        "text": "春天的公园"
+                    }],
+                    "file_signature": {
+                        "modified_unix_millis": 0,
+                        "size_bytes": 9
+                    }
+                }, {
+                    "modality": "image",
+                    "path": "/tmp/root-a/no-content.jpg",
+                    "title": "no-content.jpg",
+                    "searchable_text": "",
+                    "file_signature": {
+                        "modified_unix_millis": 0,
+                        "size_bytes": 9
+                    }
+                }]
             }))
             .expect("serialize manifest"),
         )
@@ -10206,6 +11888,14 @@ mod tests {
         });
 
         assert_eq!(response.manifest_count, 1);
+        assert_eq!(response.manifest_entry_count, 3);
+        assert_eq!(response.document_count, 1);
+        assert_eq!(response.image_count, 2);
+        assert_eq!(response.content_indexed_image_count, 1);
+        assert_eq!(response.vlm_indexed_image_count, 1);
+        assert_eq!(response.ocr_indexed_image_count, 0);
+        assert_eq!(response.image_content_missing_count, 1);
+        assert_eq!(response.image_text_source_counts.get("vlm"), Some(&1));
         assert_eq!(response.embedding_cache_count, 1);
         assert_eq!(response.embedding_entry_count, 1);
         assert!(response.storage_usage_bytes > 0);
@@ -10286,7 +11976,9 @@ mod tests {
             .read_dir()
             .expect("list index root")
             .flatten()
-            .any(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("json")));
+            .any(
+                |entry| entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+            ));
 
         let _ = fs::remove_file(admin_path);
         let _ = fs::remove_file(registry_path);

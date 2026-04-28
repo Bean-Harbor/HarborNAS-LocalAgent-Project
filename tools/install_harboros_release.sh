@@ -228,6 +228,13 @@ EXISTING_MODEL_API_REQUEST_TIMEOUT_MS="${HARBOR_MODEL_API_REQUEST_TIMEOUT_MS:-}"
 EXISTING_MODEL_API_CANDLE_CHAT_MODEL_ID="${HARBOR_MODEL_API_CANDLE_CHAT_MODEL_ID:-${HARBOR_MODEL_API_CANDLE_MODEL_ID:-}}"
 EXISTING_MODEL_API_CANDLE_EMBEDDING_MODEL_ID="${HARBOR_MODEL_API_CANDLE_EMBEDDING_MODEL_ID:-}"
 EXISTING_MODEL_API_CANDLE_CACHE_DIR="${HARBOR_MODEL_API_CANDLE_CACHE_DIR:-}"
+EXISTING_MODEL_CACHE_DIR="${HARBOR_MODEL_CACHE_DIR:-${HARBOR_MODEL_DIR:-${HARBOR_MODEL_STORE_DIR:-}}}"
+EXISTING_HF_ENDPOINT="${HF_ENDPOINT:-}"
+EXISTING_HF_TOKEN="${HF_TOKEN:-}"
+EXISTING_HUGGING_FACE_HUB_TOKEN="${HUGGING_FACE_HUB_TOKEN:-}"
+EXISTING_HTTP_PROXY="${HTTP_PROXY:-}"
+EXISTING_HTTPS_PROXY="${HTTPS_PROXY:-}"
+EXISTING_NO_PROXY="${NO_PROXY:-}"
 
 if [[ "${INSTALL_ROOT_SET}" -ne 1 && -n "${EXISTING_RELEASE_INSTALL_ROOT}" ]]; then
   INSTALL_ROOT="${EXISTING_RELEASE_INSTALL_ROOT}"
@@ -239,6 +246,14 @@ if [[ "${WRITABLE_ROOT_SET}" -ne 1 ]]; then
   else
     WRITABLE_ROOT="$(default_writable_root)"
   fi
+fi
+
+if [[ -n "${EXISTING_MODEL_CACHE_DIR}" ]]; then
+  MODEL_CACHE_DIR="${EXISTING_MODEL_CACHE_DIR}"
+elif [[ -d "/mnt/software" || "${WRITABLE_ROOT}" == /mnt/software/* ]]; then
+  MODEL_CACHE_DIR="/mnt/software/harborbeacon-models"
+else
+  MODEL_CACHE_DIR="${WRITABLE_ROOT}/models"
 fi
 
 FFMPEG_BIN="$(resolve_ffmpeg_bin \
@@ -268,6 +283,7 @@ mkdir -p \
   "${RUNTIME_DIR}" \
   "${CAPTURES_DIR}" \
   "${LOGS_DIR}" \
+  "${MODEL_CACHE_DIR}" \
   "${WRITABLE_ROOT}" \
   "$(dirname "${ENV_FILE}")" \
   "$(dirname "${STATUS_HELPER_LINK}")"
@@ -281,6 +297,7 @@ ln -sfn "${CURRENT_LINK}/templates/bin/harbor-agent-hub-helper" "${STATUS_HELPER
 
 mkdir -p "${RUNTIME_DIR}/harborgate" "${RUNTIME_DIR}/models"
 chown -R "${SERVICE_USER}:${SERVICE_USER}" "${RUNTIME_DIR}" "${CAPTURES_DIR}" "${LOGS_DIR}" "${WRITABLE_ROOT}"
+chown "${SERVICE_USER}:${SERVICE_USER}" "${MODEL_CACHE_DIR}"
 
 export TEMPLATE_INSTALL_ROOT="${INSTALL_ROOT}"
 export TEMPLATE_WRITABLE_ROOT="${WRITABLE_ROOT}"
@@ -329,6 +346,7 @@ HARBORDESK_DIST=${CURRENT_LINK}/harbordesk/dist/harbordesk
 HARBOR_HARBOROS_USER=${HARBOROS_PRINCIPAL}
 HARBOR_HARBOROS_WRITABLE_ROOT=${WRITABLE_ROOT}
 HARBOR_KNOWLEDGE_INDEX_ROOT=${EXISTING_KNOWLEDGE_INDEX_ROOT:-${WRITABLE_ROOT}/knowledge-index}
+HARBOR_MODEL_CACHE_DIR=${MODEL_CACHE_DIR}
 
 HARBOR_MODEL_API_BIND=127.0.0.1:4176
 HARBOR_MODEL_API_BASE_URL=http://127.0.0.1:4176/v1
@@ -376,6 +394,12 @@ append_optional_env "HARBOR_FFMPEG_BIN" "${FFMPEG_BIN}"
 append_optional_env "HARBOR_MODEL_API_CANDLE_CHAT_MODEL_ID" "${EXISTING_MODEL_API_CANDLE_CHAT_MODEL_ID}"
 append_optional_env "HARBOR_MODEL_API_CANDLE_EMBEDDING_MODEL_ID" "${EXISTING_MODEL_API_CANDLE_EMBEDDING_MODEL_ID}"
 append_optional_env "HARBOR_MODEL_API_CANDLE_CACHE_DIR" "${EXISTING_MODEL_API_CANDLE_CACHE_DIR}"
+append_optional_env "HF_ENDPOINT" "${EXISTING_HF_ENDPOINT}"
+append_optional_env "HF_TOKEN" "${EXISTING_HF_TOKEN}"
+append_optional_env "HUGGING_FACE_HUB_TOKEN" "${EXISTING_HUGGING_FACE_HUB_TOKEN}"
+append_optional_env "HTTP_PROXY" "${EXISTING_HTTP_PROXY}"
+append_optional_env "HTTPS_PROXY" "${EXISTING_HTTPS_PROXY}"
+append_optional_env "NO_PROXY" "${EXISTING_NO_PROXY}"
 
 chmod 0644 \
   "${ENV_FILE}" \
@@ -396,18 +420,20 @@ else
   CORE_SERVICE_STATUS="enabled, start skipped"
 fi
 
-if [[ -n "${EXISTING_WEIXIN_ACCOUNT_ID}" ]]; then
-  systemctl enable "${OPTIONAL_WEIXIN_SERVICE}"
-  if [[ "${SKIP_START}" -ne 1 ]]; then
-    systemctl restart "${OPTIONAL_WEIXIN_SERVICE}"
+systemctl enable "${OPTIONAL_WEIXIN_SERVICE}"
+if [[ "${SKIP_START}" -ne 1 ]]; then
+  systemctl restart "${OPTIONAL_WEIXIN_SERVICE}"
+  if [[ -n "${EXISTING_WEIXIN_ACCOUNT_ID}" ]]; then
     WEIXIN_RUNNER_STATUS="configured, enabled and restarted"
   else
-    WEIXIN_RUNNER_STATUS="configured, enabled, start skipped"
+    WEIXIN_RUNNER_STATUS="waiting for QR login credentials, enabled and restarted"
   fi
 else
-  systemctl disable "${OPTIONAL_WEIXIN_SERVICE}" >/dev/null 2>&1 || true
-  systemctl stop "${OPTIONAL_WEIXIN_SERVICE}" >/dev/null 2>&1 || true
-  WEIXIN_RUNNER_STATUS="not configured, skipped (unit installed, service disabled/stopped)"
+  if [[ -n "${EXISTING_WEIXIN_ACCOUNT_ID}" ]]; then
+    WEIXIN_RUNNER_STATUS="configured, enabled, start skipped"
+  else
+    WEIXIN_RUNNER_STATUS="waiting for QR login credentials, enabled, start skipped"
+  fi
 fi
 
 echo
@@ -415,6 +441,7 @@ echo "HarborOS release installed."
 echo "Version      : ${VERSION}"
 echo "Install root : ${INSTALL_ROOT}"
 echo "Writable root: ${WRITABLE_ROOT}"
+echo "Model cache  : ${MODEL_CACHE_DIR}"
 echo "Current link : ${CURRENT_LINK}"
 echo "Env file     : ${ENV_FILE}"
 echo "Service user : ${SERVICE_USER}"
