@@ -92,8 +92,7 @@ def test_harboros_installer_manages_release_layout_and_services() -> None:
         "harborgate-weixin-runner.service",
         "systemctl daemon-reload",
         "systemctl enable",
-        "systemctl disable",
-        "systemctl stop",
+        "systemctl restart",
         '${INSTALL_ROOT}/bin/harbor-agent-hub-helper',
         "ln -sfn",
         "HARBOR_HARBOROS_USER",
@@ -102,7 +101,7 @@ def test_harboros_installer_manages_release_layout_and_services() -> None:
         "HARBORBEACON_ADMIN_API_URL=http://127.0.0.1:4174",
         "HARBORBEACON_ADMIN_API_TOKEN",
         "IM_AGENT_CONTRACT_VERSION=2.0",
-        "not configured, skipped",
+        "waiting for QR login credentials",
         "append_optional_env",
     ]
     assert all(phrase in content for phrase in required_phrases)

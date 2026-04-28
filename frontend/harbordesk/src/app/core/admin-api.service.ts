@@ -1810,7 +1810,7 @@ export class HarborDeskAdminApiService {
         ...this.baseModel('models-policies'),
         eyebrow: 'Model center and retrieval operations',
         summary: 'Runtime alignment, multimodal readiness, knowledge roots, endpoint state, and route-policy control now share the same HarborDesk page.',
-        endpoint: 'GET /api/models/endpoints + /api/models/policies + /api/models/local-catalog + /api/models/local-downloads + /api/knowledge/settings + /api/rag/readiness',
+        endpoint: 'GET /api/models/endpoints + /api/models/policies + /api/feature-availability + /api/models/local-catalog + /api/models/local-downloads + /api/knowledge/settings + /api/rag/readiness',
         setupFlow: this.setupFlow(
           'Knowledge & multimodal setup flow',
           'The setup flow exposes OCR, VLM, embedding, source roots, and local index storage using persisted HarborDesk settings.',
