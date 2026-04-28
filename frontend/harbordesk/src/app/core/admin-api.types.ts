@@ -163,6 +163,7 @@ export interface RagReadinessResponse {
   embedding_model?: RagReadinessComponent;
   model_readiness?: RagModelReadinessCard[];
   resource_profiles?: RagResourceProfileStatus[];
+  capability_profiles?: RagCapabilityReadinessCard[];
   privacy_policy?: RagReadinessComponent;
   media_parser?: RagReadinessComponent;
   storage_writable?: RagReadinessComponent;
@@ -201,6 +202,16 @@ export interface RagResourceProfileStatus {
   detail: string;
   blockers: string[];
   warnings: string[];
+}
+
+export interface RagCapabilityReadinessCard {
+  capability_id: string;
+  label: string;
+  status: ReleaseReadinessStatus | string;
+  summary: string;
+  blockers: string[];
+  warnings: string[];
+  evidence: string[];
 }
 
 export interface HardwareReadinessDevice {
@@ -264,19 +275,36 @@ export interface HarborOsImCapabilityMapResponse {
 export interface LocalModelCatalogItem {
   model_id: string;
   label?: string;
+  display_name?: string;
   provider?: string;
+  provider_key?: string;
   model_kind?: string;
-  status: ReleaseReadinessStatus;
+  recommended_hardware?: string;
+  status: ReleaseReadinessStatus | string;
   size_bytes?: number | null;
   installed?: boolean;
+  local_path?: string | null;
   download_job_id?: string | null;
+  download_size_hint?: string;
   detail?: string;
+  source_kind?: string;
+  repo_id?: string | null;
+  revision?: string | null;
+  file_policy?: string;
+  runtime_profiles?: string[];
+  expected_capabilities?: string[];
+  acceptance_note?: string | null;
+  evidence?: string[];
 }
 
 export interface LocalModelCatalogResponse {
   status?: ReleaseReadinessStatus;
+  generated_at?: string | null;
   checked_at?: string;
+  cache_roots?: string[];
   models: LocalModelCatalogItem[];
+  download_jobs?: LocalModelDownloadStatusResponse[];
+  downloads?: LocalModelDownloadStatusResponse[];
   blockers?: string[];
   warnings?: string[];
 }
@@ -284,22 +312,42 @@ export interface LocalModelCatalogResponse {
 export interface LocalModelDownloadStatusResponse {
   job_id: string;
   model_id?: string;
-  status: ReleaseReadinessStatus | 'queued' | 'downloading' | 'completed' | 'failed';
+  display_name?: string;
+  provider_key?: string;
+  status: ReleaseReadinessStatus | 'queued' | 'running' | 'downloading' | 'completed' | 'failed' | 'canceled' | 'cancelled' | string;
+  requested_at?: string;
+  target_path?: string | null;
   progress_percent?: number | null;
   bytes_downloaded?: number | null;
   total_bytes?: number | null;
   error_message?: string | null;
   started_at?: string;
   updated_at?: string;
+  completed_at?: string | null;
+  message?: string;
+  metadata?: Record<string, unknown>;
 }
 
 export interface LocalModelDownloadsResponse {
   status?: ReleaseReadinessStatus;
   generated_at?: string | null;
   checked_at?: string | null;
+  jobs?: LocalModelDownloadStatusResponse[];
   downloads: LocalModelDownloadStatusResponse[];
   blockers?: string[];
   warnings?: string[];
+}
+
+export interface StartLocalModelDownloadRequest {
+  model_id: string;
+  display_name?: string;
+  provider_key?: string;
+  target_path?: string | null;
+  metadata?: Record<string, unknown>;
+}
+
+export interface LocalModelDownloadJobResponse extends LocalModelDownloadStatusResponse {
+  job?: LocalModelDownloadStatusResponse;
 }
 
 export interface ReleaseReadinessEndpointStatus {
@@ -630,6 +678,15 @@ export interface KnowledgeIndexStatusResponse {
   index_root_writable: boolean;
   manifest_count: number;
   manifest_entry_count: number;
+  document_count?: number;
+  image_count?: number;
+  audio_count?: number;
+  video_count?: number;
+  content_indexed_image_count?: number;
+  vlm_indexed_image_count?: number;
+  ocr_indexed_image_count?: number;
+  image_content_missing_count?: number;
+  image_text_source_counts?: Record<string, number>;
   embedding_cache_count: number;
   embedding_entry_count: number;
   storage_usage_bytes: number;
@@ -910,6 +967,8 @@ export interface DeskPageModel {
   knowledgeSettings?: KnowledgeSettings;
   knowledgeIndexStatus?: KnowledgeIndexStatusResponse;
   knowledgeIndexJobs?: KnowledgeIndexJobRecord[];
+  localModelCatalog?: LocalModelCatalogResponse;
+  localModelDownloads?: LocalModelDownloadStatusResponse[];
   ragReadiness?: RagReadinessResponse;
   featureGroups?: FeatureAvailabilityGroup[];
   runtimeAlignment?: RuntimeAlignmentSummary;

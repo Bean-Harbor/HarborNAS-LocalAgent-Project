@@ -210,6 +210,13 @@
   font-size: 0.86rem;
 }
 
+.compact-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
 .readiness-status-grid,
 .readiness-split-grid,
 .endpoint-state-grid,

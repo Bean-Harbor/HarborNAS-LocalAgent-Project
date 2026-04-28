@@ -11,10 +11,12 @@ import {
   FilesBrowseResponse,
   KnowledgeIndexRunResponse,
   KnowledgeSettings,
+  LocalModelCatalogItem,
   ManualDevicePayload,
   ModelEndpointTestResult,
   RtspCheckPayload,
-  RtspCheckResult
+  RtspCheckResult,
+  StartLocalModelDownloadRequest
 } from '../core/admin-api.types';
 import { HarborDeskAdminApiService } from '../core/admin-api.service';
 import { HarborDeskPageId } from '../core/page-registry';
@@ -40,6 +42,7 @@ import { PageStatePanelComponent } from '../shared/page-state-panel.component';
       [releaseReadinessBusy]="releaseReadinessBusy"
       [knowledgeIndexBusy]="knowledgeIndexBusy"
       [knowledgeIndexJobBusyId]="knowledgeIndexJobBusyId"
+      [modelDownloadBusyId]="modelDownloadBusyId"
       [filesBrowse]="filesBrowse"
       (defaultDeliverySurfaceChange)="updateDefaultDeliverySurface($event.userId, $event.surface)"
       (notificationTargetDefaultChange)="setDefaultNotificationTarget($event)"
@@ -58,6 +61,8 @@ import { PageStatePanelComponent } from '../shared/page-state-panel.component';
       (knowledgeSettingsSave)="saveKnowledgeSettings($event)"
       (knowledgeIndexRunRequested)="runKnowledgeIndex()"
       (knowledgeIndexJobCancelRequested)="cancelKnowledgeIndexJob($event)"
+      (localModelDownloadRequested)="startLocalModelDownload($event)"
+      (localModelDownloadCancelRequested)="cancelLocalModelDownload($event)"
       (filesBrowseRequested)="browseFiles($event)"
     ></hd-page-state-panel>
   `
@@ -80,6 +85,7 @@ export class DeskPageComponent {
   protected releaseReadinessBusy = false;
   protected knowledgeIndexBusy = false;
   protected knowledgeIndexJobBusyId: string | null = null;
+  protected modelDownloadBusyId: string | null = null;
   protected filesBrowse: FilesBrowseResponse | null = null;
 
   protected readonly state$ = combineLatest([this.route.data, this.refresh$]).pipe(
@@ -383,6 +389,69 @@ export class DeskPageComponent {
       .subscribe({
         error: (error: unknown) => {
           this.saveError = this.errorMessage(error, this.text('Failed to cancel knowledge index job.', '取消知识库索引任务失败。'));
+          this.saveSuccess = null;
+        }
+      });
+  }
+
+  protected startLocalModelDownload(model: LocalModelCatalogItem): void {
+    const modelId = model.model_id;
+    const payload: StartLocalModelDownloadRequest = {
+      model_id: modelId,
+      display_name: model.display_name ?? model.label ?? modelId,
+      provider_key: model.provider_key ?? model.provider ?? 'local',
+      target_path: null,
+      metadata: {
+        source_kind: model.source_kind ?? 'huggingface',
+        repo_id: model.repo_id ?? model.model_id,
+        revision: model.revision ?? 'main',
+        file_policy: model.file_policy ?? 'runtime_snapshot'
+      }
+    };
+    this.modelDownloadBusyId = modelId;
+    this.saveError = null;
+    this.saveSuccess = null;
+    this.api
+      .startLocalModelDownload(payload)
+      .pipe(
+        tap((result) => {
+          const jobId = result.job?.job_id ?? result.job_id;
+          this.saveSuccess = this.text(
+            `Model download queued: ${jobId}.`,
+            `模型下载任务已提交：${jobId}。`
+          );
+          this.refresh$.next(Date.now());
+        }),
+        finalize(() => {
+          this.modelDownloadBusyId = null;
+        })
+      )
+      .subscribe({
+        error: (error: unknown) => {
+          this.saveError = this.errorMessage(error, this.text('Model download request failed.', '模型下载请求失败。'));
+          this.saveSuccess = null;
+        }
+      });
+  }
+
+  protected cancelLocalModelDownload(jobId: string): void {
+    this.modelDownloadBusyId = jobId;
+    this.saveError = null;
+    this.saveSuccess = null;
+    this.api
+      .cancelLocalModelDownload(jobId)
+      .pipe(
+        tap(() => {
+          this.saveSuccess = this.text('Model download cancel requested.', '模型下载取消请求已提交。');
+          this.refresh$.next(Date.now());
+        }),
+        finalize(() => {
+          this.modelDownloadBusyId = null;
+        })
+      )
+      .subscribe({
+        error: (error: unknown) => {
+          this.saveError = this.errorMessage(error, this.text('Failed to cancel model download.', '取消模型下载失败。'));
           this.saveSuccess = null;
         }
       });
