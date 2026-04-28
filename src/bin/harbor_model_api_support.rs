@@ -16,7 +16,7 @@ use candle_transformers::models::jina_bert::{
     BertModel as JinaBertModel, Config as JinaBertConfig,
 };
 use candle_transformers::models::qwen3::{Config as QwenConfig, ModelForCausalLM as QwenModel};
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
@@ -1757,7 +1757,9 @@ fn resolve_local_model_assets(model_path: &PathBuf) -> AnyResult<ResolvedModelAs
 }
 
 fn resolve_hf_model_assets(model_id: &str) -> AnyResult<ResolvedModelAssets> {
-    let api = Api::new().context("failed to initialize Hugging Face hub client")?;
+    let api = ApiBuilder::from_env()
+        .build()
+        .context("failed to initialize Hugging Face hub client")?;
     let repo = api.repo(Repo::with_revision(
         model_id.to_string(),
         RepoType::Model,

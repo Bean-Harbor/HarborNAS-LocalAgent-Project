@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use harborbeacon_local_agent::runtime::admin_console::AdminConsoleStore;
+use harborbeacon_local_agent::runtime::model_center::ADMIN_STATE_PATH_ENV;
 use harborbeacon_local_agent::runtime::registry::DeviceRegistryStore;
 use harborbeacon_local_agent::runtime::task_api::{
     TaskApiService, TaskTurnEnvelope, TaskTurnRequestAcceptance,
@@ -231,6 +232,7 @@ fn main() {
     let service_token = resolve_service_token(cli.service_token);
     let device_registry_path = resolve_state_path(&cli.device_registry);
     let admin_state_path = resolve_state_path(&cli.admin_state);
+    std::env::set_var(ADMIN_STATE_PATH_ENV, &admin_state_path);
     let conversation_path = resolve_state_path(&cli.conversations);
 
     let registry_store = DeviceRegistryStore::new(device_registry_path);

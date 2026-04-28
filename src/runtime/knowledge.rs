@@ -80,6 +80,12 @@ pub struct KnowledgeSearchHit {
     pub provenance: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_path: Option<String>,
+    #[serde(default)]
+    pub content_source_kinds: Vec<String>,
+    #[serde(default)]
+    pub content_indexed: bool,
+    #[serde(default)]
+    pub filename_match_used: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -194,6 +200,7 @@ pub struct KnowledgeSearchService;
 struct SearchCandidate {
     hit: KnowledgeSearchHit,
     embedding_text: String,
+    semantic_only: bool,
 }
 
 impl KnowledgeSearchService {
@@ -350,6 +357,11 @@ impl KnowledgeSearchService {
                                 &mut embedding_store,
                                 &mut embedding_store_dirty,
                             );
+                            if candidate.semantic_only
+                                && candidate.hit.embedding_score.unwrap_or_default() <= 0.05
+                            {
+                                continue;
+                            }
                             let hit = candidate.hit;
                             let dedupe_key = (
                                 hit.modality.clone(),
@@ -371,6 +383,11 @@ impl KnowledgeSearchService {
                                 &mut embedding_store,
                                 &mut embedding_store_dirty,
                             );
+                            if candidate.semantic_only
+                                && candidate.hit.embedding_score.unwrap_or_default() <= 0.05
+                            {
+                                continue;
+                            }
                             let hit = candidate.hit;
                             let dedupe_key = (
                                 hit.modality.clone(),
@@ -727,18 +744,22 @@ fn build_hit_candidate(
     let path_lower = display_path.to_lowercase();
     let title_lower = title.to_lowercase();
     let searchable_lower = searchable_text.map(str::to_lowercase);
+    let allow_name_match = modality != KnowledgeModality::Image;
 
     let mut score = 0;
+    let mut filename_match_used = false;
     let mut matched_terms = Vec::new();
     for term in query_terms {
         let normalized = term.to_lowercase();
         let mut matched = false;
-        if title_lower.contains(&normalized) {
+        if allow_name_match && title_lower.contains(&normalized) {
             score += 32;
             matched = true;
-        } else if path_lower.contains(&normalized) {
+            filename_match_used = true;
+        } else if allow_name_match && path_lower.contains(&normalized) {
             score += 18;
             matched = true;
+            filename_match_used = true;
         }
         if let Some(text) = searchable_lower.as_ref() {
             if text.contains(&normalized) {
@@ -758,7 +779,19 @@ fn build_hit_candidate(
     matched_terms.sort();
     matched_terms.dedup();
 
-    if score == 0 {
+    let content_source_kinds = content_source_kinds_for_chunk(chunk);
+    let content_indexed = match modality {
+        KnowledgeModality::Image => content_source_kinds
+            .iter()
+            .any(|kind| matches!(kind.as_str(), "vlm" | "ocr")),
+        _ => searchable_text.is_some_and(|text| !text.trim().is_empty()),
+    };
+    let semantic_only = score == 0
+        && modality == KnowledgeModality::Image
+        && content_indexed
+        && searchable_text.is_some_and(|text| !text.trim().is_empty());
+
+    if score == 0 && !semantic_only {
         return None;
     }
 
@@ -766,6 +799,7 @@ fn build_hit_candidate(
 
     Some(SearchCandidate {
         embedding_text: searchable_text.unwrap_or_default().to_string(),
+        semantic_only,
         hit: KnowledgeSearchHit {
             modality: modality.as_str().to_string(),
             path: display_path,
@@ -783,8 +817,23 @@ fn build_hit_candidate(
                 .map(|item| item.source_kind.clone())
                 .filter(|value| !value.trim().is_empty()),
             source_path: chunk.and_then(|item| item.source_path.clone()),
+            content_source_kinds,
+            content_indexed,
+            filename_match_used,
         },
     })
+}
+
+fn content_source_kinds_for_chunk(chunk: Option<&KnowledgeIndexChunk>) -> Vec<String> {
+    let Some(chunk) = chunk else {
+        return Vec::new();
+    };
+    let source_kind = chunk.source_kind.trim().to_ascii_lowercase();
+    if source_kind.is_empty() {
+        Vec::new()
+    } else {
+        vec![source_kind]
+    }
 }
 
 fn apply_hybrid_scores(
@@ -1625,6 +1674,212 @@ mod tests {
             .iter()
             .any(|item| item == "vlm"));
         assert!(!response.pending_modalities.iter().any(|item| item == "vlm"));
+
+        cleanup_dir(&root);
+        cleanup_dir(&index_root);
+        cleanup_dir(
+            admin_state_path
+                .parent()
+                .expect("admin state path parent directory"),
+        );
+    }
+
+    #[test]
+    fn image_search_does_not_match_filename_or_path() {
+        let _guard = INDEX_TEST_LOCK.lock().expect("lock");
+        let root = unique_dir("harborbeacon-knowledge-image-name-exclusion");
+        let index_root = unique_dir("harborbeacon-knowledge-index-store");
+        let admin_state_path =
+            unique_dir("harborbeacon-admin-model-center-name-exclusion").join("state.json");
+        fs::create_dir_all(root.join("images").join("spring-folder")).expect("create images");
+        fs::create_dir_all(&index_root).expect("create index root");
+        fs::create_dir_all(
+            admin_state_path
+                .parent()
+                .expect("admin state path parent directory"),
+        )
+        .expect("create admin state dir");
+        fs::write(
+            root.join("images")
+                .join("spring-folder")
+                .join("spring-photo.jpg"),
+            b"fake-image",
+        )
+        .expect("write image");
+        write_mock_model_center_state(&admin_state_path, "", Some("室内桌面上有一个黑色水杯"));
+
+        std::env::set_var("HARBOR_ADMIN_STATE_PATH", &admin_state_path);
+        build_search_index(&root, &index_root);
+        let response = KnowledgeSearchService::search(KnowledgeSearchRequest {
+            query: "spring".to_string(),
+            configured_roots: vec![root.to_string_lossy().into_owned()],
+            index_root: Some(index_root.to_string_lossy().into_owned()),
+            roots: vec![root.to_string_lossy().into_owned()],
+            include_documents: false,
+            include_images: true,
+            limit: 5,
+            ..KnowledgeSearchRequest::new("")
+        })
+        .expect("image search");
+        std::env::remove_var("HARBOR_ADMIN_STATE_PATH");
+
+        assert_eq!(response.images.len(), 0);
+        assert_eq!(response.total_matches, 0);
+
+        cleanup_dir(&root);
+        cleanup_dir(&index_root);
+        cleanup_dir(
+            admin_state_path
+                .parent()
+                .expect("admin state path parent directory"),
+        );
+    }
+
+    #[test]
+    fn image_search_matches_vlm_content_and_marks_content_provenance() {
+        let _guard = INDEX_TEST_LOCK.lock().expect("lock");
+        let root = unique_dir("harborbeacon-knowledge-image-content-match");
+        let index_root = unique_dir("harborbeacon-knowledge-index-store");
+        let admin_state_path =
+            unique_dir("harborbeacon-admin-model-center-content-match").join("state.json");
+        fs::create_dir_all(root.join("images")).expect("create images");
+        fs::create_dir_all(&index_root).expect("create index root");
+        fs::create_dir_all(
+            admin_state_path
+                .parent()
+                .expect("admin state path parent directory"),
+        )
+        .expect("create admin state dir");
+        fs::write(root.join("images").join("neutral-name.jpg"), b"fake-image")
+            .expect("write image");
+        write_mock_model_center_state(
+            &admin_state_path,
+            "",
+            Some("春天的公园里有绿色草地和盛开的花"),
+        );
+
+        std::env::set_var("HARBOR_ADMIN_STATE_PATH", &admin_state_path);
+        build_search_index(&root, &index_root);
+        let response = KnowledgeSearchService::search(KnowledgeSearchRequest {
+            query: "春天".to_string(),
+            configured_roots: vec![root.to_string_lossy().into_owned()],
+            index_root: Some(index_root.to_string_lossy().into_owned()),
+            roots: vec![root.to_string_lossy().into_owned()],
+            include_documents: false,
+            include_images: true,
+            limit: 5,
+            ..KnowledgeSearchRequest::new("")
+        })
+        .expect("image search");
+        std::env::remove_var("HARBOR_ADMIN_STATE_PATH");
+
+        assert_eq!(response.images.len(), 1);
+        assert_eq!(response.images[0].provenance.as_deref(), Some("vlm"));
+        assert_eq!(response.images[0].content_source_kinds, vec!["vlm"]);
+        assert!(response.images[0].content_indexed);
+        assert!(!response.images[0].filename_match_used);
+
+        cleanup_dir(&root);
+        cleanup_dir(&index_root);
+        cleanup_dir(
+            admin_state_path
+                .parent()
+                .expect("admin state path parent directory"),
+        );
+    }
+
+    #[test]
+    fn image_search_can_use_embedding_for_content_text_without_lexical_match() {
+        let _guard = INDEX_TEST_LOCK.lock().expect("lock");
+        let root = unique_dir("harborbeacon-knowledge-image-semantic-match");
+        let index_root = unique_dir("harborbeacon-knowledge-index-store");
+        let admin_state_path =
+            unique_dir("harborbeacon-admin-model-center-semantic-image").join("state.json");
+        fs::create_dir_all(&root).expect("create root");
+        fs::create_dir_all(&index_root).expect("create index root");
+        fs::create_dir_all(
+            admin_state_path
+                .parent()
+                .expect("admin state path parent directory"),
+        )
+        .expect("create admin state dir");
+        let image_path = root.join("content-photo-real-001.jpg");
+        fs::write(&image_path, b"fake-image").expect("write image");
+        let service = KnowledgeIndexService::from_config(
+            KnowledgeIndexConfig::new(index_root.clone()).expect("config"),
+        )
+        .expect("service");
+        let snapshot = service.load_or_refresh(&root).expect("seed manifest path");
+        fs::write(
+            snapshot.manifest_path,
+            serde_json::to_string_pretty(&json!({
+                "schema_version": 1,
+                "root": root.to_string_lossy(),
+                "root_signature": {
+                    "modified_unix_millis": 0,
+                    "size_bytes": 0
+                },
+                "generated_at": "200",
+                "directories": [],
+                "entries": [{
+                    "modality": "image",
+                    "path": image_path.to_string_lossy(),
+                    "title": "content-photo-real-001.jpg",
+                    "searchable_text": "a large tree with pink flowers",
+                    "chunks": [{
+                        "chunk_id": "chunk-0001",
+                        "line_start": 1,
+                        "line_end": 1,
+                        "text": "a large tree with pink flowers",
+                        "source_kind": "vlm"
+                    }],
+                    "text_sources": [{
+                        "source_kind": "vlm",
+                        "provider_key": "mock-vlm",
+                        "text": "a large tree with pink flowers"
+                    }],
+                    "file_signature": {
+                        "modified_unix_millis": 0,
+                        "size_bytes": 10
+                    }
+                }]
+            }))
+            .expect("serialize manifest"),
+        )
+        .expect("write manifest");
+        write_mock_model_center_state_with_embed(
+            &admin_state_path,
+            json!({
+                "春天": [1.0, 0.0],
+                "a large tree with pink flowers": [0.98, 0.02]
+            }),
+        );
+
+        std::env::set_var("HARBOR_ADMIN_STATE_PATH", &admin_state_path);
+        let response = KnowledgeSearchService::search(KnowledgeSearchRequest {
+            query: "春天".to_string(),
+            configured_roots: vec![root.to_string_lossy().into_owned()],
+            index_root: Some(index_root.to_string_lossy().into_owned()),
+            roots: vec![root.to_string_lossy().into_owned()],
+            include_documents: false,
+            include_images: true,
+            limit: 5,
+            ..KnowledgeSearchRequest::new("")
+        })
+        .expect("image semantic search");
+        std::env::remove_var("HARBOR_ADMIN_STATE_PATH");
+
+        assert_eq!(response.images.len(), 1);
+        assert_eq!(response.images[0].provenance.as_deref(), Some("vlm"));
+        assert_eq!(response.images[0].content_source_kinds, vec!["vlm"]);
+        assert!(response.images[0].content_indexed);
+        assert!(!response.images[0].filename_match_used);
+        assert!(response.images[0].matched_terms.is_empty());
+        assert_eq!(response.images[0].lexical_score, Some(0.0));
+        assert!(
+            response.images[0].embedding_score.unwrap_or_default() > 0.9,
+            "expected semantic image match to be driven by embedding score"
+        );
 
         cleanup_dir(&root);
         cleanup_dir(&index_root);
