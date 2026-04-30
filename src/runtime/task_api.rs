@@ -1755,12 +1755,12 @@ impl TaskApiService {
                 {
                     return response;
                 }
-                let mut routed = request.clone();
-                routed.intent.domain = KNOWLEDGE_DOMAIN.to_string();
-                routed.intent.action = KNOWLEDGE_OP_SEARCH.to_string();
-                if let Some(query) = plan.query {
-                    upsert_json_string(&mut routed.args, "/query", &query);
-                }
+                let routed = self.routed_general_message_knowledge_request(
+                    request,
+                    &plan,
+                    KNOWLEDGE_DOMAIN,
+                    KNOWLEDGE_OP_SEARCH,
+                );
                 self.handle_knowledge_search(&routed)
             }
             GeneralMessagePlanKind::RagAnswer => {
@@ -1769,12 +1769,12 @@ impl TaskApiService {
                 {
                     return response;
                 }
-                let mut routed = request.clone();
-                routed.intent.domain = RAG_DOMAIN.to_string();
-                routed.intent.action = RAG_OP_ANSWER.to_string();
-                if let Some(query) = plan.query {
-                    upsert_json_string(&mut routed.args, "/query", &query);
-                }
+                let routed = self.routed_general_message_knowledge_request(
+                    request,
+                    &plan,
+                    RAG_DOMAIN,
+                    RAG_OP_ANSWER,
+                );
                 self.handle_rag_answer(&routed)
             }
             GeneralMessagePlanKind::Unsupported => {
@@ -2174,15 +2174,126 @@ impl TaskApiService {
             .into_iter()
             .filter(|task_run| task_run.task_id != request.task_id)
             .take(GENERAL_MESSAGE_RECAP_LIMIT)
-            .map(|task_run| {
-                json!({
-                    "intent_text": task_run.intent_text,
-                    "domain": task_run.domain,
-                    "action": task_run.action,
-                    "status": serde_json::to_value(task_run.status).unwrap_or(Value::Null),
-                })
-            })
+            .map(|task_run| self.general_message_recap_entry(&task_run))
             .collect()
+    }
+
+    fn general_message_recap_entry(&self, task_run: &TaskRun) -> Value {
+        let mut entry = json!({
+            "intent_text": task_run.intent_text,
+            "domain": task_run.domain,
+            "action": task_run.action,
+            "status": serde_json::to_value(task_run.status).unwrap_or(Value::Null),
+        });
+
+        if let Some(query) = first_string(
+            &[&task_run.args],
+            &["/query", "/search/query", "/knowledge/query"],
+        ) {
+            insert_string_value_if_object(&mut entry, "query", query);
+        }
+
+        let step_output = task_run
+            .metadata
+            .pointer("/step_id")
+            .and_then(Value::as_str)
+            .and_then(|step_id| {
+                self.conversation_store
+                    .load_task_step(step_id)
+                    .ok()
+                    .flatten()
+            })
+            .map(|step| step.output_payload)
+            .unwrap_or(Value::Null);
+        if let Some(kind) = string_at_paths(&step_output, &["/data/kind", "/data/reply_pack/kind"])
+        {
+            insert_string_value_if_object(&mut entry, "data_kind", kind);
+        }
+        if let Some(query) = first_string(
+            &[&step_output],
+            &[
+                "/data/query",
+                "/data/search/query",
+                "/data/reply_pack/query",
+                "/query",
+            ],
+        ) {
+            insert_string_value_if_object(&mut entry, "query", query);
+        }
+        let video_count =
+            array_len_at_paths(&step_output, &["/data/videos", "/data/search/videos"]).unwrap_or(0);
+        let image_count =
+            array_len_at_paths(&step_output, &["/data/images", "/data/search/images"]).unwrap_or(0);
+        let document_count =
+            array_len_at_paths(&step_output, &["/data/documents", "/data/search/documents"])
+                .unwrap_or(0);
+        if let Some(object) = entry.as_object_mut() {
+            object.insert(
+                "result_counts".to_string(),
+                json!({
+                    "documents": document_count,
+                    "images": image_count,
+                    "videos": video_count,
+                }),
+            );
+        }
+
+        if let Some(top_video_path) = self
+            .conversation_store
+            .artifacts_for_task(&task_run.task_id)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|artifact| artifact.artifact_kind == ArtifactKind::Video)
+            .and_then(|artifact| artifact.path)
+        {
+            insert_string_value_if_object(&mut entry, "top_video_path", top_video_path);
+        }
+
+        entry
+    }
+
+    fn routed_general_message_knowledge_request(
+        &self,
+        request: &TaskRequest,
+        plan: &GeneralMessagePlan,
+        domain: &str,
+        action: &str,
+    ) -> TaskRequest {
+        let mut routed = request.clone();
+        routed.intent.domain = domain.to_string();
+        routed.intent.action = action.to_string();
+
+        let session_recap = self.recent_general_message_session_recap(request);
+        let normalized = normalize_command_text(request.intent.raw_text.as_str());
+        let contextual_follow_up = knowledge_search_contextual_follow_up(&normalized);
+        let recent_query = recent_search_query_from_recap(&session_recap);
+        let query = if contextual_follow_up {
+            recent_query.clone().or_else(|| plan.query.clone())
+        } else {
+            plan.query.clone().or(recent_query)
+        };
+        if let Some(query) = query.filter(|value| !value.trim().is_empty()) {
+            upsert_json_string(&mut routed.args, "/query", &query);
+        }
+
+        if let Some(modalities) = knowledge_follow_up_modalities(&normalized) {
+            upsert_json_value(
+                &mut routed.args,
+                "/modalities",
+                Value::Array(modalities.into_iter().map(Value::String).collect()),
+            );
+        }
+
+        let focus_paths = knowledge_follow_up_focus_paths(&normalized, &session_recap);
+        if !focus_paths.is_empty() {
+            upsert_json_value(
+                &mut routed.args,
+                "/search/focus_paths",
+                Value::Array(focus_paths.into_iter().map(Value::String).collect()),
+            );
+        }
+
+        routed
     }
 
     fn handle_camera_record_clip(&self, request: &TaskRequest) -> TaskResponse {
@@ -2613,7 +2724,7 @@ impl TaskApiService {
                 "缺少可检索的主题，请提供 query 或更明确地说明要找什么内容。".to_string(),
             );
         };
-        let (include_documents, include_images) = knowledge_modalities(request);
+        let (include_documents, include_images, include_videos) = knowledge_modalities(request);
         let knowledge_settings = match self.admin_store.knowledge_settings() {
             Ok(settings) => settings,
             Err(error) => {
@@ -2681,8 +2792,10 @@ impl TaskApiService {
             configured_roots: knowledge_settings.enabled_source_root_paths(),
             index_root: Some(knowledge_settings.index_root.clone()),
             roots: knowledge_search_roots(request),
+            focus_paths: knowledge_focus_paths(request),
             include_documents,
             include_images,
+            include_videos,
             limit: knowledge_result_limit(request),
             privacy_level,
             resource_profile,
@@ -2774,7 +2887,7 @@ impl TaskApiService {
                 "缺少可回答的问题，请提供 query 或更明确地说明要回答什么。".to_string(),
             );
         };
-        let (include_documents, include_images) = knowledge_modalities(request);
+        let (include_documents, include_images, include_videos) = knowledge_modalities(request);
         let knowledge_settings = match self.admin_store.knowledge_settings() {
             Ok(settings) => settings,
             Err(error) => {
@@ -2843,8 +2956,10 @@ impl TaskApiService {
             configured_roots: knowledge_settings.enabled_source_root_paths(),
             index_root: Some(knowledge_settings.index_root.clone()),
             roots: knowledge_search_roots(request),
+            focus_paths: knowledge_focus_paths(request),
             include_documents,
             include_images,
+            include_videos,
             limit: knowledge_result_limit(request),
             privacy_level,
             resource_profile,
@@ -5184,7 +5299,11 @@ fn mime_type_from_path(path: &str) -> Option<String> {
         "jpg" | "jpeg" => Some("image/jpeg".to_string()),
         "png" => Some("image/png".to_string()),
         "webp" => Some("image/webp".to_string()),
-        "mp4" => Some("video/mp4".to_string()),
+        "mp4" | "m4v" => Some("video/mp4".to_string()),
+        "mov" => Some("video/quicktime".to_string()),
+        "mkv" => Some("video/x-matroska".to_string()),
+        "webm" => Some("video/webm".to_string()),
+        "avi" => Some("video/x-msvideo".to_string()),
         _ => None,
     }
 }
@@ -5244,6 +5363,7 @@ fn build_knowledge_search_artifacts(response: &KnowledgeSearchResponse) -> Vec<T
         .documents
         .iter()
         .chain(response.images.iter())
+        .chain(response.videos.iter())
         .take(6)
         .map(|hit| {
             let proxied_video_path = resolved_video_proxy_path(hit);
@@ -5251,6 +5371,8 @@ fn build_knowledge_search_artifacts(response: &KnowledgeSearchResponse) -> Vec<T
             let path = proxied_video_path.unwrap_or_else(|| hit.path.clone());
             TaskArtifact {
                 kind: if is_video_proxy {
+                    "video".to_string()
+                } else if hit.modality.as_str() == "video" {
                     "video".to_string()
                 } else if hit.modality.as_str() == "image" {
                     "image".to_string()
@@ -5261,6 +5383,8 @@ fn build_knowledge_search_artifacts(response: &KnowledgeSearchResponse) -> Vec<T
                 mime_type: mime_type_from_path(&path).unwrap_or_else(|| {
                     if is_video_proxy {
                         "video/mp4".to_string()
+                    } else if hit.modality.as_str() == "video" {
+                        "video/*".to_string()
                     } else if hit.modality.as_str() == "image" {
                         "image/*".to_string()
                     } else {
@@ -5272,10 +5396,16 @@ fn build_knowledge_search_artifacts(response: &KnowledgeSearchResponse) -> Vec<T
                 url: None,
                 metadata: json!({
                     "modality": if is_video_proxy { "video" } else { hit.modality.as_str() },
+                    "display_name": hit.title.clone(),
+                    "content_summary": hit.snippet.clone(),
+                    "match_source": knowledge_hit_match_source(hit),
+                    "segment_locator": video_segment_locator(hit),
+                    "video_level_result": hit.modality.as_str() == "video" && video_segment_locator(hit).is_null(),
                     "score": hit.score,
                     "content_source_kinds": hit.content_source_kinds.clone(),
                     "content_indexed": hit.content_indexed,
                     "filename_match_used": hit.filename_match_used,
+                    "content_match_used": hit.content_match_used,
                     "source_image_path": if is_video_proxy { Some(hit.path.clone()) } else { None::<String> },
                     "citation": {
                         "title": hit.title.clone(),
@@ -5287,10 +5417,14 @@ fn build_knowledge_search_artifacts(response: &KnowledgeSearchResponse) -> Vec<T
                         "matched_terms": hit.matched_terms.clone(),
                         "preview": hit.snippet.clone(),
                         "score": hit.score,
+                        "provenance": hit.provenance.clone(),
+                        "match_source": knowledge_hit_match_source(hit),
+                        "segment_locator": video_segment_locator(hit),
                         "source_path": hit.source_path.clone(),
                         "content_source_kinds": hit.content_source_kinds.clone(),
                         "content_indexed": hit.content_indexed,
                         "filename_match_used": hit.filename_match_used,
+                        "content_match_used": hit.content_match_used,
                     },
                 }),
             }
@@ -5301,6 +5435,9 @@ fn build_knowledge_search_artifacts(response: &KnowledgeSearchResponse) -> Vec<T
 fn resolved_video_proxy_path(
     hit: &crate::runtime::knowledge::KnowledgeSearchHit,
 ) -> Option<String> {
+    if hit.modality.as_str() != "image" {
+        return None;
+    }
     let sidecar_path = hit
         .source_path
         .as_deref()
@@ -5328,6 +5465,183 @@ fn resolved_video_proxy_path(
         .filter(|value| !value.trim().is_empty())
 }
 
+fn knowledge_hit_match_source(hit: &crate::runtime::knowledge::KnowledgeSearchHit) -> String {
+    if hit.content_match_used {
+        return hit
+            .provenance
+            .clone()
+            .or_else(|| hit.content_source_kinds.first().cloned())
+            .unwrap_or_else(|| "content".to_string());
+    }
+    if hit.filename_match_used {
+        return "filename".to_string();
+    }
+    if hit.embedding_score.unwrap_or_default() > 0.0 {
+        return "semantic_embedding".to_string();
+    }
+    "unknown".to_string()
+}
+
+fn video_segment_locator(hit: &crate::runtime::knowledge::KnowledgeSearchHit) -> Value {
+    if hit.modality.as_str() != "video" {
+        return Value::Null;
+    }
+    if let Some(locator) = hit
+        .snippet
+        .as_deref()
+        .and_then(video_keyframe_percent_locator)
+    {
+        return locator;
+    }
+    if hit.provenance.as_deref() == Some("video_sidecar") {
+        if let Some(locator) = hit
+            .source_path
+            .as_deref()
+            .and_then(video_sidecar_segment_locator)
+        {
+            return locator;
+        }
+    }
+    if let Some(locator) = hit.snippet.as_deref().and_then(video_timecode_locator) {
+        return locator;
+    }
+    Value::Null
+}
+
+fn video_keyframe_percent_locator(text: &str) -> Option<Value> {
+    let lower = text.to_lowercase();
+    let percent_index = lower.find('%')?;
+    if !lower[..percent_index].contains("keyframe") {
+        return None;
+    }
+    let digits = lower[..percent_index]
+        .chars()
+        .rev()
+        .skip_while(|ch| ch.is_whitespace())
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    let percent = digits.parse::<u32>().ok().filter(|value| *value <= 100)?;
+    Some(json!({
+        "kind": "keyframe_percent",
+        "percent": percent,
+        "source": "vlm_keyframe",
+    }))
+}
+
+fn video_sidecar_segment_locator(source_path: &str) -> Option<Value> {
+    let path = Path::new(source_path);
+    if path.extension()?.to_str()?.to_ascii_lowercase() != "json" {
+        return None;
+    }
+    let text = fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&text).ok()?;
+    let start = first_json_scalar_string(
+        &value,
+        &[
+            "/start_time",
+            "/start",
+            "/start_at",
+            "/start_seconds",
+            "/start_ms",
+            "/segment/start",
+            "/segments/0/start",
+            "/segments/0/start_time",
+        ],
+    );
+    let end = first_json_scalar_string(
+        &value,
+        &[
+            "/end_time",
+            "/end",
+            "/end_at",
+            "/end_seconds",
+            "/end_ms",
+            "/segment/end",
+            "/segments/0/end",
+            "/segments/0/end_time",
+        ],
+    );
+    let timestamp = first_json_scalar_string(
+        &value,
+        &[
+            "/timestamp",
+            "/timestamp_time",
+            "/timestamp_seconds",
+            "/timestamp_ms",
+            "/timecode",
+            "/segments/0/timestamp",
+            "/segments/0/timecode",
+        ],
+    );
+    if start.is_none() && end.is_none() && timestamp.is_none() {
+        return None;
+    }
+    Some(json!({
+        "kind": if start.is_some() || end.is_some() { "time_range" } else { "timestamp" },
+        "start": start,
+        "end": end,
+        "timestamp": timestamp,
+        "source": "video_sidecar",
+    }))
+}
+
+fn video_timecode_locator(text: &str) -> Option<Value> {
+    text.split_whitespace()
+        .map(|token| {
+            token.trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    ',' | '.'
+                        | ';'
+                        | ':'
+                        | '，'
+                        | '。'
+                        | '；'
+                        | '：'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                )
+            })
+        })
+        .find(|token| looks_like_timecode(token))
+        .map(|timestamp| {
+            json!({
+                "kind": "timestamp",
+                "timestamp": timestamp,
+                "source": "snippet",
+            })
+        })
+}
+
+fn looks_like_timecode(value: &str) -> bool {
+    let parts = value.split(':').collect::<Vec<_>>();
+    matches!(parts.len(), 2 | 3)
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn first_json_scalar_string(value: &Value, paths: &[&str]) -> Option<String> {
+    paths.iter().find_map(|path| {
+        let value = value.pointer(path)?;
+        if let Some(text) = value.as_str() {
+            let text = text.trim();
+            return (!text.is_empty()).then(|| text.to_string());
+        }
+        if let Some(number) = value.as_i64() {
+            return Some(number.to_string());
+        }
+        value.as_f64().map(|number| number.to_string())
+    })
+}
+
 fn format_knowledge_search_message(response: &KnowledgeSearchResponse) -> String {
     response.reply_pack.summary.clone()
 }
@@ -5340,8 +5654,20 @@ fn knowledge_search_next_actions(response: &KnowledgeSearchResponse) -> Vec<Stri
     if !response.images.is_empty() {
         actions.push("只看图片结果".to_string());
     }
+    if !response.videos.is_empty() {
+        actions.push("只看视频结果".to_string());
+        actions.push("只看第一个视频里的结果".to_string());
+        actions.push("找同一段前后".to_string());
+    }
     if actions.is_empty() {
-        actions.push("换个关键词再搜".to_string());
+        match response.empty_reason.as_deref() {
+            Some("no_video_files") => actions.push("检查知识源视频目录".to_string()),
+            Some("video_not_indexed")
+            | Some("video_sidecar_or_vlm_unavailable")
+            | Some("video_content_unavailable") => actions.push("先刷新视频索引".to_string()),
+            Some("video_content_no_match") => actions.push("换个视频关键词再搜".to_string()),
+            _ => actions.push("换个关键词再搜".to_string()),
+        }
     }
     actions
 }
@@ -5541,6 +5867,9 @@ fn rag_answer_next_actions(response: &KnowledgeSearchResponse, degraded: bool) -
     if !response.reply_pack.citations.is_empty() {
         actions.push("查看引用来源".to_string());
         actions.push("只检索不总结".to_string());
+    }
+    if !response.videos.is_empty() {
+        actions.push("只看视频结果".to_string());
     }
     if degraded {
         actions.push("换个关键词再问".to_string());
@@ -5834,6 +6163,12 @@ fn insert_string_value(value: &mut Value, key: &str, item: &str) {
     }
     if let Some(object) = value.as_object_mut() {
         object.insert(key.to_string(), Value::String(item.to_string()));
+    }
+}
+
+fn insert_string_value_if_object(value: &mut Value, key: &str, item: String) {
+    if let Some(object) = value.as_object_mut() {
+        object.insert(key.to_string(), Value::String(item));
     }
 }
 
@@ -6441,6 +6776,17 @@ fn upsert_json_string(target: &mut Value, pointer: &str, value: &str) {
     }
 }
 
+fn upsert_json_value(target: &mut Value, pointer: &str, value: Value) {
+    ensure_json_pointer_parent(target, pointer);
+    if let Some((parent_pointer, leaf)) = split_json_pointer(pointer) {
+        if let Some(parent) = target.pointer_mut(parent_pointer) {
+            if let Some(map) = parent.as_object_mut() {
+                map.insert(leaf.to_string(), value);
+            }
+        }
+    }
+}
+
 fn ensure_json_pointer_parent(target: &mut Value, pointer: &str) {
     if !target.is_object() {
         *target = json!({});
@@ -6834,40 +7180,59 @@ fn extract_general_message_signals(
             .get("domain")
             .and_then(Value::as_str)
             .is_some_and(|value| value.eq_ignore_ascii_case(KNOWLEDGE_DOMAIN))
+            || entry
+                .get("data_kind")
+                .and_then(Value::as_str)
+                .is_some_and(|value| {
+                    matches!(value, "knowledge.search" | "rag.answer")
+                        || value.eq_ignore_ascii_case(KNOWLEDGE_OP_SEARCH)
+                })
+            || entry.get("query").and_then(Value::as_str).is_some()
     });
     let explicit_snapshot = matches_any(
         &normalized,
         &["抓拍", "拍照", "拍一张", "来一张", "快照", "截图", "截一张"],
     );
-    let explicit_clip = matches_any(
-        &normalized,
-        &[
-            "录一段",
-            "录一下",
-            "录个",
-            "录像",
-            "录视频",
-            "拍视频",
-            "短视频",
-        ],
-    );
-    let explicit_search = matches_any(
-        &normalized,
-        &[
-            "找一下",
-            "找到",
-            "查一下",
-            "查找",
-            "搜索",
-            "搜一下",
-            "搜搜",
-            "检索",
-            "找视频",
-            "找照片",
-            "找图片",
-            "搜索已有内容",
-        ],
-    );
+    let explicit_video_search = looks_like_video_search_request(&normalized);
+    let explicit_clip = !explicit_video_search
+        && matches_any(
+            &normalized,
+            &[
+                "录一段",
+                "录一下",
+                "录个",
+                "录像",
+                "录视频",
+                "拍视频",
+                "短视频",
+            ],
+        );
+    let explicit_search = explicit_video_search
+        || matches_any(
+            &normalized,
+            &[
+                "找一下",
+                "找到",
+                "查一下",
+                "查找",
+                "搜索",
+                "搜一下",
+                "搜搜",
+                "检索",
+                "找视频",
+                "找录像",
+                "找片段",
+                "找回放",
+                "查录像",
+                "搜索录像",
+                "找照片",
+                "找图片",
+                "只看视频",
+                "只看视频结果",
+                "排除图片和文档",
+                "搜索已有内容",
+            ],
+        );
     let recent_clip_available = recent_clip.is_some();
     let explicit_clip_playback =
         recent_clip_available && recent_clip_playback_request_from_normalized(&normalized);
@@ -6920,7 +7285,7 @@ fn build_general_message_candidates(
     signals: &GeneralMessageSignals,
     default_camera_hint: Option<&str>,
     pending_loop: Option<&PendingTaskGeneralMessageLoop>,
-    _session_recap: &[Value],
+    session_recap: &[Value],
     recent_clip: Option<&RecentClipPlaybackState>,
 ) -> Vec<GeneralMessageCandidate> {
     let mut candidates = Vec::new();
@@ -6932,8 +7297,15 @@ fn build_general_message_candidates(
                 default_camera_hint,
             )
         });
+    let recent_query = recent_search_query_from_recap(session_recap);
+    let contextual_search_follow_up = knowledge_search_contextual_follow_up(&signals.normalized);
     let query = pending_loop
         .and_then(|pending| pending.query.clone())
+        .or_else(|| {
+            contextual_search_follow_up
+                .then(|| recent_query.clone())
+                .flatten()
+        })
         .or_else(|| infer_query_from_raw_text(request.intent.raw_text.as_str()));
 
     if signals.asks_capability {
@@ -6998,6 +7370,19 @@ fn build_general_message_candidates(
                 query: query.clone(),
                 recent_clip: None,
                 reason: "structured_signal_search".to_string(),
+            },
+        );
+    }
+    if !signals.explicit_search && signals.recent_search_context && contextual_search_follow_up {
+        push_general_message_candidate(
+            &mut candidates,
+            GeneralMessageCandidate {
+                kind: GeneralMessagePlanKind::KnowledgeSearch,
+                confidence: 90,
+                camera_hint: None,
+                query: query.clone(),
+                recent_clip: None,
+                reason: "recent_search_context_filter".to_string(),
             },
         );
     }
@@ -7826,8 +8211,10 @@ fn infer_query_from_raw_text(raw_text: &str) -> Option<String> {
         "找到",
         "找一下",
         "找出",
+        "找",
         "查一下",
         "查找",
+        "查",
         "搜索",
         "搜一下",
         "搜",
@@ -7839,6 +8226,14 @@ fn infer_query_from_raw_text(raw_text: &str) -> Option<String> {
         "有关的",
         "相关的",
         "有关",
+        "只看",
+        "仅看",
+        "只要",
+        "结果",
+        "排除",
+        "不要",
+        "不看",
+        "出现",
         "回答",
         "总结",
         "概括",
@@ -7852,6 +8247,17 @@ fn infer_query_from_raw_text(raw_text: &str) -> Option<String> {
         "文档",
         "图片",
         "照片",
+        "视频里",
+        "录像里",
+        "片段里",
+        "视频",
+        "录像",
+        "回放",
+        "片段",
+        "相邻",
+        "同一段",
+        "第一个",
+        "前后",
         "资料",
         "内容",
         "file",
@@ -7877,6 +8283,7 @@ fn infer_query_from_raw_text(raw_text: &str) -> Option<String> {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+        .trim_matches(|ch| matches!(ch, '的' | '了'))
         .trim()
         .to_string();
 
@@ -8058,10 +8465,12 @@ fn fallback_general_message_plan(
         });
     }
 
-    if matches_any(
-        &normalized,
-        &["录一段", "录视频", "拍视频", "录个视频", "录像"],
-    ) {
+    if !looks_like_video_search_request(&normalized)
+        && matches_any(
+            &normalized,
+            &["录一段", "录视频", "拍视频", "录个视频", "录像"],
+        )
+    {
         return Some(GeneralMessagePlan {
             kind: GeneralMessagePlanKind::CameraRecordClip,
             conversation_act: None,
@@ -8104,6 +8513,11 @@ fn fallback_general_message_plan(
             "检索",
             "找照片",
             "找视频",
+            "找录像",
+            "找片段",
+            "找回放",
+            "只看视频",
+            "排除图片和文档",
         ],
     ) {
         return Some(GeneralMessagePlan {
@@ -8154,6 +8568,102 @@ fn looks_like_rag_answer_request(normalized: &str) -> bool {
     mentions_knowledge_context && asks_for_answer
 }
 
+fn looks_like_video_search_request(normalized: &str) -> bool {
+    let mentions_video = matches_any(
+        normalized,
+        &[
+            "视频", "录像", "回放", "片段", "video", "videos", "clip", "clips",
+        ],
+    );
+    if !mentions_video {
+        return false;
+    }
+    matches_any(
+        normalized,
+        &[
+            "找", "查", "搜", "检索", "搜索", "已有", "保存", "历史", "本地", "只看", "仅看",
+            "筛选", "排除", "不要", "不看",
+        ],
+    )
+}
+
+fn knowledge_search_contextual_follow_up(normalized: &str) -> bool {
+    matches_any(
+        normalized,
+        &[
+            "只看视频",
+            "只看视频结果",
+            "仅看视频",
+            "排除图片和文档",
+            "不要图片和文档",
+            "不看图片和文档",
+            "只看第一个视频",
+            "第一个视频",
+            "同一段",
+            "相邻片段",
+            "前后片段",
+            "前后一段",
+            "再搜一下",
+            "再查一下",
+            "再找找",
+            "搜已有内容",
+        ],
+    )
+}
+
+fn knowledge_follow_up_modalities(normalized: &str) -> Option<Vec<String>> {
+    if knowledge_video_only_request_from_normalized(normalized) {
+        return Some(vec!["video".to_string()]);
+    }
+    None
+}
+
+fn knowledge_video_only_request_from_normalized(normalized: &str) -> bool {
+    matches_any(
+        normalized,
+        &[
+            "只看视频",
+            "只看视频结果",
+            "仅看视频",
+            "只要视频",
+            "排除图片和文档",
+            "排除文档和图片",
+            "不要图片和文档",
+            "不要文档和图片",
+            "不看图片和文档",
+            "不看文档和图片",
+        ],
+    )
+}
+
+fn recent_search_query_from_recap(session_recap: &[Value]) -> Option<String> {
+    session_recap.iter().find_map(|entry| {
+        string_at_paths(entry, &["/query"])
+            .or_else(|| string_at_paths(entry, &["/search/query", "/data/query"]))
+    })
+}
+
+fn knowledge_follow_up_focus_paths(normalized: &str, session_recap: &[Value]) -> Vec<String> {
+    if !matches_any(
+        normalized,
+        &[
+            "只看第一个视频",
+            "第一个视频",
+            "同一段",
+            "相邻片段",
+            "前后片段",
+            "前后一段",
+        ],
+    ) {
+        return Vec::new();
+    }
+    session_recap
+        .iter()
+        .find_map(|entry| string_at_paths(entry, &["/top_video_path"]))
+        .map(|path| vec![path])
+        .unwrap_or_default()
+}
+
 fn matches_any(normalized: &str, candidates: &[&str]) -> bool {
     candidates
         .iter()
@@ -8165,6 +8675,18 @@ fn knowledge_search_roots(request: &TaskRequest) -> Vec<String> {
     first_string_vec(
         &[&request.args],
         &["/roots", "/search/roots", "/knowledge/roots"],
+    )
+}
+
+fn knowledge_focus_paths(request: &TaskRequest) -> Vec<String> {
+    first_string_vec(
+        &[&request.args],
+        &[
+            "/focus_paths",
+            "/focusPaths",
+            "/search/focus_paths",
+            "/knowledge/focus_paths",
+        ],
     )
 }
 
@@ -8307,7 +8829,7 @@ fn privacy_level_as_str(level: PrivacyLevel) -> &'static str {
     }
 }
 
-fn knowledge_modalities(request: &TaskRequest) -> (bool, bool) {
+fn knowledge_modalities(request: &TaskRequest) -> (bool, bool, bool) {
     let requested = first_string_vec(
         &[&request.args],
         &["/modalities", "/search/modalities", "/knowledge/modalities"],
@@ -8328,31 +8850,37 @@ fn knowledge_modalities(request: &TaskRequest) -> (bool, bool) {
                 "image" | "images" | "photo" | "photos" | "picture" | "pictures"
             )
         });
-        return (include_documents, include_images);
+        let include_videos = requested.iter().any(|item| {
+            matches!(
+                item.as_str(),
+                "video" | "videos" | "clip" | "clips" | "movie" | "movies"
+            )
+        });
+        return (include_documents, include_images, include_videos);
+    }
+
+    let normalized_command = normalize_command_text(request.intent.raw_text.as_str());
+    if knowledge_video_only_request_from_normalized(&normalized_command) {
+        return (false, false, true);
     }
 
     let normalized = request.intent.raw_text.to_lowercase();
-    let asks_for_documents = [
-        "文档",
-        "文件",
-        "资料",
-        "document",
-        "documents",
-        "file",
-        "files",
-    ]
-    .iter()
-    .any(|token| normalized.contains(token));
+    let asks_for_documents = ["文档", "document", "documents"]
+        .iter()
+        .any(|token| normalized.contains(token));
     let asks_for_images = [
         "图片", "照片", "image", "images", "photo", "photos", "picture",
     ]
     .iter()
     .any(|token| normalized.contains(token));
+    let asks_for_videos = [
+        "视频", "录像", "回放", "片段", "video", "videos", "clip", "clips", "movie",
+    ]
+    .iter()
+    .any(|token| normalized.contains(token));
 
-    match (asks_for_documents, asks_for_images) {
-        (true, false) => return (true, false),
-        (false, true) => return (false, true),
-        _ => {}
+    if asks_for_documents || asks_for_images || asks_for_videos {
+        return (asks_for_documents, asks_for_images, asks_for_videos);
     }
 
     if request
@@ -8366,14 +8894,10 @@ fn knowledge_modalities(request: &TaskRequest) -> (bool, bool) {
             .trim()
             .eq_ignore_ascii_case(KNOWLEDGE_OP_SEARCH)
     {
-        return (true, true);
+        return (true, true, true);
     }
 
-    match (asks_for_documents, asks_for_images) {
-        (true, false) => (true, false),
-        (false, true) => (false, true),
-        _ => (true, true),
-    }
+    (true, true, true)
 }
 
 fn room_aliases<'a>(name: &'a str, room: &'a str) -> Vec<&'static str> {
@@ -8399,6 +8923,12 @@ fn string_at_paths(value: &Value, paths: &[&str]) -> Option<String> {
             .map(|item| item.trim().to_string())
             .filter(|item| !item.is_empty())
     })
+}
+
+fn array_len_at_paths(value: &Value, paths: &[&str]) -> Option<usize> {
+    paths
+        .iter()
+        .find_map(|path| value.pointer(path).and_then(Value::as_array).map(Vec::len))
 }
 
 fn usize_at_paths(value: &Value, paths: &[&str]) -> Option<usize> {
@@ -8891,12 +9421,11 @@ mod tests {
         notification_delivery_outcome, parse_general_message_plan, pending_candidates_from_results,
         protocol_string, resolve_notification_recipient, room_aliases,
         should_route_general_message_to_knowledge, GeneralMessageConversationAct,
-        GeneralMessagePlanKind, PendingTaskCandidate,
-        TaskApiService, TaskArtifact, TaskIntent, TaskMessage, TaskRequest, TaskRequestAcceptance,
-        TaskResponse, TaskResultEnvelope, TaskSource, TaskStatus, TaskTurnActor, TaskTurnBlock,
-        TaskTurnContinuation, TaskTurnConversation, TaskTurnEnvelope, TaskTurnInput,
-        TaskTurnTransport, ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV, KNOWLEDGE_DOMAIN,
-        KNOWLEDGE_OP_SEARCH,
+        GeneralMessagePlanKind, PendingTaskCandidate, TaskApiService, TaskArtifact, TaskIntent,
+        TaskMessage, TaskRequest, TaskRequestAcceptance, TaskResponse, TaskResultEnvelope,
+        TaskSource, TaskStatus, TaskTurnActor, TaskTurnBlock, TaskTurnContinuation,
+        TaskTurnConversation, TaskTurnEnvelope, TaskTurnInput, TaskTurnTransport,
+        ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV, KNOWLEDGE_DOMAIN, KNOWLEDGE_OP_SEARCH,
     };
     use crate::connectors::notifications::{
         NotificationContent, NotificationDelivery, NotificationDeliveryError,
@@ -8975,7 +9504,9 @@ mod tests {
                 content_source_kinds: vec!["vlm".to_string()],
                 content_indexed: true,
                 filename_match_used: false,
+                content_match_used: true,
             }],
+            videos: Vec::new(),
             reply_pack: KnowledgeSearchReplyPack::default(),
             supported_modalities: vec!["vlm".to_string()],
             pending_modalities: Vec::new(),
@@ -8987,6 +9518,8 @@ mod tests {
             source_scope: Vec::new(),
             privacy_level: "strict_local".to_string(),
             resource_profile: "cpu_only".to_string(),
+            empty_reason: None,
+            empty_guidance: None,
         };
 
         let artifacts = build_knowledge_search_artifacts(&response);
@@ -9005,6 +9538,149 @@ mod tests {
             artifacts[0].metadata["citation"]["content_source_kinds"][0],
             "vlm"
         );
+        assert_eq!(artifacts[0].metadata["content_match_used"], true);
+        assert_eq!(
+            artifacts[0].metadata["citation"]["content_match_used"],
+            true
+        );
+    }
+
+    #[test]
+    fn knowledge_search_video_artifacts_are_native_video_results() {
+        let response = KnowledgeSearchResponse {
+            query: "快递".to_string(),
+            roots: vec!["/mnt/videos".to_string()],
+            total_matches: 1,
+            documents: Vec::new(),
+            images: Vec::new(),
+            videos: vec![KnowledgeSearchHit {
+                modality: "video".to_string(),
+                path: "/mnt/videos/porch-clip.mp4".to_string(),
+                title: "porch-clip.mp4".to_string(),
+                score: 760,
+                lexical_score: Some(0.76),
+                embedding_score: None,
+                hybrid_score: Some(0.76),
+                chunk_id: Some("chunk-0001".to_string()),
+                line_start: Some(1),
+                line_end: Some(1),
+                snippet: Some("keyframe 30%: 门口有一个快递箱".to_string()),
+                matched_terms: vec!["快递".to_string()],
+                provenance: Some("vlm_keyframe".to_string()),
+                source_path: Some("/tmp/keyframes/frame-02.jpg".to_string()),
+                content_source_kinds: vec!["vlm_keyframe".to_string()],
+                content_indexed: true,
+                filename_match_used: false,
+                content_match_used: true,
+            }],
+            reply_pack: KnowledgeSearchReplyPack::default(),
+            supported_modalities: vec!["video".to_string(), "vlm_keyframe".to_string()],
+            pending_modalities: Vec::new(),
+            status: "ok".to_string(),
+            degraded: false,
+            degraded_reason: None,
+            blockers: Vec::new(),
+            warnings: Vec::new(),
+            source_scope: Vec::new(),
+            privacy_level: "strict_local".to_string(),
+            resource_profile: "cpu_only".to_string(),
+            empty_reason: None,
+            empty_guidance: None,
+        };
+
+        let artifacts = build_knowledge_search_artifacts(&response);
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].kind, "video");
+        assert_eq!(artifacts[0].mime_type, "video/mp4");
+        assert_eq!(
+            artifacts[0].path.as_deref(),
+            Some("/mnt/videos/porch-clip.mp4")
+        );
+        assert_eq!(artifacts[0].metadata["modality"], "video");
+        assert_eq!(artifacts[0].metadata["content_indexed"], true);
+        assert_eq!(artifacts[0].metadata["filename_match_used"], false);
+        assert_eq!(artifacts[0].metadata["content_match_used"], true);
+        assert_eq!(artifacts[0].metadata["match_source"], "vlm_keyframe");
+        assert_eq!(
+            artifacts[0].metadata["segment_locator"],
+            json!({
+                "kind": "keyframe_percent",
+                "percent": 30,
+                "source": "vlm_keyframe"
+            })
+        );
+        assert_eq!(artifacts[0].metadata["video_level_result"], false);
+        assert_eq!(
+            artifacts[0].metadata["citation"]["source_path"],
+            "/tmp/keyframes/frame-02.jpg"
+        );
+    }
+
+    #[test]
+    fn knowledge_search_video_artifacts_surface_sidecar_time_range_when_present() {
+        let sidecar_path = unique_path("harborbeacon-video-sidecar");
+        fs::write(
+            &sidecar_path,
+            r#"{"summary":"门口有人拿起快递箱","start_time":"00:00:05","end_time":"00:00:12"}"#,
+        )
+        .expect("write sidecar");
+        let response = KnowledgeSearchResponse {
+            query: "快递".to_string(),
+            roots: vec!["/mnt/videos".to_string()],
+            total_matches: 1,
+            documents: Vec::new(),
+            images: Vec::new(),
+            videos: vec![KnowledgeSearchHit {
+                modality: "video".to_string(),
+                path: "/mnt/videos/porch-clip.mp4".to_string(),
+                title: "porch-clip.mp4".to_string(),
+                score: 760,
+                lexical_score: Some(0.76),
+                embedding_score: None,
+                hybrid_score: Some(0.76),
+                chunk_id: Some("chunk-0001".to_string()),
+                line_start: Some(1),
+                line_end: Some(1),
+                snippet: Some("门口有人拿起快递箱".to_string()),
+                matched_terms: vec!["快递".to_string()],
+                provenance: Some("video_sidecar".to_string()),
+                source_path: Some(sidecar_path.to_string_lossy().into_owned()),
+                content_source_kinds: vec!["video_sidecar".to_string()],
+                content_indexed: true,
+                filename_match_used: false,
+                content_match_used: true,
+            }],
+            reply_pack: KnowledgeSearchReplyPack::default(),
+            supported_modalities: vec!["video".to_string()],
+            pending_modalities: Vec::new(),
+            status: "ok".to_string(),
+            degraded: false,
+            degraded_reason: None,
+            blockers: Vec::new(),
+            warnings: Vec::new(),
+            source_scope: Vec::new(),
+            privacy_level: "strict_local".to_string(),
+            resource_profile: "cpu_only".to_string(),
+            empty_reason: None,
+            empty_guidance: None,
+        };
+
+        let artifacts = build_knowledge_search_artifacts(&response);
+
+        assert_eq!(
+            artifacts[0].metadata["segment_locator"],
+            json!({
+                "kind": "time_range",
+                "start": "00:00:05",
+                "end": "00:00:12",
+                "timestamp": null,
+                "source": "video_sidecar"
+            })
+        );
+        assert_eq!(artifacts[0].metadata["video_level_result"], false);
+
+        let _ = fs::remove_file(sidecar_path);
     }
 
     fn unique_path(prefix: &str) -> std::path::PathBuf {
@@ -12501,6 +13177,77 @@ mod tests {
     }
 
     #[test]
+    fn handle_general_message_video_follow_up_focuses_first_video_hit() {
+        let _guard = RETRIEVAL_GATE_TEST_LOCK.lock().expect("lock");
+        let (service, _conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("harborbeacon-video-follow-up");
+        let knowledge_root = unique_dir("harborbeacon-knowledge-video-follow-up");
+        let index_root = unique_dir("harborbeacon-knowledge-index-video-follow-up");
+        let video_dir = knowledge_root.join("videos");
+        fs::create_dir_all(&video_dir).expect("create videos");
+        let first_video = video_dir.join("a-porch.mp4");
+        let second_video = video_dir.join("b-garage.mp4");
+        fs::write(&first_video, b"fake-video-a").expect("write first video");
+        fs::write(&second_video, b"fake-video-b").expect("write second video");
+        fs::write(
+            video_dir.join("a-porch.json"),
+            r#"{"summary":"门口摄像头看到快递箱放在门边","start_time":"00:00:05","end_time":"00:00:12"}"#,
+        )
+        .expect("write first sidecar");
+        fs::write(
+            video_dir.join("b-garage.json"),
+            r#"{"summary":"车库摄像头看到快递箱放在架子旁","start_time":"00:00:15","end_time":"00:00:22"}"#,
+        )
+        .expect("write second sidecar");
+        configure_knowledge_source(&service.clone().admin_store, &knowledge_root, &index_root);
+
+        let first_request =
+            general_message_test_request("video-follow-up-1", "帮我找视频里快递箱", json!({}));
+        let source = first_request.source.clone();
+        let first_response = service.handle_task(first_request);
+        let top_video_path = first_response
+            .result
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "video")
+            .and_then(|artifact| artifact.path.clone())
+            .expect("top video artifact");
+        assert_eq!(first_response.status, TaskStatus::Completed);
+        assert_eq!(
+            first_response.result.data["videos"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+
+        let mut second_request =
+            general_message_test_request("video-follow-up-2", "只看第一个视频里的结果", json!({}));
+        second_request.source = source;
+        let second_response = service.handle_task(second_request);
+
+        assert_eq!(second_response.status, TaskStatus::Completed);
+        assert_eq!(second_response.result.data["query"], "快递箱");
+        assert_eq!(
+            second_response.result.data["videos"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            second_response.result.data["videos"][0]["path"],
+            top_video_path
+        );
+        assert_eq!(
+            second_response.result.artifacts[0].path.as_deref(),
+            Some(top_video_path.as_str())
+        );
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
+        let _ = fs::remove_dir_all(knowledge_root);
+        let _ = fs::remove_dir_all(index_root);
+    }
+
+    #[test]
     fn handle_knowledge_search_rejects_unconfigured_root_expansion() {
         let admin_path = unique_path("harborbeacon-admin-state");
         let registry_path = unique_path("harborbeacon-device-registry");
@@ -12999,7 +13746,9 @@ mod tests {
         assert_eq!(response.status, TaskStatus::Completed);
         assert_eq!(response.executor_used, "knowledge_search_service");
         assert_eq!(
-            response.result.data["source_scope"].as_array().map(Vec::len),
+            response.result.data["source_scope"]
+                .as_array()
+                .map(Vec::len),
             Some(1)
         );
         let expected_scope = knowledge_root
@@ -13042,7 +13791,40 @@ mod tests {
             message: None,
         };
 
-        assert_eq!(knowledge_modalities(&request), (false, true));
+        assert_eq!(knowledge_modalities(&request), (false, true, false));
+    }
+
+    #[test]
+    fn knowledge_search_modalities_follow_video_language() {
+        let request = TaskRequest {
+            task_id: "task-video-modality".to_string(),
+            trace_id: "trace-video-modality".to_string(),
+            step_id: "step-video-modality".to_string(),
+            source: TaskSource::default(),
+            intent: TaskIntent {
+                domain: KNOWLEDGE_DOMAIN.to_string(),
+                action: KNOWLEDGE_OP_SEARCH.to_string(),
+                raw_text: "找一下视频里出现快递箱的片段".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({}),
+            autonomy: Default::default(),
+            message: None,
+        };
+
+        assert_eq!(knowledge_modalities(&request), (false, false, true));
+
+        let exclude_non_video_request = TaskRequest {
+            intent: TaskIntent {
+                raw_text: "排除图片和文档，只看视频结果".to_string(),
+                ..request.intent.clone()
+            },
+            ..request
+        };
+        assert_eq!(
+            knowledge_modalities(&exclude_non_video_request),
+            (false, false, true)
+        );
     }
 
     #[test]
@@ -13128,6 +13910,13 @@ mod tests {
                 .kind,
             GeneralMessagePlanKind::CameraRecordClip
         );
+        let video_search_plan = fallback_general_message_plan("帮我找录像里出现快递箱的片段", None)
+            .expect("video search plan");
+        assert_eq!(
+            video_search_plan.kind,
+            GeneralMessagePlanKind::KnowledgeSearch
+        );
+        assert_eq!(video_search_plan.query.as_deref(), Some("快递箱"));
         assert_eq!(
             fallback_general_message_plan("非常好，帮我录一段", None)
                 .expect("clip plan")

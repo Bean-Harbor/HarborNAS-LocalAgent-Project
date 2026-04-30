@@ -34,6 +34,8 @@ import {
   KnowledgeIndexJobRecord,
   KnowledgeIndexRunResponse,
   KnowledgeIndexStatusResponse,
+  KnowledgeSearchRequestPayload,
+  KnowledgeSearchResponse,
   KnowledgeSettings,
   LocalModelCatalogResponse,
   LocalModelDownloadJobResponse,
@@ -86,6 +88,7 @@ interface EndpointProjection<T> {
 export class HarborDeskAdminApiService {
   private readonly http = inject(HttpClient);
   private readonly outputDirectory = 'frontend/harbordesk/dist/harbordesk';
+  private readonly apiBase = this.resolveApiBase();
 
   observePage(pageId: HarborDeskPageId): Observable<PageState<DeskPageModel>> {
     return concat(
@@ -96,54 +99,54 @@ export class HarborDeskAdminApiService {
 
   updateDefaultDeliverySurface(userId: string, surface: DeliverySurface): Observable<AccessMemberSummary[]> {
     return this.http.post<AccessMemberSummary[]>(
-      `/api/access/members/${encodeURIComponent(userId)}/default-delivery-surface`,
+      this.apiUrl(`/access/members/${encodeURIComponent(userId)}/default-delivery-surface`),
       { surface }
     );
   }
 
   setDefaultNotificationTarget(targetId: string): Observable<void> {
-    return this.http.post<void>('/api/admin/notification-targets/default', { target_id: targetId });
+    return this.http.post<void>(this.apiUrl('/admin/notification-targets/default'), { target_id: targetId });
   }
 
   deleteNotificationTarget(targetId: string): Observable<void> {
-    return this.http.delete<void>(`/api/admin/notification-targets/${encodeURIComponent(targetId)}`);
+    return this.http.delete<void>(this.apiUrl(`/admin/notification-targets/${encodeURIComponent(targetId)}`));
   }
 
   testModelEndpoint(modelEndpointId: string): Observable<ModelEndpointTestResult> {
     return this.http.post<ModelEndpointTestResult>(
-      `/api/models/endpoints/${encodeURIComponent(modelEndpointId)}/test`,
+      this.apiUrl(`/models/endpoints/${encodeURIComponent(modelEndpointId)}/test`),
       {}
     );
   }
 
   scanDevices(payload: DiscoveryScanPayload): Observable<unknown> {
-    return this.http.post<unknown>('/api/discovery/scan', payload);
+    return this.http.post<unknown>(this.apiUrl('/discovery/scan'), payload);
   }
 
   addManualDevice(payload: ManualDevicePayload): Observable<unknown> {
-    return this.http.post<unknown>('/api/devices/manual', payload);
+    return this.http.post<unknown>(this.apiUrl('/devices/manual'), payload);
   }
 
   setDefaultCamera(deviceId: string | null): Observable<AdminStateResponse> {
-    return this.http.post<AdminStateResponse>('/api/devices/default-camera', { device_id: deviceId });
+    return this.http.post<AdminStateResponse>(this.apiUrl('/devices/default-camera'), { device_id: deviceId });
   }
 
   saveDeviceCredentials(deviceId: string, payload: DeviceCredentialsPayload): Observable<DeviceCredentialStatus> {
     return this.http.post<DeviceCredentialStatus>(
-      `/api/devices/${encodeURIComponent(deviceId)}/credentials`,
+      this.apiUrl(`/devices/${encodeURIComponent(deviceId)}/credentials`),
       payload
     );
   }
 
   checkDeviceRtsp(deviceId: string, payload: RtspCheckPayload): Observable<RtspCheckResult> {
     return this.http.post<RtspCheckResult>(
-      `/api/devices/${encodeURIComponent(deviceId)}/rtsp-check`,
+      this.apiUrl(`/devices/${encodeURIComponent(deviceId)}/rtsp-check`),
       payload
     );
   }
 
   getDeviceEvidence(deviceId: string): Observable<DeviceEvidenceResponse> {
-    return this.http.get<DeviceEvidenceResponse>(`/api/devices/${encodeURIComponent(deviceId)}/evidence`);
+    return this.http.get<DeviceEvidenceResponse>(this.apiUrl(`/devices/${encodeURIComponent(deviceId)}/evidence`));
   }
 
   runDeviceValidation(
@@ -151,102 +154,112 @@ export class HarborDeskAdminApiService {
     payload: DeviceValidationRunRequest = { scope: 'all' }
   ): Observable<DeviceValidationRunResponse> {
     return this.http.post<DeviceValidationRunResponse>(
-      `/api/devices/${encodeURIComponent(deviceId)}/validation/run`,
+      this.apiUrl(`/devices/${encodeURIComponent(deviceId)}/validation/run`),
       payload
     );
   }
 
   createCameraShareLink(deviceId: string): Observable<unknown> {
-    return this.http.post<unknown>(`/api/cameras/${encodeURIComponent(deviceId)}/share-link`, {});
+    return this.http.post<unknown>(this.apiUrl(`/cameras/${encodeURIComponent(deviceId)}/share-link`), {});
   }
 
   revokeShareLink(shareLinkId: string): Observable<unknown> {
-    return this.http.post<unknown>(`/api/share-links/${encodeURIComponent(shareLinkId)}/revoke`, {});
+    return this.http.post<unknown>(this.apiUrl(`/share-links/${encodeURIComponent(shareLinkId)}/revoke`), {});
   }
 
   createCameraSnapshotTask(deviceId: string): Observable<unknown> {
-    return this.http.post<unknown>(`/api/cameras/${encodeURIComponent(deviceId)}/snapshot`, {});
+    return this.http.post<unknown>(this.apiUrl(`/cameras/${encodeURIComponent(deviceId)}/snapshot`), {});
   }
 
   getReleaseReadiness(): Observable<ReleaseReadinessResponse> {
-    return this.http.get<ReleaseReadinessResponse>('/api/release/readiness');
+    return this.http.get<ReleaseReadinessResponse>(this.apiUrl('/release/readiness'));
   }
 
   getReleaseReadinessHistory(): Observable<ReleaseReadinessHistoryResponse> {
-    return this.http.get<ReleaseReadinessHistoryResponse>('/api/release/readiness/history');
+    return this.http.get<ReleaseReadinessHistoryResponse>(this.apiUrl('/release/readiness/history'));
   }
 
   runReleaseReadiness(payload: ReleaseReadinessRunRequest = { scope: 'all' }): Observable<ReleaseReadinessRunResponse> {
-    return this.http.post<ReleaseReadinessRunResponse>('/api/release/readiness/run', payload);
+    return this.http.post<ReleaseReadinessRunResponse>(this.apiUrl('/release/readiness/run'), payload);
   }
 
   getHardwareReadiness(): Observable<HardwareReadinessResponse> {
-    return this.http.get<HardwareReadinessResponse>('/api/hardware/readiness');
+    return this.http.get<HardwareReadinessResponse>(this.apiUrl('/hardware/readiness'));
   }
 
   getHarborOsStatus(): Observable<HarborOsStatusResponse> {
-    return this.http.get<HarborOsStatusResponse>('/api/harboros/status');
+    return this.http.get<HarborOsStatusResponse>(this.apiUrl('/harboros/status'));
   }
 
   getHarborOsImCapabilityMap(): Observable<HarborOsImCapabilityMapResponse> {
-    return this.http.get<HarborOsImCapabilityMapResponse>('/api/harboros/im-capability-map');
+    return this.http.get<HarborOsImCapabilityMapResponse>(this.apiUrl('/harboros/im-capability-map'));
   }
 
   getLocalModelCatalog(): Observable<LocalModelCatalogResponse> {
-    return this.http.get<LocalModelCatalogResponse>('/api/models/local-catalog');
+    return this.http.get<LocalModelCatalogResponse>(this.apiUrl('/models/local-catalog'));
   }
 
   getRagReadiness(): Observable<RagReadinessResponse> {
-    return this.http.get<RagReadinessResponse>('/api/rag/readiness');
+    return this.http.get<RagReadinessResponse>(this.apiUrl('/rag/readiness'));
   }
 
   getKnowledgeSettings(): Observable<KnowledgeSettings> {
-    return this.http.get<KnowledgeSettings>('/api/knowledge/settings');
+    return this.http.get<KnowledgeSettings>(this.apiUrl('/knowledge/settings'));
   }
 
   saveKnowledgeSettings(payload: KnowledgeSettings): Observable<KnowledgeSettings> {
-    return this.http.put<KnowledgeSettings>('/api/knowledge/settings', payload);
+    return this.http.put<KnowledgeSettings>(this.apiUrl('/knowledge/settings'), payload);
   }
 
   runKnowledgeIndex(): Observable<KnowledgeIndexRunResponse> {
-    return this.http.post<KnowledgeIndexRunResponse>('/api/knowledge/index/run', {});
+    return this.http.post<KnowledgeIndexRunResponse>(this.apiUrl('/knowledge/index/run'), {});
   }
 
   getKnowledgeIndexStatus(): Observable<KnowledgeIndexStatusResponse> {
-    return this.http.get<KnowledgeIndexStatusResponse>('/api/knowledge/index/status');
+    return this.http.get<KnowledgeIndexStatusResponse>(this.apiUrl('/knowledge/index/status'));
   }
 
   getKnowledgeIndexJobs(): Observable<KnowledgeIndexJobsResponse> {
-    return this.http.get<KnowledgeIndexJobsResponse>('/api/knowledge/index/jobs');
+    return this.http.get<KnowledgeIndexJobsResponse>(this.apiUrl('/knowledge/index/jobs'));
+  }
+
+  searchKnowledge(payload: KnowledgeSearchRequestPayload): Observable<KnowledgeSearchResponse> {
+    return this.http.post<KnowledgeSearchResponse>(this.apiUrl('/knowledge/search'), payload);
+  }
+
+  previewKnowledge(path: string): Observable<Blob> {
+    return this.http.get(`${this.apiUrl('/knowledge/preview')}?path=${encodeURIComponent(path)}`, {
+      responseType: 'blob'
+    });
   }
 
   cancelKnowledgeIndexJob(jobId: string): Observable<KnowledgeIndexJobRecord> {
     return this.http.post<KnowledgeIndexJobRecord>(
-      `/api/knowledge/index/jobs/${encodeURIComponent(jobId)}/cancel`,
+      this.apiUrl(`/knowledge/index/jobs/${encodeURIComponent(jobId)}/cancel`),
       {}
     );
   }
 
   browseFiles(path?: string | null): Observable<FilesBrowseResponse> {
     const query = path ? `?path=${encodeURIComponent(path)}` : '';
-    return this.http.get<FilesBrowseResponse>(`/api/files/browse${query}`);
+    return this.http.get<FilesBrowseResponse>(`${this.apiUrl('/files/browse')}${query}`);
   }
 
   getLocalModelDownloads(): Observable<LocalModelDownloadsResponse> {
-    return this.http.get<LocalModelDownloadsResponse>('/api/models/local-downloads');
+    return this.http.get<LocalModelDownloadsResponse>(this.apiUrl('/models/local-downloads'));
   }
 
   getLocalModelDownload(jobId: string): Observable<LocalModelDownloadStatusResponse> {
-    return this.http.get<LocalModelDownloadStatusResponse>(`/api/models/local-downloads/${encodeURIComponent(jobId)}`);
+    return this.http.get<LocalModelDownloadStatusResponse>(this.apiUrl(`/models/local-downloads/${encodeURIComponent(jobId)}`));
   }
 
   startLocalModelDownload(payload: StartLocalModelDownloadRequest): Observable<LocalModelDownloadJobResponse> {
-    return this.http.post<LocalModelDownloadJobResponse>('/api/models/local-downloads', payload);
+    return this.http.post<LocalModelDownloadJobResponse>(this.apiUrl('/models/local-downloads'), payload);
   }
 
   cancelLocalModelDownload(jobId: string): Observable<LocalModelDownloadJobResponse> {
     return this.http.post<LocalModelDownloadJobResponse>(
-      `/api/models/local-downloads/${encodeURIComponent(jobId)}/cancel`,
+      this.apiUrl(`/models/local-downloads/${encodeURIComponent(jobId)}/cancel`),
       {}
     );
   }
@@ -343,39 +356,48 @@ export class HarborDeskAdminApiService {
   }
 
   private getState(): Observable<AdminStateResponse> {
-    return this.http.get<AdminStateResponse>('/api/state');
+    return this.http.get<AdminStateResponse>(this.apiUrl('/state'));
   }
 
   private getAccountManagement(): Observable<AccountManagementSnapshot> {
-    return this.http.get<AccountManagementSnapshot>('/api/account-management');
+    return this.http.get<AccountManagementSnapshot>(this.apiUrl('/account-management'));
   }
 
   private getAccessMembers(): Observable<AccessMemberSummary[]> {
-    return this.http.get<AccessMemberSummary[]>('/api/access/members');
+    return this.http.get<AccessMemberSummary[]>(this.apiUrl('/access/members'));
   }
 
   private getPendingApprovals(): Observable<TaskApprovalSummary[]> {
-    return this.http.get<TaskApprovalSummary[]>('/api/tasks/approvals');
+    return this.http.get<TaskApprovalSummary[]>(this.apiUrl('/tasks/approvals'));
   }
 
   private getGatewayStatus(): Observable<GatewayStatusResponse> {
-    return this.http.get<GatewayStatusResponse>('/api/gateway/status');
+    return this.http.get<GatewayStatusResponse>(this.apiUrl('/gateway/status'));
   }
 
   private getModelEndpoints(): Observable<ModelEndpointsResponse> {
-    return this.http.get<ModelEndpointsResponse>('/api/models/endpoints');
+    return this.http.get<ModelEndpointsResponse>(this.apiUrl('/models/endpoints'));
   }
 
   private getModelPolicies(): Observable<ModelPoliciesResponse> {
-    return this.http.get<ModelPoliciesResponse>('/api/models/policies');
+    return this.http.get<ModelPoliciesResponse>(this.apiUrl('/models/policies'));
   }
 
   private getFeatureAvailability(): Observable<FeatureAvailabilityResponse> {
-    return this.http.get<FeatureAvailabilityResponse>('/api/feature-availability');
+    return this.http.get<FeatureAvailabilityResponse>(this.apiUrl('/feature-availability'));
   }
 
   private getShareLinks(): Observable<ShareLinkSummary[]> {
-    return this.http.get<ShareLinkSummary[]>('/api/share-links');
+    return this.http.get<ShareLinkSummary[]>(this.apiUrl('/share-links'));
+  }
+
+  private apiUrl(path: string): string {
+    return `${this.apiBase}${path.startsWith('/') ? path : `/${path}`}`;
+  }
+
+  private resolveApiBase(): string {
+    const pathname = globalThis.location?.pathname ?? '';
+    return pathname.startsWith('/ui/') || pathname === '/ui' ? '/api/harbordesk' : '/api';
   }
 
   private getDeviceEvidenceProjections(

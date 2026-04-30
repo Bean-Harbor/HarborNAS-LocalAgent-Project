@@ -455,6 +455,19 @@ HarborBeacon 文件系统
    └─ 返回结果 + 多模态预览
 ```
 
+### 4.2.1 HarborBot 北向独立入口
+
+HarborBot 是多模态检索的 northbound user retrieval surface，作为
+HarborNAS WebUI 原生页面 `/ui/harborbot` 存在；HarborDesk 继续承担
+source roots、index、privacy/resource profile 等管理与配置入口。
+
+HarborBot 只消费 HarborBeacon 的真实同源 knowledge API：
+`POST /api/harbordesk/knowledge/search` 和
+`GET /api/harbordesk/knowledge/preview`。它不新增 shortcut、mock、聚合 API
+或绕开运行时的演示层；documents / images / videos 在页面内合并为瀑布流，
+并展示 `content_source_kinds`、`content_indexed`、`content_match_used`、
+`filename_match_used` 等 evidence 字段，用于证明检索来自内容索引而不是文件名捷径。
+
 ### 4.3 向量数据库 Schema
 
 ```sql

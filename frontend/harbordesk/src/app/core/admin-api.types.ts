@@ -728,6 +728,79 @@ export interface KnowledgeIndexJobsResponse {
   jobs: KnowledgeIndexJobRecord[];
 }
 
+export interface KnowledgeSearchRequestPayload {
+  query: string;
+  limit?: number;
+  include_documents?: boolean;
+  include_images?: boolean;
+  include_videos?: boolean;
+}
+
+export interface KnowledgeSearchCitation {
+  title: string;
+  path: string;
+  modality: string;
+  chunk_id?: string | null;
+  line_start?: number | null;
+  line_end?: number | null;
+  matched_terms: string[];
+  preview?: string | null;
+  score: number;
+  lexical_score?: number | null;
+  embedding_score?: number | null;
+  hybrid_score?: number | null;
+  provenance?: string | null;
+  source_path?: string | null;
+}
+
+export interface KnowledgeSearchReplyPack {
+  summary: string;
+  citations: KnowledgeSearchCitation[];
+}
+
+export interface KnowledgeSearchHit {
+  modality: string;
+  path: string;
+  title: string;
+  score: number;
+  lexical_score?: number | null;
+  embedding_score?: number | null;
+  hybrid_score?: number | null;
+  chunk_id?: string | null;
+  line_start?: number | null;
+  line_end?: number | null;
+  snippet?: string | null;
+  matched_terms: string[];
+  provenance?: string | null;
+  source_path?: string | null;
+  content_source_kinds: string[];
+  content_indexed: boolean;
+  filename_match_used: boolean;
+  content_match_used: boolean;
+}
+
+export interface KnowledgeSearchResponse {
+  query: string;
+  roots: string[];
+  total_matches: number;
+  documents: KnowledgeSearchHit[];
+  images: KnowledgeSearchHit[];
+  videos: KnowledgeSearchHit[];
+  reply_pack: KnowledgeSearchReplyPack;
+  supported_modalities: string[];
+  pending_modalities: string[];
+  status: string;
+  degraded: boolean;
+  degraded_reason?: string | null;
+  blockers: string[];
+  warnings: string[];
+  source_scope: string[];
+  privacy_level: RagPrivacyLevel | string;
+  resource_profile: RagResourceProfile | string;
+  empty_reason?: string | null;
+  empty_guidance?: string | null;
+}
+
 export interface FileBrowseEntry {
   name: string;
   path: string;

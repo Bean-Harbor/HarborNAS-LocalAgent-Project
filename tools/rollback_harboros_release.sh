@@ -25,6 +25,7 @@ CORE_SERVICES=(
   harborgate.service
 )
 OPTIONAL_WEIXIN_SERVICE="harborgate-weixin-runner.service"
+OPTIONAL_VLM_SERVICE="harbor-vlm-sidecar.service"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -139,6 +140,9 @@ if [[ "${SKIP_START}" -ne 1 ]]; then
   systemctl restart "${CORE_SERVICES[@]}"
   if systemctl is-enabled "${OPTIONAL_WEIXIN_SERVICE}" >/dev/null 2>&1; then
     systemctl restart "${OPTIONAL_WEIXIN_SERVICE}"
+  fi
+  if systemctl is-enabled "${OPTIONAL_VLM_SERVICE}" >/dev/null 2>&1; then
+    systemctl restart "${OPTIONAL_VLM_SERVICE}"
   fi
 fi
 

@@ -20,6 +20,7 @@ use crate::runtime::knowledge_index::{
 use crate::runtime::model_center;
 
 const DEFAULT_LIMIT: usize = 5;
+const SEMANTIC_ONLY_MATCH_MIN_SCORE: f32 = 0.55;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnowledgeSearchRequest {
@@ -27,8 +28,10 @@ pub struct KnowledgeSearchRequest {
     pub configured_roots: Vec<String>,
     pub index_root: Option<String>,
     pub roots: Vec<String>,
+    pub focus_paths: Vec<String>,
     pub include_documents: bool,
     pub include_images: bool,
+    pub include_videos: bool,
     pub limit: usize,
     pub privacy_level: PrivacyLevel,
     pub resource_profile: RagResourceProfile,
@@ -43,8 +46,10 @@ impl KnowledgeSearchRequest {
             configured_roots: Vec::new(),
             index_root: None,
             roots: Vec::new(),
+            focus_paths: Vec::new(),
             include_documents: true,
             include_images: true,
+            include_videos: false,
             limit: DEFAULT_LIMIT,
             privacy_level: PrivacyLevel::StrictLocal,
             resource_profile: RagResourceProfile::CpuOnly,
@@ -86,6 +91,8 @@ pub struct KnowledgeSearchHit {
     pub content_indexed: bool,
     #[serde(default)]
     pub filename_match_used: bool,
+    #[serde(default)]
+    pub content_match_used: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -133,6 +140,8 @@ pub struct KnowledgeSearchResponse {
     #[serde(default)]
     pub images: Vec<KnowledgeSearchHit>,
     #[serde(default)]
+    pub videos: Vec<KnowledgeSearchHit>,
+    #[serde(default)]
     pub reply_pack: KnowledgeSearchReplyPack,
     #[serde(default)]
     pub supported_modalities: Vec<String>,
@@ -154,6 +163,10 @@ pub struct KnowledgeSearchResponse {
     pub privacy_level: String,
     #[serde(default)]
     pub resource_profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub empty_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub empty_guidance: Option<String>,
 }
 
 impl KnowledgeSearchResponse {
@@ -176,6 +189,7 @@ impl KnowledgeSearchResponse {
             total_matches: 0,
             documents: Vec::new(),
             images: Vec::new(),
+            videos: Vec::new(),
             reply_pack: KnowledgeSearchReplyPack {
                 summary: message.clone(),
                 citations: Vec::new(),
@@ -190,11 +204,26 @@ impl KnowledgeSearchResponse {
             source_scope: roots,
             privacy_level: privacy_level_as_str(privacy_level).to_string(),
             resource_profile: resource_profile.as_str().to_string(),
+            empty_reason: None,
+            empty_guidance: None,
         }
     }
 }
 
 pub struct KnowledgeSearchService;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SearchDiagnostics {
+    indexed_videos: usize,
+    indexed_video_content: usize,
+    video_content_source_kinds: HashSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KnowledgeEmptyState {
+    reason: String,
+    guidance: String,
+}
 
 #[derive(Debug, Clone)]
 struct SearchCandidate {
@@ -211,14 +240,14 @@ impl KnowledgeSearchService {
                 "缺少知识库检索关键词，请提供 query 或更明确的自然语言检索请求。".to_string(),
             );
         }
-        if !request.include_documents && !request.include_images {
+        if !request.include_documents && !request.include_images && !request.include_videos {
             return Ok(KnowledgeSearchResponse::degraded(
                 query,
                 Vec::new(),
                 request.privacy_level,
                 request.resource_profile,
                 "unsupported_modalities",
-                "当前检索请求没有启用可支持的模态，至少需要文档或图片之一。",
+                "当前检索请求没有启用可支持的模态，至少需要文档、图片或视频之一。",
             ));
         }
 
@@ -248,8 +277,21 @@ impl KnowledgeSearchService {
         };
         let root_strings = roots
             .iter()
-            .map(|path| path.to_string_lossy().into_owned())
+            .map(|path| normalize_search_path_text(path.to_string_lossy().as_ref()))
             .collect::<Vec<_>>();
+        let focus_paths = match resolve_focus_paths(&request.focus_paths, &roots) {
+            Ok(paths) => paths,
+            Err(error) => {
+                return Ok(KnowledgeSearchResponse::degraded(
+                    query,
+                    root_strings,
+                    request.privacy_level,
+                    request.resource_profile,
+                    "focus_scope_blocked",
+                    error,
+                ))
+            }
+        };
         let query_terms = build_query_terms(&query);
         let index_service = match knowledge_index_service(request.index_root.as_deref()) {
             Ok(service) => service,
@@ -280,9 +322,9 @@ impl KnowledgeSearchService {
             ));
         }
         let query_embedding = model_center::run_embedding_with_state(&query, &model_center_state);
-        let query_embedding_vector =
-            (!query_embedding.vector.is_empty() && query_embedding.available)
-                .then_some(query_embedding.vector.clone());
+        let query_embedding_vector = (!query_embedding.vector.is_empty()
+            && query_embedding.available)
+            .then_some(query_embedding.vector.clone());
         if request.require_embeddings && query_embedding_vector.is_none() {
             return Ok(KnowledgeSearchResponse::degraded(
                 query,
@@ -307,6 +349,8 @@ impl KnowledgeSearchService {
 
         let mut documents = Vec::new();
         let mut images = Vec::new();
+        let mut videos = Vec::new();
+        let mut diagnostics = SearchDiagnostics::default();
         for root in &roots {
             let snapshot = match index_service.load_existing(root) {
                 Ok(snapshot) => snapshot,
@@ -345,10 +389,16 @@ impl KnowledgeSearchService {
             embedding_store.model_name = query_embedding.model_name.clone();
             let mut embedding_store_dirty = false;
             for entry in &snapshot.manifest.entries {
+                diagnostics.observe_entry(entry);
+                if !focus_paths.is_empty() && !entry_matches_focus_paths(&entry.path, &focus_paths)
+                {
+                    continue;
+                }
                 let modality = entry.modality;
                 match modality {
                     KnowledgeModality::Document if request.include_documents => {
-                        for mut candidate in build_hit_candidates_from_index_entry(entry, &query_terms)
+                        for mut candidate in
+                            build_hit_candidates_from_index_entry(entry, &query_terms)
                         {
                             apply_hybrid_scores(
                                 &mut candidate,
@@ -357,9 +407,7 @@ impl KnowledgeSearchService {
                                 &mut embedding_store,
                                 &mut embedding_store_dirty,
                             );
-                            if candidate.semantic_only
-                                && candidate.hit.embedding_score.unwrap_or_default() <= 0.05
-                            {
+                            if semantic_only_candidate_below_threshold(&candidate) {
                                 continue;
                             }
                             let hit = candidate.hit;
@@ -374,7 +422,8 @@ impl KnowledgeSearchService {
                         }
                     }
                     KnowledgeModality::Image if request.include_images => {
-                        for mut candidate in build_hit_candidates_from_index_entry(entry, &query_terms)
+                        for mut candidate in
+                            build_hit_candidates_from_index_entry(entry, &query_terms)
                         {
                             apply_hybrid_scores(
                                 &mut candidate,
@@ -383,9 +432,7 @@ impl KnowledgeSearchService {
                                 &mut embedding_store,
                                 &mut embedding_store_dirty,
                             );
-                            if candidate.semantic_only
-                                && candidate.hit.embedding_score.unwrap_or_default() <= 0.05
-                            {
+                            if semantic_only_candidate_below_threshold(&candidate) {
                                 continue;
                             }
                             let hit = candidate.hit;
@@ -396,6 +443,31 @@ impl KnowledgeSearchService {
                             );
                             if seen_hits.insert(dedupe_key) {
                                 images.push(hit);
+                            }
+                        }
+                    }
+                    KnowledgeModality::Video if request.include_videos => {
+                        for mut candidate in
+                            build_hit_candidates_from_index_entry(entry, &query_terms)
+                        {
+                            apply_hybrid_scores(
+                                &mut candidate,
+                                query_embedding_vector.as_deref(),
+                                &model_center_state,
+                                &mut embedding_store,
+                                &mut embedding_store_dirty,
+                            );
+                            if semantic_only_candidate_below_threshold(&candidate) {
+                                continue;
+                            }
+                            let hit = candidate.hit;
+                            let dedupe_key = (
+                                hit.modality.clone(),
+                                hit.path.clone(),
+                                hit.chunk_id.clone().unwrap_or_default(),
+                            );
+                            if seen_hits.insert(dedupe_key) {
+                                videos.push(hit);
                             }
                         }
                     }
@@ -418,12 +490,28 @@ impl KnowledgeSearchService {
 
         sort_hits(&mut documents);
         sort_hits(&mut images);
+        sort_hits(&mut videos);
 
-        let total_matches = documents.len() + images.len();
+        let total_matches = documents.len() + images.len() + videos.len();
         let limit = request.limit.clamp(1, 10);
         documents.truncate(limit);
         images.truncate(limit);
-        let reply_pack = build_reply_pack(&query, total_matches, &documents, &images);
+        videos.truncate(limit);
+        let empty_state = build_empty_state(
+            &request,
+            &roots,
+            &diagnostics,
+            &model_center_state,
+            total_matches,
+        );
+        let reply_pack = build_reply_pack(
+            &query,
+            total_matches,
+            &documents,
+            &images,
+            &videos,
+            empty_state.as_ref(),
+        );
         let (supported_modalities, pending_modalities) = modality_support_matrix();
 
         Ok(KnowledgeSearchResponse {
@@ -432,6 +520,7 @@ impl KnowledgeSearchService {
             total_matches,
             documents,
             images,
+            videos,
             reply_pack,
             supported_modalities,
             pending_modalities,
@@ -447,6 +536,8 @@ impl KnowledgeSearchService {
             source_scope: root_strings,
             privacy_level: privacy_level_as_str(request.privacy_level).to_string(),
             resource_profile: request.resource_profile.as_str().to_string(),
+            empty_reason: empty_state.as_ref().map(|state| state.reason.clone()),
+            empty_guidance: empty_state.as_ref().map(|state| state.guidance.clone()),
         })
     }
 }
@@ -487,9 +578,7 @@ fn resource_profile_runtime_blocker(
         }
         RagResourceProfile::CloudAllowed => {
             if privacy_level == PrivacyLevel::StrictLocal {
-                Some(
-                    "resource_profile=cloud_allowed 与 strict_local 隐私策略冲突。".to_string(),
-                )
+                Some("resource_profile=cloud_allowed 与 strict_local 隐私策略冲突。".to_string())
             } else if endpoint_kind_available(model_center_state, ModelEndpointKind::Cloud) {
                 None
             } else {
@@ -525,7 +614,9 @@ fn privacy_level_as_str(level: PrivacyLevel) -> &'static str {
 }
 
 fn normalize_scope_strings(mut roots: Vec<String>) -> Vec<String> {
-    roots.iter_mut().for_each(|root| *root = root.trim().to_string());
+    roots
+        .iter_mut()
+        .for_each(|root| *root = root.trim().to_string());
     roots.retain(|root| !root.is_empty());
     roots.sort();
     roots.dedup();
@@ -536,9 +627,10 @@ fn modality_support_matrix() -> (Vec<String>, Vec<String>) {
     let mut supported = vec![
         "document".to_string(),
         "image".to_string(),
+        "video".to_string(),
         "ocr".to_string(),
     ];
-    let mut pending = vec!["audio".to_string(), "video".to_string()];
+    let mut pending = vec!["audio".to_string()];
 
     let model_center_state = model_center::load_model_center_state();
     let embed_ready = model_center_state.endpoints.iter().any(|endpoint| {
@@ -552,16 +644,22 @@ fn modality_support_matrix() -> (Vec<String>, Vec<String>) {
         pending.push("embedding".to_string());
         pending.push("hybrid_retrieval".to_string());
     }
-    let vlm_ready = model_center_state.endpoints.iter().any(|endpoint| {
-        endpoint.model_kind == ModelKind::Vlm && endpoint.status != ModelEndpointStatus::Disabled
-    });
+    let vlm_ready = model_vlm_ready(&model_center_state);
     if vlm_ready {
         supported.push("vlm".to_string());
+        supported.push("vlm_keyframe".to_string());
     } else {
         pending.push("vlm".to_string());
+        pending.push("vlm_keyframe".to_string());
     }
 
     (supported, pending)
+}
+
+fn model_vlm_ready(model_center_state: &AdminModelCenterState) -> bool {
+    model_center_state.endpoints.iter().any(|endpoint| {
+        endpoint.model_kind == ModelKind::Vlm && endpoint.status != ModelEndpointStatus::Disabled
+    })
 }
 
 fn knowledge_index_service(index_root: Option<&str>) -> Result<KnowledgeIndexService, String> {
@@ -574,7 +672,123 @@ fn knowledge_index_service(index_root: Option<&str>) -> Result<KnowledgeIndexSer
     KnowledgeIndexService::from_config(KnowledgeIndexConfig::new(PathBuf::from(index_root))?)
 }
 
-fn resolve_roots(configured_roots: &[String], request_roots: &[String]) -> Result<Vec<PathBuf>, String> {
+impl SearchDiagnostics {
+    fn observe_entry(&mut self, entry: &KnowledgeIndexEntry) {
+        if entry.modality != KnowledgeModality::Video {
+            return;
+        }
+        self.indexed_videos += 1;
+        let mut entry_has_content = false;
+        for source in &entry.text_sources {
+            let source_kind = source.source_kind.trim().to_ascii_lowercase();
+            if !source_kind.is_empty() {
+                self.video_content_source_kinds.insert(source_kind);
+            }
+            if !source.text.trim().is_empty() {
+                entry_has_content = true;
+            }
+        }
+        if entry_has_content || !entry.searchable_text.trim().is_empty() {
+            self.indexed_video_content += 1;
+        }
+    }
+}
+
+fn build_empty_state(
+    request: &KnowledgeSearchRequest,
+    roots: &[PathBuf],
+    diagnostics: &SearchDiagnostics,
+    model_center_state: &AdminModelCenterState,
+    total_matches: usize,
+) -> Option<KnowledgeEmptyState> {
+    if total_matches > 0 || !request.include_videos {
+        return None;
+    }
+    if request.include_documents || request.include_images {
+        return None;
+    }
+
+    let video_files = count_video_files(roots);
+    if video_files == 0 {
+        return Some(KnowledgeEmptyState {
+            reason: "no_video_files".to_string(),
+            guidance: "已检索配置的知识源，但没有发现本地视频文件。请确认视频目录已加入知识源。"
+                .to_string(),
+        });
+    }
+    if diagnostics.indexed_videos == 0 {
+        let reason = if model_vlm_ready(model_center_state) {
+            "video_not_indexed"
+        } else {
+            "video_sidecar_or_vlm_unavailable"
+        };
+        return Some(KnowledgeEmptyState {
+            reason: reason.to_string(),
+            guidance: "已发现本地视频文件，但还没有可检索的视频内容索引。请刷新知识索引，并确认 sidecar 文本或 VLM keyframe 能力可用。".to_string(),
+        });
+    }
+    if diagnostics.indexed_video_content == 0 {
+        return Some(KnowledgeEmptyState {
+            reason: "video_content_unavailable".to_string(),
+            guidance: "视频文件已有索引记录，但没有 sidecar 或 keyframe 文本可用于内容检索。请补充 sidecar 或启用 VLM keyframe 索引。".to_string(),
+        });
+    }
+
+    Some(KnowledgeEmptyState {
+        reason: "video_content_no_match".to_string(),
+        guidance:
+            "视频内容索引可用，但没有命中当前关键词；可以换一个画面、人物、物品或事件描述再搜。"
+                .to_string(),
+    })
+}
+
+fn count_video_files(roots: &[PathBuf]) -> usize {
+    roots.iter().map(|root| count_video_files_in(root)).sum()
+}
+
+fn count_video_files_in(path: &Path) -> usize {
+    if path.is_file() {
+        return usize::from(is_video_path(path));
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| {
+            let child = entry.path();
+            if child.is_dir() {
+                count_video_files_in(&child)
+            } else {
+                usize::from(is_video_path(&child))
+            }
+        })
+        .sum()
+}
+
+fn is_video_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn normalize_search_path_text(value: &str) -> String {
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    value.strip_prefix(r"\\?\").unwrap_or(value).to_string()
+}
+
+fn resolve_roots(
+    configured_roots: &[String],
+    request_roots: &[String],
+) -> Result<Vec<PathBuf>, String> {
     let configured = configured_roots
         .iter()
         .map(|item| item.trim())
@@ -623,12 +837,50 @@ fn resolve_roots(configured_roots: &[String], request_roots: &[String]) -> Resul
     }
 
     if roots.is_empty() {
-        return Err("未找到可检索的已配置知识源目录；请先通过 HarborDesk 配置并确认目录存在。".to_string());
+        return Err(
+            "未找到可检索的已配置知识源目录；请先通过 HarborDesk 配置并确认目录存在。".to_string(),
+        );
     }
 
     roots.sort();
     roots.dedup();
     Ok(roots)
+}
+
+fn resolve_focus_paths(focus_paths: &[String], roots: &[PathBuf]) -> Result<Vec<String>, String> {
+    let mut resolved = Vec::new();
+    for focus_path in focus_paths
+        .iter()
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+    {
+        let candidate = PathBuf::from(focus_path);
+        if !candidate.exists() {
+            return Err(format!("请求的知识检索 focus_path 不存在：{focus_path}"));
+        }
+        let canonical = candidate.canonicalize().unwrap_or(candidate);
+        let canonical_string = normalize_search_path_text(canonical.to_string_lossy().as_ref());
+        let inside_scope = roots.iter().any(|root| {
+            let root_string = normalize_search_path_text(root.to_string_lossy().as_ref());
+            path_is_same_or_inside(&canonical_string, &root_string)
+        });
+        if !inside_scope {
+            return Err(format!(
+                "请求的知识检索 focus_path 不在已启用知识源范围内：{focus_path}"
+            ));
+        }
+        resolved.push(canonical_string);
+    }
+    resolved.sort();
+    resolved.dedup();
+    Ok(resolved)
+}
+
+fn entry_matches_focus_paths(entry_path: &str, focus_paths: &[String]) -> bool {
+    let entry_path = normalize_search_path_text(entry_path);
+    focus_paths
+        .iter()
+        .any(|focus_path| path_is_same_or_inside(&entry_path, focus_path))
 }
 
 /// Build a HarborBeacon-owned hit from an indexed entry, preserving the stable
@@ -670,10 +922,13 @@ fn build_reply_pack(
     total_matches: usize,
     documents: &[KnowledgeSearchHit],
     images: &[KnowledgeSearchHit],
+    videos: &[KnowledgeSearchHit],
+    empty_state: Option<&KnowledgeEmptyState>,
 ) -> KnowledgeSearchReplyPack {
     let citations = documents
         .iter()
         .chain(images.iter())
+        .chain(videos.iter())
         .map(|hit| KnowledgeSearchCitation {
             title: hit.title.clone(),
             path: hit.path.clone(),
@@ -691,7 +946,7 @@ fn build_reply_pack(
             source_path: hit.source_path.clone(),
         })
         .collect::<Vec<_>>();
-    let summary = build_reply_summary(query, total_matches, documents, images);
+    let summary = build_reply_summary(query, total_matches, documents, images, videos, empty_state);
     KnowledgeSearchReplyPack { summary, citations }
 }
 
@@ -700,10 +955,18 @@ fn build_reply_summary(
     total_matches: usize,
     documents: &[KnowledgeSearchHit],
     images: &[KnowledgeSearchHit],
+    videos: &[KnowledgeSearchHit],
+    empty_state: Option<&KnowledgeEmptyState>,
 ) -> String {
     if total_matches == 0 {
+        if let Some(empty_state) = empty_state {
+            return format!(
+                "已检索知识库，但没有找到与“{}”相关的视频内容。{}",
+                query, empty_state.guidance
+            );
+        }
         return format!(
-            "已检索知识库，但暂时没有找到与“{}”相关的文档、图片或 OCR 线索。",
+            "已检索知识库，但暂时没有找到与“{}”相关的文档、图片、视频或 OCR 线索。",
             query
         );
     }
@@ -715,7 +978,10 @@ fn build_reply_summary(
     if !images.is_empty() {
         parts.push(format!("{} 张图片", images.len()));
     }
-    let visible = documents.len() + images.len();
+    if !videos.is_empty() {
+        parts.push(format!("{} 个视频片段", videos.len()));
+    }
+    let visible = documents.len() + images.len() + videos.len();
     if visible < total_matches {
         format!(
             "已找到与“{}”相关的 {}，当前展示 {} 条可引用结果。",
@@ -735,7 +1001,7 @@ fn build_hit_candidate(
     query_terms: &[String],
     chunk: Option<&KnowledgeIndexChunk>,
 ) -> Option<SearchCandidate> {
-    let display_path = path.to_string_lossy().into_owned();
+    let display_path = normalize_search_path_text(path.to_string_lossy().as_ref());
     let title = path
         .file_name()
         .and_then(|item| item.to_str())
@@ -744,11 +1010,17 @@ fn build_hit_candidate(
     let path_lower = display_path.to_lowercase();
     let title_lower = title.to_lowercase();
     let searchable_lower = searchable_text.map(str::to_lowercase);
-    let allow_name_match = modality != KnowledgeModality::Image;
+    let allow_name_match = matches!(
+        modality,
+        KnowledgeModality::Document | KnowledgeModality::Audio
+    );
 
     let mut score = 0;
     let mut filename_match_used = false;
+    let mut content_match_used = false;
     let mut matched_terms = Vec::new();
+    let content_source_kinds = content_source_kinds_for_chunk(chunk);
+    let content_derived_source = is_content_derived_source(modality, &content_source_kinds);
     for term in query_terms {
         let normalized = term.to_lowercase();
         let mut matched = false;
@@ -770,6 +1042,7 @@ fn build_hit_candidate(
                     KnowledgeModality::Video => 18,
                 };
                 matched = true;
+                content_match_used |= content_derived_source;
             }
         }
         if matched {
@@ -779,15 +1052,20 @@ fn build_hit_candidate(
     matched_terms.sort();
     matched_terms.dedup();
 
-    let content_source_kinds = content_source_kinds_for_chunk(chunk);
     let content_indexed = match modality {
         KnowledgeModality::Image => content_source_kinds
             .iter()
             .any(|kind| matches!(kind.as_str(), "vlm" | "ocr")),
+        KnowledgeModality::Video => content_source_kinds
+            .iter()
+            .any(|kind| matches!(kind.as_str(), "vlm_keyframe" | "video_sidecar")),
         _ => searchable_text.is_some_and(|text| !text.trim().is_empty()),
     };
     let semantic_only = score == 0
-        && modality == KnowledgeModality::Image
+        && matches!(
+            modality,
+            KnowledgeModality::Image | KnowledgeModality::Video
+        )
         && content_indexed
         && searchable_text.is_some_and(|text| !text.trim().is_empty());
 
@@ -820,6 +1098,7 @@ fn build_hit_candidate(
             content_source_kinds,
             content_indexed,
             filename_match_used,
+            content_match_used,
         },
     })
 }
@@ -833,6 +1112,19 @@ fn content_source_kinds_for_chunk(chunk: Option<&KnowledgeIndexChunk>) -> Vec<St
         Vec::new()
     } else {
         vec![source_kind]
+    }
+}
+
+fn is_content_derived_source(modality: KnowledgeModality, content_source_kinds: &[String]) -> bool {
+    match modality {
+        KnowledgeModality::Document => true,
+        KnowledgeModality::Image => content_source_kinds
+            .iter()
+            .any(|kind| matches!(kind.as_str(), "vlm" | "ocr")),
+        KnowledgeModality::Audio => content_source_kinds.iter().any(|kind| kind == "transcript"),
+        KnowledgeModality::Video => content_source_kinds
+            .iter()
+            .any(|kind| matches!(kind.as_str(), "vlm_keyframe" | "video_sidecar")),
     }
 }
 
@@ -867,6 +1159,11 @@ fn apply_hybrid_scores(
     candidate.hit.score = (hybrid_score * 1000.0).round() as u32;
 }
 
+fn semantic_only_candidate_below_threshold(candidate: &SearchCandidate) -> bool {
+    candidate.semantic_only
+        && candidate.hit.embedding_score.unwrap_or_default() < SEMANTIC_ONLY_MATCH_MIN_SCORE
+}
+
 fn embedding_vector_for_candidate(
     candidate: &SearchCandidate,
     model_center_state: &AdminModelCenterState,
@@ -893,12 +1190,16 @@ fn embedding_vector_for_candidate(
     }
 
     let vector = execution.vector.clone();
-    embedding_store.provider_key = (!execution.provider_key.trim().is_empty())
-        .then_some(execution.provider_key.clone());
+    embedding_store.provider_key =
+        (!execution.provider_key.trim().is_empty()).then_some(execution.provider_key.clone());
     embedding_store.model_endpoint_id = execution.model_endpoint_id.clone();
     embedding_store.model_name = execution.model_name.clone();
 
-    if let Some(existing) = embedding_store.entries.iter_mut().find(|entry| entry.key == key) {
+    if let Some(existing) = embedding_store
+        .entries
+        .iter_mut()
+        .find(|entry| entry.key == key)
+    {
         existing.text_hash = text_hash;
         existing.vector = vector.clone();
         existing.path = candidate.hit.path.clone();
@@ -1256,10 +1557,7 @@ mod tests {
         .expect("write admin state");
     }
 
-    fn write_mock_model_center_state_with_embed(
-        path: &Path,
-        mock_embeddings: Value,
-    ) {
+    fn write_mock_model_center_state_with_embed(path: &Path, mock_embeddings: Value) {
         let state = AdminConsoleState {
             models: AdminModelCenterState {
                 endpoints: vec![ModelEndpoint {
@@ -1471,7 +1769,8 @@ mod tests {
         let _guard = INDEX_TEST_LOCK.lock().expect("lock");
         let root = unique_dir("harborbeacon-knowledge-hybrid");
         let index_root = unique_dir("harborbeacon-knowledge-index-store");
-        let admin_state_path = unique_dir("harborbeacon-admin-model-center-embed").join("state.json");
+        let admin_state_path =
+            unique_dir("harborbeacon-admin-model-center-embed").join("state.json");
         fs::create_dir_all(root.join("docs")).expect("create docs");
         fs::create_dir_all(&index_root).expect("create index root");
         fs::create_dir_all(
@@ -1512,21 +1811,24 @@ mod tests {
         assert_eq!(response.documents[1].title, "a-note.md");
         assert!(response.documents[0].embedding_score.unwrap_or_default() > 0.9);
         assert!(response.documents[0].hybrid_score.unwrap_or_default() > 0.5);
-        assert!(response.reply_pack.citations[0]
-            .embedding_score
-            .unwrap_or_default()
-            > 0.9);
+        assert!(
+            response.reply_pack.citations[0]
+                .embedding_score
+                .unwrap_or_default()
+                > 0.9
+        );
         assert!(response
             .supported_modalities
             .iter()
             .any(|item| item == "hybrid_retrieval"));
-        assert!(
-            index_root
-                .read_dir()
-                .expect("list index root")
-                .flatten()
-                .any(|entry| entry.file_name().to_string_lossy().ends_with(".embeddings.json"))
-        );
+        assert!(index_root
+            .read_dir()
+            .expect("list index root")
+            .flatten()
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".embeddings.json")));
 
         cleanup_dir(&root);
         cleanup_dir(&index_root);
@@ -1888,5 +2190,317 @@ mod tests {
                 .parent()
                 .expect("admin state path parent directory"),
         );
+    }
+
+    #[test]
+    fn image_search_rejects_low_confidence_semantic_only_match() {
+        let _guard = INDEX_TEST_LOCK.lock().expect("lock");
+        let root = unique_dir("harborbeacon-knowledge-image-semantic-low-confidence");
+        let index_root = unique_dir("harborbeacon-knowledge-index-store");
+        let admin_state_path =
+            unique_dir("harborbeacon-admin-model-center-semantic-image-low").join("state.json");
+        fs::create_dir_all(&root).expect("create root");
+        fs::create_dir_all(&index_root).expect("create index root");
+        fs::create_dir_all(
+            admin_state_path
+                .parent()
+                .expect("admin state path parent directory"),
+        )
+        .expect("create admin state dir");
+        let image_path = root.join("demo-status-card.png");
+        fs::write(&image_path, b"fake-image").expect("write image");
+        let service = KnowledgeIndexService::from_config(
+            KnowledgeIndexConfig::new(index_root.clone()).expect("config"),
+        )
+        .expect("service");
+        let snapshot = service.load_or_refresh(&root).expect("seed manifest path");
+        fs::write(
+            snapshot.manifest_path,
+            serde_json::to_string_pretty(&json!({
+                "schema_version": 1,
+                "root": root.to_string_lossy(),
+                "root_signature": {
+                    "modified_unix_millis": 0,
+                    "size_bytes": 0
+                },
+                "generated_at": "200",
+                "directories": [],
+                "entries": [{
+                    "modality": "image",
+                    "path": image_path.to_string_lossy(),
+                    "title": "demo-status-card.png",
+                    "searchable_text": "harbor demo status card with runtime ready text",
+                    "chunks": [{
+                        "chunk_id": "chunk-0001",
+                        "line_start": 1,
+                        "line_end": 1,
+                        "text": "harbor demo status card with runtime ready text",
+                        "source_kind": "vlm"
+                    }],
+                    "text_sources": [{
+                        "source_kind": "vlm",
+                        "provider_key": "mock-vlm",
+                        "text": "harbor demo status card with runtime ready text"
+                    }],
+                    "file_signature": {
+                        "modified_unix_millis": 0,
+                        "size_bytes": 10
+                    }
+                }]
+            }))
+            .expect("serialize manifest"),
+        )
+        .expect("write manifest");
+        write_mock_model_center_state_with_embed(
+            &admin_state_path,
+            json!({
+                "春天的照片": [1.0, 0.0],
+                "harbor demo status card with runtime ready text": [0.32, 0.947417]
+            }),
+        );
+
+        std::env::set_var("HARBOR_ADMIN_STATE_PATH", &admin_state_path);
+        let response = KnowledgeSearchService::search(KnowledgeSearchRequest {
+            query: "春天的照片".to_string(),
+            configured_roots: vec![root.to_string_lossy().into_owned()],
+            index_root: Some(index_root.to_string_lossy().into_owned()),
+            roots: vec![root.to_string_lossy().into_owned()],
+            include_documents: false,
+            include_images: true,
+            limit: 5,
+            ..KnowledgeSearchRequest::new("")
+        })
+        .expect("image semantic search");
+        std::env::remove_var("HARBOR_ADMIN_STATE_PATH");
+
+        assert_eq!(response.images.len(), 0);
+        assert_eq!(response.total_matches, 0);
+
+        cleanup_dir(&root);
+        cleanup_dir(&index_root);
+        cleanup_dir(
+            admin_state_path
+                .parent()
+                .expect("admin state path parent directory"),
+        );
+    }
+
+    #[test]
+    fn video_search_uses_sidecar_content_without_filename_guessing() {
+        let _guard = INDEX_TEST_LOCK.lock().expect("lock");
+        let root = unique_dir("harborbeacon-knowledge-video-sidecar");
+        let index_root = unique_dir("harborbeacon-knowledge-index-store");
+        fs::create_dir_all(root.join("videos")).expect("create videos");
+        fs::create_dir_all(&index_root).expect("create index root");
+        fs::write(root.join("videos").join("spring-clip.mp4"), b"fake-video").expect("write video");
+        fs::write(
+            root.join("videos").join("spring-clip.json"),
+            r#"{"summary":"garage camera clip: courier delivered a box at the door"}"#,
+        )
+        .expect("write video sidecar");
+        build_search_index(&root, &index_root);
+
+        let sidecar_response = KnowledgeSearchService::search(KnowledgeSearchRequest {
+            query: "courier".to_string(),
+            configured_roots: vec![root.to_string_lossy().into_owned()],
+            index_root: Some(index_root.to_string_lossy().into_owned()),
+            roots: vec![root.to_string_lossy().into_owned()],
+            include_documents: false,
+            include_images: false,
+            include_videos: true,
+            limit: 5,
+            ..KnowledgeSearchRequest::new("")
+        })
+        .expect("video sidecar search");
+        let filename_response = KnowledgeSearchService::search(KnowledgeSearchRequest {
+            query: "spring".to_string(),
+            configured_roots: vec![root.to_string_lossy().into_owned()],
+            index_root: Some(index_root.to_string_lossy().into_owned()),
+            roots: vec![root.to_string_lossy().into_owned()],
+            include_documents: false,
+            include_images: false,
+            include_videos: true,
+            limit: 5,
+            ..KnowledgeSearchRequest::new("")
+        })
+        .expect("video filename search");
+
+        assert_eq!(sidecar_response.videos.len(), 1);
+        assert_eq!(
+            sidecar_response.videos[0].provenance.as_deref(),
+            Some("video_sidecar")
+        );
+        assert_eq!(
+            sidecar_response.videos[0].content_source_kinds,
+            vec!["video_sidecar"]
+        );
+        assert!(sidecar_response.videos[0].content_indexed);
+        assert!(sidecar_response.videos[0].content_match_used);
+        assert!(!sidecar_response.videos[0].filename_match_used);
+        assert_eq!(filename_response.videos.len(), 0);
+        assert_eq!(
+            filename_response.empty_reason.as_deref(),
+            Some("video_content_no_match")
+        );
+
+        cleanup_dir(&root);
+        cleanup_dir(&index_root);
+    }
+
+    #[test]
+    fn video_search_focus_paths_restrict_follow_up_scope() {
+        let _guard = INDEX_TEST_LOCK.lock().expect("lock");
+        let root = unique_dir("harborbeacon-knowledge-video-focus");
+        let index_root = unique_dir("harborbeacon-knowledge-index-store");
+        let video_dir = root.join("videos");
+        fs::create_dir_all(&video_dir).expect("create videos");
+        fs::create_dir_all(&index_root).expect("create index root");
+        let first_video = video_dir.join("a-porch.mp4");
+        let second_video = video_dir.join("b-garage.mp4");
+        fs::write(&first_video, b"fake-video-a").expect("write first video");
+        fs::write(&second_video, b"fake-video-b").expect("write second video");
+        fs::write(
+            video_dir.join("a-porch.json"),
+            r#"{"summary":"courier left a parcel near the front door"}"#,
+        )
+        .expect("write first sidecar");
+        fs::write(
+            video_dir.join("b-garage.json"),
+            r#"{"summary":"courier left a parcel near the garage shelf"}"#,
+        )
+        .expect("write second sidecar");
+        build_search_index(&root, &index_root);
+
+        let first_response = KnowledgeSearchService::search(KnowledgeSearchRequest {
+            query: "courier parcel".to_string(),
+            configured_roots: vec![root.to_string_lossy().into_owned()],
+            index_root: Some(index_root.to_string_lossy().into_owned()),
+            roots: vec![root.to_string_lossy().into_owned()],
+            include_documents: false,
+            include_images: false,
+            include_videos: true,
+            limit: 5,
+            ..KnowledgeSearchRequest::new("")
+        })
+        .expect("video search");
+        let focused_response = KnowledgeSearchService::search(KnowledgeSearchRequest {
+            query: "courier parcel".to_string(),
+            configured_roots: vec![root.to_string_lossy().into_owned()],
+            index_root: Some(index_root.to_string_lossy().into_owned()),
+            roots: vec![root.to_string_lossy().into_owned()],
+            focus_paths: vec![first_video.to_string_lossy().into_owned()],
+            include_documents: false,
+            include_images: false,
+            include_videos: true,
+            limit: 5,
+            ..KnowledgeSearchRequest::new("")
+        })
+        .expect("focused video search");
+
+        assert_eq!(first_response.videos.len(), 2);
+        assert_eq!(focused_response.videos.len(), 1);
+        assert_eq!(
+            focused_response.videos[0].path,
+            first_video.to_string_lossy()
+        );
+        assert!(focused_response.videos[0].content_match_used);
+
+        cleanup_dir(&root);
+        cleanup_dir(&index_root);
+    }
+
+    #[test]
+    fn video_search_surfaces_vlm_keyframe_provenance() {
+        let _guard = INDEX_TEST_LOCK.lock().expect("lock");
+        let root = unique_dir("harborbeacon-knowledge-video-vlm");
+        let index_root = unique_dir("harborbeacon-knowledge-index-store");
+        fs::create_dir_all(&root).expect("create root");
+        fs::create_dir_all(&index_root).expect("create index root");
+        let video_path = root.join("porch-clip.mp4");
+        let frame_path = index_root.join("video-keyframes").join("frame-01.jpg");
+        fs::create_dir_all(frame_path.parent().expect("frame parent")).expect("frame dir");
+        fs::write(&video_path, b"fake-video").expect("write video");
+        fs::write(&frame_path, b"fake-frame").expect("write frame");
+        let frame_path_text = frame_path.to_string_lossy().into_owned();
+        let service = KnowledgeIndexService::from_config(
+            KnowledgeIndexConfig::new(index_root.clone()).expect("config"),
+        )
+        .expect("service");
+        let snapshot = service.load_or_refresh(&root).expect("seed manifest path");
+        fs::write(
+            snapshot.manifest_path,
+            serde_json::to_string_pretty(&json!({
+                "schema_version": 1,
+                "root": root.to_string_lossy(),
+                "root_signature": {
+                    "modified_unix_millis": 0,
+                    "size_bytes": 0
+                },
+                "generated_at": "200",
+                "directories": [],
+                "entries": [{
+                    "modality": "video",
+                    "path": video_path.to_string_lossy(),
+                    "title": "porch-clip.mp4",
+                    "searchable_text": "keyframe 30%: 门口地面有一个快递箱",
+                    "chunks": [{
+                        "chunk_id": "chunk-0001",
+                        "line_start": 1,
+                        "line_end": 1,
+                        "text": "keyframe 30%: 门口地面有一个快递箱",
+                        "source_kind": "vlm_keyframe",
+                        "source_path": frame_path_text.clone()
+                    }],
+                    "text_sources": [{
+                        "source_kind": "vlm_keyframe",
+                        "source_path": frame_path_text.clone(),
+                        "provider_key": "mock-vlm",
+                        "text": "keyframe 30%: 门口地面有一个快递箱"
+                    }],
+                    "file_signature": {
+                        "modified_unix_millis": 0,
+                        "size_bytes": 10
+                    }
+                }]
+            }))
+            .expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let response = KnowledgeSearchService::search(KnowledgeSearchRequest {
+            query: "快递箱".to_string(),
+            configured_roots: vec![root.to_string_lossy().into_owned()],
+            index_root: Some(index_root.to_string_lossy().into_owned()),
+            roots: vec![root.to_string_lossy().into_owned()],
+            include_documents: false,
+            include_images: false,
+            include_videos: true,
+            limit: 5,
+            ..KnowledgeSearchRequest::new("")
+        })
+        .expect("video vlm search");
+
+        assert_eq!(response.videos.len(), 1);
+        assert_eq!(
+            response.videos[0].provenance.as_deref(),
+            Some("vlm_keyframe")
+        );
+        assert_eq!(
+            response.videos[0].source_path.as_deref(),
+            Some(frame_path_text.as_str())
+        );
+        assert_eq!(
+            response.videos[0].content_source_kinds,
+            vec!["vlm_keyframe"]
+        );
+        assert!(response.videos[0].content_indexed);
+        assert!(response.videos[0].content_match_used);
+        assert!(!response.videos[0].filename_match_used);
+        assert_eq!(response.reply_pack.citations.len(), 1);
+        assert_eq!(response.reply_pack.citations[0].modality, "video");
+        assert!(response.reply_pack.summary.contains("视频片段"));
+
+        cleanup_dir(&root);
+        cleanup_dir(&index_root);
     }
 }

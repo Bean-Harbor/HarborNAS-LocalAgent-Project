@@ -18,6 +18,7 @@ SERVICE_ORDER = [
     "harbor-model-api.service",
     "assistant-task-api.service",
     "agent-hub-admin-api.service",
+    "harbor-vlm-sidecar.service",
     "harborgate.service",
     "harborgate-weixin-runner.service",
 ]
@@ -28,6 +29,9 @@ SERVICE_ALIASES = {
     "assistant-task-api": "assistant-task-api.service",
     "admin": "agent-hub-admin-api.service",
     "agent-hub-admin-api": "agent-hub-admin-api.service",
+    "vlm": "harbor-vlm-sidecar.service",
+    "vlm-sidecar": "harbor-vlm-sidecar.service",
+    "harbor-vlm-sidecar": "harbor-vlm-sidecar.service",
     "gateway": "harborgate.service",
     "harborgate": "harborgate.service",
     "weixin": "harborgate-weixin-runner.service",
@@ -64,7 +68,7 @@ def parse_args() -> argparse.Namespace:
         "service",
         nargs="?",
         default="all",
-        help="Service alias: model, task, admin, gateway, weixin, or all.",
+        help="Service alias: model, task, admin, vlm, gateway, weixin, or all.",
     )
     logs_parser.add_argument("--lines", type=int, default=120, help="Number of journal lines.")
     logs_parser.add_argument(
@@ -183,6 +187,15 @@ def model_health_url(runtime_env: dict[str, str]) -> str:
     if base_url.endswith("/v1"):
         base_url = base_url[:-3]
     return join_url(base_url, "/healthz")
+
+
+def vlm_health_url(runtime_env: dict[str, str]) -> str:
+    bind = runtime_env.get("HARBOR_VLM_BIND", "127.0.0.1:4196").strip() or "127.0.0.1:4196"
+    host, _, port = bind.rpartition(":")
+    host = host or "127.0.0.1"
+    if host in {"0.0.0.0", "::"}:
+        host = "127.0.0.1"
+    return f"http://{host}:{port or '4196'}/healthz"
 
 
 def http_json(url: str, *, headers: dict[str, str] | None = None) -> dict[str, object]:
@@ -351,6 +364,7 @@ def build_health_payload(runtime_env: dict[str, str], env_file: str) -> dict[str
             runtime_env.get("HARBORBEACON_TASK_API_URL", "http://127.0.0.1:4175"), "/healthz"
         ),
         "model_api": model_health_url(runtime_env),
+        "vlm_sidecar": vlm_health_url(runtime_env),
         "gateway": join_url(runtime_env.get("HARBORGATE_BASE_URL", "http://127.0.0.1:8787"), "/health"),
     }
 
@@ -408,7 +422,7 @@ def run_logs(command_env: dict[str, str], service_name: str, lines: int, since: 
     normalized = normalize_service_name(service_name)
     if not normalized and service_name.strip().lower() != "all":
         return fail(
-            "unknown service alias; expected one of: model, task, admin, gateway, weixin, or all"
+            "unknown service alias; expected one of: model, task, admin, vlm, gateway, weixin, or all"
         )
     command = ["journalctl", "--no-pager", "--lines", str(max(1, lines))]
     if since.strip():

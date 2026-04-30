@@ -249,6 +249,24 @@ cp -R "${REPO_ROOT}/tools/release_templates/." "${BUNDLE_ROOT}/templates/"
 cp "${REPO_ROOT}/tools/install_harboros_release.sh" "${BUNDLE_ROOT}/install/install_harboros_release.sh"
 cp "${REPO_ROOT}/tools/rollback_harboros_release.sh" "${BUNDLE_ROOT}/install/rollback_harboros_release.sh"
 
+python3 - "${BUNDLE_ROOT}" <<'PY'
+import pathlib
+import sys
+
+bundle_root = pathlib.Path(sys.argv[1])
+for path in [
+    bundle_root / "install" / "install_harboros_release.sh",
+    bundle_root / "install" / "rollback_harboros_release.sh",
+]:
+    data = path.read_bytes()
+    path.write_bytes(data.replace(b"\r\n", b"\n").replace(b"\r", b"\n"))
+
+for path in (bundle_root / "templates" / "bin").glob("*"):
+    if path.is_file():
+        data = path.read_bytes()
+        path.write_bytes(data.replace(b"\r\n", b"\n").replace(b"\r", b"\n"))
+PY
+
 chmod 0755 \
   "${BUNDLE_ROOT}/install/install_harboros_release.sh" \
   "${BUNDLE_ROOT}/install/rollback_harboros_release.sh"
@@ -291,6 +309,10 @@ payload = {
                 "bin/validate-contract-schemas",
                 "bin/run-e2e-suite",
             ],
+            "runtime_launchers": [
+                "templates/bin/run-harbor-vlm-sidecar",
+                "templates/bin/harbor-vlm-sidecar",
+            ],
         },
         "harbordesk": {
             "dist": "harbordesk/dist/harbordesk",
@@ -318,6 +340,7 @@ payload = {
             "harbor-model-api.service",
             "assistant-task-api.service",
             "agent-hub-admin-api.service",
+            "harbor-vlm-sidecar.service",
             "harborgate.service",
             "harborgate-weixin-runner.service",
         ],

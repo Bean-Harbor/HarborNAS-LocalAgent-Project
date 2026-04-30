@@ -11,3 +11,5 @@ yolov8n.pt
 dist/release-bundles/
 .tmp-live/
 tmp-hos*-snapshot.jpg
+.codex_tmp/
+.codex_tmp_*.png

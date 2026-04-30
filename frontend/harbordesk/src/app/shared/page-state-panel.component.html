@@ -542,6 +542,263 @@
                 </div>
               </section>
             }
+
+            <section class="readiness-block">
+              <div class="section-head compact-head">
+                <div>
+                  <p class="content-label">{{ text('Local-first posture', 'Local-first 姿态') }}</p>
+                  <p class="table-copy">{{ text('Use this panel to explain that HarborBeacon prefers local execution and only uses cloud as a controlled fallback when policy allows it.', '这个面板用于说明 HarborBeacon 默认优先本地执行，只有在策略允许时才把云端当作受控 fallback。') }}</p>
+                </div>
+                <span class="status-pill" [ngClass]="readinessToneClass(rag.privacy_policy?.status)">{{ rag.privacy_policy?.summary || knowledgePrivacyLevel }}</span>
+              </div>
+              <div class="detail-grid">
+                <section class="detail-row tone-good">
+                  <div class="detail-row-head">
+                    <strong>{{ text('Default operating stance', '默认运行姿态') }}</strong>
+                    <span>{{ text('local first', '本地优先') }}</span>
+                  </div>
+                  <ul class="detail-meta">
+                    <li><code>local_preferred=true</code> {{ text('keeps local and sidecar paths ahead of cloud execution.', '让本地与 sidecar 路径始终排在云端前面。') }}</li>
+                    <li><code>fallback_order=local -&gt; sidecar -&gt; cloud</code> {{ text('is the demo narrative to keep tomorrow consistent.', '是明天联调的统一讲法。') }}</li>
+                  </ul>
+                </section>
+                <section class="detail-row" [ngClass]="knowledgePrivacyLevel === 'strict_local' ? 'tone-warn' : 'tone-neutral'">
+                  <div class="detail-row-head">
+                    <strong>{{ text('Privacy gate', '隐私闸门') }}</strong>
+                    <span>{{ knowledgePrivacyLevel }}</span>
+                  </div>
+                  <ul class="detail-meta">
+                    <li>{{ text('strict_local blocks cloud_allowed even when cloud endpoints are healthy.', 'strict_local 会阻断 cloud_allowed，即使云端端点是健康的。') }}</li>
+                    <li>{{ text('allow_redacted_cloud means cloud is a controlled fallback, not the default home for inference.', 'allow_redacted_cloud 表示云端只是受控 fallback，不是默认推理主场。') }}</li>
+                  </ul>
+                </section>
+                @if (state.data.modelPolicies?.length) {
+                  <section class="detail-row tone-neutral">
+                    <div class="detail-row-head">
+                      <strong>{{ text('Route policy projection', '路由策略投影') }}</strong>
+                      <span>{{ state.data.modelPolicies?.length }}</span>
+                    </div>
+                    <div class="policy-chip-row">
+                      @for (policy of state.data.modelPolicies ?? []; track policy.route_policy_id) {
+                        <div class="policy-chip">
+                          <strong>{{ policy.domain_scope }} / {{ policy.modality }}</strong>
+                          <span>{{ policy.privacy_level }}</span>
+                          <span>{{ text('local preferred', '本地优先') }}: {{ policy.local_preferred }}</span>
+                          <span>fallback: {{ featureFallbackLabel(policy.fallback_order) }}</span>
+                        </div>
+                      }
+                    </div>
+                  </section>
+                }
+              </div>
+            </section>
+
+            <section class="readiness-block">
+              <div class="section-head compact-head">
+                <div>
+                  <p class="content-label">{{ text('RAG operator', 'RAG 操作台') }}</p>
+                  <p class="table-copy">{{ text('Tomorrow, use this area to search the rehearsal corpus, preview evidence, and keep the local-first explanation anchored in actual indexed content.', '明天可以直接在这里检索 rehearsal 语料、预览证据，并把 local-first 的解释锚定在真实索引内容上。') }}</p>
+                </div>
+                @if (knowledgeSearchResult) {
+                  <span class="status-pill" [ngClass]="knowledgeSearchResult.degraded ? 'tone-warn' : 'tone-good'">{{ knowledgeSearchResult.status }}</span>
+                }
+              </div>
+
+              <div class="knowledge-operator-grid">
+                <section class="detail-row knowledge-operator-query">
+                  <div class="detail-row-head">
+                    <strong>{{ text('Search prompt', '检索问题') }}</strong>
+                    <span>{{ text('Use the prefix “搜索已有内容：...” for architecture questions.', '架构类问题建议带“搜索已有内容：...”前缀。') }}</span>
+                  </div>
+                  <label class="knowledge-query-label">
+                    <span>{{ text('Query', '问题') }}</span>
+                    <textarea
+                      name="knowledge-search-query"
+                      rows="4"
+                      [(ngModel)]="knowledgeSearchDraft"
+                      [placeholder]="text('搜索已有内容：根据当前知识库，总结 Harbor 82 的演示环境。', '搜索已有内容：根据当前知识库，总结 Harbor 82 的演示环境。')"
+                    ></textarea>
+                  </label>
+                  <div class="knowledge-query-presets">
+                    <button
+                      type="button"
+                      class="action-button"
+                      (click)="applyKnowledgeSearchPreset('搜索已有内容：根据当前知识库，总结 Harbor 82 的演示环境。')"
+                    >
+                      {{ text('Use demo environment query', '填入演示环境问题') }}
+                    </button>
+                    <button
+                      type="button"
+                      class="action-button"
+                      (click)="applyKnowledgeSearchPreset('搜索已有内容：HarborBeacon 为什么说是 local first，而不是 cloud first？')"
+                    >
+                      {{ text('Use local-first query', '填入 local-first 问题') }}
+                    </button>
+                    <button type="button" class="action-button" [disabled]="knowledgeSearchBusy" (click)="requestKnowledgeSearch()">
+                      {{ knowledgeSearchBusy ? text('Searching...', '检索中...') : text('Run search', '执行检索') }}
+                    </button>
+                  </div>
+                  @if (knowledgeSearchQuery) {
+                    <p class="table-copy">{{ text('Last query', '最近一次问题') }}: <code>{{ knowledgeSearchQuery }}</code></p>
+                  }
+                  @if (knowledgeSearchError) {
+                    <p class="inline-error">{{ knowledgeSearchError }}</p>
+                  }
+                  @if (knowledgeSearchResult?.warnings?.length || knowledgeSearchResult?.blockers?.length) {
+                    <ul class="signal-list">
+                      @for (warning of knowledgeSearchResult?.warnings ?? []; track warning) {
+                        <li class="tone-warning">{{ warning }}</li>
+                      }
+                      @for (blocker of knowledgeSearchResult?.blockers ?? []; track blocker) {
+                        <li class="tone-danger">{{ blocker }}</li>
+                      }
+                    </ul>
+                  }
+                </section>
+
+                <section class="detail-row knowledge-operator-preview">
+                  <div class="detail-row-head">
+                    <strong>{{ text('Preview', '预览') }}</strong>
+                    @if (knowledgePreviewPath) {
+                      <span>{{ knowledgePreviewPath }}</span>
+                    } @else {
+                      <span>{{ text('Select a result to preview.', '从结果里选一条来预览。') }}</span>
+                    }
+                  </div>
+                  @if (knowledgePreviewError) {
+                    <p class="inline-error">{{ knowledgePreviewError }}</p>
+                  }
+                  @if (knowledgePreviewBusyPath) {
+                    <p class="table-copy">{{ text('Loading preview', '正在加载预览') }}: <code>{{ knowledgePreviewBusyPath }}</code></p>
+                  } @else if (knowledgePreviewUrl) {
+                    @if (previewIsImage()) {
+                      <div class="knowledge-preview-frame">
+                        <img [src]="knowledgePreviewUrl" [alt]="knowledgePreviewPath || 'preview'" />
+                      </div>
+                    } @else if (knowledgePreviewText) {
+                      <pre class="knowledge-preview-text">{{ knowledgePreviewText }}</pre>
+                    } @else {
+                      <p class="table-copy">{{ text('Preview is ready. Open it in a new tab when the file is binary or not rendered inline.', '预览已就绪；如果是二进制文件或当前不适合内联展示，可以新窗口打开。') }}</p>
+                    }
+                    <div class="knowledge-preview-actions">
+                      <a class="action-button preview-link-button" [href]="knowledgePreviewUrl" target="_blank" rel="noreferrer">
+                        {{ text('Open preview', '打开预览') }}
+                      </a>
+                      @if (knowledgePreviewMimeType) {
+                        <span class="cell-note">{{ knowledgePreviewMimeType }}</span>
+                      }
+                    </div>
+                  } @else {
+                    <p class="empty-copy">{{ text('Image results render inline here. Text and markdown results show a snippet and can be opened in a new tab.', '图片结果会在这里内联展示；文本和 Markdown 结果会显示片段，并且可以新窗口打开。') }}</p>
+                  }
+                </section>
+              </div>
+
+              @if (knowledgeSearchResult) {
+                <div class="detail-grid">
+                  <section class="detail-row tone-neutral">
+                    <div class="detail-row-head">
+                      <strong>{{ text('Search summary', '检索摘要') }}</strong>
+                      <span>{{ knowledgeSearchResult.total_matches }}</span>
+                    </div>
+                    <p class="feature-copy">{{ knowledgeSearchResult.reply_pack.summary || text('Search returned indexed evidence for the operator panel.', '检索已返回可供操作台使用的索引证据。') }}</p>
+                    <ul class="detail-meta">
+                      <li>{{ text('Privacy level', '隐私级别') }}: {{ knowledgeSearchResult.privacy_level }}</li>
+                      <li>{{ text('Resource profile', '资源策略') }}: {{ knowledgeSearchResult.resource_profile }}</li>
+                      <li>{{ text('Supported modalities', '支持模态') }}: {{ knowledgeSearchResult.supported_modalities.join(' | ') || text('none', '无') }}</li>
+                      @if (knowledgeSearchResult.pending_modalities.length) {
+                        <li>{{ text('Pending modalities', '待支持模态') }}: {{ knowledgeSearchResult.pending_modalities.join(' | ') }}</li>
+                      }
+                      @if (knowledgeSearchResult.degraded_reason) {
+                        <li class="tone-warning">{{ knowledgeSearchResult.degraded_reason }}</li>
+                      }
+                    </ul>
+                  </section>
+
+                  @if (knowledgeSearchResult.reply_pack.citations.length) {
+                    <section class="detail-row">
+                      <div class="detail-row-head">
+                        <strong>{{ text('Reply citations', '回答引用') }}</strong>
+                        <span>{{ knowledgeSearchResult.reply_pack.citations.length }}</span>
+                      </div>
+                      <div class="knowledge-result-stack">
+                        @for (citation of knowledgeSearchResult.reply_pack.citations; track citation.path + '-' + citation.chunk_id) {
+                          <section class="knowledge-result-card">
+                            <div class="detail-row-head">
+                              <strong>{{ citation.title }}</strong>
+                              <span>{{ citation.modality }}</span>
+                            </div>
+                            <p class="table-copy">{{ citation.preview || citation.path }}</p>
+                            <ul class="detail-meta">
+                              <li>{{ text('Path', '路径') }}: <code>{{ citation.path }}</code></li>
+                              <li>{{ text('Score', '分数') }}: {{ citation.score }}</li>
+                              @if (citation.matched_terms.length) {
+                                <li>{{ text('Matched terms', '命中词') }}: {{ citation.matched_terms.join(' | ') }}</li>
+                              }
+                            </ul>
+                          </section>
+                        }
+                      </div>
+                    </section>
+                  }
+
+                  @for (group of [
+                    { label: text('Document hits', '文档结果'), hits: knowledgeSearchResult.documents },
+                    { label: text('Image hits', '图片结果'), hits: knowledgeSearchResult.images },
+                    { label: text('Video hits', '视频结果'), hits: knowledgeSearchResult.videos }
+                  ]; track group.label) {
+                    @if (group.hits.length) {
+                      <section class="detail-row">
+                        <div class="detail-row-head">
+                          <strong>{{ group.label }}</strong>
+                          <span>{{ group.hits.length }}</span>
+                        </div>
+                        <div class="knowledge-result-stack">
+                          @for (hit of group.hits; track hit.path + '-' + hit.chunk_id + '-' + hit.modality) {
+                            <section class="knowledge-result-card">
+                              <div class="detail-row-head">
+                                <div class="knowledge-result-title">
+                                  <strong>{{ hit.title }}</strong>
+                                  <span>{{ hit.path }}</span>
+                                </div>
+                                <span class="status-pill">{{ hit.modality }}</span>
+                              </div>
+                              <p class="feature-copy">{{ hit.snippet || text('No snippet returned; use preview to inspect the source asset.', '当前没有返回 snippet，可通过预览查看原始内容。') }}</p>
+                              <ul class="detail-meta">
+                                @for (line of knowledgeResultMeta(hit.source_path || hit.path, hit.score, hit.modality); track line) {
+                                  <li>{{ line }}</li>
+                                }
+                                <li>{{ text('Content source kinds', '内容来源种类') }}: {{ hit.content_source_kinds.join(' | ') || text('none', '无') }}</li>
+                                <li>{{ text('Content indexed', '正文已索引') }}: {{ hit.content_indexed }}</li>
+                                <li>{{ text('Filename match used', '使用文件名匹配') }}: {{ hit.filename_match_used }}</li>
+                                <li>{{ text('Content match used', '使用正文匹配') }}: {{ hit.content_match_used }}</li>
+                                @if (hit.matched_terms.length) {
+                                  <li>{{ text('Matched terms', '命中词') }}: {{ hit.matched_terms.join(' | ') }}</li>
+                                }
+                              </ul>
+                              <div class="inline-action">
+                                <button
+                                  type="button"
+                                  class="action-button"
+                                  [disabled]="knowledgePreviewBusyPath === hit.path"
+                                  (click)="requestKnowledgePreview(hit.path)"
+                                >
+                                  {{
+                                    knowledgePreviewBusyPath === hit.path
+                                      ? text('Loading preview...', '预览加载中...')
+                                      : text('Preview', '预览')
+                                  }}
+                                </button>
+                              </div>
+                            </section>
+                          }
+                        </div>
+                      </section>
+                    }
+                  }
+                </div>
+              }
+            </section>
           }
 
           <div class="device-admin-grid">

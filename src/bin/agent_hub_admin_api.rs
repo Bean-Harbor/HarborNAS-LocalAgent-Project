@@ -48,6 +48,7 @@ use harborbeacon_local_agent::runtime::hub::{
     CameraConnectRequest, CameraHubService, HubManualAddSummary, HubScanRequest, HubScanSummary,
     HubStateSnapshot,
 };
+use harborbeacon_local_agent::runtime::knowledge::{KnowledgeSearchRequest, KnowledgeSearchService};
 use harborbeacon_local_agent::runtime::knowledge_index::{
     load_embedding_store, KnowledgeIndexConfig, KnowledgeIndexManifest, KnowledgeIndexService,
     KnowledgeModality,
@@ -582,6 +583,19 @@ struct KnowledgeIndexRunResponse {
     errors: Vec<String>,
 }
 
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+struct KnowledgeSearchApiRequest {
+    query: String,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    include_documents: Option<bool>,
+    #[serde(default)]
+    include_images: Option<bool>,
+    #[serde(default)]
+    include_videos: Option<bool>,
+}
+
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 struct KnowledgeIndexStatusResponse {
     generated_at: String,
@@ -1015,6 +1029,12 @@ impl AdminApi {
             }
             Method::Put if path == "/api/knowledge/settings" => self
                 .handle_save_knowledge_settings(&mut request, &identity_hints)
+                .boxed(),
+            Method::Post if path == "/api/knowledge/search" => self
+                .handle_knowledge_search(&mut request, &identity_hints)
+                .boxed(),
+            Method::Get if path == "/api/knowledge/preview" => self
+                .handle_knowledge_preview(&raw_url, &identity_hints)
                 .boxed(),
             Method::Post if path == "/api/knowledge/index/run" => {
                 self.handle_run_knowledge_index(&identity_hints).boxed()
@@ -1519,6 +1539,58 @@ impl AdminApi {
             Ok(state) => ok_json(&state.knowledge),
             Err(error) => error_json(StatusCode(422), &error),
         }
+    }
+
+    fn handle_knowledge_search(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let payload: KnowledgeSearchApiRequest = match read_json_body(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let settings = match self.admin_store.knowledge_settings() {
+            Ok(settings) => settings,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let search_request = match build_admin_knowledge_search_request(payload, &settings) {
+            Ok(request) => request,
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
+        match KnowledgeSearchService::search(search_request) {
+            Ok(response) => ok_json(&response),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_knowledge_preview(
+        &self,
+        raw_url: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let requested_path = match parse_query_param(raw_url, "path")
+            .and_then(percent_decode_optional_query_value)
+            .and_then(|value| non_empty_string(&value))
+        {
+            Some(path) => path,
+            None => return error_json(StatusCode(400), "knowledge preview requires path"),
+        };
+        let settings = match self.admin_store.knowledge_settings() {
+            Ok(settings) => settings,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let preview_path = match resolve_knowledge_preview_path(&requested_path, &settings) {
+            Ok(path) => path,
+            Err(error) => return error_json(error.status, &error.message),
+        };
+        static_file_response(&preview_path)
     }
 
     fn handle_run_knowledge_index(
@@ -4881,6 +4953,8 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/hardware/readiness"
         || path == "/api/rag/readiness"
         || path == "/api/knowledge/settings"
+        || path == "/api/knowledge/search"
+        || path == "/api/knowledge/preview"
         || path == "/api/knowledge/index/run"
         || path == "/api/knowledge/index/status"
         || path == "/api/knowledge/index/jobs"
@@ -4987,8 +5061,18 @@ fn mime_type_for_path(path: &Path) -> &'static str {
         Some("json") => "application/json; charset=utf-8",
         Some("svg") => "image/svg+xml",
         Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("bmp") => "image/bmp",
+        Some("mp4") | Some("m4v") => "video/mp4",
+        Some("mov") => "video/quicktime",
+        Some("mkv") => "video/x-matroska",
+        Some("webm") => "video/webm",
+        Some("avi") => "video/x-msvideo",
         Some("ico") => "image/x-icon",
         Some("txt") => "text/plain; charset=utf-8",
+        Some("md") | Some("markdown") => "text/markdown; charset=utf-8",
         Some("map") => "application/json; charset=utf-8",
         Some("webmanifest") => "application/manifest+json; charset=utf-8",
         Some("woff") => "font/woff",
@@ -6049,6 +6133,163 @@ fn knowledge_index_storage_summary(index_path: &Path) -> KnowledgeIndexStorageSu
             max_unix_timestamp_string(summary.last_indexed_at.take(), Some(manifest.generated_at));
     }
     summary
+}
+
+fn build_admin_knowledge_search_request(
+    payload: KnowledgeSearchApiRequest,
+    settings: &KnowledgeSettings,
+) -> Result<KnowledgeSearchRequest, String> {
+    let query = payload.query.trim();
+    if query.is_empty() {
+        return Err("HarborBot search requires a non-empty query.".to_string());
+    }
+    let configured_roots = settings.enabled_source_root_paths();
+    if configured_roots.is_empty() {
+        return Err("No enabled knowledge source roots are configured.".to_string());
+    }
+    let mut request = KnowledgeSearchRequest::new(query.to_string());
+    request.configured_roots = configured_roots.clone();
+    request.roots = configured_roots;
+    request.index_root = non_empty_string(&settings.index_root);
+    request.include_documents = payload.include_documents.unwrap_or(true);
+    request.include_images = payload.include_images.unwrap_or(true);
+    request.include_videos = payload.include_videos.unwrap_or(true);
+    request.limit = payload.limit.unwrap_or(24).clamp(1, 50);
+    request.privacy_level = settings.privacy_level;
+    request.resource_profile = settings.default_resource_profile;
+    request.require_embeddings = false;
+    request.latency_budget_ms = None;
+    Ok(request)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KnowledgePreviewError {
+    status: StatusCode,
+    message: String,
+}
+
+impl KnowledgePreviewError {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+}
+
+fn resolve_knowledge_preview_path(
+    requested_path: &str,
+    settings: &KnowledgeSettings,
+) -> Result<PathBuf, KnowledgePreviewError> {
+    let requested = PathBuf::from(requested_path.trim());
+    if !requested.is_absolute() {
+        return Err(KnowledgePreviewError::new(
+            StatusCode(400),
+            "knowledge preview path must be absolute",
+        ));
+    }
+    let requested = requested.canonicalize().map_err(|_| {
+        KnowledgePreviewError::new(
+            StatusCode(404),
+            format!("knowledge preview file not found: {}", requested.display()),
+        )
+    })?;
+    if requested.is_dir() {
+        return Err(KnowledgePreviewError::new(
+            StatusCode(400),
+            "knowledge preview does not support directory paths",
+        ));
+    }
+    if !requested.is_file() {
+        return Err(KnowledgePreviewError::new(
+            StatusCode(404),
+            format!("knowledge preview file not found: {}", requested.display()),
+        ));
+    }
+    if !knowledge_preview_mime_supported(&requested) {
+        return Err(KnowledgePreviewError::new(
+            StatusCode(415),
+            format!(
+                "knowledge preview supports images, videos, text, and Markdown only: {}",
+                requested.display()
+            ),
+        ));
+    }
+    let allowed_roots = enabled_existing_knowledge_roots(settings);
+    if allowed_roots.is_empty() {
+        return Err(KnowledgePreviewError::new(
+            StatusCode(422),
+            "No enabled knowledge source roots are configured.",
+        ));
+    }
+    if !allowed_roots.iter().any(|root| path_is_same_or_inside(
+        &requested.to_string_lossy(),
+        &root.to_string_lossy()
+    )) {
+        return Err(KnowledgePreviewError::new(
+            StatusCode(403),
+            format!(
+                "knowledge preview path is outside configured source roots: {}",
+                requested.display()
+            ),
+        ));
+    }
+    if !knowledge_preview_path_is_indexed(&requested, settings, &allowed_roots) {
+        return Err(KnowledgePreviewError::new(
+            StatusCode(404),
+            format!(
+                "knowledge preview path is not present in the current index: {}",
+                requested.display()
+            ),
+        ));
+    }
+    Ok(requested)
+}
+
+fn enabled_existing_knowledge_roots(settings: &KnowledgeSettings) -> Vec<PathBuf> {
+    settings
+        .source_roots
+        .iter()
+        .filter(|root| root.enabled)
+        .filter_map(|root| non_empty_string(&root.path))
+        .filter_map(|path| PathBuf::from(path).canonicalize().ok())
+        .filter(|path| path.is_dir())
+        .collect()
+}
+
+fn knowledge_preview_path_is_indexed(
+    requested: &Path,
+    settings: &KnowledgeSettings,
+    allowed_roots: &[PathBuf],
+) -> bool {
+    let service = match KnowledgeIndexConfig::new(PathBuf::from(settings.index_root.clone()))
+        .and_then(KnowledgeIndexService::from_config)
+    {
+        Ok(service) => service,
+        Err(_) => return false,
+    };
+    let requested_string = requested.to_string_lossy();
+    allowed_roots
+        .iter()
+        .filter(|root| path_is_same_or_inside(&requested_string, &root.to_string_lossy()))
+        .filter_map(|root| service.load_existing(root).ok())
+        .flat_map(|snapshot| snapshot.manifest.entries.into_iter())
+        .any(|entry| indexed_entry_matches_path(&entry.path, requested))
+}
+
+fn indexed_entry_matches_path(indexed_path: &str, requested: &Path) -> bool {
+    let indexed = PathBuf::from(indexed_path);
+    let indexed = indexed.canonicalize().unwrap_or(indexed);
+    path_is_same_or_inside(&indexed.to_string_lossy(), &requested.to_string_lossy())
+        && path_is_same_or_inside(&requested.to_string_lossy(), &indexed.to_string_lossy())
+}
+
+fn knowledge_preview_mime_supported(path: &Path) -> bool {
+    let mime = mime_type_for_path(path);
+    mime.starts_with("image/")
+        || mime.starts_with("video/")
+        || mime.starts_with("text/plain")
+        || mime.starts_with("text/markdown")
 }
 
 fn directory_storage_bytes(path: &Path) -> u64 {
@@ -7274,6 +7515,21 @@ fn local_model_catalog_specs() -> Vec<LocalModelCatalogSpec> {
             runtime_profiles: &["openai-compatible-embedding"],
             expected_capabilities: &["embedding"],
             acceptance_note: Some("legacy-catalog"),
+        },
+        LocalModelCatalogSpec {
+            model_id: "HuggingFaceTB/SmolVLM-256M-Instruct",
+            display_name: "SmolVLM 256M Instruct",
+            provider_key: "huggingfacetb",
+            model_kind: "vlm",
+            recommended_hardware: "CPU smoke VLM; slow but suitable for VM content-index validation",
+            download_size_hint: "1-2 GB",
+            source_kind: "huggingface",
+            repo_id: Some("HuggingFaceTB/SmolVLM-256M-Instruct"),
+            revision: "main",
+            file_policy: "runtime_snapshot",
+            runtime_profiles: &["openai-compatible-vlm", "cpu-vlm-sidecar"],
+            expected_capabilities: &["vlm", "image_text_to_text"],
+            acceptance_note: Some("vm-cpu-photo-rag"),
         },
         LocalModelCatalogSpec {
             model_id: "minicpm-v-2.6",
@@ -10479,18 +10735,20 @@ impl Drop for FfmpegMjpegStream {
 mod tests {
     use super::{
         apply_bridge_provider_binding_projection, authorize_gateway_service_request,
-        build_device_credential_status, build_feature_availability_response,
-        build_files_browse_response, build_harboros_im_capability_map,
-        build_harboros_status_response, build_hardware_readiness_response,
-        build_knowledge_index_job, build_knowledge_index_status_response,
+        build_admin_knowledge_search_request, build_device_credential_status,
+        build_feature_availability_response, build_files_browse_response,
+        build_harboros_im_capability_map, build_harboros_status_response,
+        build_hardware_readiness_response, build_knowledge_index_job,
+        build_knowledge_index_status_response,
         build_local_model_catalog, build_rag_readiness_response, build_release_readiness_response,
         build_rtsp_url_from_patch, default_model_download_target_path, default_model_endpoints,
         ensure_local_admin_access, ensure_local_camera_access, harbordesk_build_missing_response,
         has_forwarding_headers, huggingface_download_should_fallback_to_plain_http,
         huggingface_resolve_url, identity_query_suffix, is_admin_surface_path,
         is_harbordesk_client_route, is_harbordesk_surface_path, local_model_catalog_item,
-        local_model_catalog_specs, live_bridge_provider_from_setup_status, mime_type_for_path,
-        model_download_jobs_status, model_snapshot_file_allowed,
+        knowledge_preview_mime_supported, local_model_catalog_specs,
+        live_bridge_provider_from_setup_status, mime_type_for_path, model_download_jobs_status,
+        model_snapshot_file_allowed,
         overlay_model_endpoints_with_runtime_truth, parse_approval_decision_path,
         parse_camera_analyze_path, parse_camera_live_page_path, parse_camera_live_stream_path,
         parse_camera_share_link_path, parse_camera_snapshot_path, parse_camera_task_snapshot_path,
@@ -10506,8 +10764,9 @@ mod tests {
         redact_bridge_provider_config, redact_camera_device_projection,
         redact_model_endpoint_response, redact_state_snapshot, redact_stream_url_credentials,
         redact_value_stream_credentials, release_item, request_identity_hints,
-        resolve_harbordesk_asset_path, run_knowledge_index_jobs, run_model_download_transfer,
-        url_encode_path_segment, AdminApi, LocalModelRuntimeProjection, ManualAddRequest,
+        resolve_harbordesk_asset_path, resolve_knowledge_preview_path, run_knowledge_index_jobs,
+        run_model_download_transfer, url_encode_path_segment, AdminApi, KnowledgeSearchApiRequest,
+        LocalModelRuntimeProjection, ManualAddRequest,
     };
     use harborbeacon_local_agent::control_plane::media::{
         MediaDeliveryMode, MediaSession, MediaSessionKind, MediaSessionStatus, ShareAccessScope,
@@ -10526,6 +10785,9 @@ mod tests {
         RemoteViewConfig,
     };
     use harborbeacon_local_agent::runtime::hub::CameraHubService;
+    use harborbeacon_local_agent::runtime::knowledge_index::{
+        KnowledgeIndexConfig, KnowledgeIndexService,
+    };
     use harborbeacon_local_agent::runtime::registry::{CameraDevice, DeviceRegistryStore};
     use harborbeacon_local_agent::runtime::remote_view;
     use harborbeacon_local_agent::runtime::task_api::TaskApiService;
@@ -11091,6 +11353,8 @@ mod tests {
         assert!(is_admin_surface_path("/api/access/members"));
         assert!(is_admin_surface_path("/api/account-management"));
         assert!(is_admin_surface_path("/api/gateway/status"));
+        assert!(is_admin_surface_path("/api/knowledge/search"));
+        assert!(is_admin_surface_path("/api/knowledge/preview"));
         assert!(is_admin_surface_path("/api/share-links"));
         assert!(is_admin_surface_path("/api/models/endpoints"));
         assert!(is_admin_surface_path("/api/models/policies"));
@@ -11153,6 +11417,26 @@ mod tests {
             mime_type_for_path(Path::new("C:/tmp/icon.svg")),
             "image/svg+xml"
         );
+        assert_eq!(
+            mime_type_for_path(Path::new("C:/tmp/photo.jpeg")),
+            "image/jpeg"
+        );
+        assert_eq!(
+            mime_type_for_path(Path::new("C:/tmp/note.md")),
+            "text/markdown; charset=utf-8"
+        );
+        assert_eq!(
+            mime_type_for_path(Path::new("C:/tmp/clip.mp4")),
+            "video/mp4"
+        );
+        assert_eq!(
+            mime_type_for_path(Path::new("C:/tmp/clip.webm")),
+            "video/webm"
+        );
+        assert!(knowledge_preview_mime_supported(Path::new("C:/tmp/photo.webp")));
+        assert!(knowledge_preview_mime_supported(Path::new("C:/tmp/clip.mp4")));
+        assert!(knowledge_preview_mime_supported(Path::new("C:/tmp/note.txt")));
+        assert!(!knowledge_preview_mime_supported(Path::new("C:/tmp/data.json")));
     }
 
     #[test]
@@ -11542,6 +11826,27 @@ mod tests {
             not_today.acceptance_note.as_deref(),
             Some("not-today-acceptance")
         );
+
+        let smolvlm = catalog
+            .models
+            .iter()
+            .find(|item| item.model_id == "HuggingFaceTB/SmolVLM-256M-Instruct")
+            .expect("vm cpu smolvlm catalog model");
+        assert_eq!(smolvlm.source_kind, "huggingface");
+        assert_eq!(
+            smolvlm.repo_id.as_deref(),
+            Some("HuggingFaceTB/SmolVLM-256M-Instruct")
+        );
+        assert_eq!(smolvlm.model_kind, "vlm");
+        assert_eq!(smolvlm.file_policy, "runtime_snapshot");
+        assert!(smolvlm
+            .runtime_profiles
+            .iter()
+            .any(|profile| profile == "cpu-vlm-sidecar"));
+        assert_eq!(
+            smolvlm.acceptance_note.as_deref(),
+            Some("vm-cpu-photo-rag")
+        );
     }
 
     #[test]
@@ -11900,6 +12205,153 @@ mod tests {
         assert_eq!(response.embedding_entry_count, 1);
         assert!(response.storage_usage_bytes > 0);
         assert_eq!(response.last_indexed_at.as_deref(), Some("200"));
+        let _ = fs::remove_dir_all(index_root);
+    }
+
+    #[test]
+    fn admin_knowledge_search_request_uses_enabled_roots_and_clamps_limit() {
+        let settings = KnowledgeSettings {
+            source_roots: vec![
+                KnowledgeSourceRoot {
+                    root_id: "enabled".to_string(),
+                    label: "Enabled".to_string(),
+                    path: "/mnt/source-a".to_string(),
+                    enabled: true,
+                    include: Vec::new(),
+                    exclude: Vec::new(),
+                    last_indexed_at: None,
+                },
+                KnowledgeSourceRoot {
+                    root_id: "disabled".to_string(),
+                    label: "Disabled".to_string(),
+                    path: "/mnt/source-b".to_string(),
+                    enabled: false,
+                    include: Vec::new(),
+                    exclude: Vec::new(),
+                    last_indexed_at: None,
+                },
+            ],
+            index_root: "/mnt/index".to_string(),
+            ..Default::default()
+        };
+
+        let request = build_admin_knowledge_search_request(
+            KnowledgeSearchApiRequest {
+                query: " 找到春天照片 ".to_string(),
+                limit: Some(500),
+                include_documents: Some(false),
+                include_images: None,
+                include_videos: Some(true),
+            },
+            &settings,
+        )
+        .expect("search request");
+
+        assert_eq!(request.query, "找到春天照片");
+        assert_eq!(request.limit, 50);
+        assert_eq!(request.configured_roots, vec!["/mnt/source-a".to_string()]);
+        assert_eq!(request.roots, vec!["/mnt/source-a".to_string()]);
+        assert!(!request.include_documents);
+        assert!(request.include_images);
+        assert!(request.include_videos);
+        assert_eq!(request.index_root.as_deref(), Some("/mnt/index"));
+    }
+
+    #[test]
+    fn knowledge_preview_allows_indexed_files_under_enabled_source_root() {
+        let source_root = unique_store_path("harborbot-preview-source");
+        let index_root = unique_store_path("harborbot-preview-index");
+        fs::create_dir_all(&source_root).expect("create source root");
+        fs::create_dir_all(&index_root).expect("create index root");
+        let indexed_path = source_root.join("indexed.md");
+        fs::write(&indexed_path, "HarborBot indexed preview").expect("write indexed file");
+        let service =
+            KnowledgeIndexService::from_config(KnowledgeIndexConfig::new(index_root.clone()).unwrap())
+                .expect("index service");
+        service
+            .load_or_refresh(&source_root)
+            .expect("write index manifest");
+        let settings = KnowledgeSettings {
+            source_roots: vec![KnowledgeSourceRoot {
+                root_id: "source".to_string(),
+                label: "Source".to_string(),
+                path: source_root.to_string_lossy().into_owned(),
+                enabled: true,
+                include: Vec::new(),
+                exclude: Vec::new(),
+                last_indexed_at: Some("1".to_string()),
+            }],
+            index_root: index_root.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+
+        let resolved =
+            resolve_knowledge_preview_path(&indexed_path.to_string_lossy(), &settings)
+                .expect("preview path");
+
+        assert_eq!(resolved, indexed_path.canonicalize().expect("canonical path"));
+        let _ = fs::remove_dir_all(source_root);
+        let _ = fs::remove_dir_all(index_root);
+    }
+
+    #[test]
+    fn knowledge_preview_rejects_outside_unindexed_directory_and_unsupported_files() {
+        let source_root = unique_store_path("harborbot-preview-guard-source");
+        let outside_root = unique_store_path("harborbot-preview-guard-outside");
+        let index_root = unique_store_path("harborbot-preview-guard-index");
+        fs::create_dir_all(&source_root).expect("create source root");
+        fs::create_dir_all(&outside_root).expect("create outside root");
+        fs::create_dir_all(&index_root).expect("create index root");
+        let indexed_path = source_root.join("indexed.md");
+        fs::write(&indexed_path, "indexed").expect("write indexed file");
+        let service =
+            KnowledgeIndexService::from_config(KnowledgeIndexConfig::new(index_root.clone()).unwrap())
+                .expect("index service");
+        service
+            .load_or_refresh(&source_root)
+            .expect("write index manifest");
+        let unindexed_path = source_root.join("unindexed.md");
+        fs::write(&unindexed_path, "not indexed").expect("write unindexed file");
+        let unsupported_path = source_root.join("payload.bin");
+        fs::write(&unsupported_path, "not previewable").expect("write unsupported file");
+        let outside_path = outside_root.join("outside.md");
+        fs::write(&outside_path, "outside").expect("write outside file");
+        let settings = KnowledgeSettings {
+            source_roots: vec![KnowledgeSourceRoot {
+                root_id: "source".to_string(),
+                label: "Source".to_string(),
+                path: source_root.to_string_lossy().into_owned(),
+                enabled: true,
+                include: Vec::new(),
+                exclude: Vec::new(),
+                last_indexed_at: Some("1".to_string()),
+            }],
+            index_root: index_root.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+
+        let outside_error =
+            resolve_knowledge_preview_path(&outside_path.to_string_lossy(), &settings)
+                .expect_err("outside root rejected");
+        assert_eq!(outside_error.status, StatusCode(403));
+
+        let unindexed_error =
+            resolve_knowledge_preview_path(&unindexed_path.to_string_lossy(), &settings)
+                .expect_err("unindexed path rejected");
+        assert_eq!(unindexed_error.status, StatusCode(404));
+
+        let directory_error =
+            resolve_knowledge_preview_path(&source_root.to_string_lossy(), &settings)
+                .expect_err("directory rejected");
+        assert_eq!(directory_error.status, StatusCode(400));
+
+        let unsupported_error =
+            resolve_knowledge_preview_path(&unsupported_path.to_string_lossy(), &settings)
+                .expect_err("unsupported mime rejected");
+        assert_eq!(unsupported_error.status, StatusCode(415));
+
+        let _ = fs::remove_dir_all(source_root);
+        let _ = fs::remove_dir_all(outside_root);
         let _ = fs::remove_dir_all(index_root);
     }
 
