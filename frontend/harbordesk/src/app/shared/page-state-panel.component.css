@@ -354,6 +354,125 @@
   gap: 18px;
 }
 
+.policy-chip-row,
+.knowledge-result-stack {
+  display: grid;
+  gap: 12px;
+}
+
+.policy-chip {
+  border: 1px solid rgba(166, 195, 224, 0.14);
+  border-radius: 12px;
+  background: rgba(8, 14, 24, 0.76);
+  padding: 12px;
+  display: grid;
+  gap: 6px;
+}
+
+.policy-chip strong {
+  color: var(--text);
+}
+
+.policy-chip span {
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.knowledge-operator-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(300px, 0.85fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.knowledge-operator-query,
+.knowledge-operator-preview {
+  min-height: 100%;
+}
+
+.knowledge-query-label {
+  display: grid;
+  gap: 8px;
+}
+
+.knowledge-query-label span {
+  color: var(--muted);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.knowledge-query-presets,
+.knowledge-preview-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.knowledge-result-card {
+  border: 1px solid rgba(166, 195, 224, 0.14);
+  border-radius: 12px;
+  background: rgba(8, 14, 24, 0.76);
+  padding: 14px;
+  display: grid;
+  gap: 10px;
+}
+
+.knowledge-result-title {
+  display: grid;
+  gap: 4px;
+}
+
+.knowledge-result-title strong {
+  color: var(--text);
+}
+
+.knowledge-result-title span {
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.knowledge-preview-frame {
+  border: 1px solid rgba(166, 195, 224, 0.14);
+  border-radius: 12px;
+  overflow: hidden;
+  background: rgba(8, 14, 24, 0.76);
+  min-height: 220px;
+  display: grid;
+  place-items: center;
+}
+
+.knowledge-preview-frame img {
+  display: block;
+  width: 100%;
+  height: auto;
+  object-fit: contain;
+}
+
+.knowledge-preview-text {
+  margin: 0;
+  border: 1px solid rgba(166, 195, 224, 0.14);
+  border-radius: 12px;
+  background: rgba(8, 14, 24, 0.76);
+  color: var(--text);
+  padding: 14px;
+  overflow: auto;
+  max-height: 420px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: inherit;
+  line-height: 1.5;
+}
+
+.preview-link-button {
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+}
+
 .feature-group {
   display: grid;
   gap: 14px;
@@ -617,7 +736,8 @@
   .readiness-status-grid,
   .readiness-split-grid,
   .release-domain-grid,
-  .history-grid {
+  .history-grid,
+  .knowledge-operator-grid {
     grid-template-columns: 1fr;
   }
 }

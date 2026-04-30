@@ -9,6 +9,8 @@ import {
   DeskPageModel,
   DiscoveryScanPayload,
   FilesBrowseResponse,
+  KnowledgeSearchRequestPayload,
+  KnowledgeSearchResponse,
   FeatureAvailabilityStatus,
   KnowledgeSettings,
   KnowledgeSourceRoot,
@@ -51,6 +53,16 @@ export class PageStatePanelComponent {
   @Input() knowledgeIndexJobBusyId: string | null = null;
   @Input() modelDownloadBusyId: string | null = null;
   @Input() filesBrowse: FilesBrowseResponse | null = null;
+  @Input() knowledgeSearchBusy = false;
+  @Input() knowledgeSearchQuery = '';
+  @Input() knowledgeSearchResult: KnowledgeSearchResponse | null = null;
+  @Input() knowledgeSearchError: string | null = null;
+  @Input() knowledgePreviewBusyPath: string | null = null;
+  @Input() knowledgePreviewPath: string | null = null;
+  @Input() knowledgePreviewUrl: string | null = null;
+  @Input() knowledgePreviewMimeType: string | null = null;
+  @Input() knowledgePreviewText: string | null = null;
+  @Input() knowledgePreviewError: string | null = null;
 
   @Output() readonly defaultDeliverySurfaceChange = new EventEmitter<{
     userId: string;
@@ -81,6 +93,8 @@ export class PageStatePanelComponent {
   @Output() readonly localModelDownloadRequested = new EventEmitter<LocalModelCatalogItem>();
   @Output() readonly localModelDownloadCancelRequested = new EventEmitter<string>();
   @Output() readonly filesBrowseRequested = new EventEmitter<string | null>();
+  @Output() readonly knowledgeSearchRequested = new EventEmitter<KnowledgeSearchRequestPayload>();
+  @Output() readonly knowledgePreviewRequested = new EventEmitter<string>();
 
   protected scanForm: Required<DiscoveryScanPayload> = {
     cidr: '',
@@ -102,6 +116,7 @@ export class PageStatePanelComponent {
   protected knowledgeSourceRootEnabled: Record<string, boolean> = {};
   protected knowledgePrivacyLevel: RagPrivacyLevel = 'strict_local';
   protected knowledgeResourceProfile: RagResourceProfile = 'cpu_only';
+  protected knowledgeSearchDraft = '搜索已有内容：根据当前知识库，总结 Harbor 82 的演示环境。';
   protected readonly knowledgePrivacyOptions: Array<{ value: RagPrivacyLevel; label: string; detail: string }> = [
     {
       value: 'strict_local',
@@ -390,6 +405,49 @@ export class PageStatePanelComponent {
 
   protected requestFilesBrowse(path?: string | null): void {
     this.filesBrowseRequested.emit(path?.trim() || null);
+  }
+
+  protected requestKnowledgeSearch(): void {
+    const query = this.knowledgeSearchDraft.trim();
+    if (!query) {
+      return;
+    }
+    this.knowledgeSearchRequested.emit({
+      query,
+      limit: 8,
+      include_documents: true,
+      include_images: true,
+      include_videos: false
+    });
+  }
+
+  protected applyKnowledgeSearchPreset(query: string): void {
+    this.knowledgeSearchDraft = query;
+  }
+
+  protected requestKnowledgePreview(path: string): void {
+    if (!path) {
+      return;
+    }
+    this.knowledgePreviewRequested.emit(path);
+  }
+
+  protected knowledgeResultMeta(path: string | undefined | null, score: number | undefined, modality: string | undefined): string[] {
+    const lines: string[] = [];
+    if (modality) {
+      lines.push(`modality=${modality}`);
+    }
+    if (typeof score === 'number') {
+      lines.push(`score=${score}`);
+    }
+    if (path) {
+      lines.push(path);
+    }
+    return lines;
+  }
+
+  protected previewIsImage(): boolean {
+    return Boolean(this.knowledgePreviewMimeType?.startsWith('image/'));
   }
 
   protected addKnowledgeSourcePath(path: string): void {

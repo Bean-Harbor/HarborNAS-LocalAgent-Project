@@ -1,5 +1,5 @@
 import { AsyncPipe } from '@angular/common';
-import { Component, inject } from '@angular/core';
+import { Component, OnDestroy, inject } from '@angular/core';
 import { ActivatedRoute } from '@angular/router';
 import { BehaviorSubject, Observable, combineLatest } from 'rxjs';
 import { finalize, switchMap, tap } from 'rxjs/operators';
@@ -10,6 +10,8 @@ import {
   DiscoveryScanPayload,
   FilesBrowseResponse,
   KnowledgeIndexRunResponse,
+  KnowledgeSearchRequestPayload,
+  KnowledgeSearchResponse,
   KnowledgeSettings,
   LocalModelCatalogItem,
   ManualDevicePayload,
@@ -44,6 +46,16 @@ import { PageStatePanelComponent } from '../shared/page-state-panel.component';
       [knowledgeIndexJobBusyId]="knowledgeIndexJobBusyId"
       [modelDownloadBusyId]="modelDownloadBusyId"
       [filesBrowse]="filesBrowse"
+      [knowledgeSearchBusy]="knowledgeSearchBusy"
+      [knowledgeSearchQuery]="knowledgeSearchQuery"
+      [knowledgeSearchResult]="knowledgeSearchResult"
+      [knowledgeSearchError]="knowledgeSearchError"
+      [knowledgePreviewBusyPath]="knowledgePreviewBusyPath"
+      [knowledgePreviewPath]="knowledgePreviewPath"
+      [knowledgePreviewUrl]="knowledgePreviewUrl"
+      [knowledgePreviewMimeType]="knowledgePreviewMimeType"
+      [knowledgePreviewText]="knowledgePreviewText"
+      [knowledgePreviewError]="knowledgePreviewError"
       (defaultDeliverySurfaceChange)="updateDefaultDeliverySurface($event.userId, $event.surface)"
       (notificationTargetDefaultChange)="setDefaultNotificationTarget($event)"
       (notificationTargetDelete)="deleteNotificationTarget($event)"
@@ -64,10 +76,12 @@ import { PageStatePanelComponent } from '../shared/page-state-panel.component';
       (localModelDownloadRequested)="startLocalModelDownload($event)"
       (localModelDownloadCancelRequested)="cancelLocalModelDownload($event)"
       (filesBrowseRequested)="browseFiles($event)"
+      (knowledgeSearchRequested)="runKnowledgeSearch($event)"
+      (knowledgePreviewRequested)="loadKnowledgePreview($event)"
     ></hd-page-state-panel>
   `
 })
-export class DeskPageComponent {
+export class DeskPageComponent implements OnDestroy {
   private readonly route = inject(ActivatedRoute);
   private readonly api = inject(HarborDeskAdminApiService);
   private readonly refresh$ = new BehaviorSubject(0);
@@ -87,6 +101,16 @@ export class DeskPageComponent {
   protected knowledgeIndexJobBusyId: string | null = null;
   protected modelDownloadBusyId: string | null = null;
   protected filesBrowse: FilesBrowseResponse | null = null;
+  protected knowledgeSearchBusy = false;
+  protected knowledgeSearchQuery = '';
+  protected knowledgeSearchResult: KnowledgeSearchResponse | null = null;
+  protected knowledgeSearchError: string | null = null;
+  protected knowledgePreviewBusyPath: string | null = null;
+  protected knowledgePreviewPath: string | null = null;
+  protected knowledgePreviewUrl: string | null = null;
+  protected knowledgePreviewMimeType: string | null = null;
+  protected knowledgePreviewText: string | null = null;
+  protected knowledgePreviewError: string | null = null;
 
   protected readonly state$ = combineLatest([this.route.data, this.refresh$]).pipe(
     switchMap(([data]) => this.api.observePage(data['pageId'] as HarborDeskPageId))
@@ -469,6 +493,69 @@ export class DeskPageComponent {
       });
   }
 
+  protected runKnowledgeSearch(payload: KnowledgeSearchRequestPayload): void {
+    this.knowledgeSearchBusy = true;
+    this.knowledgeSearchError = null;
+    this.knowledgeSearchQuery = payload.query;
+    this.api
+      .searchKnowledge(payload)
+      .pipe(
+        tap((result) => {
+          this.knowledgeSearchResult = result;
+          this.knowledgePreviewError = null;
+        }),
+        finalize(() => {
+          this.knowledgeSearchBusy = false;
+        })
+      )
+      .subscribe({
+        error: (error: unknown) => {
+          this.knowledgeSearchError = this.errorMessage(
+            error,
+            this.text('Knowledge search failed.', '知识检索失败。')
+          );
+          this.knowledgeSearchResult = null;
+        }
+      });
+  }
+
+  protected loadKnowledgePreview(path: string): void {
+    this.knowledgePreviewBusyPath = path;
+    this.knowledgePreviewError = null;
+    this.api
+      .previewKnowledge(path)
+      .pipe(finalize(() => {
+        this.knowledgePreviewBusyPath = null;
+      }))
+      .subscribe({
+        next: async (blob) => {
+          this.resetKnowledgePreviewUrl();
+          this.knowledgePreviewPath = path;
+          this.knowledgePreviewMimeType = blob.type || 'application/octet-stream';
+          this.knowledgePreviewUrl = URL.createObjectURL(blob);
+          if (
+            this.knowledgePreviewMimeType.startsWith('text/') ||
+            this.knowledgePreviewMimeType.includes('markdown') ||
+            this.knowledgePreviewMimeType.includes('json')
+          ) {
+            this.knowledgePreviewText = await blob.text();
+          } else {
+            this.knowledgePreviewText = null;
+          }
+        },
+        error: (error: unknown) => {
+          this.knowledgePreviewError = this.errorMessage(
+            error,
+            this.text('Knowledge preview failed.', '知识预览失败。')
+          );
+        }
+      });
+  }
+
+  ngOnDestroy(): void {
+    this.resetKnowledgePreviewUrl();
+  }
+
   private knowledgeIndexRunMessage(result: KnowledgeIndexRunResponse): string {
     const jobIds = result.job_ids ?? [];
     const jobSuffix = jobIds.length ? ` Job(s): ${jobIds.join(', ')}.` : '';
@@ -558,5 +645,15 @@ export class DeskPageComponent {
 
   private text(english: string, chinese: string): string {
     return uiText(english, chinese);
+  }
+
+  private resetKnowledgePreviewUrl(): void {
+    if (this.knowledgePreviewUrl) {
+      URL.revokeObjectURL(this.knowledgePreviewUrl);
+    }
+    this.knowledgePreviewUrl = null;
+    this.knowledgePreviewPath = null;
+    this.knowledgePreviewMimeType = null;
+    this.knowledgePreviewText = null;
   }
 }
