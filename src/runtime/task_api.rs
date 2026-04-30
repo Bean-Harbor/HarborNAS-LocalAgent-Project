@@ -1813,7 +1813,9 @@ impl TaskApiService {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string)
-            .unwrap_or_else(general_message_support_summary);
+            .unwrap_or_else(|| {
+                general_message_support_summary_for_request(request.intent.raw_text.as_str())
+            });
         let examples = general_message_supported_examples();
         self.completed(
             request,
@@ -8015,6 +8017,10 @@ fn general_message_requests_capability_summary(raw_text: &str) -> bool {
         return false;
     }
 
+    if general_message_requests_local_first_architecture_summary(raw_text) {
+        return true;
+    }
+
     let exact_matches = ["帮助", "帮助一下", "help", "helpme"];
     if exact_matches
         .iter()
@@ -8046,6 +8052,54 @@ fn general_message_requests_capability_summary(raw_text: &str) -> bool {
     .any(|candidate| normalized.contains(&candidate))
 }
 
+fn general_message_requests_local_first_architecture_summary(raw_text: &str) -> bool {
+    let normalized = normalize_command_text(raw_text);
+    if normalized.is_empty() {
+        return false;
+    }
+
+    let mentions_harbor_core = matches_any(&normalized, &["harborbeacon", "harborgate"]);
+    let mentions_policy_or_fallback = matches_any(
+        &normalized,
+        &[
+            "fallback",
+            "回退",
+            "云端",
+            "privacy",
+            "resource",
+            "policy",
+            "策略",
+        ],
+    );
+    let mentions_local_first = matches_any(
+        &normalized,
+        &[
+            "local-first",
+            "localfirst",
+            "本地优先",
+            "本地优先策略",
+            "云端fallback",
+            "受控fallback",
+            "受控回退",
+        ],
+    );
+    let asks_architecture = matches_any(
+        &normalized,
+        &[
+            "架构",
+            "怎么受控",
+            "怎么工作",
+            "如何工作",
+            "解释一下",
+            "说明一下",
+            "讲一下",
+        ],
+    );
+
+    asks_architecture
+        && (mentions_local_first || mentions_harbor_core || mentions_policy_or_fallback)
+}
+
 fn general_message_supported_examples() -> Vec<String> {
     vec![
         "帮我抓拍一下当前摄像头画面".to_string(),
@@ -8053,6 +8107,14 @@ fn general_message_supported_examples() -> Vec<String> {
         "帮我找到和樱花有关的文件".to_string(),
         "根据资料回答樱花计划是什么".to_string(),
     ]
+}
+
+fn general_message_support_summary_for_request(raw_text: &str) -> String {
+    if general_message_requests_local_first_architecture_summary(raw_text) {
+        return "当前链路默认 local-first：HarborBeacon 负责业务状态、RAG 和策略裁决，HarborGate 只负责 IM 传输；云端模型只有在 privacy/resource policy 放行时才作为受控 fallback，SiliconFlow 只是当前 .82 fallback proof，不是默认架构。".to_string();
+    }
+
+    general_message_support_summary()
 }
 
 fn general_message_support_summary() -> String {
@@ -13756,9 +13818,16 @@ mod tests {
             .unwrap_or_else(|_| knowledge_root.clone())
             .to_string_lossy()
             .into_owned();
+        let actual_scope = response.result.data["source_scope"][0]
+            .as_str()
+            .expect("source scope path");
         assert_eq!(
-            response.result.data["source_scope"][0].as_str(),
-            Some(expected_scope.as_str())
+            actual_scope
+                .strip_prefix("\\\\?\\")
+                .unwrap_or(actual_scope),
+            expected_scope
+                .strip_prefix("\\\\?\\")
+                .unwrap_or(expected_scope.as_str())
         );
         assert!(response.result.message.contains("春天"));
         assert_ne!(
@@ -13888,14 +13957,29 @@ mod tests {
         assert!(general_message_requests_capability_summary(
             "摄像头能干什么"
         ));
+        assert!(general_message_requests_capability_summary(
+            "解释一下 HarborBeacon 和 HarborGate 现在的 local-first 架构，以及云端 fallback 是怎么受控的"
+        ));
         assert!(!general_message_requests_capability_summary(
             "帮助我抓拍一下当前摄像头画面"
+        ));
+        assert!(!general_message_requests_capability_summary(
+            "HarborBot 怎么工作"
         ));
 
         assert_eq!(
             fallback_general_message_plan("摄像头能干什么", None)
                 .expect("capability summary plan")
                 .kind,
+            GeneralMessagePlanKind::CapabilitySummary
+        );
+        assert_eq!(
+            fallback_general_message_plan(
+                "解释一下 HarborBeacon 和 HarborGate 现在的 local-first 架构",
+                None,
+            )
+            .expect("local-first architecture plan")
+            .kind,
             GeneralMessagePlanKind::CapabilitySummary
         );
         assert_eq!(
@@ -14052,6 +14136,37 @@ mod tests {
         let _ = fs::remove_file(admin_path);
         let _ = fs::remove_file(registry_path);
         let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn general_message_local_first_architecture_returns_policy_summary() {
+        let (service, _conversation_store, admin_path, registry_path, conversation_path) =
+            build_task_api_service("general-message-local-first-architecture");
+        let request = general_message_test_request(
+            "local-first-architecture",
+            "解释一下 HarborBeacon 和 HarborGate 现在的 local-first 架构，以及云端 fallback 是怎么受控的",
+            Value::Null,
+        );
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.executor_used, "agentic_interpreter");
+        assert_eq!(
+            response.result.data["reply_pack"]["kind"],
+            "capability_summary"
+        );
+        assert!(response.result.message.contains("local-first"));
+        assert!(response.result.message.contains("HarborBeacon"));
+        assert!(response.result.message.contains("HarborGate"));
+        assert!(response.result.message.contains("受控 fallback"));
+        assert!(response.result.message.contains("SiliconFlow"));
+        assert_eq!(
+            response.result.data["general_message_controller"]["router_llm"],
+            false
+        );
+
+        cleanup_task_api_service(admin_path, registry_path, conversation_path);
     }
 
     #[test]
