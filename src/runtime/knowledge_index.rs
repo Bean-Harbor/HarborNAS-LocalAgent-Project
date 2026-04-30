@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use markitdown::model::ConversionOptions;
@@ -11,6 +12,7 @@ use markitdown::MarkItDown;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::runtime::media_tools::{resolve_ffmpeg_bin, resolve_ffprobe_bin};
 use crate::runtime::model_center;
 
 pub const KNOWLEDGE_INDEX_ROOT_ENV: &str = "HARBOR_KNOWLEDGE_INDEX_ROOT";
@@ -48,6 +50,7 @@ const SIDECAR_EXTENSIONS: &[&str] = &["txt", "md", "markdown", "json", "csv", "y
 const MARKITDOWN_EXTENSIONS: &[&str] = &[
     "html", "htm", "xml", "rss", "atom", "pdf", "docx", "pptx", "xlsx", "zip",
 ];
+const VIDEO_KEYFRAME_SAMPLE_POINTS: &[u32] = &[10, 30, 50, 70, 90];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -232,7 +235,13 @@ impl KnowledgeIndexService {
             manifest_path.clone(),
             current_root_signature.clone(),
         );
-        refresh_directory(&root, &old_state, &mut new_state, &mut stats)?;
+        refresh_directory(
+            &root,
+            &self.config.index_root,
+            &old_state,
+            &mut new_state,
+            &mut stats,
+        )?;
 
         new_state.manifest.generated_at = current_timestamp();
         new_state.manifest.root = root.to_string_lossy().into_owned();
@@ -473,6 +482,7 @@ pub fn save_embedding_store(path: &Path, store: &KnowledgeEmbeddingStore) -> Res
 
 fn refresh_directory(
     path: &Path,
+    index_root: &Path,
     old_state: &LoadedManifestState,
     new_state: &mut KnowledgeIndexState,
     stats: &mut KnowledgeIndexRefreshStats,
@@ -499,14 +509,15 @@ fn refresh_directory(
             if should_skip_directory(&child) {
                 continue;
             }
-            refresh_directory(&child, old_state, new_state, stats)?;
+            refresh_directory(&child, index_root, old_state, new_state, stats)?;
             continue;
         }
 
         let Some(modality) = classify_path(&child) else {
             continue;
         };
-        let Some(index_entry) = refresh_entry(&child, modality, old_state, stats)? else {
+        let Some(index_entry) = refresh_entry(&child, modality, index_root, old_state, stats)?
+        else {
             continue;
         };
         new_state.manifest.entries.push(index_entry);
@@ -517,6 +528,7 @@ fn refresh_directory(
 fn refresh_entry(
     path: &Path,
     modality: KnowledgeModality,
+    index_root: &Path,
     old_state: &LoadedManifestState,
     stats: &mut KnowledgeIndexRefreshStats,
 ) -> Result<Option<KnowledgeIndexEntry>, String> {
@@ -593,9 +605,43 @@ fn refresh_entry(
                 sidecar_signature,
             }))
         }
-        KnowledgeModality::Audio | KnowledgeModality::Video => {
+        KnowledgeModality::Audio => {
             let (sidecar_path, sidecar_signature, text_sources) =
                 media_text_sources(path, modality)?;
+            if text_sources.is_empty() {
+                return Ok(None);
+            }
+            let searchable_text = join_text_sources(&text_sources);
+            let chunks = build_text_chunks(&text_sources);
+            if let Some(old_entry) = old_state.entries.get(&path_key) {
+                if old_entry.file_signature == file_signature
+                    && old_entry.sidecar_signature == sidecar_signature
+                    && old_entry.text_sources == text_sources
+                {
+                    stats.reused += 1;
+                    return Ok(Some(old_entry.clone()));
+                }
+            }
+            if old_state.entries.contains_key(&path_key) {
+                stats.updated += 1;
+            } else {
+                stats.added += 1;
+            }
+            Ok(Some(KnowledgeIndexEntry {
+                modality,
+                path: path_key,
+                title,
+                searchable_text,
+                chunks,
+                text_sources,
+                sidecar_path,
+                file_signature,
+                sidecar_signature,
+            }))
+        }
+        KnowledgeModality::Video => {
+            let (sidecar_path, sidecar_signature, text_sources) =
+                video_text_sources(path, index_root)?;
             if text_sources.is_empty() {
                 return Ok(None);
             }
@@ -701,6 +747,134 @@ fn media_text_sources(
         });
     }
     Ok((sidecar_path, sidecar_signature, text_sources))
+}
+
+fn video_text_sources(
+    video_path: &Path,
+    index_root: &Path,
+) -> Result<
+    (
+        Option<String>,
+        Option<KnowledgeFileSignature>,
+        Vec<KnowledgeIndexTextSource>,
+    ),
+    String,
+> {
+    let (sidecar_path, sidecar_signature, sidecar_text) = media_sidecar_state(video_path)?;
+    let mut text_sources = Vec::new();
+    if !sidecar_text.is_empty() {
+        text_sources.push(KnowledgeIndexTextSource {
+            source_kind: "video_sidecar".to_string(),
+            source_path: sidecar_path.clone(),
+            provider_key: None,
+            text: sidecar_text,
+        });
+    }
+
+    for (index, frame_path) in extract_video_keyframes(video_path, index_root)
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+    {
+        let vlm = model_center::run_vlm_summary(&frame_path);
+        if vlm.available && !vlm.text.trim().is_empty() {
+            let percent = VIDEO_KEYFRAME_SAMPLE_POINTS
+                .get(index)
+                .copied()
+                .unwrap_or_default();
+            text_sources.push(KnowledgeIndexTextSource {
+                source_kind: "vlm_keyframe".to_string(),
+                source_path: Some(frame_path.to_string_lossy().into_owned()),
+                provider_key: Some(vlm.provider_key),
+                text: format!("keyframe {percent}%: {}", vlm.text.trim()),
+            });
+        }
+    }
+
+    Ok((sidecar_path, sidecar_signature, text_sources))
+}
+
+fn extract_video_keyframes(video_path: &Path, index_root: &Path) -> Result<Vec<PathBuf>, String> {
+    let Some(ffmpeg_bin) = resolve_ffmpeg_bin() else {
+        return Ok(Vec::new());
+    };
+    let Some(duration_seconds) = probe_video_duration_seconds(video_path) else {
+        return Ok(Vec::new());
+    };
+    if duration_seconds <= 0.0 {
+        return Ok(Vec::new());
+    }
+
+    let output_dir = video_keyframe_cache_dir(index_root, video_path);
+    fs::create_dir_all(&output_dir).map_err(|error| {
+        format!(
+            "failed to create video keyframe cache {}: {error}",
+            output_dir.display()
+        )
+    })?;
+
+    let mut frames = Vec::new();
+    for (index, percent) in VIDEO_KEYFRAME_SAMPLE_POINTS.iter().enumerate() {
+        let timestamp = (duration_seconds * (*percent as f64 / 100.0)).max(0.0);
+        let output_path = output_dir.join(format!("frame-{:02}.jpg", index + 1));
+        let status = Command::new(&ffmpeg_bin)
+            .arg("-y")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-ss")
+            .arg(format!("{timestamp:.3}"))
+            .arg("-i")
+            .arg(video_path)
+            .arg("-frames:v")
+            .arg("1")
+            .arg("-q:v")
+            .arg("3")
+            .arg(&output_path)
+            .status();
+        match status {
+            Ok(status)
+                if status.success()
+                    && output_path
+                        .metadata()
+                        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0) =>
+            {
+                frames.push(output_path);
+            }
+            _ => {}
+        }
+    }
+    Ok(frames)
+}
+
+fn probe_video_duration_seconds(video_path: &Path) -> Option<f64> {
+    let ffprobe_bin = resolve_ffprobe_bin()?;
+    let output = Command::new(&ffprobe_bin)
+        .arg("-v")
+        .arg("error")
+        .arg("-show_entries")
+        .arg("format=duration")
+        .arg("-of")
+        .arg("default=noprint_wrappers=1:nokey=1")
+        .arg(video_path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    text.parse::<f64>().ok().filter(|value| value.is_finite())
+}
+
+fn video_keyframe_cache_dir(index_root: &Path, video_path: &Path) -> PathBuf {
+    let canonical = video_path
+        .canonicalize()
+        .unwrap_or_else(|_| video_path.to_path_buf());
+    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    let key = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    index_root.join("video-keyframes").join(key)
 }
 
 fn image_sidecar_state(
