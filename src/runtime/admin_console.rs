@@ -169,6 +169,137 @@ pub struct AdminDefaults {
     pub keyframe_interval_seconds: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KnowledgeSourceRoot {
+    #[serde(default)]
+    pub root_id: String,
+    #[serde(default)]
+    pub label: String,
+    pub path: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    #[serde(default)]
+    pub last_indexed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KnowledgeSettings {
+    #[serde(default)]
+    pub source_roots: Vec<KnowledgeSourceRoot>,
+    #[serde(default = "default_knowledge_index_root")]
+    pub index_root: String,
+    #[serde(default)]
+    pub privacy_level: PrivacyLevel,
+    #[serde(default)]
+    pub default_resource_profile: RagResourceProfile,
+}
+
+impl Default for KnowledgeSettings {
+    fn default() -> Self {
+        Self {
+            source_roots: Vec::new(),
+            index_root: default_knowledge_index_root(),
+            privacy_level: PrivacyLevel::StrictLocal,
+            default_resource_profile: RagResourceProfile::CpuOnly,
+        }
+    }
+}
+
+impl KnowledgeSettings {
+    pub fn enabled_source_root_paths(&self) -> Vec<String> {
+        self.source_roots
+            .iter()
+            .filter(|root| root.enabled)
+            .map(|root| root.path.trim())
+            .filter(|path| !path.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RagResourceProfile {
+    #[default]
+    CpuOnly,
+    LocalGpu,
+    SidecarGpu,
+    CloudAllowed,
+}
+
+impl RagResourceProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CpuOnly => "cpu_only",
+            Self::LocalGpu => "local_gpu",
+            Self::SidecarGpu => "sidecar_gpu",
+            Self::CloudAllowed => "cloud_allowed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct KnowledgeIndexJobRecord {
+    pub job_id: String,
+    pub source_root_id: String,
+    pub source_root_label: String,
+    pub source_root_path: String,
+    #[serde(default)]
+    pub modalities: Vec<String>,
+    pub status: String,
+    #[serde(default)]
+    pub progress_percent: Option<u8>,
+    #[serde(default)]
+    pub requested_at: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+    #[serde(default)]
+    pub error_message: Option<String>,
+    #[serde(default)]
+    pub retry_count: u32,
+    #[serde(default)]
+    pub checkpoint: Value,
+    #[serde(default)]
+    pub resource_profile: RagResourceProfile,
+    #[serde(default)]
+    pub cancel_requested: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct DeviceCredentialSecret {
+    pub device_id: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default)]
+    pub rtsp_port: Option<u16>,
+    #[serde(default)]
+    pub rtsp_paths: Vec<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub last_verified_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeviceEvidenceRecord {
+    pub evidence_id: String,
+    pub device_id: String,
+    pub evidence_kind: String,
+    pub status: String,
+    pub observed_at: String,
+    pub summary: String,
+    #[serde(default)]
+    pub details: Value,
+}
+
 impl Default for AdminDefaults {
     fn default() -> Self {
         Self {
@@ -229,6 +360,35 @@ impl Default for AdminModelCenterState {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelDownloadJobRecord {
+    pub job_id: String,
+    pub model_id: String,
+    pub display_name: String,
+    pub provider_key: String,
+    pub status: String,
+    pub requested_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub target_path: Option<String>,
+    #[serde(default)]
+    pub progress_percent: Option<u8>,
+    #[serde(default)]
+    pub bytes_downloaded: Option<u64>,
+    #[serde(default)]
+    pub total_bytes: Option<u64>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+    #[serde(default)]
+    pub error_message: Option<String>,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub metadata: Value,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct AdminConsoleState {
     #[serde(default)]
@@ -244,9 +404,19 @@ pub struct AdminConsoleState {
     #[serde(default)]
     pub notification_targets: Vec<NotificationTargetRecord>,
     #[serde(default)]
+    pub device_credentials: Vec<DeviceCredentialSecret>,
+    #[serde(default)]
+    pub device_evidence: Vec<DeviceEvidenceRecord>,
+    #[serde(default)]
     pub platform: AdminPlatformState,
     #[serde(default)]
     pub models: AdminModelCenterState,
+    #[serde(default)]
+    pub model_download_jobs: Vec<ModelDownloadJobRecord>,
+    #[serde(default)]
+    pub knowledge: KnowledgeSettings,
+    #[serde(default)]
+    pub knowledge_index_jobs: Vec<KnowledgeIndexJobRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -378,6 +548,7 @@ const DEFAULT_PROACTIVE_DELIVERY_SURFACE: &str = "feishu";
 const HARBOROS_CURRENT_USER_ENV: &str = "HARBOR_HARBOROS_USER";
 const HARBOROS_WRITABLE_ROOT_ENV: &str = "HARBOR_HARBOROS_WRITABLE_ROOT";
 const DEFAULT_HARBOROS_WRITABLE_ROOT: &str = "/mnt/software/harborbeacon-agent-ci";
+const DEFAULT_KNOWLEDGE_INDEX_SUBDIR: &str = "knowledge-index";
 const MODEL_API_BASE_URL_ENV: &str = "HARBOR_MODEL_API_BASE_URL";
 const MODEL_API_TOKEN_ENV: &str = "HARBOR_MODEL_API_TOKEN";
 const DEFAULT_MODEL_API_BASE_URL: &str = "http://127.0.0.1:4176/v1";
@@ -784,6 +955,170 @@ impl AdminConsoleStore {
         self.save_projected_state(state)
     }
 
+    pub fn knowledge_settings(&self) -> Result<KnowledgeSettings, String> {
+        Ok(self.load_or_create_state()?.knowledge)
+    }
+
+    pub fn save_knowledge_settings(
+        &self,
+        settings: KnowledgeSettings,
+    ) -> Result<AdminConsoleState, String> {
+        let settings = validate_knowledge_settings(sanitize_knowledge_settings(settings))?;
+        let mut state = self.load_or_create_state()?;
+        state.knowledge = settings;
+        self.save_projected_state(state)
+    }
+
+    pub fn list_knowledge_index_jobs(&self) -> Result<Vec<KnowledgeIndexJobRecord>, String> {
+        let mut jobs = self.load_or_create_state()?.knowledge_index_jobs;
+        jobs.sort_by(|left, right| {
+            right
+                .requested_at
+                .cmp(&left.requested_at)
+                .then_with(|| right.job_id.cmp(&left.job_id))
+        });
+        Ok(jobs)
+    }
+
+    pub fn save_knowledge_index_job(
+        &self,
+        job: KnowledgeIndexJobRecord,
+    ) -> Result<KnowledgeIndexJobRecord, String> {
+        let job = sanitize_knowledge_index_job(job)
+            .ok_or_else(|| "knowledge index job requires a job_id".to_string())?;
+        let mut state = self.load_or_create_state()?;
+        if let Some(existing) = state
+            .knowledge_index_jobs
+            .iter_mut()
+            .find(|item| item.job_id == job.job_id)
+        {
+            *existing = job.clone();
+        } else {
+            state.knowledge_index_jobs.push(job.clone());
+        }
+        state.knowledge_index_jobs = sanitize_knowledge_index_jobs(state.knowledge_index_jobs);
+        self.save_projected_state(state)?;
+        Ok(job)
+    }
+
+    pub fn cancel_knowledge_index_job(
+        &self,
+        job_id: &str,
+        canceled_at: String,
+    ) -> Result<Option<KnowledgeIndexJobRecord>, String> {
+        let job_id = job_id.trim();
+        if job_id.is_empty() {
+            return Err("job_id 不能为空".to_string());
+        }
+
+        let mut state = self.load_or_create_state()?;
+        let Some(existing) = state
+            .knowledge_index_jobs
+            .iter_mut()
+            .find(|item| item.job_id == job_id)
+        else {
+            return Ok(None);
+        };
+
+        if matches!(existing.status.as_str(), "queued" | "running") {
+            existing.status = "canceled".to_string();
+            existing.cancel_requested = true;
+            existing.completed_at = Some(canceled_at);
+            existing.progress_percent = existing.progress_percent.or(Some(0));
+        }
+        let updated = existing.clone();
+        state.knowledge_index_jobs = sanitize_knowledge_index_jobs(state.knowledge_index_jobs);
+        self.save_projected_state(state)?;
+        Ok(Some(updated))
+    }
+
+    pub fn save_device_credential(
+        &self,
+        credential: DeviceCredentialSecret,
+    ) -> Result<AdminConsoleState, String> {
+        let credential = sanitize_device_credential(credential)
+            .ok_or_else(|| "device credential requires a device_id".to_string())?;
+        let mut state = self.load_or_create_state()?;
+        if let Some(existing) = state
+            .device_credentials
+            .iter_mut()
+            .find(|item| item.device_id == credential.device_id)
+        {
+            *existing = credential;
+        } else {
+            state.device_credentials.push(credential);
+        }
+        self.save_projected_state(state)
+    }
+
+    pub fn mark_device_credential_verified(
+        &self,
+        device_id: &str,
+        verified_at: String,
+    ) -> Result<AdminConsoleState, String> {
+        let device_id = device_id.trim();
+        if device_id.is_empty() {
+            return Err("device_id 不能为空".to_string());
+        }
+
+        let mut state = self.load_or_create_state()?;
+        if let Some(existing) = state
+            .device_credentials
+            .iter_mut()
+            .find(|item| item.device_id == device_id)
+        {
+            existing.last_verified_at = Some(verified_at);
+            return self.save_projected_state(state);
+        }
+
+        Ok(state)
+    }
+
+    pub fn record_device_evidence(
+        &self,
+        mut record: DeviceEvidenceRecord,
+    ) -> Result<AdminConsoleState, String> {
+        if record.evidence_id.trim().is_empty() {
+            record.evidence_id = format!("device-evidence-{}", Uuid::new_v4().simple());
+        }
+        let record = sanitize_device_evidence_record(record)
+            .ok_or_else(|| "device evidence requires a device_id".to_string())?;
+        let mut state = self.load_or_create_state()?;
+        if let Some(existing) = state
+            .device_evidence
+            .iter_mut()
+            .find(|item| item.evidence_id == record.evidence_id)
+        {
+            *existing = record;
+        } else {
+            state.device_evidence.push(record);
+        }
+        self.save_projected_state(state)
+    }
+
+    pub fn list_device_evidence(
+        &self,
+        device_id: &str,
+    ) -> Result<Vec<DeviceEvidenceRecord>, String> {
+        let device_id = device_id.trim();
+        if device_id.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut evidence = self
+            .load_or_create_state()?
+            .device_evidence
+            .into_iter()
+            .filter(|record| record.device_id == device_id)
+            .collect::<Vec<_>>();
+        evidence.sort_by(|left, right| {
+            right
+                .observed_at
+                .cmp(&left.observed_at)
+                .then(right.evidence_id.cmp(&left.evidence_id))
+        });
+        Ok(evidence)
+    }
+
     pub fn save_remote_view_config(
         &self,
         config: RemoteViewConfig,
@@ -978,6 +1313,114 @@ impl AdminConsoleStore {
         self.save_projected_state(state)
     }
 
+    pub fn create_model_download_job(
+        &self,
+        model_id: &str,
+        display_name: &str,
+        provider_key: &str,
+        target_path: Option<String>,
+        metadata: Value,
+    ) -> Result<ModelDownloadJobRecord, String> {
+        let model_id = model_id.trim();
+        if model_id.is_empty() {
+            return Err("model_id 不能为空".to_string());
+        }
+        let now = model_test_timestamp();
+        let job = ModelDownloadJobRecord {
+            job_id: format!("model-download-{}", Uuid::new_v4().simple()),
+            model_id: model_id.to_string(),
+            display_name: display_name.trim().to_string(),
+            provider_key: provider_key.trim().to_string(),
+            status: "queued".to_string(),
+            requested_at: now.clone(),
+            updated_at: now,
+            target_path,
+            progress_percent: Some(0),
+            bytes_downloaded: Some(0),
+            total_bytes: None,
+            started_at: None,
+            completed_at: None,
+            error_message: None,
+            message: "download job queued by explicit admin action".to_string(),
+            metadata,
+        };
+
+        let mut state = self.load_or_create_state()?;
+        state.model_download_jobs.push(job.clone());
+        self.save_projected_state(state)?;
+        Ok(job)
+    }
+
+    pub fn model_download_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<ModelDownloadJobRecord>, String> {
+        let job_id = job_id.trim();
+        if job_id.is_empty() {
+            return Ok(None);
+        }
+        Ok(self
+            .load_or_create_state()?
+            .model_download_jobs
+            .into_iter()
+            .find(|job| job.job_id == job_id))
+    }
+
+    pub fn cancel_model_download_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<ModelDownloadJobRecord>, String> {
+        let job_id = job_id.trim();
+        if job_id.is_empty() {
+            return Ok(None);
+        }
+        let mut state = self.load_or_create_state()?;
+        let Some(job) = state
+            .model_download_jobs
+            .iter_mut()
+            .find(|job| job.job_id == job_id)
+        else {
+            return Ok(None);
+        };
+        if !matches!(
+            job.status.as_str(),
+            "completed" | "failed" | "cancelled" | "canceled"
+        ) {
+            job.status = "canceled".to_string();
+            job.updated_at = model_test_timestamp();
+            job.completed_at = Some(job.updated_at.clone());
+            job.message = "download job canceled by explicit admin action".to_string();
+        }
+        let cancelled = job.clone();
+        self.save_projected_state(state)?;
+        Ok(Some(cancelled))
+    }
+
+    pub fn list_model_download_jobs(&self) -> Result<Vec<ModelDownloadJobRecord>, String> {
+        Ok(self.load_or_create_state()?.model_download_jobs)
+    }
+
+    pub fn save_model_download_job(
+        &self,
+        job: ModelDownloadJobRecord,
+    ) -> Result<ModelDownloadJobRecord, String> {
+        let job_id = job.job_id.trim();
+        if job_id.is_empty() {
+            return Err("job_id 不能为空".to_string());
+        }
+        let mut state = self.load_or_create_state()?;
+        let Some(existing) = state
+            .model_download_jobs
+            .iter_mut()
+            .find(|existing| existing.job_id == job_id)
+        else {
+            return Err(format!("未找到模型下载任务 {job_id}"));
+        };
+        *existing = job.clone();
+        self.save_projected_state(state)?;
+        Ok(job)
+    }
+
     pub fn save_model_route_policies(
         &self,
         policies: Vec<ModelRoutePolicy>,
@@ -1064,14 +1507,330 @@ pub fn sanitize_defaults(mut defaults: AdminDefaults) -> AdminDefaults {
     defaults.selected_camera_device_id = defaults
         .selected_camera_device_id
         .and_then(|value| non_empty_opt(&value));
-    defaults.capture_subdirectory =
-        sanitize_capture_subdirectory(&defaults.capture_subdirectory).unwrap_or_else(
-            default_capture_subdirectory,
-        );
+    defaults.capture_subdirectory = sanitize_capture_subdirectory(&defaults.capture_subdirectory)
+        .unwrap_or_else(default_capture_subdirectory);
     defaults.clip_length_seconds = defaults.clip_length_seconds.clamp(3, 300);
     defaults.keyframe_count = defaults.keyframe_count.clamp(1, 12);
     defaults.keyframe_interval_seconds = defaults.keyframe_interval_seconds.clamp(1, 60);
     defaults
+}
+
+pub fn sanitize_knowledge_settings(settings: KnowledgeSettings) -> KnowledgeSettings {
+    let mut normalized_roots = Vec::new();
+    let mut seen_ids = HashSet::new();
+    let mut seen_paths = HashSet::new();
+    for (index, mut root) in settings.source_roots.into_iter().enumerate() {
+        root.path = root.path.trim().to_string();
+        if root.path.is_empty() {
+            continue;
+        }
+        root.root_id = sanitize_knowledge_root_id(&root.root_id, &root.label, &root.path, index);
+        root.label = sanitize_knowledge_root_label(&root.label, &root.path, &root.root_id);
+        root.include = sanitize_string_list(root.include);
+        root.exclude = sanitize_string_list(root.exclude);
+        root.last_indexed_at = root.last_indexed_at.and_then(|value| non_empty_opt(&value));
+        let path_key = normalized_path_key(&root.path);
+        if seen_ids.insert(root.root_id.clone()) && seen_paths.insert(path_key) {
+            normalized_roots.push(root);
+        }
+    }
+    KnowledgeSettings {
+        source_roots: normalized_roots,
+        index_root: non_empty_opt(&settings.index_root)
+            .unwrap_or_else(default_knowledge_index_root),
+        privacy_level: settings.privacy_level,
+        default_resource_profile: settings.default_resource_profile,
+    }
+}
+
+fn sanitize_knowledge_index_jobs(
+    jobs: Vec<KnowledgeIndexJobRecord>,
+) -> Vec<KnowledgeIndexJobRecord> {
+    let mut sanitized = jobs
+        .into_iter()
+        .filter_map(sanitize_knowledge_index_job)
+        .collect::<Vec<_>>();
+    sanitized.sort_by(|left, right| {
+        right
+            .requested_at
+            .cmp(&left.requested_at)
+            .then_with(|| right.job_id.cmp(&left.job_id))
+    });
+    sanitized.truncate(50);
+    sanitized
+}
+
+fn sanitize_knowledge_index_job(
+    mut job: KnowledgeIndexJobRecord,
+) -> Option<KnowledgeIndexJobRecord> {
+    job.job_id = job.job_id.trim().to_string();
+    if job.job_id.is_empty() {
+        return None;
+    }
+    job.source_root_id = job.source_root_id.trim().to_string();
+    job.source_root_label = job.source_root_label.trim().to_string();
+    job.source_root_path = job.source_root_path.trim().to_string();
+    job.status = non_empty_opt(&job.status).unwrap_or_else(|| "queued".to_string());
+    job.modalities = sanitize_string_list(job.modalities);
+    job.progress_percent = job.progress_percent.map(|value| value.min(100));
+    Some(job)
+}
+
+pub fn validate_knowledge_settings(
+    settings: KnowledgeSettings,
+) -> Result<KnowledgeSettings, String> {
+    let settings = sanitize_knowledge_settings(settings);
+    if settings.index_root.trim().is_empty() {
+        return Err("knowledge.index_root 不能为空".to_string());
+    }
+    for root in &settings.source_roots {
+        if path_is_same_or_inside(&settings.index_root, &root.path) {
+            return Err(format!(
+                "knowledge.index_root 不能位于 source_root 内：index_root={} source_root={}",
+                settings.index_root, root.path
+            ));
+        }
+    }
+    Ok(settings)
+}
+
+fn sanitize_knowledge_root_id(root_id: &str, label: &str, path: &str, index: usize) -> String {
+    let existing = slugify_identity_component(root_id);
+    if !existing.is_empty() && existing != "item" {
+        return existing;
+    }
+    let from_label = slugify_identity_component(label);
+    if !from_label.is_empty() && from_label != "item" {
+        return format!("knowledge-{from_label}");
+    }
+    let from_path = Path::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(slugify_identity_component)
+        .filter(|value| !value.is_empty() && value != "item")
+        .unwrap_or_else(|| format!("root-{}", index + 1));
+    format!("knowledge-{from_path}")
+}
+
+fn sanitize_knowledge_root_label(label: &str, path: &str, root_id: &str) -> String {
+    let label = label.trim();
+    if !label.is_empty() {
+        return label.to_string();
+    }
+    Path::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| root_id.to_string())
+}
+
+fn sanitize_string_list(values: Vec<String>) -> Vec<String> {
+    let mut output = Vec::new();
+    let mut seen = HashSet::new();
+    for value in values {
+        let value = value.trim().to_string();
+        if !value.is_empty() && seen.insert(value.clone()) {
+            output.push(value);
+        }
+    }
+    output
+}
+
+pub fn path_is_same_or_inside(child: &str, parent: &str) -> bool {
+    let child = normalized_path_key(child);
+    let parent = normalized_path_key(parent);
+    if child.is_empty() || parent.is_empty() {
+        return false;
+    }
+    child == parent || child.starts_with(&(parent.trim_end_matches('/').to_string() + "/"))
+}
+
+fn normalized_path_key(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let candidate = PathBuf::from(trimmed);
+    let resolved = fs::canonicalize(&candidate).unwrap_or(candidate);
+    let mut key = resolved.to_string_lossy().replace('\\', "/");
+    while key.len() > 1 && key.ends_with('/') {
+        key.pop();
+    }
+    if cfg!(windows) {
+        key.to_ascii_lowercase()
+    } else {
+        key
+    }
+}
+
+fn sanitize_device_credentials(
+    credentials: Vec<DeviceCredentialSecret>,
+) -> Vec<DeviceCredentialSecret> {
+    let mut normalized = Vec::new();
+    let mut seen = HashSet::new();
+    for credential in credentials {
+        let Some(credential) = sanitize_device_credential(credential) else {
+            continue;
+        };
+        if seen.insert(credential.device_id.clone()) {
+            normalized.push(credential);
+        }
+    }
+    normalized
+}
+
+fn sanitize_device_credential(
+    mut credential: DeviceCredentialSecret,
+) -> Option<DeviceCredentialSecret> {
+    credential.device_id = credential.device_id.trim().to_string();
+    if credential.device_id.is_empty() {
+        return None;
+    }
+    credential.username = credential.username.trim().to_string();
+    credential.password = credential.password.trim().to_string();
+    credential.rtsp_port = credential.rtsp_port.filter(|port| *port > 0);
+    credential.rtsp_paths = dedupe_rtsp_paths(credential.rtsp_paths);
+    credential.updated_at = credential
+        .updated_at
+        .and_then(|value| non_empty_opt(&value));
+    credential.last_verified_at = credential
+        .last_verified_at
+        .and_then(|value| non_empty_opt(&value));
+    Some(credential)
+}
+
+fn sanitize_device_evidence_records(
+    records: Vec<DeviceEvidenceRecord>,
+) -> Vec<DeviceEvidenceRecord> {
+    records
+        .into_iter()
+        .filter_map(sanitize_device_evidence_record)
+        .collect()
+}
+
+fn sanitize_device_evidence_record(
+    mut record: DeviceEvidenceRecord,
+) -> Option<DeviceEvidenceRecord> {
+    record.evidence_id = record.evidence_id.trim().to_string();
+    record.device_id = record.device_id.trim().to_string();
+    record.evidence_kind = record.evidence_kind.trim().to_string();
+    record.status = record.status.trim().to_string();
+    record.observed_at = record.observed_at.trim().to_string();
+    record.summary = redact_device_evidence_text(record.summary.trim());
+    redact_device_evidence_value(&mut record.details);
+
+    if record.evidence_id.is_empty()
+        || record.device_id.is_empty()
+        || record.evidence_kind.is_empty()
+        || record.status.is_empty()
+        || record.observed_at.is_empty()
+    {
+        return None;
+    }
+    Some(record)
+}
+
+fn redact_device_evidence_value(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map.iter_mut() {
+                if is_secret_like_key(key) {
+                    *value = Value::String("redacted".to_string());
+                } else {
+                    redact_device_evidence_value(value);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_device_evidence_value(item);
+            }
+        }
+        Value::String(text) => {
+            *text = redact_device_evidence_text(text);
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn is_secret_like_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase();
+    normalized.contains("password")
+        || normalized.contains("secret")
+        || normalized.contains("token")
+        || normalized.contains("api_key")
+        || normalized.contains("apikey")
+        || normalized.contains("credential")
+}
+
+fn redact_device_evidence_text(value: &str) -> String {
+    let mut redacted = redact_device_evidence_url_userinfo(value);
+    for key in ["password", "token", "api_key", "apikey", "secret"] {
+        redacted = redact_query_like_secret(&redacted, key);
+    }
+    redacted
+}
+
+fn redact_query_like_secret(value: &str, key: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+    let needle = format!("{key}=");
+    let lower = value.to_ascii_lowercase();
+    while let Some(relative_start) = lower[cursor..].find(&needle) {
+        let start = cursor + relative_start;
+        let value_start = start + needle.len();
+        let value_end = value[value_start..]
+            .find(|ch: char| matches!(ch, '&' | ' ' | '\n' | '\r' | '\t' | '"' | '\'' | '<' | '>'))
+            .map(|relative| value_start + relative)
+            .unwrap_or(value.len());
+        output.push_str(&value[cursor..value_start]);
+        output.push_str("redacted");
+        cursor = value_end;
+    }
+    output.push_str(&value[cursor..]);
+    output
+}
+
+fn redact_device_evidence_url_userinfo(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+    while let Some(relative_scheme_end) = value[cursor..].find("://") {
+        let scheme_end = cursor + relative_scheme_end;
+        let scheme_start = value[..scheme_end]
+            .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '+' || ch == '-' || ch == '.'))
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let scheme = &value[scheme_start..scheme_end];
+        if !matches!(scheme, "rtsp" | "rtsps" | "http" | "https") {
+            output.push_str(&value[cursor..scheme_end + 3]);
+            cursor = scheme_end + 3;
+            continue;
+        }
+
+        let authority_start = scheme_end + 3;
+        let authority_end = value[authority_start..]
+            .find(|ch: char| {
+                matches!(
+                    ch,
+                    '/' | '?' | '#' | '"' | '\'' | '<' | '>' | ' ' | '\n' | '\r' | '\t'
+                )
+            })
+            .map(|relative| authority_start + relative)
+            .unwrap_or(value.len());
+        let authority = &value[authority_start..authority_end];
+        if let Some(userinfo_end) = authority.rfind('@') {
+            output.push_str(&value[cursor..authority_start]);
+            output.push_str("redacted:redacted@");
+            output.push_str(&authority[userinfo_end + 1..]);
+        } else {
+            output.push_str(&value[cursor..authority_end]);
+        }
+        cursor = authority_end;
+    }
+    output.push_str(&value[cursor..]);
+    output
 }
 
 fn sanitize_capture_subdirectory(value: &str) -> Option<String> {
@@ -1600,7 +2359,11 @@ fn sanitize_legacy_admin_fields(state: &mut AdminConsoleState) {
     state.bridge_provider = sanitize_bridge_provider_config(state.bridge_provider.clone());
     state.remote_view = sanitize_remote_view_config(state.remote_view.clone());
     state.notification_targets = sanitize_notification_targets(state.notification_targets.clone());
+    state.device_credentials = sanitize_device_credentials(state.device_credentials.clone());
+    state.device_evidence = sanitize_device_evidence_records(state.device_evidence.clone());
     state.models = sanitize_model_center_state(state.models.clone());
+    state.knowledge = sanitize_knowledge_settings(state.knowledge.clone());
+    state.knowledge_index_jobs = sanitize_knowledge_index_jobs(state.knowledge_index_jobs.clone());
 }
 
 fn hydrate_legacy_views_from_platform(state: &mut AdminConsoleState) {
@@ -1792,10 +2555,7 @@ fn apply_recording_policy_to_legacy(state: &mut AdminConsoleState) {
         &mut state.defaults.notification_channel,
         policy.metadata.get("notification_channel"),
     );
-    state.defaults.selected_camera_device_id = policy
-        .device_id
-        .as_deref()
-        .and_then(non_empty_opt);
+    state.defaults.selected_camera_device_id = policy.device_id.as_deref().and_then(non_empty_opt);
     state.defaults.capture_subdirectory = policy
         .capture_subdirectory()
         .map(str::to_string)
@@ -2967,6 +3727,18 @@ fn slugify_identity_component(value: &str) -> String {
     compact.trim_matches('-').to_string()
 }
 
+pub fn device_rtsp_credential_id(device_id: &str) -> String {
+    let slug = slugify_identity_component(device_id);
+    format!(
+        "credential-device-rtsp-{}",
+        if slug.is_empty() {
+            "device"
+        } else {
+            slug.as_str()
+        }
+    )
+}
+
 fn build_credentials(state: &AdminConsoleState) -> Vec<CredentialRecord> {
     let mut credentials = Vec::new();
     if !state.defaults.rtsp_password.trim().is_empty() {
@@ -2985,6 +3757,34 @@ fn build_credentials(state: &AdminConsoleState) -> Vec<CredentialRecord> {
             metadata: json!({
                 "present": true,
                 "path_count": state.defaults.rtsp_paths.len(),
+            }),
+        });
+    }
+    for device_credential in &state.device_credentials {
+        if device_credential.password.trim().is_empty() {
+            continue;
+        }
+        credentials.push(CredentialRecord {
+            credential_id: device_rtsp_credential_id(&device_credential.device_id),
+            provider_account_id: LOCAL_RTSP_PROVIDER_ACCOUNT_ID.to_string(),
+            credential_kind: CredentialKind::SessionSecret,
+            vault_key: format!(
+                "admin_console.device_credentials.{}.rtsp_password",
+                slugify_identity_component(&device_credential.device_id)
+            ),
+            scope: json!({
+                "device_id": device_credential.device_id.clone(),
+                "username": device_credential.username.clone(),
+                "port": device_credential.rtsp_port,
+            }),
+            expires_at: None,
+            rotation_state: CredentialRotationState::Valid,
+            last_verified_at: device_credential.last_verified_at.clone(),
+            metadata: json!({
+                "present": true,
+                "redacted": true,
+                "path_count": device_credential.rtsp_paths.len(),
+                "updated_at": device_credential.updated_at.clone(),
             }),
         });
     }
@@ -3079,6 +3879,17 @@ pub fn default_keyframe_count() -> u32 {
 
 pub fn default_keyframe_interval_seconds() -> u32 {
     3
+}
+
+fn default_true() -> bool {
+    true
+}
+
+pub fn default_knowledge_index_root() -> String {
+    Path::new(&harboros_writable_root())
+        .join(DEFAULT_KNOWLEDGE_INDEX_SUBDIR)
+        .to_string_lossy()
+        .into_owned()
 }
 
 pub fn harboros_current_user_id() -> String {
@@ -3246,8 +4057,10 @@ mod tests {
         parse_rtsp_path, resolved_identity_binding_records, resolved_remote_view_config,
         sanitize_bridge_provider_config, user_default_delivery_surface,
         user_recent_interactive_surface, AdminConsoleStore, AdminDefaults,
-        BridgeProviderCapabilities, BridgeProviderConfig, IdentityBindingRecord, RemoteViewConfig,
-        BRIDGE_PROVIDER_ACCOUNT_ID, LOCAL_RTSP_CREDENTIAL_ID, LOCAL_RTSP_PROVIDER_ACCOUNT_ID,
+        BridgeProviderCapabilities, BridgeProviderConfig, DeviceCredentialSecret,
+        DeviceEvidenceRecord, IdentityBindingRecord, KnowledgeSettings, KnowledgeSourceRoot,
+        RemoteViewConfig, BRIDGE_PROVIDER_ACCOUNT_ID, LOCAL_RTSP_CREDENTIAL_ID,
+        LOCAL_RTSP_PROVIDER_ACCOUNT_ID,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -3288,6 +4101,85 @@ mod tests {
         let paths = default_rtsp_paths();
         assert!(paths.contains(&"/stream1".to_string()));
         assert!(paths.contains(&"/stream2".to_string()));
+    }
+
+    #[test]
+    fn save_device_credential_projects_redacted_platform_record() {
+        let registry_path = temp_path("registry-device-credential");
+        let admin_path = temp_path("admin-device-credential");
+        let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
+        let store = AdminConsoleStore::new(admin_path.clone(), registry);
+
+        let state = store
+            .save_device_credential(DeviceCredentialSecret {
+                device_id: "cam-1".to_string(),
+                username: "admin".to_string(),
+                password: "secret".to_string(),
+                rtsp_port: Some(8554),
+                rtsp_paths: vec!["stream1".to_string(), "/stream1".to_string()],
+                updated_at: Some("123".to_string()),
+                last_verified_at: None,
+            })
+            .expect("save device credential");
+
+        let credential = state
+            .platform
+            .credentials
+            .iter()
+            .find(|credential| {
+                credential
+                    .scope
+                    .get("device_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("cam-1")
+            })
+            .expect("platform credential projection");
+        assert_eq!(credential.scope["username"], json!("admin"));
+        assert_eq!(credential.scope["port"], json!(8554));
+        assert_eq!(credential.metadata["redacted"], json!(true));
+        assert_eq!(credential.metadata["path_count"], json!(1));
+        assert!(!format!("{credential:?}").contains("secret"));
+
+        let _ = std::fs::remove_file(admin_path);
+        let _ = std::fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn device_evidence_records_redact_stream_credentials_and_tokens() {
+        let registry_path = temp_path("registry-device-evidence");
+        let admin_path = temp_path("admin-device-evidence");
+        let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
+        let store = AdminConsoleStore::new(admin_path.clone(), registry);
+
+        store
+            .record_device_evidence(DeviceEvidenceRecord {
+                evidence_id: "evidence-1".to_string(),
+                device_id: "cam-1".to_string(),
+                evidence_kind: "rtsp_check".to_string(),
+                status: "passed".to_string(),
+                observed_at: "123".to_string(),
+                summary: "ok rtsp://admin:secret@192.168.1.10/stream1?token=abc".to_string(),
+                details: json!({
+                    "stream_url": "rtsp://admin:secret@192.168.1.10/stream1",
+                    "api_token": "raw-token",
+                    "nested": {
+                        "snapshot_url": "http://admin:secret@192.168.1.10/snap.jpg?token=abc"
+                    }
+                }),
+            })
+            .expect("record evidence");
+
+        let evidence = store.list_device_evidence("cam-1").expect("list evidence");
+        let payload = serde_json::to_string(&evidence).expect("serialize evidence");
+
+        assert!(!payload.contains("admin:secret"));
+        assert!(!payload.contains("raw-token"));
+        assert!(!payload.contains("token=abc"));
+        assert!(payload.contains("redacted:redacted@192.168.1.10"));
+        assert!(payload.contains("token=redacted"));
+
+        let _ = std::fs::remove_file(admin_path);
+        let _ = std::fs::remove_file(registry_path);
     }
 
     #[test]
@@ -3435,6 +4327,82 @@ mod tests {
         let reloaded = store.load_or_create_state().expect("reload");
         assert_eq!(reloaded.defaults.cidr, "10.42.0.0/24");
         assert_eq!(reloaded.defaults.rtsp_port, 8554);
+
+        let _ = std::fs::remove_file(admin_path);
+        let _ = std::fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn save_knowledge_settings_rejects_index_root_inside_source_root() {
+        let registry_path = temp_path("registry-knowledge-invalid");
+        let admin_path = temp_path("admin-knowledge-invalid");
+        let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
+        let store = AdminConsoleStore::new(admin_path.clone(), registry);
+        let source_root = std::env::temp_dir().join("harborbeacon-knowledge-source");
+        let index_root = source_root.join("vectors");
+
+        let result = store.save_knowledge_settings(KnowledgeSettings {
+            source_roots: vec![KnowledgeSourceRoot {
+                root_id: "sample".to_string(),
+                label: "Sample".to_string(),
+                path: source_root.to_string_lossy().into_owned(),
+                enabled: true,
+                include: Vec::new(),
+                exclude: Vec::new(),
+                last_indexed_at: None,
+            }],
+            index_root: index_root.to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("knowledge.index_root 不能位于 source_root 内"));
+
+        let _ = std::fs::remove_file(admin_path);
+        let _ = std::fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn save_knowledge_settings_persists_sanitized_roots() {
+        let registry_path = temp_path("registry-knowledge-valid");
+        let admin_path = temp_path("admin-knowledge-valid");
+        let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
+        let store = AdminConsoleStore::new(admin_path.clone(), registry);
+        let source_root = std::env::temp_dir().join("harborbeacon-knowledge-source-valid");
+        let index_root = std::env::temp_dir().join("harborbeacon-knowledge-index-valid");
+
+        let updated = store
+            .save_knowledge_settings(KnowledgeSettings {
+                source_roots: vec![KnowledgeSourceRoot {
+                    root_id: "  ".to_string(),
+                    label: "  Family Docs  ".to_string(),
+                    path: format!(" {} ", source_root.to_string_lossy()),
+                    enabled: true,
+                    include: vec![" **/*.md ".to_string(), "**/*.md".to_string()],
+                    exclude: vec![" tmp/** ".to_string()],
+                    last_indexed_at: Some("  ".to_string()),
+                }],
+                index_root: index_root.to_string_lossy().into_owned(),
+                ..Default::default()
+            })
+            .expect("save knowledge settings");
+
+        assert_eq!(updated.knowledge.source_roots.len(), 1);
+        assert_eq!(updated.knowledge.source_roots[0].label, "Family Docs");
+        assert_eq!(
+            updated.knowledge.source_roots[0].root_id,
+            "knowledge-familydocs"
+        );
+        assert_eq!(updated.knowledge.source_roots[0].include, vec!["**/*.md"]);
+        assert_eq!(updated.knowledge.source_roots[0].exclude, vec!["tmp/**"]);
+        assert_eq!(updated.knowledge.source_roots[0].last_indexed_at, None);
+
+        let reloaded = store
+            .knowledge_settings()
+            .expect("reload knowledge settings");
+        assert_eq!(reloaded.source_roots[0].label, "Family Docs");
 
         let _ = std::fs::remove_file(admin_path);
         let _ = std::fs::remove_file(registry_path);
@@ -3873,7 +4841,10 @@ mod tests {
         assert_eq!(snapshot.access_governance.role_policies.len(), 6);
         assert_eq!(snapshot.gateway.setup_url, "");
         assert_eq!(snapshot.gateway.static_setup_url, "");
-        assert_eq!(snapshot.gateway.manage_url, "http://gateway.local:4180/admin/im");
+        assert_eq!(
+            snapshot.gateway.manage_url,
+            "http://gateway.local:4180/admin/im"
+        );
         assert_eq!(snapshot.delivery_policy.interactive_reply, "source_bound");
         assert_eq!(
             snapshot.delivery_policy.proactive_delivery,
