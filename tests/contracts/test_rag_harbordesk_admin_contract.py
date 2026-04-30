@@ -20,7 +20,7 @@ def test_rag_admin_endpoints_are_exposed_by_backend_and_harbordesk() -> None:
     for method, route in required_routes:
         assert method in backend
         assert route in backend
-        assert route in service
+        assert route.removeprefix("/api") in service
 
     assert "path.ends_with(\"/cancel\")" in backend
     assert "/cancel`" in service
@@ -34,13 +34,22 @@ def test_harbordesk_admin_service_uses_same_origin_beacon_api_only() -> None:
         r"this\.http\.(?:get|post|put|delete)<[^>]+>\(\s*([`'])([^`']+)",
         service,
     )
+    api_url_calls = re.findall(r"this\.apiUrl\(\s*([`'])([^`']+)", service)
 
     assert direct_calls
-    assert len(literal_calls) == len(direct_calls)
+    assert api_url_calls
     for _quote, url in literal_calls:
-        assert url.startswith("/api/"), url
+        assert url.startswith("/api/") or url.startswith("${this.apiUrl("), url
+    for _quote, path in api_url_calls:
+        assert path.startswith("/"), path
+        assert not path.startswith("/api/"), path
+        assert not path.startswith("http://"), path
+        assert not path.startswith("https://"), path
 
     assert "this.http.get<" in service
+    assert "private apiUrl(path: string): string" in service
+    assert "private resolveApiBase(): string" in service
+    assert "'/api/harbordesk' : '/api'" in service
     assert "http://" not in service
     assert "https://" not in service
 
