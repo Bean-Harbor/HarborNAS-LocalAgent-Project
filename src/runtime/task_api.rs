@@ -84,6 +84,8 @@ const RAG_OP_ANSWER: &str = "answer";
 const RAG_ANSWER_CONTEXT_LIMIT: usize = 5;
 const RAG_ANSWER_BUDGET_MS: u64 = 6_000;
 const RAG_ANSWER_MAX_TOKENS: u32 = 256;
+const RAG_ANSWER_BUDGET_MS_ENV: &str = "HARBOR_RAG_ANSWER_BUDGET_MS";
+const RAG_ANSWER_MAX_TOKENS_ENV: &str = "HARBOR_RAG_ANSWER_MAX_TOKENS";
 const RECENT_CLIP_PLAYBACK_WINDOW_MS: u128 = 15 * 60 * 1000;
 const DEFAULT_TURN_INTENT_DOMAIN: &str = "general";
 const DEFAULT_TURN_INTENT_ACTION: &str = "message";
@@ -1759,11 +1761,6 @@ impl TaskApiService {
                 if let Some(query) = plan.query {
                     upsert_json_string(&mut routed.args, "/query", &query);
                 }
-                if routed.args.pointer("/roots").is_none() {
-                    if let Some(root) = self.default_capture_search_root() {
-                        upsert_json_string_vec(&mut routed.args, "/roots", &[root]);
-                    }
-                }
                 self.handle_knowledge_search(&routed)
             }
             GeneralMessagePlanKind::RagAnswer => {
@@ -1777,11 +1774,6 @@ impl TaskApiService {
                 routed.intent.action = RAG_OP_ANSWER.to_string();
                 if let Some(query) = plan.query {
                     upsert_json_string(&mut routed.args, "/query", &query);
-                }
-                if routed.args.pointer("/roots").is_none() {
-                    if let Some(root) = self.default_capture_search_root() {
-                        upsert_json_string_vec(&mut routed.args, "/roots", &[root]);
-                    }
                 }
                 self.handle_rag_answer(&routed)
             }
@@ -2667,21 +2659,23 @@ impl TaskApiService {
                 ),
             );
         }
-        let resource_profile =
-            match knowledge_resource_profile(request, knowledge_settings.default_resource_profile) {
-                Ok(profile) => profile,
-                Err(error) => {
-                    return self.failed_knowledge_search_degraded(
-                        request,
-                        &query,
-                        knowledge_search_roots(request),
-                        privacy_level,
-                        knowledge_settings.default_resource_profile,
-                        "invalid_resource_profile",
-                        error,
-                    )
-                }
-            };
+        let resource_profile = match knowledge_resource_profile(
+            request,
+            knowledge_settings.default_resource_profile,
+        ) {
+            Ok(profile) => profile,
+            Err(error) => {
+                return self.failed_knowledge_search_degraded(
+                    request,
+                    &query,
+                    knowledge_search_roots(request),
+                    privacy_level,
+                    knowledge_settings.default_resource_profile,
+                    "invalid_resource_profile",
+                    error,
+                )
+            }
+        };
         let search_request = KnowledgeSearchRequest {
             query,
             configured_roots: knowledge_settings.enabled_source_root_paths(),
@@ -2826,21 +2820,23 @@ impl TaskApiService {
                 ),
             );
         }
-        let resource_profile =
-            match knowledge_resource_profile(request, knowledge_settings.default_resource_profile) {
-                Ok(profile) => profile,
-                Err(error) => {
-                    return self.failed_rag_answer_degraded(
-                        request,
-                        &query,
-                        knowledge_search_roots(request),
-                        privacy_level,
-                        knowledge_settings.default_resource_profile,
-                        "invalid_resource_profile",
-                        error,
-                    )
-                }
-            };
+        let resource_profile = match knowledge_resource_profile(
+            request,
+            knowledge_settings.default_resource_profile,
+        ) {
+            Ok(profile) => profile,
+            Err(error) => {
+                return self.failed_rag_answer_degraded(
+                    request,
+                    &query,
+                    knowledge_search_roots(request),
+                    privacy_level,
+                    knowledge_settings.default_resource_profile,
+                    "invalid_resource_profile",
+                    error,
+                )
+            }
+        };
 
         let search_request = KnowledgeSearchRequest {
             query: query.clone(),
@@ -2940,8 +2936,8 @@ impl TaskApiService {
                                 purpose: Some("rag.answer".to_string()),
                                 system_prompt: Some(build_rag_answer_system_prompt()),
                                 temperature: Some(0.0),
-                                max_tokens: Some(RAG_ANSWER_MAX_TOKENS),
-                                timeout: Some(Duration::from_millis(RAG_ANSWER_BUDGET_MS)),
+                                max_tokens: Some(rag_answer_max_tokens()),
+                                timeout: Some(Duration::from_millis(rag_answer_budget_ms())),
                             },
                         );
                         model = json!({
@@ -2956,8 +2952,7 @@ impl TaskApiService {
                             if rag_answer_has_citation_marker(&generated, citations.len()) {
                                 answer = generated;
                             } else {
-                                degraded_reason
-                                    .get_or_insert_with(|| "uncited_answer".to_string());
+                                degraded_reason.get_or_insert_with(|| "uncited_answer".to_string());
                                 warnings.push(
                                     "LLM 输出缺少可解析 citation 标记，已降级为引用片段摘要。"
                                         .to_string(),
@@ -2965,7 +2960,10 @@ impl TaskApiService {
                             }
                         } else {
                             degraded_reason.get_or_insert_with(|| "llm_unavailable".to_string());
-                            warnings.push(format!("LLM 不可用，已降级为引用片段摘要：{}", llm_result.summary));
+                            warnings.push(format!(
+                                "LLM 不可用，已降级为引用片段摘要：{}",
+                                llm_result.summary
+                            ));
                         }
                     }
                     Err(error) => {
@@ -3097,13 +3095,6 @@ impl TaskApiService {
             .first()
             .cloned()
             .ok_or_else(|| "未找到可分析的摄像头设备。".to_string())
-    }
-
-    fn default_capture_search_root(&self) -> Option<String> {
-        let state = self.admin_store.load_or_create_state().ok()?;
-        resolved_capture_directory(&state, resolved_recording_policy(&state, None).as_ref())
-            .ok()
-            .map(|path| path.to_string_lossy().to_string())
     }
 
     fn persist_snapshot_capture(
@@ -5282,6 +5273,9 @@ fn build_knowledge_search_artifacts(response: &KnowledgeSearchResponse) -> Vec<T
                 metadata: json!({
                     "modality": if is_video_proxy { "video" } else { hit.modality.as_str() },
                     "score": hit.score,
+                    "content_source_kinds": hit.content_source_kinds.clone(),
+                    "content_indexed": hit.content_indexed,
+                    "filename_match_used": hit.filename_match_used,
                     "source_image_path": if is_video_proxy { Some(hit.path.clone()) } else { None::<String> },
                     "citation": {
                         "title": hit.title.clone(),
@@ -5294,6 +5288,9 @@ fn build_knowledge_search_artifacts(response: &KnowledgeSearchResponse) -> Vec<T
                         "preview": hit.snippet.clone(),
                         "score": hit.score,
                         "source_path": hit.source_path.clone(),
+                        "content_source_kinds": hit.content_source_kinds.clone(),
+                        "content_indexed": hit.content_indexed,
+                        "filename_match_used": hit.filename_match_used,
                     },
                 }),
             }
@@ -5349,7 +5346,9 @@ fn knowledge_search_next_actions(response: &KnowledgeSearchResponse) -> Vec<Stri
     actions
 }
 
-fn rag_answer_context_citations(response: &KnowledgeSearchResponse) -> Vec<KnowledgeSearchCitation> {
+fn rag_answer_context_citations(
+    response: &KnowledgeSearchResponse,
+) -> Vec<KnowledgeSearchCitation> {
     response
         .reply_pack
         .citations
@@ -5974,6 +5973,42 @@ fn delivery_hints_from_task_response(response: &TaskResponse) -> Vec<TaskDeliver
             }),
         });
     }
+    if !hints
+        .iter()
+        .any(|hint| matches!(hint.kind.as_str(), "native_image" | "native_images"))
+    {
+        let image_artifacts = response
+            .result
+            .artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact.kind == "image"
+                    && artifact
+                        .path
+                        .as_deref()
+                        .map(|path| !path.trim().is_empty())
+                        .unwrap_or(false)
+            })
+            .take(3)
+            .collect::<Vec<_>>();
+        if let Some(first) = image_artifacts.first() {
+            let paths = image_artifacts
+                .iter()
+                .filter_map(|artifact| artifact.path.clone())
+                .collect::<Vec<_>>();
+            hints.push(TaskDeliveryHint {
+                kind: "native_image".to_string(),
+                artifact_id: first.media_asset_id.clone(),
+                fallback: Some("text".to_string()),
+                metadata: json!({
+                    "max_items": 3,
+                    "artifact_count": image_artifacts.len(),
+                    "preferred_transport": "native_image",
+                    "paths": paths,
+                }),
+            });
+        }
+    }
     hints
 }
 
@@ -6401,20 +6436,6 @@ fn upsert_json_string(target: &mut Value, pointer: &str, value: &str) {
         if let Some(parent) = target.pointer_mut(parent_pointer) {
             if let Some(map) = parent.as_object_mut() {
                 map.insert(leaf.to_string(), Value::String(value.to_string()));
-            }
-        }
-    }
-}
-
-fn upsert_json_string_vec(target: &mut Value, pointer: &str, values: &[String]) {
-    ensure_json_pointer_parent(target, pointer);
-    if let Some((parent_pointer, leaf)) = split_json_pointer(pointer) {
-        if let Some(parent) = target.pointer_mut(parent_pointer) {
-            if let Some(map) = parent.as_object_mut() {
-                map.insert(
-                    leaf.to_string(),
-                    Value::Array(values.iter().cloned().map(Value::String).collect()),
-                );
             }
         }
     }
@@ -8219,6 +8240,36 @@ fn knowledge_latency_budget_ms(request: &TaskRequest) -> Option<u64> {
     )
 }
 
+fn rag_answer_budget_ms() -> u64 {
+    positive_env_u64(RAG_ANSWER_BUDGET_MS_ENV, RAG_ANSWER_BUDGET_MS)
+}
+
+fn rag_answer_max_tokens() -> u32 {
+    positive_env_u32(RAG_ANSWER_MAX_TOKENS_ENV, RAG_ANSWER_MAX_TOKENS)
+}
+
+fn positive_env_u64(name: &str, default: u64) -> u64 {
+    positive_u64_value(std::env::var(name).ok().as_deref(), default)
+}
+
+fn positive_env_u32(name: &str, default: u32) -> u32 {
+    positive_u32_value(std::env::var(name).ok().as_deref(), default)
+}
+
+fn positive_u64_value(value: Option<&str>, default: u64) -> u64 {
+    value
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|parsed| *parsed > 0)
+        .unwrap_or(default)
+}
+
+fn positive_u32_value(value: Option<&str>, default: u32) -> u32 {
+    value
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|parsed| *parsed > 0)
+        .unwrap_or(default)
+}
+
 fn parse_privacy_level(value: &str) -> Option<PrivacyLevel> {
     match value.trim().to_lowercase().as_str() {
         "strict_local" | "strict-local" | "local" => Some(PrivacyLevel::StrictLocal),
@@ -8280,20 +8331,6 @@ fn knowledge_modalities(request: &TaskRequest) -> (bool, bool) {
         return (include_documents, include_images);
     }
 
-    if request
-        .intent
-        .domain
-        .trim()
-        .eq_ignore_ascii_case(KNOWLEDGE_DOMAIN)
-        && request
-            .intent
-            .action
-            .trim()
-            .eq_ignore_ascii_case(KNOWLEDGE_OP_SEARCH)
-    {
-        return (true, true);
-    }
-
     let normalized = request.intent.raw_text.to_lowercase();
     let asks_for_documents = [
         "文档",
@@ -8311,6 +8348,26 @@ fn knowledge_modalities(request: &TaskRequest) -> (bool, bool) {
     ]
     .iter()
     .any(|token| normalized.contains(token));
+
+    match (asks_for_documents, asks_for_images) {
+        (true, false) => return (true, false),
+        (false, true) => return (false, true),
+        _ => {}
+    }
+
+    if request
+        .intent
+        .domain
+        .trim()
+        .eq_ignore_ascii_case(KNOWLEDGE_DOMAIN)
+        && request
+            .intent
+            .action
+            .trim()
+            .eq_ignore_ascii_case(KNOWLEDGE_OP_SEARCH)
+    {
+        return (true, true);
+    }
 
     match (asks_for_documents, asks_for_images) {
         (true, false) => (true, false),
@@ -8825,18 +8882,21 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        artifact_kind_from_name, build_artifact_records, conversation_key,
-        effective_autonomy_level, effective_autonomy_level_for_task_run,
-        effective_requires_approval, ensure_safe_capture_root, env_flag_enabled,
-        fallback_general_message_plan, format_pending_candidates,
-        general_message_requests_capability_summary, infer_query_from_raw_text,
-        normalize_command_text, notification_delivery_outcome, parse_general_message_plan,
-        pending_candidates_from_results, protocol_string, resolve_notification_recipient,
-        room_aliases, should_route_general_message_to_knowledge, GeneralMessageConversationAct,
-        GeneralMessagePlanKind, PendingTaskCandidate, TaskApiService, TaskArtifact, TaskIntent,
-        TaskMessage, TaskRequest, TaskRequestAcceptance, TaskSource, TaskStatus, TaskTurnActor,
-        TaskTurnBlock, TaskTurnContinuation, TaskTurnConversation, TaskTurnEnvelope, TaskTurnInput,
-        TaskTurnTransport, ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV,
+        artifact_kind_from_name, build_artifact_records, build_knowledge_search_artifacts,
+        conversation_key, delivery_hints_from_task_response, effective_autonomy_level,
+        effective_autonomy_level_for_task_run, effective_requires_approval,
+        ensure_safe_capture_root, env_flag_enabled, fallback_general_message_plan,
+        format_pending_candidates, general_message_requests_capability_summary,
+        infer_query_from_raw_text, knowledge_modalities, normalize_command_text,
+        notification_delivery_outcome, parse_general_message_plan, pending_candidates_from_results,
+        protocol_string, resolve_notification_recipient, room_aliases,
+        should_route_general_message_to_knowledge, GeneralMessageConversationAct,
+        GeneralMessagePlanKind, PendingTaskCandidate,
+        TaskApiService, TaskArtifact, TaskIntent, TaskMessage, TaskRequest, TaskRequestAcceptance,
+        TaskResponse, TaskResultEnvelope, TaskSource, TaskStatus, TaskTurnActor, TaskTurnBlock,
+        TaskTurnContinuation, TaskTurnConversation, TaskTurnEnvelope, TaskTurnInput,
+        TaskTurnTransport, ALLOW_NON_HARBOROS_CAPTURE_ROOT_ENV, KNOWLEDGE_DOMAIN,
+        KNOWLEDGE_OP_SEARCH,
     };
     use crate::connectors::notifications::{
         NotificationContent, NotificationDelivery, NotificationDeliveryError,
@@ -8854,11 +8914,15 @@ mod tests {
     use crate::control_plane::tasks::{
         ArtifactKind, ConversationSession, ExecutionRoute, TaskRunStatus, TaskStepRunStatus,
     };
+    use crate::orchestrator::contracts::RiskLevel;
     use crate::runtime::admin_console::{
         AdminConsoleState, AdminConsoleStore, IdentityBindingRecord, KnowledgeSettings,
         KnowledgeSourceRoot, RemoteViewConfig,
     };
     use crate::runtime::hub::HubScanResultItem;
+    use crate::runtime::knowledge::{
+        KnowledgeSearchHit, KnowledgeSearchReplyPack, KnowledgeSearchResponse,
+    };
     use crate::runtime::knowledge_index::{KnowledgeIndexConfig, KnowledgeIndexService};
     use crate::runtime::media::{SnapshotCaptureResult, SnapshotFormat};
     use crate::runtime::registry::{
@@ -8872,6 +8936,76 @@ mod tests {
 
     static RETRIEVAL_GATE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static HARBOROS_TASK_API_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn rag_answer_env_overrides_accept_only_positive_numbers() {
+        assert_eq!(super::positive_u64_value(Some("9000"), 6_000), 9_000);
+        assert_eq!(super::positive_u64_value(Some("0"), 6_000), 6_000);
+        assert_eq!(super::positive_u64_value(Some("nope"), 6_000), 6_000);
+        assert_eq!(super::positive_u64_value(None, 6_000), 6_000);
+
+        assert_eq!(super::positive_u32_value(Some("64"), 256), 64);
+        assert_eq!(super::positive_u32_value(Some("0"), 256), 256);
+        assert_eq!(super::positive_u32_value(Some("4294967296"), 256), 256);
+        assert_eq!(super::positive_u32_value(None, 256), 256);
+    }
+
+    #[test]
+    fn knowledge_search_image_artifacts_include_content_index_audit_metadata() {
+        let response = KnowledgeSearchResponse {
+            query: "春天".to_string(),
+            roots: vec!["/mnt/photos".to_string()],
+            total_matches: 1,
+            documents: Vec::new(),
+            images: vec![KnowledgeSearchHit {
+                modality: "image".to_string(),
+                path: "/mnt/photos/neutral-name.jpg".to_string(),
+                title: "neutral-name.jpg".to_string(),
+                score: 820,
+                lexical_score: Some(0.82),
+                embedding_score: None,
+                hybrid_score: Some(0.82),
+                chunk_id: Some("chunk-0001".to_string()),
+                line_start: Some(1),
+                line_end: Some(1),
+                snippet: Some("春天的公园里有绿色草地和盛开的花".to_string()),
+                matched_terms: vec!["春天".to_string()],
+                provenance: Some("vlm".to_string()),
+                source_path: None,
+                content_source_kinds: vec!["vlm".to_string()],
+                content_indexed: true,
+                filename_match_used: false,
+            }],
+            reply_pack: KnowledgeSearchReplyPack::default(),
+            supported_modalities: vec!["vlm".to_string()],
+            pending_modalities: Vec::new(),
+            status: "ok".to_string(),
+            degraded: false,
+            degraded_reason: None,
+            blockers: Vec::new(),
+            warnings: Vec::new(),
+            source_scope: Vec::new(),
+            privacy_level: "strict_local".to_string(),
+            resource_profile: "cpu_only".to_string(),
+        };
+
+        let artifacts = build_knowledge_search_artifacts(&response);
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].kind, "image");
+        assert_eq!(artifacts[0].metadata["content_indexed"], true);
+        assert_eq!(artifacts[0].metadata["filename_match_used"], false);
+        assert_eq!(artifacts[0].metadata["content_source_kinds"][0], "vlm");
+        assert_eq!(artifacts[0].metadata["citation"]["content_indexed"], true);
+        assert_eq!(
+            artifacts[0].metadata["citation"]["filename_match_used"],
+            false
+        );
+        assert_eq!(
+            artifacts[0].metadata["citation"]["content_source_kinds"][0],
+            "vlm"
+        );
+    }
 
     fn unique_path(prefix: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
@@ -12220,6 +12354,57 @@ mod tests {
     }
 
     #[test]
+    fn delivery_hints_add_native_image_for_image_artifacts() {
+        let response = TaskResponse {
+            task_id: "task-image-hint".to_string(),
+            trace_id: "trace-image-hint".to_string(),
+            status: TaskStatus::Completed,
+            executor_used: "knowledge_search_service".to_string(),
+            risk_level: RiskLevel::Low,
+            result: TaskResultEnvelope {
+                message: "found images".to_string(),
+                data: json!({}),
+                artifacts: vec![
+                    TaskArtifact {
+                        kind: "image".to_string(),
+                        label: "spring one".to_string(),
+                        mime_type: "image/jpeg".to_string(),
+                        media_asset_id: Some("artifact-image-1".to_string()),
+                        path: Some("/mnt/photos/spring-1.jpg".to_string()),
+                        url: None,
+                        metadata: json!({}),
+                    },
+                    TaskArtifact {
+                        kind: "image".to_string(),
+                        label: "spring two".to_string(),
+                        mime_type: "image/jpeg".to_string(),
+                        media_asset_id: Some("artifact-image-2".to_string()),
+                        path: Some("/mnt/photos/spring-2.jpg".to_string()),
+                        url: None,
+                        metadata: json!({}),
+                    },
+                ],
+                events: Vec::new(),
+                next_actions: Vec::new(),
+            },
+            audit_ref: "audit-image-hint".to_string(),
+            missing_fields: Vec::new(),
+            prompt: None,
+            resume_token: None,
+        };
+
+        let hints = delivery_hints_from_task_response(&response);
+
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].kind, "native_image");
+        assert_eq!(hints[0].artifact_id.as_deref(), Some("artifact-image-1"));
+        assert_eq!(hints[0].fallback.as_deref(), Some("text"));
+        assert_eq!(hints[0].metadata["max_items"], 3);
+        assert_eq!(hints[0].metadata["artifact_count"], 2);
+        assert_eq!(hints[0].metadata["paths"][0], "/mnt/photos/spring-1.jpg");
+    }
+
+    #[test]
     fn handle_knowledge_search_returns_document_and_image_hits() {
         let admin_path = unique_path("harborbeacon-admin-state");
         let registry_path = unique_path("harborbeacon-device-registry");
@@ -12537,9 +12722,7 @@ mod tests {
             response.result.data["answer_citation_policy"],
             "cited_context_only"
         );
-        assert!(response
-            .result
-            .data["answer"]
+        assert!(response.result.data["answer"]
             .as_str()
             .unwrap_or_default()
             .contains("[1]"));
@@ -12758,6 +12941,111 @@ mod tests {
     }
 
     #[test]
+    fn general_message_search_uses_configured_roots_when_roots_are_omitted() {
+        let _guard = RETRIEVAL_GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let admin_path = unique_path("harborbeacon-admin-state");
+        let registry_path = unique_path("harborbeacon-device-registry");
+        let conversation_path = unique_path("harborbeacon-task-runtime");
+        let knowledge_root = unique_dir("harborbeacon-knowledge-general-message-default-root");
+        let index_root = unique_dir("harborbeacon-knowledge-index-general-message-default-root");
+        fs::create_dir_all(knowledge_root.join("docs")).expect("create docs");
+        fs::write(
+            knowledge_root.join("docs").join("spring-photo-note.md"),
+            "春天照片测试：花树、粉色花朵和公园场景。",
+        )
+        .expect("write doc");
+
+        let admin_store = AdminConsoleStore::new(
+            admin_path.clone(),
+            DeviceRegistryStore::new(registry_path.clone()),
+        );
+        configure_knowledge_source(&admin_store, &knowledge_root, &index_root);
+        let service = TaskApiService::new(
+            admin_store,
+            TaskConversationStore::new(conversation_path.clone()),
+        );
+        let request = TaskRequest {
+            task_id: "task-general-message-search-default-roots".to_string(),
+            trace_id: "trace-general-message-search-default-roots".to_string(),
+            step_id: "step-general-message-search-default-roots".to_string(),
+            source: TaskSource {
+                channel: "wechat".to_string(),
+                surface: "harborgate".to_string(),
+                conversation_id: "chat-search".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "session-search".to_string(),
+                route_key: "gw_route_search".to_string(),
+            },
+            intent: TaskIntent {
+                domain: "general".to_string(),
+                action: "message".to_string(),
+                raw_text: "找到和春天相关的内容".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({}),
+            autonomy: Default::default(),
+            message: Some(TaskMessage {
+                message_id: "om_knowledge_02".to_string(),
+                chat_type: "p2p".to_string(),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }),
+        };
+
+        let response = service.handle_task(request);
+
+        assert_eq!(response.status, TaskStatus::Completed);
+        assert_eq!(response.executor_used, "knowledge_search_service");
+        assert_eq!(
+            response.result.data["source_scope"].as_array().map(Vec::len),
+            Some(1)
+        );
+        let expected_scope = knowledge_root
+            .canonicalize()
+            .unwrap_or_else(|_| knowledge_root.clone())
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            response.result.data["source_scope"][0].as_str(),
+            Some(expected_scope.as_str())
+        );
+        assert!(response.result.message.contains("春天"));
+        assert_ne!(
+            response.result.data["degraded_reason"].as_str(),
+            Some("source_scope_blocked")
+        );
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+        let _ = fs::remove_dir_all(knowledge_root);
+        let _ = fs::remove_dir_all(index_root);
+    }
+
+    #[test]
+    fn knowledge_search_modalities_follow_photo_language_after_general_routing() {
+        let request = TaskRequest {
+            task_id: "task-photo-modality".to_string(),
+            trace_id: "trace-photo-modality".to_string(),
+            step_id: "step-photo-modality".to_string(),
+            source: TaskSource::default(),
+            intent: TaskIntent {
+                domain: KNOWLEDGE_DOMAIN.to_string(),
+                action: KNOWLEDGE_OP_SEARCH.to_string(),
+                raw_text: "找到和春天相关的照片".to_string(),
+            },
+            entity_refs: Value::Null,
+            args: json!({}),
+            autonomy: Default::default(),
+            message: None,
+        };
+
+        assert_eq!(knowledge_modalities(&request), (false, true));
+    }
+
+    #[test]
     fn general_message_routes_knowledge_question_to_rag_answer() {
         let _guard = RETRIEVAL_GATE_TEST_LOCK
             .lock()
@@ -12788,9 +13076,7 @@ mod tests {
         assert_eq!(response.status, TaskStatus::Completed);
         assert_eq!(response.executor_used, "rag_answer_service");
         assert_eq!(response.result.data["kind"], "rag.answer");
-        assert!(response
-            .result
-            .data["answer"]
+        assert!(response.result.data["answer"]
             .as_str()
             .unwrap_or_default()
             .contains("[1]"));
@@ -12854,8 +13140,8 @@ mod tests {
                 .kind,
             GeneralMessagePlanKind::KnowledgeSearch
         );
-        let rag_plan =
-            fallback_general_message_plan("根据资料回答樱花计划是什么", None).expect("rag answer plan");
+        let rag_plan = fallback_general_message_plan("根据资料回答樱花计划是什么", None)
+            .expect("rag answer plan");
         assert_eq!(rag_plan.kind, GeneralMessagePlanKind::RagAnswer);
         assert_eq!(rag_plan.query.as_deref(), Some("樱花计划"));
     }

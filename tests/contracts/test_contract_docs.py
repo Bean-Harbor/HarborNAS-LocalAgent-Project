@@ -116,7 +116,8 @@ def test_model_center_runtime_truth_surface_stays_consistent_across_backend_and_
     assert "projection_mismatch" in readme_content
     assert 'Method::Get if path == "/api/feature-availability"' in backend_content
     assert "build_feature_availability_response" in backend_content
-    assert "'GET /api/models/endpoints + /api/models/policies + /api/feature-availability'" in angular_service_content
+    assert "GET /api/models/endpoints + /api/models/policies + /api/feature-availability" in angular_service_content
+    assert "/api/knowledge/settings + /api/rag/readiness" in angular_service_content
     assert "Projection mismatch means runtime truth is overruling stale admin state." in angular_service_content
     assert "Runtime alignment" in angular_panel_content
     assert "Feature availability" in angular_panel_content
