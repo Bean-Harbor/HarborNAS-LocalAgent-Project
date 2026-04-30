@@ -249,12 +249,51 @@ impl DiscoveryService {
 }
 
 fn preferred_rtsp_paths(request: &DiscoveryRequest, candidate: &DiscoveryCandidate) -> Vec<String> {
-    if !candidate.rtsp_paths.is_empty() {
-        candidate.rtsp_paths.clone()
-    } else if !request.rtsp_paths.is_empty() {
-        request.rtsp_paths.clone()
+    let mut paths = Vec::new();
+    extend_rtsp_paths(&mut paths, &candidate.rtsp_paths);
+    extend_rtsp_paths(&mut paths, &request.rtsp_paths);
+
+    if let Some(vendor_paths) =
+        vendor_rtsp_paths(candidate.vendor.as_deref(), candidate.model.as_deref())
+    {
+        extend_rtsp_paths(&mut paths, &vendor_paths);
+    }
+
+    extend_rtsp_paths(&mut paths, &default_rtsp_paths());
+    paths
+}
+
+fn vendor_rtsp_paths(vendor: Option<&str>, model: Option<&str>) -> Option<Vec<String>> {
+    if is_tp_link_tapo_vendor(vendor, model) {
+        Some(vec!["/stream1".to_string(), "/stream2".to_string()])
     } else {
-        default_rtsp_paths()
+        None
+    }
+}
+
+fn is_tp_link_tapo_vendor(vendor: Option<&str>, model: Option<&str>) -> bool {
+    let vendor = vendor.unwrap_or_default().to_ascii_lowercase();
+    let model = model.unwrap_or_default().to_ascii_lowercase();
+    vendor.contains("tapo")
+        || vendor.contains("tp-link")
+        || vendor.contains("tplink")
+        || model.contains("tapo")
+}
+
+fn extend_rtsp_paths(paths: &mut Vec<String>, candidates: &[String]) {
+    for path in candidates {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let normalized = if trimmed.starts_with('/') {
+            trimmed.to_string()
+        } else {
+            format!("/{trimmed}")
+        };
+        if !paths.iter().any(|existing| existing == &normalized) {
+            paths.push(normalized);
+        }
     }
 }
 
@@ -270,13 +309,14 @@ fn should_seed_rtsp_candidates(
             .all(|protocol| *protocol == DiscoveryProtocol::RtspProbe)
 }
 
-fn default_rtsp_paths() -> Vec<String> {
+pub fn default_rtsp_paths() -> Vec<String> {
     vec![
+        "/stream1".to_string(),
+        "/stream2".to_string(),
         "/h264/ch1/main/av_stream".to_string(),
         "/ch1/main".to_string(),
         "/Streaming/Channels/101".to_string(),
         "/live".to_string(),
-        "/stream1".to_string(),
         "/h264/ch1/sub/av_stream".to_string(),
         "/ch1/sub".to_string(),
         "/Streaming/Channels/102".to_string(),
@@ -367,8 +407,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        DiscoveryBatchResult, DiscoveryCandidate, DiscoveryCandidateStatus, DiscoveryProtocol,
-        DiscoveryRequest, DiscoveryService, RtspProbeRequest, RtspProbeResult,
+        preferred_rtsp_paths, DiscoveryBatchResult, DiscoveryCandidate, DiscoveryCandidateStatus,
+        DiscoveryProtocol, DiscoveryRequest, DiscoveryService, RtspProbeRequest, RtspProbeResult,
     };
     use crate::adapters::mdns::MdnsDiscoveryAdapter;
     use crate::adapters::onvif::OnvifDiscoveryAdapter;
@@ -614,6 +654,51 @@ mod tests {
     }
 
     #[test]
+    fn probe_result_preserves_device_media_and_control_metadata() {
+        let candidate = DiscoveryCandidate {
+            candidate_id: "cand-onvif".to_string(),
+            protocol: DiscoveryProtocol::Onvif,
+            name: Some("Front Door".to_string()),
+            ip_address: "192.168.1.20".to_string(),
+            port: Some(554),
+            vendor: Some("Demo".to_string()),
+            model: Some("X1".to_string()),
+            rtsp_paths: vec!["/live".to_string()],
+            status: DiscoveryCandidateStatus::Validated,
+        };
+        let probe = RtspProbeResult {
+            candidate_id: "cand-onvif".to_string(),
+            reachable: true,
+            stream_url: Some("rtsp://192.168.1.20/live".to_string()),
+            transport: StreamTransport::Rtsp,
+            requires_auth: true,
+            capabilities: crate::runtime::registry::CameraCapabilities {
+                snapshot: true,
+                stream: true,
+                ptz: true,
+                audio: true,
+            },
+            error_message: None,
+        };
+
+        let device = probe
+            .into_camera_device(&candidate, "cam-1")
+            .expect("camera device");
+
+        assert_eq!(device.discovery_source, "onvif");
+        assert_eq!(device.primary_stream.url, "rtsp://192.168.1.20/live");
+        assert!(device.primary_stream.requires_auth);
+        assert!(device.capabilities.snapshot);
+        assert!(device.capabilities.stream);
+        assert!(device.capabilities.ptz);
+        assert!(device.capabilities.audio);
+        assert_eq!(
+            device.onvif_device_service_url.as_deref(),
+            Some("http://192.168.1.20/onvif/device_service")
+        );
+    }
+
+    #[test]
     fn discovery_service_can_seed_rtsp_scan_from_cidr() {
         let service = DiscoveryService::new(Box::new(StaticRtspAdapter), None, None, None);
         let request = DiscoveryRequest {
@@ -699,10 +784,10 @@ mod tests {
         let seen_requests = seen_requests.lock().expect("read probe requests");
 
         assert_eq!(seen_requests.len(), 1);
-        assert_eq!(
-            seen_requests[0].path_candidates,
-            vec!["/ch1/main".to_string()]
-        );
+        assert_eq!(seen_requests[0].path_candidates[0], "/ch1/main");
+        assert!(seen_requests[0]
+            .path_candidates
+            .contains(&"/stream1".to_string()));
         assert_eq!(
             result.connected_devices[0].primary_stream.url,
             "rtsp://192.168.1.30/ch1/main"
@@ -727,6 +812,37 @@ mod tests {
             .discover(&request)
             .expect_err("large scan should be rejected");
         assert!(error.contains("too large"));
+    }
+
+    #[test]
+    fn preferred_rtsp_paths_prioritize_tapo_vendor_presets() {
+        let request = DiscoveryRequest {
+            scan_id: "scan-tapo".to_string(),
+            network_cidr: "192.168.1.0/24".to_string(),
+            protocols: vec![DiscoveryProtocol::RtspProbe],
+            include_rtsp_probe: true,
+            rtsp_port: Some(554),
+            rtsp_username: None,
+            rtsp_password: None,
+            rtsp_paths: vec![],
+        };
+        let candidate = DiscoveryCandidate {
+            candidate_id: "cand-tapo".to_string(),
+            protocol: DiscoveryProtocol::RtspProbe,
+            name: Some("Porch Cam".to_string()),
+            ip_address: "192.168.1.88".to_string(),
+            port: Some(554),
+            vendor: Some("TP-Link Tapo".to_string()),
+            model: Some("C200".to_string()),
+            rtsp_paths: vec![],
+            status: DiscoveryCandidateStatus::Discovered,
+        };
+
+        let paths = preferred_rtsp_paths(&request, &candidate);
+
+        assert_eq!(paths[0], "/stream1");
+        assert_eq!(paths[1], "/stream2");
+        assert!(paths.contains(&"/h264/ch1/main/av_stream".to_string()));
     }
 
     struct EmptyOnvifAdapter;

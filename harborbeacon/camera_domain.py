@@ -13,6 +13,7 @@ CAMERA_CAPABILITIES = [
     "camera.scan",
     "camera.connect",
     "camera.snapshot",
+    "camera.share_link",
     "camera.live_view",
     "camera.analyze",
     "camera.ptz",

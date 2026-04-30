@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::connectors::harboros::{harboros_real_interface_surfaces, HarborOsParityKind};
 use crate::scripts::integration::{
     default_midcli_filesystem_command, default_midcli_service_query, discover_source_capabilities,
     file_operation_risk, service_operation_risk, IntegrationConfig, MidcliClient, MiddlewareClient,
@@ -29,8 +30,18 @@ pub struct DriftReport {
     pub harbor_repo_path: Option<String>,
     pub upstream_repo_path: Option<String>,
     pub docs_missing: Vec<String>,
+    pub harboros_parity: Vec<HarborOsParityRow>,
     pub rows: Vec<DriftRow>,
     pub blocking: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarborOsParityRow {
+    pub capability: String,
+    pub middleware_method: Option<String>,
+    pub midcli_example: Option<String>,
+    pub parity_kind: String,
+    pub notes: String,
 }
 
 pub fn live_middleware_capabilities(client: &MiddlewareClient) -> HashMap<String, bool> {
@@ -110,9 +121,9 @@ pub fn run_drift_matrix(
     upstream_repo_path: Option<String>,
 ) -> DriftReport {
     let checks = [
-        "HarborNAS-Middleware-Endpoint-Contract-v1.md",
-        "HarborNAS-Files-BatchOps-Contract-v1.md",
-        "HarborNAS-Planner-TaskDecompose-Contract-v1.md",
+        "HarborBeacon-Middleware-Endpoint-Contract-v1.md",
+        "HarborBeacon-Files-BatchOps-Contract-v1.md",
+        "HarborBeacon-Planner-TaskDecompose-Contract-v1.md",
     ];
     let missing = checks
         .iter()
@@ -144,6 +155,19 @@ pub fn run_drift_matrix(
         .all(|name| midcli_caps.get(*name) == Some(&true));
 
     let files_live_available = middleware_files_live || midcli_files_live;
+    let harboros_parity = harboros_real_interface_surfaces()
+        .iter()
+        .map(|surface| HarborOsParityRow {
+            capability: surface.capability.to_string(),
+            middleware_method: surface.middleware_method.map(|s| s.to_string()),
+            midcli_example: surface.midcli_example.map(|s| s.to_string()),
+            parity_kind: match surface.parity_kind {
+                HarborOsParityKind::Real => "real".to_string(),
+                HarborOsParityKind::ScaffoldOnly => "scaffold-only".to_string(),
+            },
+            notes: surface.notes.to_string(),
+        })
+        .collect::<Vec<_>>();
 
     let rows = vec![
         DriftRow {
@@ -229,6 +253,7 @@ pub fn run_drift_matrix(
         harbor_repo_path,
         upstream_repo_path,
         docs_missing: missing.clone(),
+        harboros_parity,
         rows,
         blocking: !missing.is_empty() || blocking_rows,
     }
@@ -236,7 +261,7 @@ pub fn run_drift_matrix(
 
 #[cfg(test)]
 mod tests {
-    use super::DriftReport;
+    use super::{DriftReport, HarborOsParityKind, HarborOsParityRow};
 
     #[test]
     fn midcli_only_is_degraded_not_blocking() {
@@ -247,6 +272,7 @@ mod tests {
             harbor_repo_path: None,
             upstream_repo_path: None,
             docs_missing: Vec::new(),
+            harboros_parity: Vec::new(),
             rows: vec![
                 super::DriftRow {
                     capability: "system.harbor_ops".to_string(),
@@ -289,5 +315,51 @@ mod tests {
         assert!(!system.blocking);
         assert_eq!(files.status, "degraded");
         assert!(!files.blocking);
+    }
+
+    #[test]
+    fn parity_rows_mark_real_and_scaffold_only_surfaces() {
+        let report = DriftReport {
+            mode: "spec-scaffold".to_string(),
+            harbor_ref: "develop".to_string(),
+            upstream_ref: "master".to_string(),
+            harbor_repo_path: None,
+            upstream_repo_path: None,
+            docs_missing: Vec::new(),
+            harboros_parity: super::harboros_real_interface_surfaces()
+                .iter()
+                .map(|surface| HarborOsParityRow {
+                    capability: surface.capability.to_string(),
+                    middleware_method: surface.middleware_method.map(|s| s.to_string()),
+                    midcli_example: surface.midcli_example.map(|s| s.to_string()),
+                    parity_kind: match surface.parity_kind {
+                        HarborOsParityKind::Real => "real".to_string(),
+                        HarborOsParityKind::ScaffoldOnly => "scaffold-only".to_string(),
+                    },
+                    notes: surface.notes.to_string(),
+                })
+                .collect(),
+            rows: Vec::new(),
+            blocking: false,
+        };
+
+        let service_query = report
+            .harboros_parity
+            .iter()
+            .find(|row| row.capability == "service.query")
+            .unwrap();
+        let read_text = report
+            .harboros_parity
+            .iter()
+            .find(|row| row.capability == "files.read_text")
+            .unwrap();
+
+        assert_eq!(service_query.parity_kind, "real");
+        assert_eq!(
+            service_query.middleware_method.as_deref(),
+            Some("service.query")
+        );
+        assert_eq!(read_text.parity_kind, "scaffold-only");
+        assert!(read_text.middleware_method.is_none());
     }
 }

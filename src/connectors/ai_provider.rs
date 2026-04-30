@@ -42,8 +42,34 @@ pub struct VisionSummaryRequest {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct TextCompletionRequest {
+    pub system_prompt: Option<String>,
+    pub user_prompt: String,
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+    pub timeout: Option<std::time::Duration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingRequest {
+    pub input: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct VisionSummaryResponse {
     pub summary: String,
+    pub raw_response: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextCompletionResponse {
+    pub text: String,
+    pub raw_response: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddingResponse {
+    pub embedding: Vec<f32>,
     pub raw_response: serde_json::Value,
 }
 
@@ -137,6 +163,16 @@ pub struct OpenAiCompatibleVisionClient {
     config: OpenAiCompatibleConfig,
 }
 
+pub struct OpenAiCompatibleTextClient {
+    client: Client,
+    config: OpenAiCompatibleConfig,
+}
+
+pub struct OpenAiCompatibleEmbeddingClient {
+    client: Client,
+    config: OpenAiCompatibleConfig,
+}
+
 impl OpenAiCompatibleVisionClient {
     pub fn new(config: OpenAiCompatibleConfig) -> Result<Self, String> {
         let client = Client::builder()
@@ -150,7 +186,7 @@ impl OpenAiCompatibleVisionClient {
         &self,
         request: &VisionSummaryRequest,
     ) -> Result<VisionSummaryResponse, String> {
-        let system_prompt = "You are a concise Chinese security-camera analyst. Summarize what matters for a HarborNAS user. Mention detected people count, approximate position, and whether the frame needs attention. Keep it under 80 Chinese characters.";
+        let system_prompt = "You are a concise Chinese security-camera analyst. Summarize what matters for a HarborBeacon user. Mention detected people count, approximate position, and whether the frame needs attention. Keep it under 80 Chinese characters.";
         let user_prompt = request.user_prompt.clone().unwrap_or_else(|| {
             "请根据检测结果和图片，用中文总结当前画面。优先说明是否有人、人数、位置和是否需要关注。".to_string()
         });
@@ -211,15 +247,137 @@ impl OpenAiCompatibleVisionClient {
     }
 
     fn headers(&self) -> Result<HeaderMap, String> {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", self.config.api_key))
-                .map_err(|e| format!("invalid OpenAI-compatible auth header: {e}"))?,
-        );
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        Ok(headers)
+        openai_compatible_headers(&self.config.api_key)
     }
+}
+
+impl OpenAiCompatibleTextClient {
+    pub fn new(config: OpenAiCompatibleConfig) -> Result<Self, String> {
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(45))
+            .build()
+            .map_err(|e| format!("failed to build OpenAI-compatible text client: {e}"))?;
+        Ok(Self { client, config })
+    }
+
+    pub fn complete_text(
+        &self,
+        request: &TextCompletionRequest,
+    ) -> Result<TextCompletionResponse, String> {
+        let mut messages = Vec::new();
+        if let Some(system_prompt) = request
+            .system_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            messages.push(json!({
+                "role": "system",
+                "content": system_prompt,
+            }));
+        }
+        messages.push(json!({
+            "role": "user",
+            "content": request.user_prompt,
+        }));
+
+        let mut payload = serde_json::Map::new();
+        payload.insert("model".to_string(), json!(self.config.model));
+        payload.insert(
+            "temperature".to_string(),
+            json!(request.temperature.unwrap_or(0.1)),
+        );
+        payload.insert("messages".to_string(), json!(messages));
+        if let Some(max_tokens) = request.max_tokens {
+            payload.insert("max_tokens".to_string(), json!(max_tokens));
+        }
+
+        let mut request_builder = self
+            .client
+            .post(format!("{}/chat/completions", self.config.base_url))
+            .headers(openai_compatible_headers(&self.config.api_key)?)
+            .json(&payload);
+        if let Some(timeout) = request.timeout {
+            request_builder = request_builder.timeout(timeout);
+        }
+
+        let response = request_builder
+            .send()
+            .map_err(|e| format!("OpenAI-compatible text request failed: {e}"))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .unwrap_or_else(|_| "<body unavailable>".to_string());
+            return Err(format!("OpenAI-compatible API error {status}: {body}"));
+        }
+
+        let raw_response: serde_json::Value = response
+            .json()
+            .map_err(|e| format!("failed to parse OpenAI-compatible response: {e}"))?;
+        let text = extract_message_text(&raw_response).ok_or_else(|| {
+            "OpenAI-compatible response did not contain assistant text".to_string()
+        })?;
+
+        Ok(TextCompletionResponse { text, raw_response })
+    }
+}
+
+impl OpenAiCompatibleEmbeddingClient {
+    pub fn new(config: OpenAiCompatibleConfig) -> Result<Self, String> {
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(45))
+            .build()
+            .map_err(|e| format!("failed to build OpenAI-compatible embedding client: {e}"))?;
+        Ok(Self { client, config })
+    }
+
+    pub fn embed_text(&self, request: &EmbeddingRequest) -> Result<EmbeddingResponse, String> {
+        let payload = json!({
+            "model": self.config.model,
+            "input": request.input,
+        });
+
+        let response = self
+            .client
+            .post(format!("{}/embeddings", self.config.base_url))
+            .headers(openai_compatible_headers(&self.config.api_key)?)
+            .json(&payload)
+            .send()
+            .map_err(|e| format!("OpenAI-compatible embedding request failed: {e}"))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .unwrap_or_else(|_| "<body unavailable>".to_string());
+            return Err(format!("OpenAI-compatible API error {status}: {body}"));
+        }
+
+        let raw_response: serde_json::Value = response
+            .json()
+            .map_err(|e| format!("failed to parse OpenAI-compatible embedding response: {e}"))?;
+        let embedding = extract_embedding_vector(&raw_response).ok_or_else(|| {
+            "OpenAI-compatible response did not contain an embedding vector".to_string()
+        })?;
+
+        Ok(EmbeddingResponse {
+            embedding,
+            raw_response,
+        })
+    }
+}
+
+fn openai_compatible_headers(api_key: &str) -> Result<HeaderMap, String> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {api_key}"))
+            .map_err(|e| format!("invalid OpenAI-compatible auth header: {e}"))?,
+    );
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(headers)
 }
 
 fn extract_message_text(value: &serde_json::Value) -> Option<String> {
@@ -247,9 +405,23 @@ fn extract_message_text(value: &serde_json::Value) -> Option<String> {
     }
 }
 
+fn extract_embedding_vector(value: &serde_json::Value) -> Option<Vec<f32>> {
+    let values = value
+        .get("data")?
+        .as_array()?
+        .first()?
+        .get("embedding")?
+        .as_array()?;
+    let mut embedding = Vec::with_capacity(values.len());
+    for item in values {
+        embedding.push(item.as_f64()? as f32);
+    }
+    (!embedding.is_empty()).then_some(embedding)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::extract_message_text;
+    use super::{extract_embedding_vector, extract_message_text};
     use serde_json::json;
 
     #[test]
@@ -284,6 +456,21 @@ mod tests {
         assert_eq!(
             extract_message_text(&response).as_deref(),
             Some("画面中有 2 人\n其中一人位于左侧")
+        );
+    }
+
+    #[test]
+    fn extract_embedding_vector_supports_openai_shape() {
+        let response = json!({
+            "data": [{
+                "embedding": [0.25, -0.5, 0.75],
+                "index": 0,
+            }]
+        });
+
+        assert_eq!(
+            extract_embedding_vector(&response),
+            Some(vec![0.25f32, -0.5f32, 0.75f32])
         );
     }
 }

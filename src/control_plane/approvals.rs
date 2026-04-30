@@ -17,6 +17,10 @@ pub enum ApprovalStatus {
 pub struct ApprovalTicket {
     pub approval_id: String,
     pub task_id: String,
+    #[serde(default)]
+    pub trace_id: String,
+    #[serde(default)]
+    pub route_key: String,
     pub policy_ref: String,
     pub requester_user_id: String,
     #[serde(default)]

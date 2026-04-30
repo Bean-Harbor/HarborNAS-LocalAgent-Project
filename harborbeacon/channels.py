@@ -274,6 +274,24 @@ def load_channel_configs(data: dict[str, Any]) -> list[ChannelConfig]:
             ch = Channel(name)
         except ValueError:
             continue  # skip unknown channels
+        raw_extra = cfg.get("extra", {})
+        extra = dict(raw_extra) if isinstance(raw_extra, dict) else {}
+        extra.update(
+            {
+                k: v
+                for k, v in cfg.items()
+                if k
+                not in (
+                    "enabled",
+                    "webhook_url",
+                    "app_id",
+                    "app_secret",
+                    "bot_token",
+                    "transport_mode",
+                    "extra",
+                )
+            }
+        )
         configs.append(ChannelConfig(
             channel=ch,
             enabled=cfg.get("enabled", False),
@@ -281,7 +299,7 @@ def load_channel_configs(data: dict[str, Any]) -> list[ChannelConfig]:
             app_id=cfg.get("app_id"),
             app_secret=cfg.get("app_secret"),
             bot_token=cfg.get("bot_token"),
-            extra={k: v for k, v in cfg.items()
-                   if k not in ("enabled", "webhook_url", "app_id", "app_secret", "bot_token")},
+            transport_mode=cfg.get("transport_mode", ""),
+            extra=extra,
         ))
     return configs

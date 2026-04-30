@@ -6,8 +6,12 @@ import re
 import shlex
 import ssl
 import sys
+import time
 
-import websocket
+try:
+    import websocket
+except ModuleNotFoundError:  # pragma: no cover - exercised when dependency is absent
+    websocket = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -22,6 +26,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def connect(url: str, user: str, password: str):
+    if websocket is None:
+        raise RuntimeError("websocket package is required for Harbor CLI websocket mode")
     sslopt = {"cert_reqs": ssl.CERT_NONE} if url.startswith("wss://") else {}
     ws = websocket.create_connection(url, timeout=15, sslopt=sslopt)
     ws.send(json.dumps({"msg": "connect", "version": "1", "support": ["1"]}))
@@ -35,14 +41,29 @@ def connect(url: str, user: str, password: str):
     return ws
 
 
-def call(ws, method: str, params: list):
-    ws.send(json.dumps({"id": 2, "msg": "method", "method": method, "params": params}))
+def call(ws, method: str, params: list, request_id: int):
+    ws.send(json.dumps({"id": request_id, "msg": "method", "method": method, "params": params}))
     recv = json.loads(ws.recv())
     if recv.get("msg") != "result":
         raise RuntimeError(f"method call failed: {recv}")
     if "error" in recv:
         raise RuntimeError(json.dumps(recv["error"], ensure_ascii=False))
     return recv.get("result")
+
+
+def wait_for_job(ws, job_id: int, request_id: int, *, timeout_s: int = 60):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        result = call(ws, "core.get_jobs", [[["id", "=", job_id]], {"get": True}], request_id)
+        state = result.get("state")
+        if state == "SUCCESS":
+            return result.get("result")
+        if state in {"FAILED", "ABORTED"}:
+            error = result.get("error") or f"job {job_id} {state.lower()}"
+            raise RuntimeError(error)
+        time.sleep(0.25)
+
+    raise RuntimeError(f"job {job_id} did not finish within {timeout_s}s")
 
 
 def parse_service_query(command: str):
@@ -102,11 +123,12 @@ def rows_to_csv(rows: list[dict], fields: list[str]) -> str:
 def main() -> int:
     args = parse_args()
     ws = connect(args.url, args.user, args.password)
+    request_id = 2
     try:
         command = args.command.strip()
         if command.startswith("service query "):
             fields, service_name = parse_service_query(command)
-            result = call(ws, "service.query", [[ ["service", "=", service_name] ], {"select": fields, "order_by": ["service"]}])
+            result = call(ws, "service.query", [[["service", "=", service_name]], {"select": fields, "order_by": ["service"]}], request_id)
             if args.mode == "csv":
                 sys.stdout.write(rows_to_csv(result if isinstance(result, list) else [result], fields))
             else:
@@ -115,7 +137,7 @@ def main() -> int:
 
         if command.startswith("filesystem listdir "):
             path = parse_filesystem_listdir(command)
-            result = call(ws, "filesystem.listdir", [path, [], {"limit": 5, "select": ["path", "type"]}])
+            result = call(ws, "filesystem.listdir", [path, [], {"limit": 5, "select": ["path", "type"]}], request_id)
             if args.mode == "csv":
                 if result:
                     sys.stdout.write(rows_to_csv(result, ["path", "type"]))
@@ -127,7 +149,7 @@ def main() -> int:
 
         if command.startswith("service "):
             action, service_name = parse_service_action(command)
-            result = call(ws, "service.control", [action.upper(), service_name, {}])
+            result = call(ws, "service.control", [action.upper(), service_name, {}], request_id)
             if args.mode == "csv":
                 sys.stdout.write("result\n")
                 sys.stdout.write(f"{json.dumps(result, ensure_ascii=False)}\n")
@@ -138,9 +160,20 @@ def main() -> int:
         if command.startswith("filesystem copy ") or command.startswith("filesystem move "):
             operation, src, dst, recursive = parse_filesystem_mutation(command)
             if operation == "copy":
-                result = call(ws, "filesystem.copy", [src, dst, {"recursive": recursive, "preserve_attrs": False}])
+                job_id = call(
+                    ws,
+                    "filesystem.copy",
+                    [{"src": src, "dst": dst, "options": {"recursive": recursive, "preserve_attrs": False}}],
+                    request_id,
+                )
             else:
-                result = call(ws, "filesystem.move", [[src], dst, {"recursive": recursive}])
+                job_id = call(
+                    ws,
+                    "filesystem.move",
+                    [{"src": [src], "dst": dst, "options": {"recursive": recursive}}],
+                    request_id,
+                )
+            result = wait_for_job(ws, job_id, request_id + 1)
             if args.mode == "csv":
                 sys.stdout.write("result\n")
                 sys.stdout.write(f"{json.dumps(result, ensure_ascii=False)}\n")

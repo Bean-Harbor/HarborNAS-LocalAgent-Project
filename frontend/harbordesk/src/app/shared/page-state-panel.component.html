@@ -1,0 +1,404 @@
+<section class="panel" [ngClass]="'state-' + (state?.kind ?? 'loading')">
+  @if (state) {
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">{{ state.data.eyebrow }}</p>
+        <h3>{{ state.data.title }}</h3>
+        <p class="summary">{{ state.data.summary }}</p>
+      </div>
+      <div class="state-chip">{{ state.kind }}</div>
+    </div>
+
+    <div class="state-detail">{{ state.detail }}</div>
+
+    @if (saveError || saveSuccess || testingEndpointId) {
+      <div class="action-status-rail">
+        @if (saveSuccess) {
+          <div class="action-status tone-good">{{ saveSuccess }}</div>
+        }
+        @if (saveError) {
+          <div class="action-status tone-danger">{{ saveError }}</div>
+        }
+        @if (testingEndpointId) {
+          <div class="action-status tone-warn">Testing model endpoint <code>{{ testingEndpointId }}</code>...</div>
+        }
+      </div>
+    }
+
+    @if (state.data.setupFlow) {
+      <article class="content-card expanded-card setup-flow-card">
+        <div class="section-head">
+          <div>
+            <p class="content-label">Release-v1 setup flow</p>
+            <p class="table-copy">{{ state.data.setupFlow.summary }}</p>
+          </div>
+          <div class="inline-badge tone-accent">{{ state.data.setupFlow.title }}</div>
+        </div>
+        <div class="setup-flow-grid">
+          @for (step of state.data.setupFlow.steps; track step.title) {
+            <section class="setup-step" [ngClass]="setupToneClass(step.state)">
+              <div class="setup-step-head">
+                <strong>{{ step.title }}</strong>
+                <span class="setup-step-state">{{ step.state }}</span>
+              </div>
+              <p class="setup-step-summary">{{ step.summary }}</p>
+              <p class="setup-step-detail">{{ step.detail }}</p>
+              @if (step.bullets?.length) {
+                <ul class="setup-step-list">
+                  @for (bullet of step.bullets; track bullet) {
+                    <li>{{ bullet }}</li>
+                  }
+                </ul>
+              }
+            </section>
+          }
+        </div>
+      </article>
+    }
+
+    @if (state.kind === 'loading') {
+      <div class="skeleton-grid" aria-hidden="true">
+        <div class="skeleton-card"></div>
+        <div class="skeleton-card"></div>
+        <div class="skeleton-card"></div>
+      </div>
+    } @else {
+      <div class="metrics-grid">
+        @for (metric of state.data.metrics; track metric.label) {
+          <article class="metric-card" [ngClass]="toneClass(metric.tone)">
+            <p>{{ metric.label }}</p>
+            <strong>{{ metric.value }}</strong>
+            <span>{{ metric.detail }}</span>
+          </article>
+        }
+      </div>
+
+      <div class="content-grid">
+        <article class="content-card">
+          <p class="content-label">Highlights</p>
+          <ul>
+            @for (highlight of state.data.highlights; track highlight) {
+              <li>{{ highlight }}</li>
+            }
+          </ul>
+        </article>
+
+        <article class="content-card">
+          <p class="content-label">Signals</p>
+          @if (state.data.blockers.length > 0) {
+            <ul class="signal-list">
+              @for (blocker of state.data.blockers; track blocker) {
+                <li class="tone-danger">{{ blocker }}</li>
+              }
+            </ul>
+          } @else if (state.kind === 'empty') {
+            <p class="empty-copy">{{ state.data.emptyNote }}</p>
+          } @else {
+            <ul class="signal-list">
+              <li class="tone-success">{{ state.data.nextStep }}</li>
+              <li class="muted">Endpoint: <code>{{ state.data.endpoint }}</code></li>
+              <li class="muted">Output: <code>{{ state.data.outputDirectory }}</code></li>
+            </ul>
+          }
+          </article>
+        </div>
+
+      @if (state.data.runtimeAlignment) {
+        <article class="content-card expanded-card">
+          <div class="section-head">
+            <div>
+              <p class="content-label">Runtime alignment</p>
+              <p class="table-copy">{{ state.data.runtimeAlignment.detail }}</p>
+            </div>
+            <div class="inline-badge" [ngClass]="toneClass(state.data.runtimeAlignment.tone)">
+              {{ state.data.runtimeAlignment.status }}
+            </div>
+          </div>
+          <div class="detail-grid">
+            @for (row of state.data.runtimeAlignment.rows; track row.title + row.subtitle) {
+              <section class="detail-row" [ngClass]="row.tone ? toneClass(row.tone) : ''">
+                <div class="detail-row-head">
+                  <strong>{{ row.title }}</strong>
+                  @if (row.subtitle) {
+                    <span>{{ row.subtitle }}</span>
+                  }
+                </div>
+                @if (row.meta?.length) {
+                  <ul class="detail-meta">
+                    @for (item of row.meta; track item) {
+                      <li>{{ item }}</li>
+                    }
+                  </ul>
+                }
+              </section>
+            }
+          </div>
+        </article>
+      }
+
+      @if (state.data.featureGroups?.length) {
+        <article class="content-card expanded-card">
+          <div class="section-head">
+            <div>
+              <p class="content-label">Feature availability</p>
+              <p class="table-copy">Live runtime, route policy, account management, and gateway status are merged into a grouped read-model here.</p>
+            </div>
+          </div>
+          <div class="feature-group-stack">
+            @for (group of state.data.featureGroups; track group.group_id) {
+              <section class="feature-group">
+                <div class="feature-group-head">
+                  <strong>{{ group.label }}</strong>
+                  <span class="cell-note">{{ group.group_id }}</span>
+                </div>
+                <div class="feature-grid">
+                  @for (item of group.items; track item.feature_id) {
+                    <section class="detail-row" [ngClass]="featureStatusToneClass(item.status)">
+                      <div class="detail-row-head">
+                        <strong>{{ item.label }}</strong>
+                        <span class="status-pill" [ngClass]="featureStatusToneClass(item.status)">{{ item.status }}</span>
+                      </div>
+                      <p class="feature-copy">{{ item.current_option }}</p>
+                      <ul class="detail-meta">
+                        <li>Feature ID: {{ item.feature_id }}</li>
+                        <li>Owner lane: {{ item.owner_lane }}</li>
+                        <li>Source of truth: {{ item.source_of_truth }}</li>
+                        <li>Fallback: {{ featureFallbackLabel(item.fallback_order) }}</li>
+                        <li>Where to edit: {{ featureWhereToEdit(item.feature_id) }}</li>
+                        @if (item.blocker) {
+                          <li class="tone-danger">Blocker: {{ item.blocker }}</li>
+                        }
+                        @if (item.evidence.length) {
+                          <li>Evidence: {{ item.evidence.join(' | ') }}</li>
+                        }
+                      </ul>
+                    </section>
+                  }
+                </div>
+              </section>
+            }
+          </div>
+        </article>
+      }
+
+      @if (state.data.detailRows?.length) {
+        <article class="content-card expanded-card">
+          <p class="content-label">Live details</p>
+          <div class="detail-grid">
+            @for (row of state.data.detailRows; track row.title + row.subtitle) {
+              <section class="detail-row" [ngClass]="row.tone ? toneClass(row.tone) : ''">
+                <div class="detail-row-head">
+                  <strong>{{ row.title }}</strong>
+                  @if (row.subtitle) {
+                    <span>{{ row.subtitle }}</span>
+                  }
+                </div>
+                @if (row.meta?.length) {
+                  <ul class="detail-meta">
+                    @for (item of row.meta; track item) {
+                      <li>{{ item }}</li>
+                    }
+                  </ul>
+                }
+              </section>
+            }
+          </div>
+        </article>
+      }
+
+      @if (state.data.notificationTargets?.length) {
+        <article class="content-card expanded-card">
+          <div class="section-head">
+            <div>
+              <p class="content-label">Notification Targets</p>
+              <p class="table-copy">HarborBeacon stores only named HarborGate route-key targets here.</p>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Label</th>
+                  <th>Platform</th>
+                  <th>Route Key</th>
+                  <th>Default</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                @for (target of state.data.notificationTargets; track target.target_id) {
+                  <tr>
+                    <td>
+                      <strong>{{ target.label }}</strong>
+                      <span class="cell-note">{{ target.target_id }}</span>
+                    </td>
+                    <td>{{ target.platform_hint || 'pending' }}</td>
+                    <td><code>{{ target.route_key }}</code></td>
+                    <td>{{ target.is_default ? 'yes' : 'no' }}</td>
+                    <td>
+                      <div class="inline-action">
+                        <button
+                          type="button"
+                          class="action-button"
+                          [disabled]="target.is_default || savingTargetId === target.target_id || deletingTargetId === target.target_id"
+                          (click)="requestNotificationTargetDefaultChange(target.target_id)"
+                        >
+                          {{ savingTargetId === target.target_id ? 'Saving...' : 'Set default' }}
+                        </button>
+                        <button
+                          type="button"
+                          class="action-button"
+                          [disabled]="deletingTargetId === target.target_id"
+                          (click)="requestNotificationTargetDelete(target.target_id)"
+                        >
+                          {{ deletingTargetId === target.target_id ? 'Deleting...' : 'Delete' }}
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                }
+              </tbody>
+            </table>
+          </div>
+        </article>
+      }
+
+      @if (state.data.members?.length) {
+        <article class="content-card expanded-card">
+          <div class="section-head">
+            <div>
+              <p class="content-label">Members</p>
+              <p class="table-copy">Per-member proactive delivery defaults stay editable here.</p>
+            </div>
+            @if (saveSuccess) {
+              <div class="inline-badge tone-success">{{ saveSuccess }}</div>
+            }
+          </div>
+          @if (saveError) {
+            <p class="inline-error">{{ saveError }}</p>
+          }
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Member</th>
+                  <th>Role</th>
+                  <th>Binding</th>
+                  <th>Recent surface</th>
+                  <th>Default proactive</th>
+                </tr>
+              </thead>
+              <tbody>
+                @for (member of state.data.members; track member.user_id) {
+                  <tr>
+                    <td>
+                      <strong>{{ member.display_name }}</strong>
+                      <span class="cell-note">{{ member.user_id }}</span>
+                    </td>
+                    <td>
+                      <span>{{ member.role_kind }}</span>
+                      <span class="cell-note">{{ member.membership_status }}</span>
+                    </td>
+                    <td>
+                      <span>{{ member.binding_availability }}</span>
+                      <span class="cell-note">{{ member.binding_availability_note || member.source }}</span>
+                    </td>
+                    <td>{{ member.recent_interactive_surface ?? 'n/a' }}</td>
+                    <td>
+                      <div class="inline-action">
+                        <select
+                          #surface
+                          [value]="member.proactive_delivery_surface"
+                          [disabled]="!member.can_edit || savingMemberId === member.user_id"
+                        >
+                          <option value="feishu">feishu</option>
+                          <option value="weixin">weixin</option>
+                        </select>
+                        <button
+                          type="button"
+                          class="action-button"
+                          [disabled]="!member.can_edit || savingMemberId === member.user_id || surface.value === member.proactive_delivery_surface"
+                          (click)="requestDefaultSurfaceChange(member.user_id, surface.value)"
+                        >
+                          {{ savingMemberId === member.user_id ? 'Saving...' : 'Save' }}
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                }
+              </tbody>
+            </table>
+          </div>
+        </article>
+      }
+
+      @if (state.data.modelEndpoints?.length) {
+        <article class="content-card expanded-card">
+          <p class="content-label">Model endpoints</p>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Endpoint</th>
+                  <th>Kind</th>
+                  <th>Status</th>
+                  <th>Capabilities</th>
+                  <th>Test</th>
+                </tr>
+              </thead>
+              <tbody>
+                @for (endpoint of state.data.modelEndpoints; track endpoint.model_endpoint_id) {
+                  <tr>
+                    <td>
+                      <strong>{{ endpoint.model_endpoint_id }}</strong>
+                      <span class="cell-note">{{ endpoint.provider_key }} / {{ endpoint.model_name }}</span>
+                    </td>
+                    <td>{{ endpoint.model_kind }} / {{ endpoint.endpoint_kind }}</td>
+                    <td>{{ endpoint.status }}</td>
+                    <td>{{ endpoint.capability_tags.join(', ') || 'n/a' }}</td>
+                    <td>
+                      <div class="inline-action">
+                        <button
+                          type="button"
+                          class="action-button"
+                          [disabled]="testingEndpointId === endpoint.model_endpoint_id"
+                          (click)="requestEndpointTest(endpoint.model_endpoint_id)"
+                        >
+                          {{ testingEndpointId === endpoint.model_endpoint_id ? 'Testing...' : 'Run test' }}
+                        </button>
+                        @if (endpointTestResults[endpoint.model_endpoint_id]) {
+                          <span
+                            class="cell-note"
+                            [ngClass]="endpointTestResults[endpoint.model_endpoint_id].ok ? 'tone-success' : 'tone-danger'"
+                          >
+                            {{ endpointTestResults[endpoint.model_endpoint_id].summary }}
+                          </span>
+                        }
+                      </div>
+                    </td>
+                  </tr>
+                }
+              </tbody>
+            </table>
+          </div>
+        </article>
+      }
+    }
+  } @else {
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">Loading</p>
+        <h3>Preparing HarborDesk</h3>
+        <p class="summary">Waiting for the first page projection.</p>
+      </div>
+      <div class="state-chip">loading</div>
+    </div>
+
+    <div class="state-detail">Bootstrapping the workspace shell.</div>
+    <div class="skeleton-grid" aria-hidden="true">
+      <div class="skeleton-card"></div>
+      <div class="skeleton-card"></div>
+      <div class="skeleton-card"></div>
+    </div>
+  }
+</section>

@@ -175,11 +175,11 @@ describe('HarborBeaconSettingsComponent', () => {
     expect(component.connectivityResults.length).toBe(1);
   }));
 
-  it('should run Feishu one-click setup and refresh settings', fakeAsync(() => {
+  it('should validate and apply Feishu config', fakeAsync(() => {
     fixture.detectChanges();
     flushInitialLoad();
 
-    component.onOneClickSetupFeishu({
+    component.onApplyFeishuConfig({
       channel: Channel.Feishu,
       enabled: true,
       app_id: 'cli_xxx',
@@ -189,7 +189,7 @@ describe('HarborBeaconSettingsComponent', () => {
 
     expect(component.feishuSetupRunning).toBe(true);
 
-    const req = httpMock.expectOne('/api/v2.0/harborbeacon/settings/feishu/one_click_setup');
+    const req = httpMock.expectOne('/api/v2.0/harborbeacon/settings/feishu/configure');
     req.flush({
       success: true,
       message: 'ok',
@@ -218,98 +218,5 @@ describe('HarborBeaconSettingsComponent', () => {
 
     expect(component.routeStatuses.length).toBe(4);
     expect(component.routeStatuses[2].available).toBe(false); // browser offline
-  });
-
-  // ---- browser-assisted Feishu setup ----
-
-  it('should start browser setup and receive session', fakeAsync(() => {
-    fixture.detectChanges();
-    flushInitialLoad();
-
-    component.onBrowserSetupFeishuStart();
-    expect(component.feishuBrowserSetupRunning).toBe(true);
-
-    const req = httpMock.expectOne('/api/v2.0/harborbeacon/settings/feishu/browser_setup/start');
-    req.flush({
-      session_id: 'abc123',
-      status: 'wait_user',
-      current_step: 'wait_qr_scan',
-      steps: [
-        { key: 'open_login', label: 'Open login', label_zh: '打开登录页', status: 'success', detail: '', started_at: '', finished_at: '' },
-        { key: 'wait_qr_scan', label: 'Wait QR', label_zh: '等待扫码', status: 'wait_user', detail: '请扫码', started_at: '', finished_at: '' },
-      ],
-      app_id: '',
-      app_secret: '',
-      app_name: '',
-      error: '',
-      created_at: '',
-      updated_at: '',
-    });
-    tick();
-
-    expect(component.feishuBrowserSetupRunning).toBe(false);
-    expect(component.feishuBrowserSession).toBeTruthy();
-    expect(component.feishuBrowserSession!.status).toBe('wait_user');
-  }));
-
-  it('should resume browser setup after QR scan', fakeAsync(() => {
-    fixture.detectChanges();
-    flushInitialLoad();
-
-    // Simulate a session already started
-    component.feishuBrowserSession = {
-      session_id: 'abc123',
-      status: 'wait_user',
-      current_step: 'wait_qr_scan',
-      steps: [],
-      app_id: '',
-      app_secret: '',
-      app_name: '',
-      error: '',
-      created_at: '',
-      updated_at: '',
-    };
-
-    component.onBrowserSetupFeishuResume();
-    expect(component.feishuBrowserSetupRunning).toBe(true);
-
-    const req = httpMock.expectOne('/api/v2.0/harborbeacon/settings/feishu/browser_setup/resume');
-    expect(req.request.body.session_id).toBe('abc123');
-    req.flush({
-      session_id: 'abc123',
-      status: 'done',
-      current_step: 'extract_creds',
-      steps: [],
-      app_id: 'cli_stub_abc123',
-      app_secret: 'secret_stub_abc123',
-      app_name: 'HarborBeacon-Bot',
-      error: '',
-      created_at: '',
-      updated_at: '',
-    });
-    tick();
-
-    // After done, component triggers a reload
-    const settingsReq = httpMock.expectOne('/api/v2.0/harborbeacon/settings');
-    settingsReq.flush(MOCK_SETTINGS);
-    const routesReq = httpMock.expectOne('/api/v2.0/harborbeacon/routes/status');
-    routesReq.flush([]);
-    tick();
-
-    expect(component.feishuBrowserSetupRunning).toBe(false);
-    expect(component.feishuBrowserSession!.status).toBe('done');
-  }));
-
-  it('should dismiss browser setup wizard', () => {
-    fixture.detectChanges();
-    flushInitialLoad();
-
-    component.feishuBrowserSession = {
-      session_id: 'x', status: 'wait_user', current_step: '', steps: [],
-      app_id: '', app_secret: '', app_name: '', error: '', created_at: '', updated_at: '',
-    };
-    component.onBrowserSetupDismiss();
-    expect(component.feishuBrowserSession).toBeNull();
-    expect(component.feishuBrowserSetupRunning).toBe(false);
   });
 });

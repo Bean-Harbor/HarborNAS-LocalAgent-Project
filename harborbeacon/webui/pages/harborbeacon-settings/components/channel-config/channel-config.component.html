@@ -57,29 +57,14 @@
               mat-flat-button
               color="accent"
               class="test-btn"
-              [disabled]="oneClickSetupRunning || !canOneClickSetupFeishu(getConfig(m.channel))"
-              (click)="onOneClickSetupFeishu()"
+              [disabled]="feishuConfigRunning || !canApplyFeishuConfig(getConfig(m.channel))"
+              (click)="onApplyFeishuConfig()"
             >
               <mat-icon>auto_fix_high</mat-icon>
-              @if (oneClickSetupRunning) {
-                Configuring...
+              @if (feishuConfigRunning) {
+                校验中...
               } @else {
-                One-Click Setup
-              }
-            </button>
-
-            <button
-              mat-flat-button
-              color="primary"
-              class="test-btn browser-setup-btn"
-              [disabled]="browserSetupRunning"
-              (click)="onBrowserSetupFeishu()"
-            >
-              <mat-icon>qr_code_scanner</mat-icon>
-              @if (browserSetupRunning) {
-                配置中…
-              } @else {
-                扫码配置飞书
+                校验并应用
               }
             </button>
           }

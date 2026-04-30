@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -12,13 +12,16 @@ use crate::adapters::mdns::AvahiMdnsAdapter;
 use crate::adapters::onvif::WsDiscoveryOnvifAdapter;
 use crate::adapters::rtsp::{CommandRtspAdapter, RtspProbeAdapter};
 use crate::adapters::ssdp::UdpSsdpAdapter;
+use crate::connectors::im_gateway::{GatewayPlatformStatus, GatewayStatusClient};
 use crate::connectors::storage::StorageTarget;
 use crate::runtime::admin_console::{
-    sanitize_defaults, AdminBindingState, AdminConsoleState, AdminConsoleStore, AdminDefaults,
-    BridgeProviderConfig,
+    delivery_policy_summary, harboros_current_user_display_name, harboros_current_user_id,
+    harboros_writable_root, sanitize_defaults, AdminBindingState, AdminConsoleState,
+    AdminConsoleStore, AdminDefaults, BridgeProviderCapabilities, BridgeProviderConfig,
+    DeliveryPolicySummary,
 };
 use crate::runtime::discovery::{
-    DiscoveryProtocol, DiscoveryRequest, DiscoveryService, RtspProbeRequest,
+    default_rtsp_paths, DiscoveryProtocol, DiscoveryRequest, DiscoveryService, RtspProbeRequest,
 };
 use crate::runtime::media::{SnapshotCaptureRequest, SnapshotCaptureResult, SnapshotFormat};
 use crate::runtime::registry::{CameraDevice, DeviceRegistryStore, DeviceStatus, StreamTransport};
@@ -28,6 +31,10 @@ pub struct HubStateSnapshot {
     pub binding: AdminBindingState,
     pub defaults: AdminDefaults,
     pub bridge_provider: BridgeProviderConfig,
+    pub delivery_policy: DeliveryPolicySummary,
+    pub writable_root: String,
+    pub current_principal_user_id: String,
+    pub current_principal_display_name: String,
     pub devices: Vec<CameraDevice>,
 }
 
@@ -85,6 +92,8 @@ pub struct CameraConnectRequest {
     #[serde(default)]
     pub port: Option<u16>,
     #[serde(default)]
+    pub snapshot_url: Option<String>,
+    #[serde(default)]
     pub discovery_source: String,
     #[serde(default)]
     pub vendor: Option<String>,
@@ -130,6 +139,10 @@ impl CameraHubService {
             binding: enrich_binding_urls(state.binding, public_origin),
             defaults: state.defaults,
             bridge_provider: state.bridge_provider,
+            delivery_policy: delivery_policy_summary(),
+            writable_root: harboros_writable_root(),
+            current_principal_user_id: harboros_current_user_id(),
+            current_principal_display_name: harboros_current_user_display_name(),
             devices,
         })
     }
@@ -143,29 +156,17 @@ impl CameraHubService {
         self.state_snapshot(public_origin)
     }
 
-    pub fn configure_bridge_provider(
+    pub fn refresh_bridge_provider_status(
         &self,
-        app_id: &str,
-        app_secret: &str,
         public_origin: Option<&str>,
     ) -> Result<HubStateSnapshot, String> {
-        let app_id = app_id.trim();
-        let app_secret = app_secret.trim();
-        if app_id.is_empty() || app_secret.is_empty() {
-            return Err("app_id 和 app_secret 都不能为空".to_string());
-        }
-
-        let (app_name, bot_open_id) = validate_bridge_provider(app_id, app_secret)?;
-        self.admin_store
-            .save_bridge_provider_config(BridgeProviderConfig {
-                configured: true,
-                app_id: app_id.to_string(),
-                app_secret: app_secret.to_string(),
-                app_name,
-                bot_open_id,
-                status: "已连接".to_string(),
-            })?;
-
+        let client = GatewayStatusClient::new()?;
+        let status = client.fetch_status()?;
+        let provider = bridge_provider_status_from_gateway_response(
+            client.config().base_url.as_str(),
+            &status.platforms,
+        );
+        self.admin_store.save_bridge_provider_status(provider)?;
         self.state_snapshot(public_origin)
     }
 
@@ -224,9 +225,15 @@ impl CameraHubService {
         let path_candidates = if request.path_candidates.is_empty() {
             state.defaults.rtsp_paths.clone()
         } else {
-            request.path_candidates
+            let mut paths = request.path_candidates.clone();
+            paths.extend(state.defaults.rtsp_paths.clone());
+            paths
         };
-        let path_candidates = crate::runtime::admin_console::dedupe_rtsp_paths(path_candidates);
+        let path_candidates = effective_rtsp_path_candidates(
+            &path_candidates,
+            request.vendor.as_deref(),
+            request.model.as_deref(),
+        );
         let username = request
             .username
             .and_then(|value| non_empty_opt(&value))
@@ -263,6 +270,7 @@ impl CameraHubService {
         device.vendor = request.vendor.filter(|value| !value.trim().is_empty());
         device.model = request.model.filter(|value| !value.trim().is_empty());
         device.ip_address = Some(ip.to_string());
+        device.snapshot_url = request.snapshot_url.and_then(|value| non_empty_opt(&value));
         device.discovery_source = if request.discovery_source.trim().is_empty() {
             "manual_entry".to_string()
         } else {
@@ -271,6 +279,8 @@ impl CameraHubService {
         device.primary_stream.transport = StreamTransport::Rtsp;
         device.primary_stream.requires_auth = probe.requires_auth;
         device.capabilities = probe.capabilities;
+        device.capabilities.snapshot =
+            device.snapshot_url.is_some() || device.capabilities.snapshot;
 
         let devices = upsert_devices(self.admin_store.registry_store(), &[device.clone()])?;
         let saved = devices
@@ -299,12 +309,15 @@ impl CameraHubService {
             .ok_or_else(|| format!("device not found: {device_id}"))?;
 
         let adapter = CommandRtspAdapter::default();
-        adapter.capture_snapshot(&SnapshotCaptureRequest::new(
-            device.device_id,
-            device.primary_stream.url,
-            SnapshotFormat::Jpeg,
-            StorageTarget::LocalDisk,
-        ))
+        adapter.capture_snapshot(
+            &SnapshotCaptureRequest::new(
+                device.device_id,
+                device.primary_stream.url,
+                SnapshotFormat::Jpeg,
+                StorageTarget::LocalDisk,
+            )
+            .with_snapshot_url(device.snapshot_url),
+        )
     }
 
     pub fn capture_camera_snapshot(&self, device_id: &str) -> Result<Vec<u8>, String> {
@@ -331,19 +344,24 @@ impl CameraHubService {
         let mut results = Vec::new();
 
         for ip in &candidate_ips {
+            let existing = existing_devices
+                .iter()
+                .find(|device| device.ip_address.as_deref() == Some(ip.as_str()))
+                .cloned();
+            let path_candidates = effective_rtsp_path_candidates(
+                &state.defaults.rtsp_paths,
+                existing.as_ref().and_then(|device| device.vendor.as_deref()),
+                existing.as_ref().and_then(|device| device.model.as_deref()),
+            );
             let probe_request = RtspProbeRequest {
                 candidate_id: format!("rtsp-{}", ip.replace('.', "-")),
                 ip_address: ip.clone(),
                 port: state.defaults.rtsp_port,
                 username: non_empty_opt(&state.defaults.rtsp_username),
                 password: non_empty_opt(&state.defaults.rtsp_password),
-                path_candidates: state.defaults.rtsp_paths.clone(),
+                path_candidates: path_candidates.clone(),
             };
             let probe = adapter.probe(&probe_request)?;
-            let existing = existing_devices
-                .iter()
-                .find(|device| device.ip_address.as_deref() == Some(ip.as_str()))
-                .cloned();
             let requires_auth = probe.requires_auth
                 || probe
                     .error_message
@@ -385,13 +403,13 @@ impl CameraHubService {
                     ip: ip.clone(),
                     port: state.defaults.rtsp_port,
                     protocol: "RTSP / 已验证".to_string(),
-                    note: "RTSP 链路已验证，可直接加入设备库并在飞书中调用。".to_string(),
+                    note: "RTSP 链路已验证，可直接加入设备库并在 IM 对话中调用。".to_string(),
                     reachable: true,
                     registered: true,
                     requires_auth,
                     vendor: device.vendor.clone(),
                     model: device.model.clone(),
-                    rtsp_paths: state.defaults.rtsp_paths.clone(),
+                    rtsp_paths: path_candidates.clone(),
                 });
             } else {
                 results.push(HubScanResultItem {
@@ -422,7 +440,7 @@ impl CameraHubService {
                     requires_auth,
                     vendor: existing.as_ref().and_then(|device| device.vendor.clone()),
                     model: existing.as_ref().and_then(|device| device.model.clone()),
-                    rtsp_paths: state.defaults.rtsp_paths.clone(),
+                    rtsp_paths: path_candidates,
                 });
             }
         }
@@ -483,11 +501,18 @@ impl CameraHubService {
                         .is_some_and(looks_like_auth_error)
             });
             let port = candidate.port.unwrap_or(state.defaults.rtsp_port);
-            let rtsp_paths = if candidate.rtsp_paths.is_empty() {
-                state.defaults.rtsp_paths.clone()
-            } else {
-                candidate.rtsp_paths.clone()
-            };
+            let vendor = candidate
+                .vendor
+                .clone()
+                .or_else(|| device.and_then(|item| item.vendor.clone()));
+            let model = candidate
+                .model
+                .clone()
+                .or_else(|| device.and_then(|item| item.model.clone()));
+            let mut candidate_paths = candidate.rtsp_paths.clone();
+            candidate_paths.extend(state.defaults.rtsp_paths.iter().cloned());
+            let rtsp_paths =
+                effective_rtsp_path_candidates(&candidate_paths, vendor.as_deref(), model.as_deref());
 
             let base = match candidate.protocol {
                 DiscoveryProtocol::Onvif => "ONVIF",
@@ -530,8 +555,8 @@ impl CameraHubService {
                 reachable,
                 registered: device.is_some(),
                 requires_auth,
-                vendor: candidate.vendor.clone().or_else(|| device.and_then(|item| item.vendor.clone())),
-                model: candidate.model.clone().or_else(|| device.and_then(|item| item.model.clone())),
+                vendor,
+                model,
                 rtsp_paths,
             });
         }
@@ -558,12 +583,10 @@ pub fn build_mobile_setup_url(public_origin: &str, session_code: Option<&str>) -
 
 pub fn enrich_binding_urls(
     mut binding: AdminBindingState,
-    public_origin: Option<&str>,
+    _public_origin: Option<&str>,
 ) -> AdminBindingState {
-    if let Some(public_origin) = public_origin {
-        binding.setup_url = build_mobile_setup_url(public_origin, Some(&binding.session_code));
-        binding.static_setup_url = build_mobile_setup_url(public_origin, None);
-    }
+    binding.setup_url.clear();
+    binding.static_setup_url.clear();
     binding
 }
 
@@ -585,6 +608,29 @@ pub fn resolve_discovery_protocols(discovery: &str) -> Vec<DiscoveryProtocol> {
     }
     protocols.push(DiscoveryProtocol::RtspProbe);
     protocols
+}
+
+fn effective_rtsp_path_candidates(
+    base_paths: &[String],
+    vendor: Option<&str>,
+    model: Option<&str>,
+) -> Vec<String> {
+    let mut paths = base_paths.to_vec();
+    if is_tp_link_tapo_vendor(vendor, model) {
+        paths.push("/stream1".to_string());
+        paths.push("/stream2".to_string());
+    }
+    paths.extend(default_rtsp_paths());
+    crate::runtime::admin_console::dedupe_rtsp_paths(paths)
+}
+
+fn is_tp_link_tapo_vendor(vendor: Option<&str>, model: Option<&str>) -> bool {
+    let vendor = vendor.unwrap_or_default().to_ascii_lowercase();
+    let model = model.unwrap_or_default().to_ascii_lowercase();
+    vendor.contains("tapo")
+        || vendor.contains("tp-link")
+        || vendor.contains("tplink")
+        || model.contains("tapo")
 }
 
 pub fn non_empty_opt(value: &str) -> Option<String> {
@@ -653,6 +699,7 @@ pub fn merge_camera(existing: CameraDevice, incoming: CameraDevice) -> CameraDev
             incoming.discovery_source
         },
         primary_stream: incoming.primary_stream,
+        snapshot_url: incoming.snapshot_url.or(existing.snapshot_url),
         onvif_device_service_url: incoming
             .onvif_device_service_url
             .or(existing.onvif_device_service_url),
@@ -725,62 +772,50 @@ pub fn collect_candidate_ips(
     Ok(ordered)
 }
 
-pub fn validate_bridge_provider(
-    app_id: &str,
-    app_secret: &str,
-) -> Result<(String, String), String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| format!("failed to build bridge provider HTTP client: {error}"))?;
+fn bridge_provider_status_from_gateway_response(
+    gateway_base_url: &str,
+    platforms: &[GatewayPlatformStatus],
+) -> BridgeProviderConfig {
+    let selected = platforms
+        .iter()
+        .find(|platform| platform.connected)
+        .or_else(|| platforms.iter().find(|platform| platform.enabled))
+        .or_else(|| platforms.first());
+    let mut provider = BridgeProviderConfig {
+        gateway_base_url: gateway_base_url.trim().to_string(),
+        last_checked_at: current_timestamp(),
+        ..Default::default()
+    };
+    let Some(selected) = selected else {
+        provider.status = "HarborGate 未配置平台".to_string();
+        return provider;
+    };
 
-    let token_resp: serde_json::Value = client
-        .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
-        .json(&serde_json::json!({ "app_id": app_id, "app_secret": app_secret }))
-        .send()
-        .map_err(|error| format!("bridge provider token request failed: {error}"))?
-        .json()
-        .map_err(|error| format!("bridge provider token response parse failed: {error}"))?;
-    if token_resp.get("code").and_then(|value| value.as_i64()) != Some(0) {
-        let msg = token_resp
-            .get("msg")
-            .and_then(|value| value.as_str())
-            .unwrap_or("unknown error");
-        return Err(format!("Bridge Provider 凭证校验失败: {msg}"));
-    }
-    let token = token_resp
-        .get("tenant_access_token")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| "Bridge Provider 校验成功但未返回 tenant_access_token".to_string())?;
+    provider.configured = selected.enabled;
+    provider.connected = selected.connected;
+    provider.platform = selected.platform.trim().to_string();
+    provider.app_name = selected.display_name.trim().to_string();
+    provider.status = if selected.connected {
+        "已连接".to_string()
+    } else if selected.enabled {
+        "已启用，待连接".to_string()
+    } else {
+        "未启用".to_string()
+    };
+    provider.capabilities = BridgeProviderCapabilities {
+        reply: selected.capabilities.reply,
+        update: selected.capabilities.update,
+        attachments: selected.capabilities.attachments,
+    };
+    provider
+}
 
-    let bot_resp: serde_json::Value = client
-        .get("https://open.feishu.cn/open-apis/bot/v3/info")
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
-        .map_err(|error| format!("bridge provider bot info request failed: {error}"))?
-        .json()
-        .map_err(|error| format!("bridge provider bot info parse failed: {error}"))?;
-    if bot_resp.get("code").and_then(|value| value.as_i64()) != Some(0) {
-        let msg = bot_resp
-            .get("msg")
-            .and_then(|value| value.as_str())
-            .unwrap_or("unknown error");
-        return Err(format!("Bridge Provider 信息读取失败: {msg}"));
-    }
-
-    let data = bot_resp.get("data").cloned().unwrap_or_default();
-    let app_name = data
-        .get("app_name")
-        .and_then(|value| value.as_str())
-        .or_else(|| data.get("bot_name").and_then(|value| value.as_str()))
-        .unwrap_or("HarborNAS Bot")
-        .to_string();
-    let bot_open_id = data
-        .get("open_id")
-        .and_then(|value| value.as_str())
+fn current_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .to_string();
-    Ok((app_name, bot_open_id))
+        .as_secs()
+        .to_string()
 }
 
 fn discover_open_rtsp_hosts(hosts: &[String], port: u16) -> Vec<String> {
@@ -876,20 +911,23 @@ fn normalize_network(network: Ipv4Addr, prefix: u8) -> Ipv4Addr {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_mobile_setup_url, humanize_probe_error, looks_like_auth_error, merge_camera,
-        normalize_camera_metadata, resolve_discovery_protocols,
+        bridge_provider_status_from_gateway_response, build_mobile_setup_url,
+        effective_rtsp_path_candidates, humanize_probe_error, looks_like_auth_error, merge_camera,
+        normalize_camera_metadata,
+        resolve_discovery_protocols,
     };
+    use crate::connectors::im_gateway::{GatewayPlatformCapabilities, GatewayPlatformStatus};
     use crate::runtime::registry::{CameraDevice, StreamTransport};
 
     #[test]
     fn build_mobile_setup_url_supports_static_and_session_variants() {
         assert_eq!(
-            build_mobile_setup_url("http://harbornas.local:4174", None),
-            "http://harbornas.local:4174/setup/mobile"
+            build_mobile_setup_url("http://harborbeacon.local:4174", None),
+            "http://harborbeacon.local:4174/setup/mobile"
         );
         assert_eq!(
-            build_mobile_setup_url("http://harbornas.local:4174/", Some("ABCD-1234")),
-            "http://harbornas.local:4174/setup/mobile?session=ABCD-1234"
+            build_mobile_setup_url("http://harborbeacon.local:4174/", Some("ABCD-1234")),
+            "http://harborbeacon.local:4174/setup/mobile?session=ABCD-1234"
         );
     }
 
@@ -899,6 +937,24 @@ mod tests {
         assert_eq!(
             humanize_probe_error("rtsp://demo: 401 Unauthorized"),
             "RTSP 返回 401，说明摄像头需要密码。"
+        );
+    }
+
+    #[test]
+    fn effective_rtsp_path_candidates_keep_existing_entries_and_add_tapo_fallbacks() {
+        let paths = effective_rtsp_path_candidates(
+            &["/Streaming/Channels/101".to_string()],
+            Some("TP-Link"),
+            Some("Tapo C200"),
+        );
+
+        assert_eq!(paths[0], "/Streaming/Channels/101");
+        assert!(paths.contains(&"/stream1".to_string()));
+        assert!(paths.contains(&"/stream2".to_string()));
+        assert!(paths.contains(&"/live".to_string()));
+        assert_eq!(
+            paths.iter().filter(|path| path.as_str() == "/stream1").count(),
+            1
         );
     }
 
@@ -930,5 +986,71 @@ mod tests {
         assert!(protocols.contains(&crate::runtime::discovery::DiscoveryProtocol::Mdns));
         assert!(protocols.contains(&crate::runtime::discovery::DiscoveryProtocol::Ssdp));
         assert!(protocols.contains(&crate::runtime::discovery::DiscoveryProtocol::RtspProbe));
+    }
+
+    #[test]
+    fn gateway_status_maps_to_redacted_bridge_provider_state() {
+        let provider = bridge_provider_status_from_gateway_response(
+            "http://gateway.local:4180",
+            &[GatewayPlatformStatus {
+                platform: "feishu".to_string(),
+                enabled: true,
+                connected: true,
+                display_name: "HarborBeacon Bot".to_string(),
+                capabilities: GatewayPlatformCapabilities {
+                    reply: true,
+                    update: false,
+                    attachments: true,
+                },
+            }],
+        );
+
+        assert!(provider.configured);
+        assert!(provider.connected);
+        assert_eq!(provider.platform, "feishu");
+        assert_eq!(provider.app_name, "HarborBeacon Bot");
+        assert_eq!(provider.gateway_base_url, "http://gateway.local:4180");
+        assert_eq!(provider.status, "已连接");
+        assert!(provider.capabilities.reply);
+        assert!(!provider.capabilities.update);
+        assert!(provider.capabilities.attachments);
+        assert_eq!(provider.app_secret, "");
+        assert_eq!(provider.bot_open_id, "");
+    }
+
+    #[test]
+    fn gateway_status_prefers_connected_platform_without_feishu_bias() {
+        let provider = bridge_provider_status_from_gateway_response(
+            "http://gateway.local:4180",
+            &[
+                GatewayPlatformStatus {
+                    platform: "feishu".to_string(),
+                    enabled: true,
+                    connected: false,
+                    display_name: "Feishu Bot".to_string(),
+                    capabilities: GatewayPlatformCapabilities {
+                        reply: true,
+                        update: false,
+                        attachments: true,
+                    },
+                },
+                GatewayPlatformStatus {
+                    platform: "telegram".to_string(),
+                    enabled: true,
+                    connected: true,
+                    display_name: "Telegram Bot".to_string(),
+                    capabilities: GatewayPlatformCapabilities {
+                        reply: true,
+                        update: true,
+                        attachments: false,
+                    },
+                },
+            ],
+        );
+
+        assert_eq!(provider.platform, "telegram");
+        assert_eq!(provider.app_name, "Telegram Bot");
+        assert_eq!(provider.status, "已连接");
+        assert!(provider.capabilities.update);
     }
 }

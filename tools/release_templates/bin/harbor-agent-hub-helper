@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib import error, request
+
+
+DEFAULT_ENV_FILE = "/etc/default/harborbeacon-agent-hub"
+DEFAULT_CONTRACT_VERSION = "2.0"
+DEFAULT_HTTP_TIMEOUT_SECONDS = 5
+SERVICE_ORDER = [
+    "harbor-model-api.service",
+    "assistant-task-api.service",
+    "agent-hub-admin-api.service",
+    "harborgate.service",
+    "harborgate-weixin-runner.service",
+]
+SERVICE_ALIASES = {
+    "model": "harbor-model-api.service",
+    "harbor-model-api": "harbor-model-api.service",
+    "task": "assistant-task-api.service",
+    "assistant-task-api": "assistant-task-api.service",
+    "admin": "agent-hub-admin-api.service",
+    "agent-hub-admin-api": "agent-hub-admin-api.service",
+    "gateway": "harborgate.service",
+    "harborgate": "harborgate.service",
+    "weixin": "harborgate-weixin-runner.service",
+    "weixin-runner": "harborgate-weixin-runner.service",
+    "harborgate-weixin-runner": "harborgate-weixin-runner.service",
+}
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def fail(message: str, *, exit_code: int = 2) -> int:
+    sys.stderr.write(f"{message}\n")
+    return exit_code
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Resident HarborOS stack helper for status, health, and logs."
+    )
+    parser.add_argument(
+        "--env-file",
+        default=os.getenv("HARBOR_ENV_FILE", DEFAULT_ENV_FILE),
+        help=f"Runtime env file path (default: {DEFAULT_ENV_FILE})",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("status", help="Print service enable/active state as JSON.")
+    subparsers.add_parser("health", help="Probe loopback health and gateway truth as JSON.")
+
+    logs_parser = subparsers.add_parser("logs", help="Open journalctl for one service or all.")
+    logs_parser.add_argument(
+        "service",
+        nargs="?",
+        default="all",
+        help="Service alias: model, task, admin, gateway, weixin, or all.",
+    )
+    logs_parser.add_argument("--lines", type=int, default=120, help="Number of journal lines.")
+    logs_parser.add_argument(
+        "--since",
+        default="",
+        help="Optional journalctl --since value such as '30 min ago'.",
+    )
+    return parser.parse_args()
+
+
+def load_runtime_env(env_file: str) -> dict[str, str]:
+    merged: dict[str, str] = {}
+    path = Path(env_file)
+    if path.exists():
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            merged[key.strip()] = value.strip()
+    merged.update(os.environ)
+    return merged
+
+
+def run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(command, check=False, capture_output=True, text=True)
+
+
+def parse_key_value_output(payload: str) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for line in payload.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        parsed[key.strip()] = value.strip()
+    return parsed
+
+
+def normalize_service_name(name: str) -> str:
+    normalized = name.strip().lower()
+    if not normalized:
+        return ""
+    if normalized == "all":
+        return normalized
+    if normalized in SERVICE_ALIASES:
+        return SERVICE_ALIASES[normalized]
+    if normalized.endswith(".service") and normalized in SERVICE_ORDER:
+        return normalized
+    if f"{normalized}.service" in SERVICE_ORDER:
+        return f"{normalized}.service"
+    return ""
+
+
+def alias_for_unit(unit: str) -> str:
+    for alias, candidate in SERVICE_ALIASES.items():
+        if alias.endswith(".service"):
+            continue
+        if candidate == unit:
+            return alias
+    return unit.removesuffix(".service")
+
+
+def service_status(unit: str) -> dict[str, object]:
+    command = [
+        "systemctl",
+        "show",
+        unit,
+        "--property=Id,ActiveState,SubState,UnitFileState,MainPID,ExecMainStartTimestamp,FragmentPath,LoadState",
+        "--no-pager",
+    ]
+    result = run_command(command)
+    fields = parse_key_value_output(result.stdout)
+    load_state = fields.get("LoadState", "").strip()
+    main_pid = 0
+    try:
+        main_pid = int(fields.get("MainPID", "0") or 0)
+    except ValueError:
+        main_pid = 0
+    payload: dict[str, object] = {
+        "alias": alias_for_unit(unit),
+        "unit": unit,
+        "load_state": load_state or "unknown",
+        "enabled": fields.get("UnitFileState", "unknown") or "unknown",
+        "active": fields.get("ActiveState", "unknown") or "unknown",
+        "sub_state": fields.get("SubState", "unknown") or "unknown",
+        "main_pid": main_pid,
+        "started_at": fields.get("ExecMainStartTimestamp", "") or "",
+        "fragment_path": fields.get("FragmentPath", "") or "",
+    }
+    if result.returncode != 0 and not load_state:
+        payload["error"] = (result.stderr or result.stdout or "systemctl show failed").strip()
+    return payload
+
+
+def build_status_payload(runtime_env: dict[str, str], env_file: str) -> dict[str, object]:
+    install_root = runtime_env.get("HARBOR_RELEASE_INSTALL_ROOT", "/var/lib/harborbeacon-agent-ci")
+    return {
+        "generated_at": utc_now(),
+        "env_file": env_file,
+        "release_version": runtime_env.get("HARBOR_RELEASE_VERSION", ""),
+        "install_root": install_root,
+        "current_link": f"{install_root}/current",
+        "services": [service_status(unit) for unit in SERVICE_ORDER],
+    }
+
+
+def join_url(base_url: str, path: str) -> str:
+    trimmed = base_url.rstrip("/")
+    if not trimmed:
+        return path
+    return f"{trimmed}{path}"
+
+
+def model_health_url(runtime_env: dict[str, str]) -> str:
+    base_url = runtime_env.get("HARBOR_MODEL_API_BASE_URL", "http://127.0.0.1:4176/v1").rstrip("/")
+    if base_url.endswith("/v1"):
+        base_url = base_url[:-3]
+    return join_url(base_url, "/healthz")
+
+
+def http_json(url: str, *, headers: dict[str, str] | None = None) -> dict[str, object]:
+    req = request.Request(url, headers=headers or {}, method="GET")
+    try:
+        with request.urlopen(req, timeout=DEFAULT_HTTP_TIMEOUT_SECONDS) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            payload: object
+            try:
+                payload = json.loads(body) if body else {}
+            except json.JSONDecodeError:
+                payload = body
+            return {
+                "ok": 200 <= response.status < 300,
+                "http_status": response.status,
+                "payload": payload,
+            }
+    except error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            payload = body
+        return {
+            "ok": False,
+            "http_status": exc.code,
+            "payload": payload,
+            "error": str(exc),
+        }
+    except Exception as exc:  # pragma: no cover - host-local runtime guard
+        return {"ok": False, "http_status": 0, "error": str(exc)}
+
+
+def summarize_endpoint(name: str, url: str, response: dict[str, object]) -> dict[str, object]:
+    payload = response.get("payload")
+    summary: dict[str, object] = {
+        "name": name,
+        "url": url,
+        "ok": bool(response.get("ok")),
+        "http_status": int(response.get("http_status") or 0),
+    }
+    if isinstance(payload, dict):
+        if name == "model_api":
+            backend = payload.get("backend") if isinstance(payload.get("backend"), dict) else {}
+            summary["status"] = str(payload.get("status") or "").strip()
+            summary["ready"] = bool(payload.get("ready"))
+            summary["backend_kind"] = str(backend.get("kind") or "").strip()
+        else:
+            summary["status"] = str(payload.get("status") or payload.get("ok") or "").strip()
+        if name == "gateway":
+            summary["gateway_version"] = str(payload.get("gateway_version") or "").strip()
+    elif isinstance(payload, str) and payload.strip():
+        summary["payload"] = payload.strip()
+    if response.get("error"):
+        summary["error"] = str(response["error"])
+    return summary
+
+
+def gateway_auth_headers(runtime_env: dict[str, str]) -> dict[str, str]:
+    headers = {"X-Contract-Version": runtime_env.get("IM_AGENT_CONTRACT_VERSION", DEFAULT_CONTRACT_VERSION)}
+    token = (
+        runtime_env.get("HARBORGATE_BEARER_TOKEN", "").strip()
+        or runtime_env.get("IM_AGENT_SERVICE_TOKEN", "").strip()
+    )
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def safe_slug(value: str) -> str:
+    text = (value or "").strip() or "default"
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in text)
+
+
+def load_transport_sidecar(runtime_env: dict[str, str]) -> dict[str, object] | None:
+    account_id = runtime_env.get("WEIXIN_ACCOUNT_ID", "").strip()
+    state_dir = runtime_env.get("WEIXIN_STATE_DIR", "").strip()
+    if not account_id or not state_dir:
+        return None
+    path = Path(state_dir) / "accounts" / f"{safe_slug(account_id)}.runtime.json"
+    if not path.exists():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        return None
+    payload["_report_path"] = str(path)
+    return payload
+
+
+def summarize_weixin_from_gateway(payload: dict[str, object]) -> dict[str, object] | None:
+    weixin = payload.get("weixin")
+    if not isinstance(weixin, dict):
+        return None
+    poll = weixin.get("poll") if isinstance(weixin.get("poll"), dict) else {}
+    delivery = weixin.get("delivery_observability") if isinstance(weixin.get("delivery_observability"), dict) else {}
+    ingress = (
+        weixin.get("ingress_observability")
+        if isinstance(weixin.get("ingress_observability"), dict)
+        else {}
+    )
+    return {
+        "source": "gateway_status",
+        "configured": bool(weixin.get("configured")),
+        "connected": bool(weixin.get("connected")),
+        "status": str(weixin.get("status") or "").strip(),
+        "blocker_category": str(weixin.get("blocker_category") or "").strip(),
+        "ingress_blocker_category": str(weixin.get("ingress_blocker_category") or "").strip(),
+        "last_poll_at": str(poll.get("last_poll_at") or "").strip(),
+        "last_getupdates_at": str(poll.get("last_getupdates_at") or "").strip(),
+        "last_getupdates_error": str(poll.get("error") or "").strip(),
+        "last_private_text_message_count": int(poll.get("last_private_text_message_count") or 0),
+        "last_private_text_message_at": str(
+            poll.get("last_private_text_message_at")
+            or ingress.get("last_private_text_message_at")
+            or ""
+        ).strip(),
+        "last_inbound_at": str(weixin.get("last_inbound_at") or ingress.get("last_inbound_at") or "").strip(),
+        "last_send_status": str(delivery.get("last_send_status") or "").strip(),
+    }
+
+
+def summarize_weixin_from_transport(runtime_env: dict[str, str]) -> dict[str, object]:
+    transport = load_transport_sidecar(runtime_env)
+    if not isinstance(transport, dict):
+        return {
+            "source": "unavailable",
+            "configured": bool(runtime_env.get("WEIXIN_ACCOUNT_ID", "").strip()),
+            "connected": False,
+            "status": "",
+            "blocker_category": "",
+            "ingress_blocker_category": "",
+            "last_poll_at": "",
+            "last_getupdates_at": "",
+            "last_getupdates_error": "",
+            "last_private_text_message_count": 0,
+            "last_private_text_message_at": "",
+            "last_inbound_at": "",
+            "last_send_status": "",
+        }
+    return {
+        "source": "transport_sidecar",
+        "configured": True,
+        "connected": bool(transport.get("connected")),
+        "status": str(transport.get("status") or "").strip(),
+        "blocker_category": "",
+        "ingress_blocker_category": "",
+        "last_poll_at": str(transport.get("last_poll_at") or "").strip(),
+        "last_getupdates_at": str(transport.get("last_getupdates_at") or "").strip(),
+        "last_getupdates_error": str(
+            transport.get("last_getupdates_error") or transport.get("last_error") or ""
+        ).strip(),
+        "last_private_text_message_count": int(transport.get("last_private_text_message_count") or 0),
+        "last_private_text_message_at": str(transport.get("last_private_text_message_at") or "").strip(),
+        "last_inbound_at": str(transport.get("last_inbound_at") or "").strip(),
+        "last_send_status": str(transport.get("last_send_status") or "").strip(),
+        "transport_state_path": str(transport.get("_report_path") or "").strip(),
+    }
+
+
+def build_health_payload(runtime_env: dict[str, str], env_file: str) -> dict[str, object]:
+    endpoint_specs = {
+        "admin_api": join_url(
+            runtime_env.get("HARBORBEACON_ADMIN_API_URL", "http://127.0.0.1:4174"), "/healthz"
+        ),
+        "task_api": join_url(
+            runtime_env.get("HARBORBEACON_TASK_API_URL", "http://127.0.0.1:4175"), "/healthz"
+        ),
+        "model_api": model_health_url(runtime_env),
+        "gateway": join_url(runtime_env.get("HARBORGATE_BASE_URL", "http://127.0.0.1:8787"), "/health"),
+    }
+
+    endpoints = {
+        name: summarize_endpoint(name, url, http_json(url))
+        for name, url in endpoint_specs.items()
+    }
+
+    gateway_status_url = join_url(
+        runtime_env.get("HARBORGATE_BASE_URL", "http://127.0.0.1:8787"),
+        "/api/gateway/status",
+    )
+    gateway_status_response = http_json(gateway_status_url, headers=gateway_auth_headers(runtime_env))
+    gateway_status_payload = (
+        gateway_status_response.get("payload")
+        if isinstance(gateway_status_response.get("payload"), dict)
+        else {}
+    )
+    gateway_summary: dict[str, object] = {
+        "url": gateway_status_url,
+        "ok": bool(gateway_status_response.get("ok")),
+        "http_status": int(gateway_status_response.get("http_status") or 0),
+    }
+    if isinstance(gateway_status_payload, dict):
+        gateway_summary["gateway_version"] = str(gateway_status_payload.get("gateway_version") or "").strip()
+        channels = gateway_status_payload.get("channels")
+        gateway_summary["channels_count"] = len(channels) if isinstance(channels, list) else 0
+        release_v1 = gateway_status_payload.get("release_v1") if isinstance(gateway_status_payload.get("release_v1"), dict) else {}
+        gateway_summary["decision"] = str(release_v1.get("decision") or "").strip()
+        gateway_summary["decision_reason"] = str(release_v1.get("decision_reason") or "").strip()
+        gateway_summary["weixin"] = gateway_status_payload.get("weixin") if isinstance(gateway_status_payload.get("weixin"), dict) else {}
+    if gateway_status_response.get("error"):
+        gateway_summary["error"] = str(gateway_status_response["error"])
+
+    weixin_summary = (
+        summarize_weixin_from_gateway(gateway_status_payload)
+        if isinstance(gateway_status_payload, dict)
+        else None
+    )
+    if weixin_summary is None:
+        weixin_summary = summarize_weixin_from_transport(runtime_env)
+
+    return {
+        "generated_at": utc_now(),
+        "env_file": env_file,
+        "release_version": runtime_env.get("HARBOR_RELEASE_VERSION", ""),
+        "services": build_status_payload(runtime_env, env_file)["services"],
+        "http_endpoints": endpoints,
+        "gateway_status": gateway_summary,
+        "weixin_runtime": weixin_summary,
+    }
+
+
+def run_logs(command_env: dict[str, str], service_name: str, lines: int, since: str) -> int:
+    normalized = normalize_service_name(service_name)
+    if not normalized and service_name.strip().lower() != "all":
+        return fail(
+            "unknown service alias; expected one of: model, task, admin, gateway, weixin, or all"
+        )
+    command = ["journalctl", "--no-pager", "--lines", str(max(1, lines))]
+    if since.strip():
+        command.extend(["--since", since.strip()])
+    units = SERVICE_ORDER if normalized == "all" else [normalized]
+    for unit in units:
+        command.extend(["-u", unit])
+    return subprocess.call(command, env=command_env)
+
+
+def main() -> int:
+    args = parse_args()
+    runtime_env = load_runtime_env(args.env_file)
+    if args.command == "status":
+        print(json.dumps(build_status_payload(runtime_env, args.env_file), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "health":
+        print(json.dumps(build_health_payload(runtime_env, args.env_file), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "logs":
+        return run_logs(os.environ.copy(), args.service, args.lines, args.since)
+    return fail(f"unsupported command: {args.command}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 SERVICE_USER="${1:-}"
-VENV_DIR="${VISION_VENV_DIR:-${REPO_ROOT}/.harbornas/.venv-vision}"
+VENV_DIR="${VISION_VENV_DIR:-${REPO_ROOT}/.harborbeacon/.venv-vision}"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Please run as root: sudo $0 [service-user]"

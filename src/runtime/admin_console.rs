@@ -1,6 +1,7 @@
 //! Thin persistence layer for the local Agent Hub admin console.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::env;
 use std::fs;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -17,11 +18,19 @@ use crate::control_plane::credentials::{
     ProviderAccountStatus, ProviderKind, ProviderOwnerScope,
 };
 use crate::control_plane::media::{RecordingPolicy, RecordingTriggerMode, StorageTargetKind};
+use crate::control_plane::models::{
+    ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, ModelRoutePolicy,
+    PrivacyLevel,
+};
 use crate::control_plane::users::{
     Membership, MembershipStatus, RoleKind, UserAccount, UserStatus, Workspace, WorkspaceStatus,
     WorkspaceType,
 };
+use crate::runtime::hub::non_empty_opt;
 use crate::runtime::registry::{CameraDevice, DeviceRegistryStore};
+
+const DEFAULT_BINDING_CHANNEL_LABEL: &str = "Harbor HarborGate";
+const DEFAULT_PROVIDER_ACCOUNT_DISPLAY_NAME: &str = "Harbor HarborGate";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AdminBindingState {
@@ -46,7 +55,7 @@ impl Default for AdminBindingState {
             status: "等待扫码".to_string(),
             metric: "等待绑定".to_string(),
             bound_user: None,
-            channel: "Harbor IM Bridge".to_string(),
+            channel: DEFAULT_BINDING_CHANNEL_LABEL.to_string(),
             session_code: session_code.clone(),
             qr_token: generate_qr_token(&session_code),
             setup_url: String::new(),
@@ -56,9 +65,25 @@ impl Default for AdminBindingState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BridgeProviderCapabilities {
+    #[serde(default)]
+    pub reply: bool,
+    #[serde(default)]
+    pub update: bool,
+    #[serde(default)]
+    pub attachments: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct BridgeProviderConfig {
     #[serde(default)]
     pub configured: bool,
+    #[serde(default)]
+    pub connected: bool,
+    #[serde(default)]
+    pub platform: String,
+    #[serde(default)]
+    pub gateway_base_url: String,
     #[serde(default)]
     pub app_id: String,
     #[serde(default)]
@@ -69,6 +94,10 @@ pub struct BridgeProviderConfig {
     pub bot_open_id: String,
     #[serde(default)]
     pub status: String,
+    #[serde(default)]
+    pub last_checked_at: String,
+    #[serde(default)]
+    pub capabilities: BridgeProviderCapabilities,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,6 +130,17 @@ pub struct IdentityBindingRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotificationTargetRecord {
+    pub target_id: String,
+    pub label: String,
+    pub route_key: String,
+    #[serde(default)]
+    pub platform_hint: String,
+    #[serde(default)]
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AdminDefaults {
     pub cidr: String,
     pub discovery: String,
@@ -117,6 +157,16 @@ pub struct AdminDefaults {
     pub rtsp_port: u16,
     #[serde(default = "default_rtsp_paths")]
     pub rtsp_paths: Vec<String>,
+    #[serde(default)]
+    pub selected_camera_device_id: Option<String>,
+    #[serde(default = "default_capture_subdirectory")]
+    pub capture_subdirectory: String,
+    #[serde(default = "default_clip_length_seconds")]
+    pub clip_length_seconds: u32,
+    #[serde(default = "default_keyframe_count")]
+    pub keyframe_count: u32,
+    #[serde(default = "default_keyframe_interval_seconds")]
+    pub keyframe_interval_seconds: u32,
 }
 
 impl Default for AdminDefaults {
@@ -133,6 +183,11 @@ impl Default for AdminDefaults {
             rtsp_password: String::new(),
             rtsp_port: default_rtsp_port(),
             rtsp_paths: default_rtsp_paths(),
+            selected_camera_device_id: None,
+            capture_subdirectory: default_capture_subdirectory(),
+            clip_length_seconds: default_clip_length_seconds(),
+            keyframe_count: default_keyframe_count(),
+            keyframe_interval_seconds: default_keyframe_interval_seconds(),
         }
     }
 }
@@ -157,6 +212,23 @@ pub struct AdminPlatformState {
     pub recording_policies: Vec<RecordingPolicy>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdminModelCenterState {
+    #[serde(default)]
+    pub endpoints: Vec<ModelEndpoint>,
+    #[serde(default)]
+    pub route_policies: Vec<ModelRoutePolicy>,
+}
+
+impl Default for AdminModelCenterState {
+    fn default() -> Self {
+        Self {
+            endpoints: default_model_endpoints(),
+            route_policies: default_model_route_policies(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct AdminConsoleState {
     #[serde(default)]
@@ -170,7 +242,119 @@ pub struct AdminConsoleState {
     #[serde(default, alias = "feishu_users")]
     pub identity_bindings: Vec<IdentityBindingRecord>,
     #[serde(default)]
+    pub notification_targets: Vec<NotificationTargetRecord>,
+    #[serde(default)]
     pub platform: AdminPlatformState,
+    #[serde(default)]
+    pub models: AdminModelCenterState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceSummary {
+    pub workspace_id: String,
+    pub display_name: String,
+    pub workspace_type: String,
+    pub status: String,
+    pub timezone: String,
+    pub locale: String,
+    pub owner_user_id: String,
+    pub member_count: usize,
+    pub active_member_count: usize,
+    pub identity_binding_count: usize,
+    pub permission_rule_count: usize,
+    pub provider_account_count: usize,
+    pub credential_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_principal_user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_principal_display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_principal_auth_source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemberRoleSummary {
+    pub role_kind: String,
+    pub member_count: usize,
+    pub active_member_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IdentityBindingSummary {
+    pub identity_id: String,
+    pub user_id: String,
+    pub display_name: String,
+    pub provider_key: String,
+    pub open_id: String,
+    #[serde(default)]
+    pub union_id: Option<String>,
+    #[serde(default)]
+    pub chat_id: Option<String>,
+    pub role_kind: String,
+    pub membership_status: String,
+    pub can_edit: bool,
+    pub is_owner: bool,
+    #[serde(default)]
+    pub proactive_delivery_surface: String,
+    #[serde(default)]
+    pub binding_availability: String,
+    #[serde(default)]
+    pub binding_available: bool,
+    #[serde(default)]
+    pub binding_availability_note: String,
+    #[serde(default)]
+    pub recent_interactive_surface: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoleGovernanceSummary {
+    pub role_kind: String,
+    pub permission_rule_count: usize,
+    pub member_count: usize,
+    pub active_member_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccessGovernanceSummary {
+    pub permission_rule_count: usize,
+    pub owner_count: usize,
+    pub member_count: usize,
+    pub active_member_count: usize,
+    pub role_policies: Vec<RoleGovernanceSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayStatusSummary {
+    pub binding_channel: String,
+    pub binding_status: String,
+    pub binding_metric: String,
+    #[serde(default)]
+    pub binding_bound_user: Option<String>,
+    #[serde(default)]
+    pub manage_url: String,
+    #[serde(default)]
+    pub setup_url: String,
+    #[serde(default)]
+    pub static_setup_url: String,
+    pub bridge_provider: BridgeProviderConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeliveryPolicySummary {
+    pub interactive_reply: String,
+    pub proactive_delivery: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccountManagementSnapshot {
+    pub workspace: WorkspaceSummary,
+    pub member_role_counts: Vec<MemberRoleSummary>,
+    pub identity_bindings: Vec<IdentityBindingSummary>,
+    pub access_governance: AccessGovernanceSummary,
+    pub gateway: GatewayStatusSummary,
+    #[serde(default)]
+    pub notification_targets: Vec<NotificationTargetRecord>,
+    pub delivery_policy: DeliveryPolicySummary,
 }
 
 #[derive(Debug, Clone)]
@@ -184,8 +368,20 @@ const DEFAULT_WORKSPACE_OWNER_ID: &str = "local-owner";
 const LOCAL_RTSP_PROVIDER_ACCOUNT_ID: &str = "provider-local-rtsp";
 const LOCAL_RTSP_CREDENTIAL_ID: &str = "credential-local-rtsp-password";
 const BRIDGE_PROVIDER_ACCOUNT_ID: &str = "provider-im-bridge";
-const BRIDGE_APP_SECRET_CREDENTIAL_ID: &str = "credential-im-bridge-app-secret";
 const DEFAULT_RECORDING_POLICY_ID: &str = "recording-policy-default";
+const DEFAULT_MODEL_WORKSPACE_ID: &str = "home-1";
+const DEFAULT_POLICY_RETRIEVAL_OCR: &str = "retrieval.ocr";
+const DEFAULT_POLICY_RETRIEVAL_EMBED: &str = "retrieval.embed";
+const DEFAULT_POLICY_RETRIEVAL_ANSWER: &str = "retrieval.answer";
+const DEFAULT_POLICY_RETRIEVAL_VISION_SUMMARY: &str = "retrieval.vision_summary";
+const DEFAULT_PROACTIVE_DELIVERY_SURFACE: &str = "feishu";
+const HARBOROS_CURRENT_USER_ENV: &str = "HARBOR_HARBOROS_USER";
+const HARBOROS_WRITABLE_ROOT_ENV: &str = "HARBOR_HARBOROS_WRITABLE_ROOT";
+const DEFAULT_HARBOROS_WRITABLE_ROOT: &str = "/mnt/software/harborbeacon-agent-ci";
+const MODEL_API_BASE_URL_ENV: &str = "HARBOR_MODEL_API_BASE_URL";
+const MODEL_API_TOKEN_ENV: &str = "HARBOR_MODEL_API_TOKEN";
+const DEFAULT_MODEL_API_BASE_URL: &str = "http://127.0.0.1:4176/v1";
+const DEFAULT_MODEL_API_TOKEN: &str = "harbor-local-model-token";
 
 impl AdminConsoleStore {
     pub fn new(path: impl Into<PathBuf>, registry_store: DeviceRegistryStore) -> Self {
@@ -348,6 +544,116 @@ impl AdminConsoleStore {
         self.save_platform_primary_state(state)
     }
 
+    pub fn upsert_notification_target(
+        &self,
+        target_id: Option<&str>,
+        label: &str,
+        route_key: &str,
+        platform_hint: &str,
+        make_default: bool,
+    ) -> Result<AdminConsoleState, String> {
+        let mut state = self.load_or_create_state()?;
+        let label = sanitize_notification_target_label(label)?;
+        let route_key = sanitize_notification_target_route_key(route_key)?;
+        let platform_hint = normalize_platform_hint(platform_hint);
+        let requested_target_id = target_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+
+        let target_index = requested_target_id
+            .as_deref()
+            .and_then(|target_id| {
+                state
+                    .notification_targets
+                    .iter()
+                    .position(|target| target.target_id == target_id)
+            })
+            .or_else(|| {
+                state
+                    .notification_targets
+                    .iter()
+                    .position(|target| target.route_key == route_key)
+            });
+
+        let target_id = if let Some(index) = target_index {
+            let target = state
+                .notification_targets
+                .get_mut(index)
+                .expect("notification target index should remain valid");
+            target.label = label;
+            target.route_key = route_key;
+            target.platform_hint = platform_hint;
+            target.target_id.clone()
+        } else {
+            let target_id = requested_target_id.unwrap_or_else(new_notification_target_id);
+            state.notification_targets.push(NotificationTargetRecord {
+                target_id: target_id.clone(),
+                label,
+                route_key,
+                platform_hint,
+                is_default: false,
+            });
+            target_id
+        };
+
+        let should_make_default = make_default
+            || state
+                .notification_targets
+                .iter()
+                .all(|target| !target.is_default);
+        if should_make_default {
+            for target in &mut state.notification_targets {
+                target.is_default = target.target_id == target_id;
+            }
+        }
+
+        state.notification_targets = sanitize_notification_targets(state.notification_targets);
+        self.save_projected_state(state)
+    }
+
+    pub fn set_default_notification_target(
+        &self,
+        target_id: &str,
+    ) -> Result<AdminConsoleState, String> {
+        let target_id = target_id.trim();
+        if target_id.is_empty() {
+            return Err("target_id 不能为空".to_string());
+        }
+
+        let mut state = self.load_or_create_state()?;
+        if !state
+            .notification_targets
+            .iter()
+            .any(|target| target.target_id == target_id)
+        {
+            return Err(format!("未找到 notification target {target_id}"));
+        }
+        for target in &mut state.notification_targets {
+            target.is_default = target.target_id == target_id;
+        }
+        state.notification_targets = sanitize_notification_targets(state.notification_targets);
+        self.save_projected_state(state)
+    }
+
+    pub fn delete_notification_target(&self, target_id: &str) -> Result<AdminConsoleState, String> {
+        let target_id = target_id.trim();
+        if target_id.is_empty() {
+            return Err("target_id 不能为空".to_string());
+        }
+
+        let mut state = self.load_or_create_state()?;
+        let original_len = state.notification_targets.len();
+        state
+            .notification_targets
+            .retain(|target| target.target_id != target_id);
+        if state.notification_targets.len() == original_len {
+            return Err(format!("未找到 notification target {target_id}"));
+        }
+        state.notification_targets = sanitize_notification_targets(state.notification_targets);
+        self.save_projected_state(state)
+    }
+
     pub fn set_member_role(
         &self,
         user_id: &str,
@@ -397,6 +703,81 @@ impl AdminConsoleStore {
         self.save_platform_primary_state(state)
     }
 
+    pub fn set_member_default_delivery_surface(
+        &self,
+        user_id: &str,
+        surface: &str,
+    ) -> Result<AdminConsoleState, String> {
+        let user_id = user_id.trim();
+        if user_id.is_empty() {
+            return Err("user_id 不能为空".to_string());
+        }
+        let surface = normalize_delivery_surface(surface)
+            .ok_or_else(|| "surface 只能是 feishu 或 weixin".to_string())?;
+
+        let mut state = self.load_or_create_state()?;
+        let workspace = state
+            .platform
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == DEFAULT_WORKSPACE_ID)
+            .or_else(|| state.platform.workspaces.first())
+            .cloned()
+            .ok_or_else(|| "当前没有可编辑的 workspace".to_string())?;
+
+        ensure_platform_user_exists(&mut state, &workspace.workspace_id, user_id)?;
+
+        let user = state
+            .platform
+            .users
+            .iter_mut()
+            .find(|user| user.user_id == user_id)
+            .ok_or_else(|| format!("未找到 user_id={user_id} 对应的平台用户"))?;
+        set_user_default_delivery_surface(user, &surface);
+
+        self.save_platform_primary_state(state)
+    }
+
+    pub fn record_member_interactive_surface(
+        &self,
+        user_id: &str,
+        surface: &str,
+        route_key: Option<&str>,
+    ) -> Result<(), String> {
+        let user_id = user_id.trim();
+        if user_id.is_empty() {
+            return Ok(());
+        }
+        let surface =
+            normalize_delivery_surface(surface).unwrap_or_else(|| surface.trim().to_string());
+        if surface.is_empty() {
+            return Ok(());
+        }
+
+        let mut state = self.load_or_create_state()?;
+        let workspace = state
+            .platform
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == DEFAULT_WORKSPACE_ID)
+            .or_else(|| state.platform.workspaces.first())
+            .cloned()
+            .ok_or_else(|| "当前没有可编辑的 workspace".to_string())?;
+        ensure_platform_user_exists(&mut state, &workspace.workspace_id, user_id)?;
+
+        if let Some(user) = state
+            .platform
+            .users
+            .iter_mut()
+            .find(|user| user.user_id == user_id)
+        {
+            set_user_recent_interactive_surface(user, &surface, route_key);
+            self.save_platform_primary_state(state)?;
+        }
+
+        Ok(())
+    }
+
     pub fn save_defaults(&self, defaults: AdminDefaults) -> Result<AdminConsoleState, String> {
         let mut state = self.load_or_create_state()?;
         state.defaults = sanitize_defaults(defaults);
@@ -420,18 +801,28 @@ impl AdminConsoleStore {
         Ok(resolved_remote_view_config(&state))
     }
 
-    pub fn save_bridge_provider_config(
+    pub fn save_bridge_provider_status(
         &self,
         config: BridgeProviderConfig,
     ) -> Result<AdminConsoleState, String> {
         let mut state = self.load_or_create_state()?;
         state.bridge_provider = sanitize_bridge_provider_config(config);
-        if state.bridge_provider.configured {
-            state.binding.status = "Bridge 已配置".to_string();
-            state.binding.metric = "Bridge 已连接".to_string();
-            if !state.bridge_provider.app_name.trim().is_empty() {
-                state.binding.bound_user = Some(state.bridge_provider.app_name.clone());
-            }
+        if state.bridge_provider.connected {
+            state.binding.status = "Gateway 已连接".to_string();
+            state.binding.metric = "Gateway 在线".to_string();
+        } else if state.bridge_provider.configured {
+            state.binding.status = "Gateway 已启用".to_string();
+            state.binding.metric = "Gateway 未连通".to_string();
+        } else {
+            state.binding.status = "等待 Gateway".to_string();
+            state.binding.metric = "Gateway 未配置".to_string();
+        }
+        if !state.bridge_provider.app_name.trim().is_empty() {
+            state.binding.bound_user = Some(state.bridge_provider.app_name.clone());
+        } else if !state.bridge_provider.platform.trim().is_empty() {
+            state.binding.bound_user = Some(format!("{} gateway", state.bridge_provider.platform));
+        } else {
+            state.binding.bound_user = None;
         }
 
         state
@@ -446,19 +837,163 @@ impl AdminConsoleStore {
             upsert_provider_account(&mut state.platform.provider_accounts, provider);
         }
 
-        state
-            .platform
-            .credentials
-            .retain(|credential| credential.credential_id != BRIDGE_APP_SECRET_CREDENTIAL_ID);
-        if let Some(credential) = build_bridge_secret_credential(&state.bridge_provider) {
-            upsert_credential(&mut state.platform.credentials, credential);
-        }
-
         if let Some(workspace) = preferred_workspace_mut(&mut state.platform) {
             set_workspace_binding_projection(workspace, &state.binding);
         }
 
         self.save_platform_primary_state(state)
+    }
+
+    pub fn save_model_endpoint(
+        &self,
+        endpoint: ModelEndpoint,
+    ) -> Result<AdminConsoleState, String> {
+        let mut state = self.load_or_create_state()?;
+        let endpoint = sanitize_model_endpoint(endpoint)?;
+        if let Some(existing) = state
+            .models
+            .endpoints
+            .iter_mut()
+            .find(|existing| existing.model_endpoint_id == endpoint.model_endpoint_id)
+        {
+            *existing = endpoint;
+        } else {
+            state.models.endpoints.push(endpoint);
+        }
+        self.save_projected_state(state)
+    }
+
+    pub fn patch_model_endpoint(
+        &self,
+        endpoint_id: &str,
+        patch: Value,
+    ) -> Result<AdminConsoleState, String> {
+        let endpoint_id = endpoint_id.trim();
+        if endpoint_id.is_empty() {
+            return Err("model endpoint id 不能为空".to_string());
+        }
+        let Some(patch_object) = patch.as_object() else {
+            return Err("模型端点 patch 必须是 JSON object".to_string());
+        };
+
+        let mut state = self.load_or_create_state()?;
+        let endpoint = state
+            .models
+            .endpoints
+            .iter_mut()
+            .find(|existing| existing.model_endpoint_id == endpoint_id)
+            .ok_or_else(|| format!("未找到模型端点 {endpoint_id}"))?;
+
+        if let Some(value) = patch_object.get("workspace_id") {
+            endpoint.workspace_id = optional_trimmed_string(value);
+        }
+        if let Some(value) = patch_object.get("provider_account_id") {
+            endpoint.provider_account_id = optional_trimmed_string(value);
+        }
+        if let Some(value) = patch_object.get("model_kind") {
+            endpoint.model_kind = serde_json::from_value(value.clone())
+                .map_err(|error| format!("invalid model_kind: {error}"))?;
+        }
+        if let Some(value) = patch_object.get("endpoint_kind") {
+            endpoint.endpoint_kind = serde_json::from_value(value.clone())
+                .map_err(|error| format!("invalid endpoint_kind: {error}"))?;
+        }
+        if let Some(value) = patch_object.get("provider_key") {
+            endpoint.provider_key = string_value_or_empty(value);
+        }
+        if let Some(value) = patch_object.get("model_name") {
+            endpoint.model_name = string_value_or_empty(value);
+        }
+        if let Some(value) = patch_object.get("capability_tags") {
+            endpoint.capability_tags = string_vec(Some(value)).unwrap_or_default();
+        }
+        if let Some(value) = patch_object.get("cost_policy") {
+            endpoint.cost_policy = value.clone();
+        }
+        if let Some(value) = patch_object.get("status") {
+            endpoint.status = serde_json::from_value(value.clone())
+                .map_err(|error| format!("invalid status: {error}"))?;
+        }
+        if let Some(value) = patch_object.get("metadata") {
+            endpoint.metadata = merge_json_object(endpoint.metadata.clone(), value.clone())?;
+        }
+
+        let sanitized = sanitize_model_endpoint(endpoint.clone())?;
+        *endpoint = sanitized;
+        self.save_projected_state(state)
+    }
+
+    pub fn record_model_endpoint_test_result(
+        &self,
+        endpoint_id: &str,
+        ok: bool,
+        observed_status: &str,
+        summary: &str,
+        details: Value,
+    ) -> Result<AdminConsoleState, String> {
+        let endpoint_id = endpoint_id.trim();
+        if endpoint_id.is_empty() {
+            return Err("model endpoint id 不能为空".to_string());
+        }
+
+        let mut state = self.load_or_create_state()?;
+        let endpoint = state
+            .models
+            .endpoints
+            .iter_mut()
+            .find(|existing| existing.model_endpoint_id == endpoint_id)
+            .ok_or_else(|| format!("未找到模型端点 {endpoint_id}"))?;
+
+        let observed_status = observed_status.trim().to_lowercase();
+        let next_status = match observed_status.as_str() {
+            "active" if endpoint.status != ModelEndpointStatus::Disabled => {
+                ModelEndpointStatus::Active
+            }
+            "degraded" | "disabled" if endpoint.status != ModelEndpointStatus::Disabled => {
+                ModelEndpointStatus::Degraded
+            }
+            _ => endpoint.status,
+        };
+
+        endpoint.status = next_status;
+        let mut metadata = match endpoint.metadata.clone() {
+            Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        metadata.insert(
+            "last_test".to_string(),
+            json!({
+                "ok": ok,
+                "status": observed_status,
+                "summary": summary.trim(),
+                "details": details,
+                "tested_at": model_test_timestamp(),
+            }),
+        );
+        metadata.insert("health_status".to_string(), Value::String(observed_status));
+        endpoint.metadata = Value::Object(metadata);
+
+        let sanitized = sanitize_model_endpoint(endpoint.clone())?;
+        *endpoint = sanitized;
+        self.save_projected_state(state)
+    }
+
+    pub fn save_model_route_policies(
+        &self,
+        policies: Vec<ModelRoutePolicy>,
+    ) -> Result<AdminConsoleState, String> {
+        let mut state = self.load_or_create_state()?;
+        let sanitized = if policies.is_empty() {
+            default_model_route_policies()
+        } else {
+            let mut sanitized = Vec::new();
+            for policy in policies {
+                sanitized.push(sanitize_model_route_policy(policy)?);
+            }
+            sanitized
+        };
+        state.models.route_policies = sanitized;
+        self.save_projected_state(state)
     }
 
     pub fn registry_store(&self) -> &DeviceRegistryStore {
@@ -526,7 +1061,29 @@ pub fn sanitize_defaults(mut defaults: AdminDefaults) -> AdminDefaults {
     if defaults.rtsp_paths.is_empty() {
         defaults.rtsp_paths = default_rtsp_paths();
     }
+    defaults.selected_camera_device_id = defaults
+        .selected_camera_device_id
+        .and_then(|value| non_empty_opt(&value));
+    defaults.capture_subdirectory =
+        sanitize_capture_subdirectory(&defaults.capture_subdirectory).unwrap_or_else(
+            default_capture_subdirectory,
+        );
+    defaults.clip_length_seconds = defaults.clip_length_seconds.clamp(3, 300);
+    defaults.keyframe_count = defaults.keyframe_count.clamp(1, 12);
+    defaults.keyframe_interval_seconds = defaults.keyframe_interval_seconds.clamp(1, 60);
     defaults
+}
+
+fn sanitize_capture_subdirectory(value: &str) -> Option<String> {
+    let sanitized = value
+        .split(['/', '\\'])
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty() && *segment != "." && *segment != "..")
+        .collect::<Vec<_>>();
+    if sanitized.is_empty() {
+        return None;
+    }
+    Some(sanitized.join("/"))
 }
 
 pub fn sanitize_binding(mut binding: AdminBindingState) -> AdminBindingState {
@@ -537,7 +1094,7 @@ pub fn sanitize_binding(mut binding: AdminBindingState) -> AdminBindingState {
         binding.metric = "等待绑定".to_string();
     }
     if binding.channel.trim().is_empty() {
-        binding.channel = "Harbor IM Bridge".to_string();
+        binding.channel = DEFAULT_BINDING_CHANNEL_LABEL.to_string();
     }
     if let Some(token_code) = normalize_binding_code(&binding.qr_token) {
         if binding.session_code.trim().is_empty() || binding.session_code != token_code {
@@ -555,10 +1112,108 @@ pub fn sanitize_binding(mut binding: AdminBindingState) -> AdminBindingState {
     binding
 }
 
+fn sanitize_notification_targets(
+    targets: Vec<NotificationTargetRecord>,
+) -> Vec<NotificationTargetRecord> {
+    let mut normalized = Vec::new();
+    let mut seen_ids = HashSet::new();
+    let mut seen_routes = HashSet::new();
+    for target in targets {
+        let Ok(target) = sanitize_notification_target(target) else {
+            continue;
+        };
+        if !seen_ids.insert(target.target_id.clone()) {
+            continue;
+        }
+        if !seen_routes.insert(target.route_key.clone()) {
+            continue;
+        }
+        normalized.push(target);
+    }
+    ensure_single_default_notification_target(&mut normalized);
+    normalized
+}
+
+fn sanitize_notification_target(
+    mut target: NotificationTargetRecord,
+) -> Result<NotificationTargetRecord, String> {
+    target.target_id = target.target_id.trim().to_string();
+    if target.target_id.is_empty() {
+        target.target_id = new_notification_target_id();
+    }
+    target.label = sanitize_notification_target_label(&target.label)?;
+    target.route_key = sanitize_notification_target_route_key(&target.route_key)?;
+    target.platform_hint = normalize_platform_hint(&target.platform_hint);
+    Ok(target)
+}
+
+fn sanitize_notification_target_label(label: &str) -> Result<String, String> {
+    let label = label.trim();
+    if label.is_empty() {
+        return Err("label 不能为空".to_string());
+    }
+    Ok(label.to_string())
+}
+
+fn sanitize_notification_target_route_key(route_key: &str) -> Result<String, String> {
+    let route_key = route_key.trim();
+    if route_key.is_empty() {
+        return Err("route_key 不能为空".to_string());
+    }
+    Ok(route_key.to_string())
+}
+
+fn normalize_platform_hint(platform_hint: &str) -> String {
+    platform_hint.trim().to_ascii_lowercase()
+}
+
+fn ensure_single_default_notification_target(targets: &mut [NotificationTargetRecord]) {
+    let mut default_seen = false;
+    for target in targets.iter_mut() {
+        if target.is_default && !default_seen {
+            default_seen = true;
+            continue;
+        }
+        if target.is_default {
+            target.is_default = false;
+        }
+    }
+    if !default_seen {
+        if let Some(first) = targets.first_mut() {
+            first.is_default = true;
+        }
+    }
+}
+
+fn new_notification_target_id() -> String {
+    format!("target-{}", Uuid::new_v4().simple())
+}
+
+pub fn gateway_manage_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.ends_with("/admin/im") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/admin/im")
+    }
+}
+
 pub fn sanitize_bridge_provider_config(mut config: BridgeProviderConfig) -> BridgeProviderConfig {
+    config.app_id.clear();
+    config.app_secret.clear();
+    config.bot_open_id.clear();
+    config.platform = config.platform.trim().to_string();
+    config.gateway_base_url = config.gateway_base_url.trim().to_string();
+    config.app_name = config.app_name.trim().to_string();
+    config.last_checked_at = config.last_checked_at.trim().to_string();
     if config.status.trim().is_empty() {
-        config.status = if config.configured {
+        config.status = if config.connected {
             "已连接".to_string()
+        } else if config.configured {
+            "已启用，待连接".to_string()
         } else {
             "未配置".to_string()
         };
@@ -572,6 +1227,359 @@ pub fn sanitize_remote_view_config(mut config: RemoteViewConfig) -> RemoteViewCo
     }
     config.share_link_ttl_minutes = config.share_link_ttl_minutes.clamp(5, 24 * 60);
     config
+}
+
+pub fn sanitize_model_center_state(state: AdminModelCenterState) -> AdminModelCenterState {
+    let mut endpoints = Vec::new();
+    for endpoint in state.endpoints {
+        if let Ok(endpoint) = sanitize_model_endpoint(endpoint) {
+            endpoints.push(endpoint);
+        }
+    }
+    endpoints.sort_by(|left, right| {
+        left.model_kind
+            .as_str()
+            .cmp(right.model_kind.as_str())
+            .then(left.model_endpoint_id.cmp(&right.model_endpoint_id))
+    });
+
+    let mut route_policies = Vec::new();
+    for policy in state.route_policies {
+        if let Ok(policy) = sanitize_model_route_policy(policy) {
+            route_policies.push(policy);
+        }
+    }
+
+    if route_policies.is_empty() {
+        route_policies = default_model_route_policies();
+    }
+
+    AdminModelCenterState {
+        endpoints,
+        route_policies,
+    }
+}
+
+pub fn sanitize_model_endpoint(mut endpoint: ModelEndpoint) -> Result<ModelEndpoint, String> {
+    endpoint.model_endpoint_id = endpoint.model_endpoint_id.trim().to_string();
+    if endpoint.model_endpoint_id.is_empty() {
+        endpoint.model_endpoint_id = format!(
+            "{}-{}-{}",
+            endpoint.model_kind.as_str(),
+            slugify_identity_component(&endpoint.provider_key),
+            slugify_identity_component(&endpoint.model_name)
+        )
+        .trim_matches('-')
+        .to_string();
+    }
+    if endpoint.model_endpoint_id.is_empty() {
+        return Err("model_endpoint_id 不能为空".to_string());
+    }
+
+    endpoint.workspace_id = endpoint
+        .workspace_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    endpoint.provider_account_id = endpoint
+        .provider_account_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    endpoint.provider_key = endpoint.provider_key.trim().to_string();
+    if endpoint.provider_key.is_empty() {
+        endpoint.provider_key = "custom".to_string();
+    }
+    endpoint.model_name = endpoint.model_name.trim().to_string();
+    if endpoint.model_name.is_empty() {
+        endpoint.model_name = endpoint.provider_key.clone();
+    }
+    endpoint.capability_tags = endpoint
+        .capability_tags
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    endpoint.capability_tags.sort();
+    endpoint.capability_tags.dedup();
+    endpoint.cost_policy = normalize_json_object(endpoint.cost_policy);
+    endpoint.metadata = normalize_json_object(endpoint.metadata);
+    Ok(endpoint)
+}
+
+pub fn sanitize_model_route_policy(
+    mut policy: ModelRoutePolicy,
+) -> Result<ModelRoutePolicy, String> {
+    policy.route_policy_id = policy.route_policy_id.trim().to_string();
+    if policy.route_policy_id.is_empty() {
+        return Err("route_policy_id 不能为空".to_string());
+    }
+    policy.workspace_id = policy.workspace_id.trim().to_string();
+    if policy.workspace_id.is_empty() {
+        policy.workspace_id = DEFAULT_MODEL_WORKSPACE_ID.to_string();
+    }
+    policy.domain_scope = policy.domain_scope.trim().to_string();
+    if policy.domain_scope.is_empty() {
+        policy.domain_scope = "retrieval".to_string();
+    }
+    policy.modality = policy.modality.trim().to_string();
+    if policy.modality.is_empty() {
+        policy.modality = "text".to_string();
+    }
+    policy.status = policy.status.trim().to_string();
+    if policy.status.is_empty() {
+        policy.status = "active".to_string();
+    }
+    policy.fallback_order = policy
+        .fallback_order
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if policy.fallback_order.is_empty() {
+        policy.fallback_order = vec![
+            "local".to_string(),
+            "sidecar".to_string(),
+            "cloud".to_string(),
+        ];
+    }
+    policy.metadata = normalize_json_object(policy.metadata);
+    Ok(policy)
+}
+
+pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
+    let local_base_url = local_model_api_base_url();
+    let local_healthz_url = local_model_api_healthz_url(&local_base_url);
+    let local_api_key = local_model_api_token();
+    vec![
+        ModelEndpoint {
+            model_endpoint_id: "ocr-local-tesseract".to_string(),
+            workspace_id: Some(DEFAULT_MODEL_WORKSPACE_ID.to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Ocr,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "tesseract".to_string(),
+            model_name: "tesseract-cli".to_string(),
+            capability_tags: vec![
+                "image".to_string(),
+                "local_first".to_string(),
+                "ocr".to_string(),
+            ],
+            cost_policy: json!({"cost_hint": "local_cpu"}),
+            status: ModelEndpointStatus::Degraded,
+            metadata: json!({
+                "builtin": true,
+                "binary_path": "",
+                "languages": "chi_sim+eng",
+                "secret_configured": false,
+            }),
+        },
+        ModelEndpoint {
+            model_endpoint_id: "embed-local-openai-compatible".to_string(),
+            workspace_id: Some(DEFAULT_MODEL_WORKSPACE_ID.to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Embedder,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "openai_compatible".to_string(),
+            model_name: "harbor-local-embed".to_string(),
+            capability_tags: vec!["embeddings".to_string(), "local_first".to_string()],
+            cost_policy: json!({"cost_hint": "local_or_sidecar"}),
+            status: ModelEndpointStatus::Degraded,
+            metadata: json!({
+                "builtin": true,
+                "base_url": local_base_url.clone(),
+                "healthz_url": local_healthz_url.clone(),
+                "api_key": local_api_key.clone(),
+                "api_key_configured": true,
+            }),
+        },
+        ModelEndpoint {
+            model_endpoint_id: "llm-local-openai-compatible".to_string(),
+            workspace_id: Some(DEFAULT_MODEL_WORKSPACE_ID.to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Llm,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "openai_compatible".to_string(),
+            model_name: "harbor-local-chat".to_string(),
+            capability_tags: vec!["chat".to_string(), "local_first".to_string()],
+            cost_policy: json!({"cost_hint": "local_or_sidecar"}),
+            status: ModelEndpointStatus::Degraded,
+            metadata: json!({
+                "builtin": true,
+                "base_url": local_base_url.clone(),
+                "healthz_url": local_healthz_url.clone(),
+                "api_key": local_api_key.clone(),
+                "api_key_configured": true,
+            }),
+        },
+        ModelEndpoint {
+            model_endpoint_id: "vlm-local-openai-compatible".to_string(),
+            workspace_id: Some(DEFAULT_MODEL_WORKSPACE_ID.to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Vlm,
+            endpoint_kind: ModelEndpointKind::Local,
+            provider_key: "openai_compatible".to_string(),
+            model_name: "vision".to_string(),
+            capability_tags: vec![
+                "image".to_string(),
+                "local_first".to_string(),
+                "multimodal".to_string(),
+            ],
+            cost_policy: json!({"cost_hint": "local_or_sidecar"}),
+            status: ModelEndpointStatus::Disabled,
+            metadata: json!({
+                "builtin": true,
+                "base_url": local_base_url,
+                "healthz_url": local_healthz_url,
+                "api_key": local_api_key,
+                "api_key_configured": true,
+            }),
+        },
+    ]
+}
+
+fn local_model_api_base_url() -> String {
+    env::var(MODEL_API_BASE_URL_ENV)
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_MODEL_API_BASE_URL.to_string())
+}
+
+fn local_model_api_healthz_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if let Some(prefix) = trimmed.strip_suffix("/v1") {
+        format!("{prefix}/healthz")
+    } else {
+        format!("{trimmed}/healthz")
+    }
+}
+
+fn local_model_api_token() -> String {
+    env::var(MODEL_API_TOKEN_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_MODEL_API_TOKEN.to_string())
+}
+
+pub fn default_model_route_policies() -> Vec<ModelRoutePolicy> {
+    vec![
+        ModelRoutePolicy {
+            route_policy_id: DEFAULT_POLICY_RETRIEVAL_OCR.to_string(),
+            workspace_id: DEFAULT_MODEL_WORKSPACE_ID.to_string(),
+            domain_scope: "retrieval".to_string(),
+            modality: "image".to_string(),
+            privacy_level: PrivacyLevel::StrictLocal,
+            local_preferred: true,
+            max_cost_per_run: None,
+            fallback_order: vec![
+                "local".to_string(),
+                "sidecar".to_string(),
+                "cloud".to_string(),
+            ],
+            status: "active".to_string(),
+            metadata: json!({"capability": "ocr"}),
+        },
+        ModelRoutePolicy {
+            route_policy_id: DEFAULT_POLICY_RETRIEVAL_EMBED.to_string(),
+            workspace_id: DEFAULT_MODEL_WORKSPACE_ID.to_string(),
+            domain_scope: "retrieval".to_string(),
+            modality: "text".to_string(),
+            privacy_level: PrivacyLevel::StrictLocal,
+            local_preferred: true,
+            max_cost_per_run: None,
+            fallback_order: vec![
+                "local".to_string(),
+                "sidecar".to_string(),
+                "cloud".to_string(),
+            ],
+            status: "active".to_string(),
+            metadata: json!({"capability": "embed"}),
+        },
+        ModelRoutePolicy {
+            route_policy_id: DEFAULT_POLICY_RETRIEVAL_ANSWER.to_string(),
+            workspace_id: DEFAULT_MODEL_WORKSPACE_ID.to_string(),
+            domain_scope: "retrieval".to_string(),
+            modality: "text".to_string(),
+            privacy_level: PrivacyLevel::AllowRedactedCloud,
+            local_preferred: true,
+            max_cost_per_run: None,
+            fallback_order: vec![
+                "local".to_string(),
+                "sidecar".to_string(),
+                "cloud".to_string(),
+            ],
+            status: "active".to_string(),
+            metadata: json!({"capability": "answer"}),
+        },
+        ModelRoutePolicy {
+            route_policy_id: DEFAULT_POLICY_RETRIEVAL_VISION_SUMMARY.to_string(),
+            workspace_id: DEFAULT_MODEL_WORKSPACE_ID.to_string(),
+            domain_scope: "retrieval".to_string(),
+            modality: "multimodal".to_string(),
+            privacy_level: PrivacyLevel::AllowRedactedCloud,
+            local_preferred: true,
+            max_cost_per_run: None,
+            fallback_order: vec![
+                "local".to_string(),
+                "sidecar".to_string(),
+                "cloud".to_string(),
+            ],
+            status: "degraded".to_string(),
+            metadata: json!({"capability": "vision_summary"}),
+        },
+    ]
+}
+
+fn optional_trimmed_string(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+}
+
+fn string_value_or_empty(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .unwrap_or_default()
+}
+
+fn normalize_json_object(value: Value) -> Value {
+    if value.is_object() {
+        value
+    } else {
+        json!({})
+    }
+}
+
+fn merge_json_object(existing: Value, patch: Value) -> Result<Value, String> {
+    match patch {
+        Value::Null => Ok(json!({})),
+        Value::Object(patch_map) => {
+            let mut merged = match existing {
+                Value::Object(existing_map) => existing_map,
+                _ => serde_json::Map::new(),
+            };
+            for (key, value) in patch_map {
+                merged.insert(key, value);
+            }
+            Ok(Value::Object(merged))
+        }
+        _ => Err("metadata patch 必须是 JSON object".to_string()),
+    }
+}
+
+fn model_test_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string()
 }
 
 fn normalize_loaded_admin_state(state: &mut AdminConsoleState) {
@@ -591,6 +1599,8 @@ fn sanitize_legacy_admin_fields(state: &mut AdminConsoleState) {
     state.defaults = sanitize_defaults(state.defaults.clone());
     state.bridge_provider = sanitize_bridge_provider_config(state.bridge_provider.clone());
     state.remote_view = sanitize_remote_view_config(state.remote_view.clone());
+    state.notification_targets = sanitize_notification_targets(state.notification_targets.clone());
+    state.models = sanitize_model_center_state(state.models.clone());
 }
 
 fn hydrate_legacy_views_from_platform(state: &mut AdminConsoleState) {
@@ -687,27 +1697,48 @@ fn apply_provider_projections_to_legacy(state: &mut AdminConsoleState) {
         .iter()
         .find(|provider| provider.provider_account_id == BRIDGE_PROVIDER_ACCOUNT_ID)
     {
-        state.bridge_provider.configured = bridge_provider.status == ProviderAccountStatus::Active;
-        assign_string(
-            &mut state.bridge_provider.bot_open_id,
-            bridge_provider.capabilities.get("bot_open_id"),
-        );
+        state.bridge_provider.connected = bridge_provider.status == ProviderAccountStatus::Active;
+        state.bridge_provider.configured =
+            !matches!(bridge_provider.status, ProviderAccountStatus::Disabled);
         assign_string(
             &mut state.defaults.notification_channel,
             bridge_provider.capabilities.get("channel"),
         );
         assign_string(
-            &mut state.bridge_provider.app_id,
-            bridge_provider.metadata.get("app_id"),
+            &mut state.bridge_provider.platform,
+            bridge_provider.metadata.get("platform"),
         );
         assign_string(
             &mut state.bridge_provider.app_name,
-            bridge_provider.metadata.get("app_name"),
+            bridge_provider.metadata.get("display_name"),
         );
         assign_string(
             &mut state.bridge_provider.status,
             bridge_provider.metadata.get("status"),
         );
+        assign_string(
+            &mut state.bridge_provider.gateway_base_url,
+            bridge_provider.metadata.get("gateway_base_url"),
+        );
+        assign_string(
+            &mut state.bridge_provider.last_checked_at,
+            bridge_provider.metadata.get("last_checked_at"),
+        );
+        state.bridge_provider.capabilities.reply = bridge_provider
+            .capabilities
+            .get("reply")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        state.bridge_provider.capabilities.update = bridge_provider
+            .capabilities
+            .get("update")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        state.bridge_provider.capabilities.attachments = bridge_provider
+            .capabilities
+            .get("attachments")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     }
 
     if let Some(local_rtsp_credential) = state
@@ -727,18 +1758,6 @@ fn apply_provider_projections_to_legacy(state: &mut AdminConsoleState) {
         {
             state.defaults.rtsp_port = port as u16;
         }
-    }
-
-    if let Some(bridge_secret_credential) = state
-        .platform
-        .credentials
-        .iter()
-        .find(|credential| credential.credential_id == BRIDGE_APP_SECRET_CREDENTIAL_ID)
-    {
-        assign_string(
-            &mut state.bridge_provider.app_id,
-            bridge_secret_credential.scope.get("app_id"),
-        );
     }
 }
 
@@ -773,6 +1792,23 @@ fn apply_recording_policy_to_legacy(state: &mut AdminConsoleState) {
         &mut state.defaults.notification_channel,
         policy.metadata.get("notification_channel"),
     );
+    state.defaults.selected_camera_device_id = policy
+        .device_id
+        .as_deref()
+        .and_then(non_empty_opt);
+    state.defaults.capture_subdirectory = policy
+        .capture_subdirectory()
+        .map(str::to_string)
+        .unwrap_or_else(default_capture_subdirectory);
+    state.defaults.clip_length_seconds = policy
+        .clip_length_seconds_hint()
+        .unwrap_or_else(default_clip_length_seconds);
+    state.defaults.keyframe_count = policy
+        .keyframe_count_hint()
+        .unwrap_or_else(default_keyframe_count);
+    state.defaults.keyframe_interval_seconds = policy
+        .keyframe_interval_seconds_hint()
+        .unwrap_or_else(default_keyframe_interval_seconds);
 }
 
 fn legacy_identity_bindings_from_platform(
@@ -823,6 +1859,76 @@ pub fn resolved_identity_binding_records(state: &AdminConsoleState) -> Vec<Ident
         .collect()
 }
 
+pub fn account_management_snapshot(
+    state: &AdminConsoleState,
+    public_origin: Option<&str>,
+) -> AccountManagementSnapshot {
+    let workspace = active_workspace_projection(state);
+    let bindings = resolved_identity_binding_records(state);
+    let membership_counts = member_role_counts(&state.platform, &workspace.workspace_id);
+    let permission_rule_count = state
+        .platform
+        .permission_bindings
+        .iter()
+        .filter(|binding| binding.workspace_id == workspace.workspace_id)
+        .count();
+
+    AccountManagementSnapshot {
+        workspace: WorkspaceSummary {
+            workspace_id: workspace.workspace_id.clone(),
+            display_name: workspace.display_name.clone(),
+            workspace_type: workspace_type_value(workspace.workspace_type).to_string(),
+            status: workspace_status_value(workspace.status).to_string(),
+            timezone: workspace.timezone.clone(),
+            locale: workspace.locale.clone(),
+            owner_user_id: workspace.owner_user_id.clone(),
+            member_count: membership_counts
+                .iter()
+                .map(|summary| summary.member_count)
+                .sum(),
+            active_member_count: membership_counts
+                .iter()
+                .map(|summary| summary.active_member_count)
+                .sum(),
+            identity_binding_count: bindings.len(),
+            permission_rule_count,
+            provider_account_count: state
+                .platform
+                .provider_accounts
+                .iter()
+                .filter(|provider| provider.workspace_id == workspace.workspace_id)
+                .count(),
+            credential_count: state
+                .platform
+                .credentials
+                .iter()
+                .filter(|credential| {
+                    state.platform.provider_accounts.iter().any(|provider| {
+                        provider.provider_account_id == credential.provider_account_id
+                            && provider.workspace_id == workspace.workspace_id
+                    })
+                })
+                .count(),
+            current_principal_user_id: Some(harboros_current_user_id()),
+            current_principal_display_name: Some(harboros_current_user_display_name()),
+            current_principal_auth_source: Some("harbor_os".to_string()),
+        },
+        member_role_counts: membership_counts,
+        identity_bindings: identity_binding_details(state, &workspace, &bindings),
+        access_governance: access_governance_summary(state, &workspace.workspace_id),
+        gateway: gateway_status_summary(state, public_origin),
+        notification_targets: state.notification_targets.clone(),
+        delivery_policy: delivery_policy_summary(),
+    }
+}
+
+pub fn delivery_policy_summary() -> DeliveryPolicySummary {
+    DeliveryPolicySummary {
+        interactive_reply: "source_bound".to_string(),
+        proactive_delivery: "notification_target_default".to_string(),
+    }
+}
+
 fn sync_platform_from_legacy(state: &AdminConsoleState) -> AdminPlatformState {
     let mut platform = state.platform.clone();
     let workspace = build_workspace_projection(state);
@@ -850,10 +1956,9 @@ fn sync_platform_from_legacy(state: &AdminConsoleState) -> AdminPlatformState {
         .provider_accounts
         .extend(build_provider_accounts(state));
 
-    platform.credentials.retain(|credential| {
-        credential.credential_id != LOCAL_RTSP_CREDENTIAL_ID
-            && credential.credential_id != BRIDGE_APP_SECRET_CREDENTIAL_ID
-    });
+    platform
+        .credentials
+        .retain(|credential| credential.credential_id != LOCAL_RTSP_CREDENTIAL_ID);
     platform.credentials.extend(build_credentials(state));
 
     platform
@@ -864,6 +1969,274 @@ fn sync_platform_from_legacy(state: &AdminConsoleState) -> AdminPlatformState {
         .push(build_recording_policy(state));
 
     platform
+}
+
+fn active_workspace_projection(state: &AdminConsoleState) -> Workspace {
+    state
+        .platform
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == DEFAULT_WORKSPACE_ID)
+        .or_else(|| state.platform.workspaces.first())
+        .cloned()
+        .unwrap_or_else(|| build_workspace_projection(state))
+}
+
+fn member_role_counts(platform: &AdminPlatformState, workspace_id: &str) -> Vec<MemberRoleSummary> {
+    ordered_role_kinds()
+        .iter()
+        .map(|role_kind| {
+            let (member_count, active_member_count) = platform
+                .memberships
+                .iter()
+                .filter(|membership| membership.workspace_id == workspace_id)
+                .filter(|membership| membership.role_kind == *role_kind)
+                .fold(
+                    (0usize, 0usize),
+                    |(member_count, active_count), membership| {
+                        (
+                            member_count + 1,
+                            active_count
+                                + usize::from(membership.status == MembershipStatus::Active),
+                        )
+                    },
+                );
+
+            MemberRoleSummary {
+                role_kind: role_kind_label(*role_kind).to_string(),
+                member_count,
+                active_member_count,
+            }
+        })
+        .collect()
+}
+
+fn identity_binding_details(
+    state: &AdminConsoleState,
+    workspace: &Workspace,
+    bindings: &[IdentityBindingRecord],
+) -> Vec<IdentityBindingSummary> {
+    let membership_map: HashMap<&str, &Membership> = state
+        .platform
+        .memberships
+        .iter()
+        .filter(|membership| membership.workspace_id == workspace.workspace_id)
+        .map(|membership| (membership.user_id.as_str(), membership))
+        .collect();
+    let user_map: HashMap<&str, &UserAccount> = state
+        .platform
+        .users
+        .iter()
+        .map(|user| (user.user_id.as_str(), user))
+        .collect();
+
+    let mut summaries = bindings
+        .iter()
+        .map(|binding| {
+            let user_id = projected_user_id_for_binding(binding);
+            let membership = membership_map.get(user_id.as_str()).copied();
+            let user = user_map.get(user_id.as_str()).copied();
+            let proactive_delivery_surface = user
+                .and_then(user_default_delivery_surface)
+                .unwrap_or_else(|| DEFAULT_PROACTIVE_DELIVERY_SURFACE.to_string());
+            let (binding_available, binding_availability, binding_availability_note) =
+                binding_availability_for_surface(binding, &proactive_delivery_surface);
+            IdentityBindingSummary {
+                identity_id: format!("identity-{}", binding.open_id),
+                user_id,
+                display_name: user
+                    .map(|user| user.display_name.clone())
+                    .or_else(|| {
+                        membership.and_then(|membership| {
+                            user_map
+                                .get(membership.user_id.as_str())
+                                .map(|user| user.display_name.clone())
+                        })
+                    })
+                    .unwrap_or_else(|| binding.display_name.clone()),
+                provider_key: "im_bridge".to_string(),
+                open_id: binding.open_id.clone(),
+                union_id: binding.union_id.clone(),
+                chat_id: binding.chat_id.clone(),
+                role_kind: membership
+                    .map(|membership| role_kind_label(membership.role_kind).to_string())
+                    .unwrap_or_else(|| "viewer".to_string()),
+                membership_status: membership
+                    .map(|membership| membership_status_label(membership.status).to_string())
+                    .unwrap_or_else(|| "active".to_string()),
+                can_edit: membership
+                    .map(|membership| membership.user_id != workspace.owner_user_id)
+                    .unwrap_or(true),
+                is_owner: membership
+                    .map(|membership| {
+                        membership.user_id == workspace.owner_user_id
+                            || membership.role_kind == RoleKind::Owner
+                    })
+                    .unwrap_or(false),
+                proactive_delivery_surface,
+                binding_availability,
+                binding_available,
+                binding_availability_note,
+                recent_interactive_surface: user.and_then(user_recent_interactive_surface),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    summaries.sort_by(|left, right| {
+        right
+            .is_owner
+            .cmp(&left.is_owner)
+            .then_with(|| left.display_name.cmp(&right.display_name))
+            .then_with(|| left.open_id.cmp(&right.open_id))
+    });
+    summaries
+}
+
+fn access_governance_summary(
+    state: &AdminConsoleState,
+    workspace_id: &str,
+) -> AccessGovernanceSummary {
+    let role_policies = ordered_role_kinds()
+        .iter()
+        .map(|role_kind| {
+            let permission_rule_count = state
+                .platform
+                .permission_bindings
+                .iter()
+                .filter(|binding| binding.workspace_id == workspace_id)
+                .filter(|binding| binding.role_kind == role_kind_label(*role_kind))
+                .count();
+            let (member_count, active_member_count) = state
+                .platform
+                .memberships
+                .iter()
+                .filter(|membership| membership.workspace_id == workspace_id)
+                .filter(|membership| membership.role_kind == *role_kind)
+                .fold(
+                    (0usize, 0usize),
+                    |(member_count, active_count), membership| {
+                        (
+                            member_count + 1,
+                            active_count
+                                + usize::from(membership.status == MembershipStatus::Active),
+                        )
+                    },
+                );
+
+            RoleGovernanceSummary {
+                role_kind: role_kind_label(*role_kind).to_string(),
+                permission_rule_count,
+                member_count,
+                active_member_count,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let member_count = state
+        .platform
+        .memberships
+        .iter()
+        .filter(|membership| membership.workspace_id == workspace_id)
+        .count();
+    let active_member_count = state
+        .platform
+        .memberships
+        .iter()
+        .filter(|membership| membership.workspace_id == workspace_id)
+        .filter(|membership| membership.status == MembershipStatus::Active)
+        .count();
+    let owner_count = state
+        .platform
+        .memberships
+        .iter()
+        .filter(|membership| {
+            membership.workspace_id == workspace_id
+                && (membership.role_kind == RoleKind::Owner
+                    || state
+                        .platform
+                        .workspaces
+                        .iter()
+                        .find(|workspace| workspace.workspace_id == workspace_id)
+                        .map(|workspace| membership.user_id == workspace.owner_user_id)
+                        .unwrap_or(false))
+        })
+        .count();
+
+    AccessGovernanceSummary {
+        permission_rule_count: state
+            .platform
+            .permission_bindings
+            .iter()
+            .filter(|binding| binding.workspace_id == workspace_id)
+            .count(),
+        owner_count,
+        member_count,
+        active_member_count,
+        role_policies,
+    }
+}
+
+fn gateway_status_summary(
+    state: &AdminConsoleState,
+    _public_origin: Option<&str>,
+) -> GatewayStatusSummary {
+    let configured_base_url = state.bridge_provider.gateway_base_url.trim();
+    GatewayStatusSummary {
+        binding_channel: state.binding.channel.clone(),
+        binding_status: state.binding.status.clone(),
+        binding_metric: state.binding.metric.clone(),
+        binding_bound_user: state.binding.bound_user.clone(),
+        manage_url: gateway_manage_url(configured_base_url),
+        setup_url: String::new(),
+        static_setup_url: String::new(),
+        bridge_provider: state.bridge_provider.clone(),
+    }
+}
+
+fn ordered_role_kinds() -> [RoleKind; 6] {
+    [
+        RoleKind::Owner,
+        RoleKind::Admin,
+        RoleKind::Operator,
+        RoleKind::Member,
+        RoleKind::Viewer,
+        RoleKind::Guest,
+    ]
+}
+
+fn role_kind_label(role_kind: RoleKind) -> &'static str {
+    match role_kind {
+        RoleKind::Owner => "owner",
+        RoleKind::Admin => "admin",
+        RoleKind::Operator => "operator",
+        RoleKind::Member => "member",
+        RoleKind::Viewer => "viewer",
+        RoleKind::Guest => "guest",
+    }
+}
+
+fn workspace_type_value(workspace_type: WorkspaceType) -> &'static str {
+    match workspace_type {
+        WorkspaceType::Home => "home",
+        WorkspaceType::Lab => "lab",
+        WorkspaceType::Managed => "managed",
+    }
+}
+
+fn workspace_status_value(status: WorkspaceStatus) -> &'static str {
+    match status {
+        WorkspaceStatus::Active => "active",
+        WorkspaceStatus::Suspended => "suspended",
+        WorkspaceStatus::Archived => "archived",
+    }
+}
+
+fn membership_status_label(status: MembershipStatus) -> &'static str {
+    match status {
+        MembershipStatus::Active => "active",
+        MembershipStatus::Pending => "pending",
+        MembershipStatus::Revoked => "revoked",
+    }
 }
 
 fn upsert_workspace(workspaces: &mut Vec<Workspace>, workspace: Workspace) {
@@ -896,17 +2269,6 @@ fn upsert_provider_account(providers: &mut Vec<ProviderAccount>, provider: Provi
         *existing = provider;
     } else {
         providers.push(provider);
-    }
-}
-
-fn upsert_credential(credentials: &mut Vec<CredentialRecord>, credential: CredentialRecord) {
-    if let Some(existing) = credentials
-        .iter_mut()
-        .find(|existing| existing.credential_id == credential.credential_id)
-    {
-        *existing = credential;
-    } else {
-        credentials.push(credential);
     }
 }
 
@@ -1003,10 +2365,7 @@ fn ensure_platform_user_exists(
             phone: None,
             status: UserStatus::Active,
             default_workspace_id: Some(workspace_id.to_string()),
-            preferences: json!({
-                "auth_source": "im_bridge",
-                "open_id": binding.open_id.clone(),
-            }),
+            preferences: default_user_preferences(&binding.open_id),
         });
         return Ok(());
     }
@@ -1161,7 +2520,7 @@ fn build_workspace_projection(state: &AdminConsoleState) -> Workspace {
         display_name: "Harbor Home".to_string(),
         timezone: "Asia/Shanghai".to_string(),
         locale: "zh-CN".to_string(),
-        owner_user_id: DEFAULT_WORKSPACE_OWNER_ID.to_string(),
+        owner_user_id: harboros_current_user_id(),
         status: WorkspaceStatus::Active,
         settings: json!({
             "binding": {
@@ -1174,11 +2533,17 @@ fn build_workspace_projection(state: &AdminConsoleState) -> Workspace {
                 "cidr": state.defaults.cidr.clone(),
                 "discovery": state.defaults.discovery.clone(),
                 "capture": state.defaults.capture.clone(),
+                "capture_subdirectory": state.defaults.capture_subdirectory.clone(),
                 "ai": state.defaults.ai.clone(),
                 "notification_channel": state.defaults.notification_channel.clone(),
                 "rtsp_port": state.defaults.rtsp_port,
                 "rtsp_paths": state.defaults.rtsp_paths.clone(),
                 "rtsp_username": state.defaults.rtsp_username.clone(),
+                "selected_camera_device_id": state.defaults.selected_camera_device_id.clone(),
+                "clip_length_seconds": state.defaults.clip_length_seconds,
+                "keyframe_count": state.defaults.keyframe_count,
+                "keyframe_interval_seconds": state.defaults.keyframe_interval_seconds,
+                "writable_root": harboros_writable_root(),
             },
         }),
     };
@@ -1226,7 +2591,11 @@ fn build_bridge_provider_account(
     notification_channel: &str,
     bound_users: usize,
 ) -> Option<ProviderAccount> {
-    if !config.configured && config.app_id.trim().is_empty() {
+    if !config.configured
+        && !config.connected
+        && config.app_name.trim().is_empty()
+        && config.gateway_base_url.trim().is_empty()
+    {
         return None;
     }
 
@@ -1235,50 +2604,60 @@ fn build_bridge_provider_account(
         workspace_id: DEFAULT_WORKSPACE_ID.to_string(),
         provider_key: "im_bridge".to_string(),
         provider_kind: ProviderKind::Bridge,
-        display_name: "Harbor IM Bridge".to_string(),
+        display_name: DEFAULT_PROVIDER_ACCOUNT_DISPLAY_NAME.to_string(),
         owner_scope: ProviderOwnerScope::Workspace,
         owner_user_id: None,
-        status: if config.configured {
+        status: if config.connected {
             ProviderAccountStatus::Active
-        } else {
+        } else if config.configured {
             ProviderAccountStatus::NeedsReauth
+        } else {
+            ProviderAccountStatus::Disabled
         },
         capabilities: json!({
-            "bot_open_id": config.bot_open_id.clone(),
             "channel": notification_channel,
             "bound_users": bound_users,
+            "reply": config.capabilities.reply,
+            "update": config.capabilities.update,
+            "attachments": config.capabilities.attachments,
         }),
         metadata: json!({
-            "app_id": config.app_id.clone(),
-            "app_name": config.app_name.clone(),
+            "platform": config.platform.clone(),
+            "display_name": config.app_name.clone(),
             "status": config.status.clone(),
+            "gateway_base_url": config.gateway_base_url.clone(),
+            "last_checked_at": config.last_checked_at.clone(),
         }),
     })
 }
 
 fn build_user_accounts(state: &AdminConsoleState, workspace: &Workspace) -> Vec<UserAccount> {
     let bindings = resolved_identity_binding_records(state);
-    let mut users = vec![UserAccount {
-        user_id: workspace.owner_user_id.clone(),
-        display_name: "本地管理员".to_string(),
-        email: None,
-        phone: None,
-        status: UserStatus::Active,
-        default_workspace_id: Some(workspace.workspace_id.clone()),
-        preferences: json!({
-            "bootstrap": true,
-            "channel": "local_console",
-        }),
-    }];
+    let mut users = vec![preserve_custom_user_account(
+        &state.platform.users,
+        UserAccount {
+            user_id: workspace.owner_user_id.clone(),
+            display_name: harboros_current_user_display_name(),
+            email: None,
+            phone: None,
+            status: UserStatus::Active,
+            default_workspace_id: Some(workspace.workspace_id.clone()),
+            preferences: json!({
+                "bootstrap": true,
+                "channel": "harbor_os",
+                "auth_source": "harbor_os",
+            }),
+        },
+    )];
 
     for binding in &bindings {
         let user_id = projected_user_id_for_binding(binding);
         if users.iter().any(|user| user.user_id == user_id) {
             continue;
         }
-        users.push(build_user_account_projection(
-            binding,
-            &workspace.workspace_id,
+        users.push(preserve_custom_user_account(
+            &state.platform.users,
+            build_user_account_projection(binding, &workspace.workspace_id),
         ));
     }
 
@@ -1296,10 +2675,156 @@ fn build_user_account_projection(
         phone: None,
         status: UserStatus::Active,
         default_workspace_id: Some(workspace_id.to_string()),
-        preferences: json!({
-            "auth_source": "im_bridge",
-            "open_id": binding.open_id.clone(),
-        }),
+        preferences: default_user_preferences(&binding.open_id),
+    }
+}
+
+fn default_user_preferences(open_id: &str) -> Value {
+    json!({
+        "auth_source": "im_bridge",
+        "open_id": open_id,
+        "delivery": {
+            "default_surface": DEFAULT_PROACTIVE_DELIVERY_SURFACE,
+        }
+    })
+}
+
+fn preserve_custom_user_account(
+    existing_users: &[UserAccount],
+    mut user: UserAccount,
+) -> UserAccount {
+    let Some(existing) = existing_users
+        .iter()
+        .find(|existing| existing.user_id == user.user_id)
+    else {
+        return user;
+    };
+
+    if !existing.display_name.trim().is_empty() {
+        user.display_name = existing.display_name.clone();
+    }
+    if existing.email.is_some() {
+        user.email = existing.email.clone();
+    }
+    if existing.phone.is_some() {
+        user.phone = existing.phone.clone();
+    }
+    user.status = existing.status;
+    if existing.default_workspace_id.is_some() {
+        user.default_workspace_id = existing.default_workspace_id.clone();
+    }
+    let keep_existing_preferences = match &existing.preferences {
+        Value::Null => false,
+        Value::Object(map) => !map.is_empty(),
+        _ => true,
+    };
+    if keep_existing_preferences {
+        user.preferences = existing.preferences.clone();
+    }
+
+    user
+}
+
+pub fn normalize_delivery_surface(value: &str) -> Option<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "feishu" => Some("feishu".to_string()),
+        "weixin" => Some("weixin".to_string()),
+        _ => None,
+    }
+}
+
+pub fn user_default_delivery_surface(user: &UserAccount) -> Option<String> {
+    user.preferences
+        .pointer("/delivery/default_surface")
+        .and_then(Value::as_str)
+        .and_then(normalize_delivery_surface)
+        .or_else(|| Some(DEFAULT_PROACTIVE_DELIVERY_SURFACE.to_string()))
+}
+
+pub fn user_recent_interactive_surface(user: &UserAccount) -> Option<String> {
+    user.preferences
+        .pointer("/delivery/recent_interactive_surface")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+}
+
+fn set_user_default_delivery_surface(user: &mut UserAccount, surface: &str) {
+    if !user.preferences.is_object() {
+        user.preferences = json!({});
+    }
+    let Some(root) = user.preferences.as_object_mut() else {
+        return;
+    };
+    let delivery = root
+        .entry("delivery".to_string())
+        .or_insert_with(|| json!({}));
+    if !delivery.is_object() {
+        *delivery = json!({});
+    }
+    if let Some(delivery_obj) = delivery.as_object_mut() {
+        delivery_obj.insert(
+            "default_surface".to_string(),
+            Value::String(surface.to_string()),
+        );
+    }
+}
+
+fn set_user_recent_interactive_surface(
+    user: &mut UserAccount,
+    surface: &str,
+    route_key: Option<&str>,
+) {
+    if !user.preferences.is_object() {
+        user.preferences = json!({});
+    }
+    let Some(root) = user.preferences.as_object_mut() else {
+        return;
+    };
+    let delivery = root
+        .entry("delivery".to_string())
+        .or_insert_with(|| json!({}));
+    if !delivery.is_object() {
+        *delivery = json!({});
+    }
+    if let Some(delivery_obj) = delivery.as_object_mut() {
+        delivery_obj.insert(
+            "recent_interactive_surface".to_string(),
+            Value::String(surface.to_string()),
+        );
+        if let Some(route_key) = route_key.map(str::trim).filter(|value| !value.is_empty()) {
+            delivery_obj.insert(
+                "recent_interactive_route_key".to_string(),
+                Value::String(route_key.to_string()),
+            );
+        }
+    }
+}
+
+fn binding_availability_for_surface(
+    binding: &IdentityBindingRecord,
+    surface: &str,
+) -> (bool, String, String) {
+    let available = binding
+        .chat_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+        || !binding.open_id.trim().is_empty();
+    if available {
+        (
+            true,
+            "available".to_string(),
+            format!("{surface} binding is available via HarborGate-owned identity linkage"),
+        )
+    } else {
+        (
+            false,
+            "blocked".to_string(),
+            format!("{surface} binding is missing an open_id/chat_id projection"),
+        )
     }
 }
 
@@ -1463,32 +2988,7 @@ fn build_credentials(state: &AdminConsoleState) -> Vec<CredentialRecord> {
             }),
         });
     }
-    if let Some(credential) = build_bridge_secret_credential(&state.bridge_provider) {
-        credentials.push(credential);
-    }
     credentials
-}
-
-fn build_bridge_secret_credential(config: &BridgeProviderConfig) -> Option<CredentialRecord> {
-    if config.app_secret.trim().is_empty() {
-        return None;
-    }
-
-    Some(CredentialRecord {
-        credential_id: BRIDGE_APP_SECRET_CREDENTIAL_ID.to_string(),
-        provider_account_id: BRIDGE_PROVIDER_ACCOUNT_ID.to_string(),
-        credential_kind: CredentialKind::ApiKey,
-        vault_key: "admin_console.bridge_provider.app_secret".to_string(),
-        scope: json!({
-            "app_id": config.app_id.clone(),
-        }),
-        expires_at: None,
-        rotation_state: CredentialRotationState::Valid,
-        last_verified_at: None,
-        metadata: json!({
-            "configured": config.configured,
-        }),
-    })
 }
 
 fn build_recording_policy(state: &AdminConsoleState) -> RecordingPolicy {
@@ -1496,7 +2996,7 @@ fn build_recording_policy(state: &AdminConsoleState) -> RecordingPolicy {
     RecordingPolicy {
         recording_policy_id: DEFAULT_RECORDING_POLICY_ID.to_string(),
         workspace_id: DEFAULT_WORKSPACE_ID.to_string(),
-        device_id: None,
+        device_id: state.defaults.selected_camera_device_id.clone(),
         trigger_mode,
         pre_event_seconds: if trigger_mode == RecordingTriggerMode::Event {
             15
@@ -1508,11 +3008,7 @@ fn build_recording_policy(state: &AdminConsoleState) -> RecordingPolicy {
         } else {
             0
         },
-        clip_length_seconds: match trigger_mode {
-            RecordingTriggerMode::Continuous | RecordingTriggerMode::Schedule => 300,
-            RecordingTriggerMode::Manual => 180,
-            RecordingTriggerMode::Event => 60,
-        },
+        clip_length_seconds: state.defaults.clip_length_seconds,
         retention_days: 30,
         storage_target: StorageTargetKind::Nas,
         metadata: json!({
@@ -1520,6 +3016,9 @@ fn build_recording_policy(state: &AdminConsoleState) -> RecordingPolicy {
             "capture_mode": state.defaults.capture.clone(),
             "ai_mode": state.defaults.ai.clone(),
             "notification_channel": state.defaults.notification_channel.clone(),
+            "capture_subdirectory": state.defaults.capture_subdirectory.clone(),
+            "keyframe_count": state.defaults.keyframe_count,
+            "keyframe_interval_seconds": state.defaults.keyframe_interval_seconds,
         }),
     }
 }
@@ -1563,11 +3062,41 @@ pub fn default_rtsp_port() -> u16 {
 }
 
 pub fn default_rtsp_paths() -> Vec<String> {
-    vec![
-        "/ch1/main".to_string(),
-        "/h264/ch1/main/av_stream".to_string(),
-        "/Streaming/Channels/101".to_string(),
-    ]
+    crate::runtime::discovery::default_rtsp_paths()
+}
+
+pub fn default_capture_subdirectory() -> String {
+    "camera-archive".to_string()
+}
+
+pub fn default_clip_length_seconds() -> u32 {
+    12
+}
+
+pub fn default_keyframe_count() -> u32 {
+    4
+}
+
+pub fn default_keyframe_interval_seconds() -> u32 {
+    3
+}
+
+pub fn harboros_current_user_id() -> String {
+    env::var(HARBOROS_CURRENT_USER_ENV)
+        .ok()
+        .and_then(|value| non_empty_opt(&value))
+        .unwrap_or_else(|| DEFAULT_WORKSPACE_OWNER_ID.to_string())
+}
+
+pub fn harboros_current_user_display_name() -> String {
+    harboros_current_user_id()
+}
+
+pub fn harboros_writable_root() -> String {
+    env::var(HARBOROS_WRITABLE_ROOT_ENV)
+        .ok()
+        .and_then(|value| non_empty_opt(&value))
+        .unwrap_or_else(|| DEFAULT_HARBOROS_WRITABLE_ROOT.to_string())
 }
 
 fn detect_primary_private_ipv4_cidr() -> Option<String> {
@@ -1702,6 +3231,9 @@ mod tests {
 
     use crate::control_plane::auth::{AuthSource, IdentityBinding};
     use crate::control_plane::media::RecordingTriggerMode;
+    use crate::control_plane::models::{
+        ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind,
+    };
     use crate::control_plane::users::{
         Membership, MembershipStatus, RoleKind, UserAccount, UserStatus,
     };
@@ -1709,12 +3241,13 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        build_platform_state, dedupe_rtsp_paths, derive_rtsp_hints, normalize_binding_code,
-        normalize_loaded_admin_state, parse_rtsp_auth, parse_rtsp_path,
-        resolved_identity_binding_records, resolved_remote_view_config, AdminConsoleStore,
-        AdminDefaults, BridgeProviderConfig, IdentityBindingRecord, RemoteViewConfig,
-        BRIDGE_APP_SECRET_CREDENTIAL_ID, BRIDGE_PROVIDER_ACCOUNT_ID, LOCAL_RTSP_CREDENTIAL_ID,
-        LOCAL_RTSP_PROVIDER_ACCOUNT_ID,
+        account_management_snapshot, build_platform_state, dedupe_rtsp_paths, default_rtsp_paths,
+        derive_rtsp_hints, normalize_binding_code, normalize_loaded_admin_state, parse_rtsp_auth,
+        parse_rtsp_path, resolved_identity_binding_records, resolved_remote_view_config,
+        sanitize_bridge_provider_config, user_default_delivery_surface,
+        user_recent_interactive_surface, AdminConsoleStore, AdminDefaults,
+        BridgeProviderCapabilities, BridgeProviderConfig, IdentityBindingRecord, RemoteViewConfig,
+        BRIDGE_PROVIDER_ACCOUNT_ID, LOCAL_RTSP_CREDENTIAL_ID, LOCAL_RTSP_PROVIDER_ACCOUNT_ID,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -1722,7 +3255,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        std::env::temp_dir().join(format!("harbornas-{name}-{unique}.json"))
+        std::env::temp_dir().join(format!("harborbeacon-{name}-{unique}.json"))
     }
 
     #[test]
@@ -1748,6 +3281,13 @@ mod tests {
             " /Streaming/Channels/101 ".to_string(),
         ]);
         assert_eq!(paths, vec!["/ch1/main", "/Streaming/Channels/101"]);
+    }
+
+    #[test]
+    fn default_rtsp_paths_include_tp_link_stream_candidates() {
+        let paths = default_rtsp_paths();
+        assert!(paths.contains(&"/stream1".to_string()));
+        assert!(paths.contains(&"/stream2".to_string()));
     }
 
     #[test]
@@ -1866,6 +3406,11 @@ mod tests {
                 rtsp_password: "secret-rtsp".to_string(),
                 rtsp_port: 8554,
                 rtsp_paths: vec!["/alt/main".to_string()],
+                selected_camera_device_id: Some("camera-selected".to_string()),
+                capture_subdirectory: "release-v1".to_string(),
+                clip_length_seconds: 12,
+                keyframe_count: 5,
+                keyframe_interval_seconds: 2,
             })
             .expect("save defaults");
 
@@ -1976,52 +3521,403 @@ mod tests {
     }
 
     #[test]
-    fn save_bridge_provider_config_returns_updated_platform_projection() {
-        let registry_path = temp_path("registry-bridge");
-        let admin_path = temp_path("admin-bridge");
+    fn set_member_default_delivery_surface_persists_member_preference() {
+        let registry_path = temp_path("registry-delivery-surface");
+        let admin_path = temp_path("admin-delivery-surface");
         let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
         let store = AdminConsoleStore::new(admin_path.clone(), registry);
+        let state = store.load_or_create_state().expect("state");
+
+        store
+            .bind_identity_user(
+                &state.binding.qr_token,
+                IdentityBindingRecord {
+                    open_id: "ou_weixin_member".to_string(),
+                    user_id: Some("user-weixin".to_string()),
+                    union_id: None,
+                    display_name: "Weixin Member".to_string(),
+                    chat_id: Some("oc_weixin_member".to_string()),
+                },
+            )
+            .expect("bind");
 
         let updated = store
-            .save_bridge_provider_config(BridgeProviderConfig {
-                configured: true,
-                app_id: "cli_a1".to_string(),
-                app_secret: "secret".to_string(),
-                app_name: "HarborNAS".to_string(),
-                bot_open_id: "ou_bot".to_string(),
-                status: "已连接".to_string(),
-            })
-            .expect("save bridge provider");
-
-        assert_eq!(updated.binding.metric, "Bridge 已连接");
-        assert_eq!(updated.binding.bound_user.as_deref(), Some("HarborNAS"));
-        assert!(updated.platform.provider_accounts.iter().any(|provider| {
-            provider.provider_account_id == BRIDGE_PROVIDER_ACCOUNT_ID
-                && provider.metadata["app_id"] == json!("cli_a1")
-        }));
-        assert!(updated.platform.credentials.iter().any(|credential| {
-            credential.credential_id == BRIDGE_APP_SECRET_CREDENTIAL_ID
-                && credential.vault_key == "admin_console.bridge_provider.app_secret"
-        }));
+            .set_member_default_delivery_surface("user-weixin", "weixin")
+            .expect("set default delivery surface");
+        let user = updated
+            .platform
+            .users
+            .iter()
+            .find(|user| user.user_id == "user-weixin")
+            .expect("user");
+        assert_eq!(
+            user_default_delivery_surface(user).as_deref(),
+            Some("weixin")
+        );
 
         let reloaded = store.load_or_create_state().expect("reload");
-        assert_eq!(reloaded.bridge_provider.app_id, "cli_a1");
-        assert_eq!(reloaded.bridge_provider.app_name, "HarborNAS");
+        let user = reloaded
+            .platform
+            .users
+            .iter()
+            .find(|user| user.user_id == "user-weixin")
+            .expect("user");
+        assert_eq!(
+            user_default_delivery_surface(user).as_deref(),
+            Some("weixin")
+        );
 
         let _ = std::fs::remove_file(admin_path);
         let _ = std::fs::remove_file(registry_path);
     }
 
     #[test]
-    fn platform_projection_adds_bridge_provider_and_secret_metadata() {
+    fn notification_targets_persist_with_single_default() {
+        let registry_path = temp_path("registry-notification-targets");
+        let admin_path = temp_path("admin-notification-targets");
+        let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
+        let store = AdminConsoleStore::new(admin_path.clone(), registry);
+
+        let updated = store
+            .upsert_notification_target(None, "我的微信", "gw_route_weixin", "weixin", true)
+            .expect("save target");
+        assert_eq!(updated.notification_targets.len(), 1);
+        assert!(updated.notification_targets[0].is_default);
+        assert_eq!(updated.notification_targets[0].platform_hint, "weixin");
+
+        let updated = store
+            .upsert_notification_target(None, "值班飞书", "gw_route_feishu", "feishu", false)
+            .expect("save second target");
+        assert_eq!(updated.notification_targets.len(), 2);
+        assert_eq!(
+            updated
+                .notification_targets
+                .iter()
+                .filter(|target| target.is_default)
+                .count(),
+            1
+        );
+        assert_eq!(
+            updated
+                .notification_targets
+                .iter()
+                .find(|target| target.is_default)
+                .map(|target| target.route_key.as_str()),
+            Some("gw_route_weixin")
+        );
+
+        let target_id = updated
+            .notification_targets
+            .iter()
+            .find(|target| target.route_key == "gw_route_feishu")
+            .map(|target| target.target_id.clone())
+            .expect("feishu target");
+        let updated = store
+            .set_default_notification_target(&target_id)
+            .expect("set default target");
+        assert_eq!(
+            updated
+                .notification_targets
+                .iter()
+                .find(|target| target.is_default)
+                .map(|target| target.route_key.as_str()),
+            Some("gw_route_feishu")
+        );
+
+        let _ = std::fs::remove_file(admin_path);
+        let _ = std::fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn record_member_interactive_surface_persists_recent_surface() {
+        let registry_path = temp_path("registry-recent-surface");
+        let admin_path = temp_path("admin-recent-surface");
+        let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
+        let store = AdminConsoleStore::new(admin_path.clone(), registry);
+        let state = store.load_or_create_state().expect("state");
+
+        store
+            .bind_identity_user(
+                &state.binding.qr_token,
+                IdentityBindingRecord {
+                    open_id: "ou_recent_member".to_string(),
+                    user_id: Some("user-recent".to_string()),
+                    union_id: None,
+                    display_name: "Recent Member".to_string(),
+                    chat_id: Some("oc_recent_member".to_string()),
+                },
+            )
+            .expect("bind");
+        store
+            .record_member_interactive_surface("user-recent", "weixin", Some("gw_route_recent"))
+            .expect("record surface");
+
+        let reloaded = store.load_or_create_state().expect("reload");
+        let user = reloaded
+            .platform
+            .users
+            .iter()
+            .find(|user| user.user_id == "user-recent")
+            .expect("user");
+        assert_eq!(
+            user_recent_interactive_surface(user).as_deref(),
+            Some("weixin")
+        );
+        assert_eq!(
+            user.preferences["delivery"]["recent_interactive_route_key"],
+            json!("gw_route_recent")
+        );
+
+        let _ = std::fs::remove_file(admin_path);
+        let _ = std::fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn record_model_endpoint_test_result_persists_health_and_last_test() {
+        let registry_path = temp_path("registry-model-test");
+        let admin_path = temp_path("admin-model-test");
+        let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
+        let store = AdminConsoleStore::new(admin_path.clone(), registry);
+
+        store
+            .save_model_endpoint(ModelEndpoint {
+                model_endpoint_id: "vlm-test".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Vlm,
+                endpoint_kind: ModelEndpointKind::Local,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "vision".to_string(),
+                capability_tags: vec!["multimodal".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({}),
+            })
+            .expect("save model endpoint");
+
+        let updated = store
+            .record_model_endpoint_test_result(
+                "vlm-test",
+                false,
+                "degraded",
+                "HTTP probe failed",
+                json!({"http_status": 502}),
+            )
+            .expect("record test result");
+
+        let endpoint = updated
+            .models
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "vlm-test")
+            .expect("endpoint");
+        assert_eq!(endpoint.status, ModelEndpointStatus::Degraded);
+        assert_eq!(endpoint.metadata["health_status"], json!("degraded"));
+        assert_eq!(endpoint.metadata["last_test"]["ok"], json!(false));
+        assert_eq!(
+            endpoint.metadata["last_test"]["summary"],
+            json!("HTTP probe failed")
+        );
+
+        let reloaded = store.load_or_create_state().expect("reload");
+        let endpoint = reloaded
+            .models
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "vlm-test")
+            .expect("endpoint");
+        assert_eq!(endpoint.status, ModelEndpointStatus::Degraded);
+        assert_eq!(
+            endpoint.metadata["last_test"]["details"]["http_status"],
+            json!(502)
+        );
+
+        let _ = std::fs::remove_file(admin_path);
+        let _ = std::fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn save_bridge_provider_status_returns_updated_platform_projection() {
+        let registry_path = temp_path("registry-bridge");
+        let admin_path = temp_path("admin-bridge");
+        let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
+        let store = AdminConsoleStore::new(admin_path.clone(), registry);
+
+        let updated = store
+            .save_bridge_provider_status(BridgeProviderConfig {
+                configured: true,
+                connected: true,
+                platform: "feishu".to_string(),
+                gateway_base_url: "http://gateway.local:4180".to_string(),
+                app_name: "HarborBeacon Bot".to_string(),
+                status: "已连接".to_string(),
+                last_checked_at: "2026-04-18T10:00:00Z".to_string(),
+                capabilities: BridgeProviderCapabilities {
+                    reply: true,
+                    update: true,
+                    attachments: true,
+                },
+                ..Default::default()
+            })
+            .expect("save bridge provider status");
+
+        assert_eq!(updated.binding.metric, "Gateway 在线");
+        assert_eq!(
+            updated.binding.bound_user.as_deref(),
+            Some("HarborBeacon Bot")
+        );
+        assert!(updated.platform.provider_accounts.iter().any(|provider| {
+            provider.provider_account_id == BRIDGE_PROVIDER_ACCOUNT_ID
+                && provider.metadata["platform"] == json!("feishu")
+                && provider.metadata["display_name"] == json!("HarborBeacon Bot")
+        }));
+        assert!(updated.platform.credentials.is_empty());
+
+        let reloaded = store.load_or_create_state().expect("reload");
+        assert_eq!(reloaded.bridge_provider.app_name, "HarborBeacon Bot");
+        assert_eq!(
+            reloaded.bridge_provider.gateway_base_url,
+            "http://gateway.local:4180"
+        );
+        assert_eq!(reloaded.bridge_provider.app_secret, "");
+        assert_eq!(reloaded.bridge_provider.bot_open_id, "");
+
+        let _ = std::fs::remove_file(admin_path);
+        let _ = std::fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn account_management_snapshot_surfaces_workspace_member_identity_and_governance_views() {
+        let registry_path = temp_path("registry-account");
+        let admin_path = temp_path("admin-account");
+        let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
+        let store = AdminConsoleStore::new(admin_path.clone(), registry);
+        let mut state = store.load_or_create_state().expect("state");
+
+        state.platform.memberships.push(Membership {
+            membership_id: "membership-u_demo".to_string(),
+            workspace_id: "home-1".to_string(),
+            user_id: "u_demo".to_string(),
+            role_kind: RoleKind::Viewer,
+            status: MembershipStatus::Active,
+            granted_by_user_id: Some("local-owner".to_string()),
+            granted_at: None,
+        });
+        state.platform.users.push(UserAccount {
+            user_id: "u_demo".to_string(),
+            display_name: "Bean".to_string(),
+            email: None,
+            phone: None,
+            status: UserStatus::Active,
+            default_workspace_id: Some("home-1".to_string()),
+            preferences: json!({}),
+        });
+        state.platform.identity_bindings.push(IdentityBinding {
+            identity_id: "identity-ou_demo".to_string(),
+            user_id: "u_demo".to_string(),
+            auth_source: AuthSource::ImChannel,
+            provider_key: "im_bridge".to_string(),
+            external_user_id: "ou_demo".to_string(),
+            external_union_id: Some("on_demo".to_string()),
+            external_chat_id: Some("oc_demo".to_string()),
+            profile_snapshot: json!({
+                "display_name": "Bean",
+            }),
+            last_seen_at: None,
+        });
+        state.bridge_provider = BridgeProviderConfig {
+            configured: true,
+            connected: true,
+            platform: "feishu".to_string(),
+            gateway_base_url: "http://gateway.local:4180".to_string(),
+            app_name: "HarborBeacon Bot".to_string(),
+            status: "已连接".to_string(),
+            last_checked_at: "2026-04-18T10:00:00Z".to_string(),
+            capabilities: BridgeProviderCapabilities {
+                reply: true,
+                update: true,
+                attachments: true,
+            },
+            ..Default::default()
+        };
+
+        let snapshot = account_management_snapshot(&state, Some("http://harborbeacon.local:4174"));
+
+        assert_eq!(snapshot.workspace.workspace_id, "home-1");
+        assert_eq!(snapshot.workspace.member_count, 2);
+        assert_eq!(snapshot.workspace.identity_binding_count, 1);
+        assert_eq!(snapshot.member_role_counts.len(), 6);
+        assert!(snapshot
+            .member_role_counts
+            .iter()
+            .any(|summary| summary.role_kind == "owner" && summary.member_count == 1));
+        assert!(snapshot
+            .member_role_counts
+            .iter()
+            .any(|summary| summary.role_kind == "viewer" && summary.member_count == 1));
+        assert_eq!(snapshot.identity_bindings.len(), 1);
+        assert_eq!(snapshot.identity_bindings[0].open_id, "ou_demo");
+        assert_eq!(snapshot.identity_bindings[0].role_kind, "viewer");
+        assert_eq!(
+            snapshot.identity_bindings[0].proactive_delivery_surface,
+            "feishu"
+        );
+        assert_eq!(
+            snapshot.identity_bindings[0].binding_availability,
+            "available"
+        );
+        assert!(snapshot.identity_bindings[0].binding_available);
+        assert_eq!(snapshot.access_governance.permission_rule_count, 9);
+        assert_eq!(snapshot.access_governance.owner_count, 1);
+        assert_eq!(snapshot.access_governance.member_count, 2);
+        assert_eq!(snapshot.access_governance.role_policies.len(), 6);
+        assert_eq!(snapshot.gateway.setup_url, "");
+        assert_eq!(snapshot.gateway.static_setup_url, "");
+        assert_eq!(snapshot.gateway.manage_url, "http://gateway.local:4180/admin/im");
+        assert_eq!(snapshot.delivery_policy.interactive_reply, "source_bound");
+        assert_eq!(
+            snapshot.delivery_policy.proactive_delivery,
+            "notification_target_default"
+        );
+
+        let _ = std::fs::remove_file(admin_path);
+        let _ = std::fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn sanitize_bridge_provider_status_keeps_platform_empty_without_feishu_fallback() {
+        let sanitized = sanitize_bridge_provider_config(BridgeProviderConfig {
+            configured: false,
+            connected: false,
+            platform: "   ".to_string(),
+            gateway_base_url: "  http://gateway.local:4180  ".to_string(),
+            app_name: "  HarborBeacon Bot  ".to_string(),
+            ..Default::default()
+        });
+
+        assert_eq!(sanitized.platform, "");
+        assert_eq!(sanitized.gateway_base_url, "http://gateway.local:4180");
+        assert_eq!(sanitized.app_name, "HarborBeacon Bot");
+        assert_eq!(sanitized.status, "未配置");
+    }
+
+    #[test]
+    fn platform_projection_adds_bridge_provider_without_secret_metadata() {
         let mut state = super::AdminConsoleState::default();
         state.bridge_provider = BridgeProviderConfig {
             configured: true,
-            app_id: "cli_a1".to_string(),
-            app_secret: "secret".to_string(),
-            app_name: "HarborNAS".to_string(),
-            bot_open_id: "ou_bot".to_string(),
+            connected: true,
+            platform: "feishu".to_string(),
+            gateway_base_url: "http://gateway.local:4180".to_string(),
+            app_name: "HarborBeacon Bot".to_string(),
             status: "已连接".to_string(),
+            last_checked_at: "2026-04-18T10:00:00Z".to_string(),
+            capabilities: BridgeProviderCapabilities {
+                reply: true,
+                update: false,
+                attachments: true,
+            },
+            ..Default::default()
         };
         state.identity_bindings.push(IdentityBindingRecord {
             open_id: "ou_demo".to_string(),
@@ -2038,11 +3934,15 @@ mod tests {
         assert_eq!(platform.identity_bindings.len(), 1);
         assert!(!platform.permission_bindings.is_empty());
         assert_eq!(platform.provider_accounts.len(), 2);
-        assert_eq!(platform.credentials.len(), 1);
+        assert!(platform.credentials.is_empty());
         assert_eq!(platform.provider_accounts[1].provider_key, "im_bridge");
         assert_eq!(
-            platform.credentials[0].vault_key,
-            "admin_console.bridge_provider.app_secret"
+            platform.provider_accounts[1].metadata["display_name"],
+            json!("HarborBeacon Bot")
+        );
+        assert_eq!(
+            platform.provider_accounts[1].capabilities["reply"],
+            json!(true)
         );
     }
 

@@ -1,9 +1,9 @@
 ---
 applyTo: "**"
-description: "Always enforce HarborNAS assistant architecture constraints: HarborOS core-integration, plugin-based skills, API->midcli->browser->mcp routing, and command-line-first execution."
+description: "Always enforce HarborBeacon assistant architecture constraints: HarborOS core-integration, plugin-based skills, API->midcli->browser->mcp routing, and command-line-first execution."
 ---
 
-# HarborNAS Assistant Constraints (Always On)
+# HarborBeacon Assistant Constraints (Always On)
 
 ## Product boundary
 

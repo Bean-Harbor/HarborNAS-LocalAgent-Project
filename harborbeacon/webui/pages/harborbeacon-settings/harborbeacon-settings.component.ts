@@ -17,8 +17,7 @@ import {
   Channel,
   ChannelConfig,
   ConnectivityResult,
-  FeishuBrowserSetupSession,
-  FeishuOneClickSetupResult,
+  FeishuConfigApplyResult,
   HarborBeaconSettings,
   Route,
   RouteStatus,
@@ -63,9 +62,7 @@ export class HarborBeaconSettingsComponent implements OnInit {
   connectivityResults: ConnectivityResult[] = [];
   testingConnectivity = false;
   feishuSetupRunning = false;
-  feishuSetupResult: FeishuOneClickSetupResult | null = null;
-  feishuBrowserSession: FeishuBrowserSetupSession | null = null;
-  feishuBrowserSetupRunning = false;
+  feishuSetupResult: FeishuConfigApplyResult | null = null;
 
   saving = false;
   loading = true;
@@ -150,10 +147,10 @@ export class HarborBeaconSettingsComponent implements OnInit {
     }
   }
 
-  onOneClickSetupFeishu(config: ChannelConfig): void {
+  onApplyFeishuConfig(config: ChannelConfig): void {
     this.feishuSetupRunning = true;
     this.cdr.markForCheck();
-    this.settingsService.oneClickSetupFeishu({
+    this.settingsService.configureFeishu({
       app_id: config.app_id ?? '',
       app_secret: config.app_secret ?? '',
       webhook_url: config.webhook_url,
@@ -168,111 +165,17 @@ export class HarborBeaconSettingsComponent implements OnInit {
           this.mergeConnectivityResult(result.connectivity);
         }
         this.feishuSetupRunning = false;
-        this.snackBar.open(result.success ? 'Feishu one-click setup completed' : result.message, 'OK', {
+        this.snackBar.open(result.success ? 'Feishu config validated and applied' : result.message, 'OK', {
           duration: result.success ? 3500 : 5000,
         });
         this.cdr.markForCheck();
       },
       error: () => {
         this.feishuSetupRunning = false;
-        this.snackBar.open('Feishu one-click setup failed', 'OK', { duration: 5000 });
+        this.snackBar.open('Feishu config validation failed', 'OK', { duration: 5000 });
         this.cdr.markForCheck();
       },
     });
-  }
-
-  // ---- browser-assisted Feishu setup ----
-
-  private _pollTimer: ReturnType<typeof setInterval> | null = null;
-
-  onBrowserSetupFeishuStart(): void {
-    this.feishuBrowserSetupRunning = true;
-    this.feishuBrowserSession = null;
-    this.cdr.markForCheck();
-
-    this.settingsService.browserSetupFeishuStart({
-      app_name: 'HarborBeacon-Bot',
-      use_playwright: true,
-    }).subscribe({
-      next: (session) => {
-        this.feishuBrowserSession = session;
-        this.feishuBrowserSetupRunning = true;
-        this.cdr.markForCheck();
-        // Start polling — the backend auto-detects login & continues
-        this._startStatusPoll(session.session_id);
-      },
-      error: () => {
-        this.feishuBrowserSetupRunning = false;
-        this.snackBar.open('无法启动浏览器辅助配置', 'OK', { duration: 5000 });
-        this.cdr.markForCheck();
-      },
-    });
-  }
-
-  onBrowserSetupFeishuResume(): void {
-    // Kept for backward compatibility — not normally shown in the UI now
-    if (!this.feishuBrowserSession) return;
-    this.feishuBrowserSetupRunning = true;
-    this.cdr.markForCheck();
-
-    this.settingsService.browserSetupFeishuResume({
-      session_id: this.feishuBrowserSession.session_id,
-    }).subscribe({
-      next: (session) => {
-        this.feishuBrowserSession = session;
-        this.feishuBrowserSetupRunning = false;
-        if (session.status === 'done') {
-          this.load();
-          this.snackBar.open('飞书扫码配置完成！凭证已保存。', 'OK', { duration: 4000 });
-        } else if (session.status === 'error') {
-          this.snackBar.open(`配置失败: ${session.error}`, 'OK', { duration: 5000 });
-        }
-        this.cdr.markForCheck();
-      },
-      error: () => {
-        this.feishuBrowserSetupRunning = false;
-        this.snackBar.open('浏览器辅助配置恢复失败', 'OK', { duration: 5000 });
-        this.cdr.markForCheck();
-      },
-    });
-  }
-
-  onBrowserSetupDismiss(): void {
-    this._stopStatusPoll();
-    this.feishuBrowserSession = null;
-    this.feishuBrowserSetupRunning = false;
-    this.cdr.markForCheck();
-  }
-
-  private _startStatusPoll(sessionId: string): void {
-    this._stopStatusPoll();
-    this._pollTimer = setInterval(() => {
-      this.settingsService.browserSetupFeishuStatus(sessionId).subscribe({
-        next: (session) => {
-          this.feishuBrowserSession = session;
-          this.cdr.markForCheck();
-          if (session.status === 'done') {
-            this._stopStatusPoll();
-            this.feishuBrowserSetupRunning = false;
-            this.load();
-            this.snackBar.open('飞书扫码配置完成！凭证已保存。', 'OK', { duration: 4000 });
-            this.cdr.markForCheck();
-          } else if (session.status === 'error') {
-            this._stopStatusPoll();
-            this.feishuBrowserSetupRunning = false;
-            this.snackBar.open(`配置失败: ${session.error}`, 'OK', { duration: 5000 });
-            this.cdr.markForCheck();
-          }
-        },
-      });
-    }, 2000);
-  }
-
-  private _stopStatusPoll(): void {
-    if (this._pollTimer) {
-      clearInterval(this._pollTimer);
-      this._pollTimer = null;
-    }
   }
 
   // ---- save / load ----

@@ -8,6 +8,7 @@ use crate::runtime::admin_console::AdminConsoleState;
 pub struct AccessIdentityHints {
     pub user_id: Option<String>,
     pub open_id: Option<String>,
+    pub harboros_user_id: Option<String>,
 }
 
 impl AccessIdentityHints {
@@ -18,6 +19,11 @@ impl AccessIdentityHints {
             .is_none_or(str::is_empty)
             && self
                 .open_id
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty)
+            && self
+                .harboros_user_id
                 .as_deref()
                 .map(str::trim)
                 .is_none_or(str::is_empty)
@@ -146,6 +152,15 @@ fn resolve_user_id(
             .ok_or_else(|| format!("未找到 open_id={open_id} 对应的绑定身份。"));
     }
 
+    if let Some(harboros_user_id) = hints
+        .harboros_user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(harboros_user_id.to_string());
+    }
+
     if allow_local_owner_fallback {
         return Ok(workspace.owner_user_id.clone());
     }
@@ -214,6 +229,7 @@ mod tests {
             &AccessIdentityHints {
                 user_id: None,
                 open_id: Some("ou_viewer".to_string()),
+                harboros_user_id: None,
             },
             AccessAction::CameraView,
             "camera:living-room",
@@ -225,11 +241,33 @@ mod tests {
             &AccessIdentityHints {
                 user_id: None,
                 open_id: Some("ou_viewer".to_string()),
+                harboros_user_id: None,
             },
             AccessAction::AdminManage,
             "workspace:home-1",
             false,
         )
         .is_err());
+    }
+
+    #[test]
+    fn harboros_user_hint_reuses_existing_workspace_membership() {
+        let mut state = AdminConsoleState::default();
+        state.platform = build_platform_state(&state);
+
+        let principal = authorize_access(
+            &state,
+            &AccessIdentityHints {
+                user_id: None,
+                open_id: None,
+                harboros_user_id: Some("local-owner".to_string()),
+            },
+            AccessAction::AdminReadState,
+            "workspace:home-1",
+            false,
+        )
+        .expect("principal");
+
+        assert_eq!(principal.user_id, "local-owner");
     }
 }

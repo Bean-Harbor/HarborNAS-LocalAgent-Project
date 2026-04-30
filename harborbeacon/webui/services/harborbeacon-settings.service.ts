@@ -6,11 +6,8 @@ import {
   Channel,
   ChannelConfig,
   ConnectivityResult,
-  FeishuBrowserSetupResumeRequest,
-  FeishuBrowserSetupSession,
-  FeishuBrowserSetupStartRequest,
-  FeishuOneClickSetupRequest,
-  FeishuOneClickSetupResult,
+  FeishuConfigApplyRequest,
+  FeishuConfigApplyResult,
   HarborBeaconSettings,
   RouteStatus,
 } from '../interfaces/harborbeacon-settings.interface';
@@ -23,7 +20,7 @@ import {
  *   GET  /api/v2.0/harborbeacon/settings
  *   PUT  /api/v2.0/harborbeacon/settings
  *   POST /api/v2.0/harborbeacon/settings/test_channel
- *   POST /api/v2.0/harborbeacon/settings/feishu/one_click_setup
+ *   POST /api/v2.0/harborbeacon/settings/feishu/configure
  *   GET  /api/v2.0/harborbeacon/routes/status
  */
 @Injectable({ providedIn: 'root' })
@@ -58,41 +55,12 @@ export class HarborBeaconSettingsService {
     );
   }
 
-  oneClickSetupFeishu(
-    payload: FeishuOneClickSetupRequest,
-  ): Observable<FeishuOneClickSetupResult> {
-    return this.http.post<FeishuOneClickSetupResult>(
-      `${this.base}/settings/feishu/one_click_setup`,
+  configureFeishu(
+    payload: FeishuConfigApplyRequest,
+  ): Observable<FeishuConfigApplyResult> {
+    return this.http.post<FeishuConfigApplyResult>(
+      `${this.base}/settings/feishu/configure`,
       payload,
-    );
-  }
-
-  // ---- Feishu browser-assisted setup ----
-
-  browserSetupFeishuStart(
-    payload: FeishuBrowserSetupStartRequest,
-  ): Observable<FeishuBrowserSetupSession> {
-    return this.http.post<FeishuBrowserSetupSession>(
-      `${this.base}/settings/feishu/browser_setup/start`,
-      payload,
-    );
-  }
-
-  browserSetupFeishuResume(
-    payload: FeishuBrowserSetupResumeRequest,
-  ): Observable<FeishuBrowserSetupSession> {
-    return this.http.post<FeishuBrowserSetupSession>(
-      `${this.base}/settings/feishu/browser_setup/resume`,
-      payload,
-    );
-  }
-
-  browserSetupFeishuStatus(
-    sessionId: string,
-  ): Observable<FeishuBrowserSetupSession> {
-    return this.http.get<FeishuBrowserSetupSession>(
-      `${this.base}/settings/feishu/browser_setup/status`,
-      { params: { session_id: sessionId } },
     );
   }
 

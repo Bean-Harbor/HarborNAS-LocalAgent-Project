@@ -146,7 +146,8 @@
   "room": "客厅",
   "ip": "192.168.3.73",
   "port": 554,
-  "path_candidates": ["/Streaming/Channels/101"],
+  "path_candidates": ["/stream1", "/stream2", "/Streaming/Channels/101"],
+  "snapshot_url": "http://192.168.3.73/snapshot.jpg",
   "username": "optional",
   "password": "optional"
 }
@@ -196,7 +197,7 @@
     {
       "kind": "image",
       "mime_type": "image/jpeg",
-      "path": ".harbornas/tmp/feishu-snapshots/cam.jpg"
+      "path": ".harborbeacon/tmp/feishu-snapshots/cam.jpg"
     }
   ]
 }
@@ -206,18 +207,19 @@
 
 - `LOW`
 
-## 3.4 `camera.live_view`
+## 3.4 `camera.share_link`
 
 用途：
 
-- 获取局域网直连观看链接或外网签名分享链接
+- 生成平台托管的共享观看入口
+- 当前正式动作名为 `camera.share_link`
+- `camera.live_view` 只保留为兼容别名，不再作为冻结主口径
 
 输入：
 
 ```json
 {
-  "device_id": "cam-rtsp-192-168-3-73",
-  "mode": "local_or_share"
+  "device_id": "cam-rtsp-192-168-3-73"
 }
 ```
 
@@ -229,9 +231,9 @@
   "artifacts": [
     {
       "kind": "link",
-      "label": "实时观看",
-      "url": "http://harbornas.local:4174/live/cameras/cam-rtsp-192-168-3-73",
-      "scope": "lan"
+      "label": "共享观看链接",
+      "url": "/shared/cameras/camera-share-token",
+      "scope": "public_link"
     }
   ]
 }
@@ -239,11 +241,12 @@
 
 风险：
 
-- `LOW`
+- `MEDIUM`
 
 说明：
 
-- 若请求外网分享，输出应为签名临时链接，而不是原始设备直连地址
+- 输出应为平台签发的临时共享入口，而不是原始设备直连地址
+- 当前 canary 主链路使用 `share_link_id` / `media_session_id` 追踪共享记录
 
 ## 3.5 `camera.analyze`
 
@@ -274,7 +277,7 @@
   "artifacts": [
     {
       "kind": "image",
-      "path": ".harbornas/vision/annotated/example.jpg"
+      "path": ".harborbeacon/vision/annotated/example.jpg"
     }
   ]
 }
@@ -359,7 +362,7 @@
 适用动作：
 
 - `camera.connect`
-- 后续可能扩展到 `camera.ptz`、`camera.live_view`
+- 后续可能扩展到 `camera.ptz`、`camera.share_link`
 
 ---
 
@@ -371,7 +374,7 @@
 - `camera.connect` -> `CameraHubService::manual_add`
 - `camera.snapshot` -> `CameraHubService::capture_camera_snapshot`
 - `camera.analyze` -> `vision.analyze_camera`
-- `camera.live_view` -> `remote_view + admin api`
+- `camera.share_link` -> `remote_view + admin api`
 - `camera.ptz` -> `feishu_harbor_bot` 现有 PTZ 逻辑，后续应下沉成正式 domain action
 
 ---

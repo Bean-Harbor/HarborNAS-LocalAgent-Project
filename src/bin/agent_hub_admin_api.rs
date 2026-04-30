@@ -1,94 +1,169 @@
 use std::collections::HashMap;
+use std::env;
 use std::fmt::Write as _;
+use std::fs;
 use std::io::{Cursor, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::thread;
+use std::time::Duration;
 
-use clap::Parser;
-use qrcodegen::{QrCode, QrCodeEcc};
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, ResponseBox, Server, StatusCode};
 
-use harbornas_local_agent::control_plane::media::{MediaSession, MediaSessionStatus, ShareLink};
-use harbornas_local_agent::control_plane::users::{MembershipStatus, RoleKind};
-use harbornas_local_agent::runtime::access_control::{
+use harborbeacon_local_agent::connectors::im_gateway::GatewayPlatformStatus;
+use harborbeacon_local_agent::control_plane::media::{MediaSession, MediaSessionStatus, ShareLink};
+use harborbeacon_local_agent::control_plane::models::{
+    ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, ModelRoutePolicy,
+};
+use harborbeacon_local_agent::control_plane::users::{MembershipStatus, RoleKind};
+use harborbeacon_local_agent::runtime::access_control::{
     authorize_access, AccessAction, AccessIdentityHints, AccessPrincipal,
 };
-use harbornas_local_agent::runtime::admin_console::{
-    AdminConsoleState, AdminConsoleStore, AdminDefaults, BridgeProviderConfig,
-    IdentityBindingRecord,
+use harborbeacon_local_agent::runtime::admin_console::{
+    account_management_snapshot, default_capture_subdirectory, default_clip_length_seconds,
+    default_keyframe_count, default_keyframe_interval_seconds, default_model_endpoints,
+    normalize_delivery_surface, user_default_delivery_surface, user_recent_interactive_surface,
+    AccountManagementSnapshot, AdminConsoleState, AdminConsoleStore, AdminDefaults,
+    BridgeProviderConfig, GatewayStatusSummary,
 };
-use harbornas_local_agent::runtime::hub::{
-    build_mobile_setup_url, CameraHubService, HubManualAddSummary, HubScanRequest, HubScanSummary,
+use harborbeacon_local_agent::runtime::hub::{
+    CameraConnectRequest, CameraHubService, HubManualAddSummary, HubScanRequest, HubScanSummary,
     HubStateSnapshot,
 };
-use harbornas_local_agent::runtime::registry::{CameraDevice, DeviceRegistryStore};
-use harbornas_local_agent::runtime::remote_view;
-use harbornas_local_agent::runtime::task_api::{
+use harborbeacon_local_agent::runtime::media_tools::{ffmpeg_resolution_hint, resolve_ffmpeg_bin};
+use harborbeacon_local_agent::runtime::model_center::{
+    redact_model_endpoint, test_model_endpoint, ModelEndpointTestResult,
+};
+use harborbeacon_local_agent::runtime::registry::{CameraDevice, DeviceRegistryStore};
+use harborbeacon_local_agent::runtime::remote_view;
+use harborbeacon_local_agent::runtime::task_api::{
     TaskApiService, TaskApprovalSummary, TaskIntent, TaskRequest, TaskResponse, TaskSource,
     TaskStatus,
 };
-use harbornas_local_agent::runtime::task_session::TaskConversationStore;
+use harborbeacon_local_agent::runtime::task_session::TaskConversationStore;
 
-#[derive(Debug, Parser)]
-#[command(name = "agent-hub-admin-api")]
-#[command(about = "Local admin API for HarborNAS Agent Hub demo console")]
+#[derive(Debug, Clone)]
 struct Cli {
-    #[arg(long, default_value = "127.0.0.1:4174", help = "Bind address")]
     bind: String,
-
-    #[arg(
-        long,
-        default_value = ".harbornas/admin-console.json",
-        help = "Admin console state file"
-    )]
     admin_state: PathBuf,
-
-    #[arg(
-        long,
-        default_value = ".harbornas/device-registry.json",
-        help = "Device registry file"
-    )]
     device_registry: PathBuf,
-
-    #[arg(
-        long,
-        default_value = ".harbornas/task-api-conversations.json",
-        help = "Task API conversation state file"
-    )]
     conversations: PathBuf,
-
-    #[arg(
-        long,
-        default_value = "http://harbornas.local:4174",
-        help = "Public origin used in QR setup URL"
-    )]
+    harbordesk_dist: PathBuf,
     public_origin: String,
+}
+
+fn take_value(args: &[String], index: &mut usize, flag: &str) -> String {
+    *index += 1;
+    if *index >= args.len() {
+        fail(&format!("missing value for {flag}"));
+    }
+    args[*index].clone()
+}
+
+fn fail(message: &str) -> ! {
+    eprintln!("{message}");
+    std::process::exit(2);
+}
+
+fn print_usage() {
+    eprintln!(
+        "Usage: agent-hub-admin-api [--bind ADDR] [--admin-state PATH] [--device-registry PATH] [--conversations PATH] [--harbordesk-dist PATH] [--public-origin URL]"
+    );
+}
+
+impl Default for Cli {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1:4174".to_string(),
+            admin_state: PathBuf::from(".harborbeacon/admin-console.json"),
+            device_registry: PathBuf::from(".harborbeacon/device-registry.json"),
+            conversations: PathBuf::from(".harborbeacon/task-api-conversations.json"),
+            harbordesk_dist: PathBuf::from("frontend/harbordesk/dist/harbordesk"),
+            public_origin: "http://harborbeacon.local:4174".to_string(),
+        }
+    }
+}
+
+impl Cli {
+    fn parse() -> Self {
+        let args = std::env::args().skip(1).collect::<Vec<_>>();
+        if matches!(args.first().map(String::as_str), Some("--help" | "-h")) {
+            print_usage();
+            std::process::exit(0);
+        }
+
+        let mut cli = Self::default();
+        let mut index = 0;
+        while index < args.len() {
+            let arg = &args[index];
+            match arg.as_str() {
+                "--bind" => cli.bind = take_value(&args, &mut index, "--bind"),
+                value if value.starts_with("--bind=") => {
+                    cli.bind = value["--bind=".len()..].to_string();
+                }
+                "--admin-state" => {
+                    cli.admin_state = PathBuf::from(take_value(&args, &mut index, "--admin-state"))
+                }
+                value if value.starts_with("--admin-state=") => {
+                    cli.admin_state = PathBuf::from(value["--admin-state=".len()..].to_string())
+                }
+                "--device-registry" => {
+                    cli.device_registry =
+                        PathBuf::from(take_value(&args, &mut index, "--device-registry"))
+                }
+                value if value.starts_with("--device-registry=") => {
+                    cli.device_registry =
+                        PathBuf::from(value["--device-registry=".len()..].to_string())
+                }
+                "--conversations" => {
+                    cli.conversations =
+                        PathBuf::from(take_value(&args, &mut index, "--conversations"))
+                }
+                value if value.starts_with("--conversations=") => {
+                    cli.conversations = PathBuf::from(value["--conversations=".len()..].to_string())
+                }
+                "--harbordesk-dist" => {
+                    cli.harbordesk_dist =
+                        PathBuf::from(take_value(&args, &mut index, "--harbordesk-dist"))
+                }
+                value if value.starts_with("--harbordesk-dist=") => {
+                    cli.harbordesk_dist =
+                        PathBuf::from(value["--harbordesk-dist=".len()..].to_string())
+                }
+                "--public-origin" => {
+                    cli.public_origin = take_value(&args, &mut index, "--public-origin")
+                }
+                value if value.starts_with("--public-origin=") => {
+                    cli.public_origin = value["--public-origin=".len()..].to_string();
+                }
+                "--help" | "-h" => {
+                    print_usage();
+                    std::process::exit(0);
+                }
+                value if value.starts_with('-') => {
+                    fail(&format!("unknown flag: {value}"));
+                }
+                value => {
+                    fail(&format!("unexpected positional argument: {value}"));
+                }
+            }
+            index += 1;
+        }
+
+        cli
+    }
 }
 
 #[derive(Debug, Clone)]
 struct AdminApi {
     admin_store: AdminConsoleStore,
     task_service: TaskApiService,
+    harbordesk_dist: PathBuf,
     public_origin: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct BindingTestRequest {
-    #[serde(default)]
-    binding_code: Option<String>,
-    display_name: String,
-    #[serde(default)]
-    open_id: Option<String>,
-    #[serde(default)]
-    user_id: Option<String>,
-    #[serde(default)]
-    union_id: Option<String>,
-    #[serde(default)]
-    chat_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,6 +172,7 @@ struct ManualAddRequest {
     room: Option<String>,
     ip: String,
     path: Option<String>,
+    snapshot_url: Option<String>,
     username: Option<String>,
     password: Option<String>,
     port: Option<u16>,
@@ -119,12 +195,41 @@ struct DefaultsRequest {
     rtsp_port: Option<u16>,
     #[serde(default)]
     rtsp_paths: Vec<String>,
+    #[serde(default)]
+    selected_camera_device_id: Option<String>,
+    #[serde(default)]
+    capture_subdirectory: Option<String>,
+    #[serde(default)]
+    clip_length_seconds: Option<u32>,
+    #[serde(default)]
+    keyframe_count: Option<u32>,
+    #[serde(default)]
+    keyframe_interval_seconds: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
-struct BridgeConfigRequest {
-    app_id: String,
-    app_secret: String,
+struct BridgeConfigRequest {}
+
+#[derive(Debug, Deserialize)]
+struct NotificationTargetUpsertRequest {
+    #[serde(default)]
+    target_id: Option<String>,
+    label: String,
+    route_key: String,
+    #[serde(default)]
+    platform_hint: String,
+    #[serde(default)]
+    is_default: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct NotificationTargetDefaultRequest {
+    target_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct NotificationTargetsResponse {
+    targets: Vec<harborbeacon_local_agent::runtime::admin_console::NotificationTargetRecord>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -136,6 +241,66 @@ struct ApprovalDecisionRequest {
 #[derive(Debug, Deserialize)]
 struct MembershipRoleUpdateRequest {
     role_kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DefaultDeliverySurfaceUpdateRequest {
+    surface: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelEndpointsResponse {
+    endpoints: Vec<ModelEndpoint>,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelPoliciesResponse {
+    route_policies: Vec<ModelRoutePolicy>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct FeatureAvailabilityResponse {
+    groups: Vec<FeatureAvailabilityGroup>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct FeatureAvailabilityGroup {
+    group_id: String,
+    label: String,
+    items: Vec<FeatureAvailabilityItem>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+struct FeatureAvailabilityItem {
+    feature_id: String,
+    label: String,
+    owner_lane: String,
+    status: String,
+    source_of_truth: String,
+    current_option: String,
+    fallback_order: Vec<String>,
+    blocker: String,
+    evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LocalModelRuntimeProjection {
+    base_url: String,
+    healthz_url: String,
+    api_key_configured: bool,
+    ready: bool,
+    backend_ready: bool,
+    backend_kind: Option<String>,
+    chat_model: Option<String>,
+    embedding_model: Option<String>,
+    note: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelPoliciesRequest {
+    #[serde(default)]
+    route_policies: Vec<ModelRoutePolicy>,
 }
 
 #[derive(Debug, Serialize)]
@@ -151,6 +316,13 @@ struct ApprovalDecisionResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct AdminStateResponse {
+    #[serde(flatten)]
+    state: StateResponse,
+    account_management: AccountManagementSnapshot,
+}
+
+#[derive(Debug, Serialize)]
 struct AccessMemberSummary {
     user_id: String,
     display_name: String,
@@ -163,6 +335,18 @@ struct AccessMemberSummary {
     chat_id: Option<String>,
     can_edit: bool,
     is_owner: bool,
+    #[serde(default)]
+    proactive_delivery_surface: String,
+    #[serde(default)]
+    proactive_delivery_default: bool,
+    #[serde(default)]
+    binding_availability: String,
+    #[serde(default)]
+    binding_available: bool,
+    #[serde(default)]
+    binding_availability_note: String,
+    #[serde(default)]
+    recent_interactive_surface: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -196,11 +380,13 @@ impl AdminApi {
     fn new(
         admin_store: AdminConsoleStore,
         task_service: TaskApiService,
+        harbordesk_dist: PathBuf,
         public_origin: String,
     ) -> Self {
         Self {
             admin_store,
             task_service,
+            harbordesk_dist,
             public_origin,
         }
     }
@@ -230,6 +416,13 @@ impl AdminApi {
         )
     }
 
+    fn authorize_workspace_camera_action(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Result<AccessPrincipal, String> {
+        self.authorize_admin_action(hints, AccessAction::CameraOperate)
+    }
+
     fn authorize_camera_action(
         &self,
         hints: &AccessIdentityHints,
@@ -240,6 +433,37 @@ impl AdminApi {
         authorize_access(&state, hints, action, &format!("camera:{device_id}"), true)
     }
 
+    fn handle_harbordesk(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+
+        let dist_root = resolve_state_path(&self.harbordesk_dist);
+        if !dist_root.exists() {
+            return harbordesk_build_missing_response(&dist_root);
+        }
+
+        if let Some(asset_path) = resolve_harbordesk_asset_path(&dist_root, path) {
+            if asset_path.is_file() {
+                return static_file_response(&asset_path);
+            }
+        }
+
+        if is_harbordesk_client_route(path) {
+            let index_path = dist_root.join("index.html");
+            if index_path.is_file() {
+                return static_file_response(&index_path);
+            }
+            return harbordesk_build_missing_response(&dist_root);
+        }
+
+        error_json(StatusCode(404), "route not found")
+    }
+
     fn handle(&self, mut request: Request) {
         let method = request.method().clone();
         let raw_url = request.url().to_string();
@@ -248,7 +472,7 @@ impl AdminApi {
         let headers = request.headers().to_vec();
         let identity_hints = request_identity_hints(&raw_url, &headers);
 
-        if is_admin_surface_path(path.as_str()) {
+        if is_admin_surface_path(path.as_str()) || is_harbordesk_surface_path(path.as_str()) {
             if let Err(error) = ensure_local_admin_access(remote_addr, &headers) {
                 let _ = request.respond(error_json(StatusCode(403), &error).boxed());
                 return;
@@ -258,6 +482,24 @@ impl AdminApi {
         let response = match method {
             Method::Get if path == "/healthz" => ok_json(&json!({"status":"ok"})).boxed(),
             Method::Get if path == "/api/state" => self.handle_state(&identity_hints).boxed(),
+            Method::Get if path == "/api/account-management" => {
+                self.handle_account_management(&identity_hints).boxed()
+            }
+            Method::Get if path == "/api/gateway/status" => {
+                self.handle_gateway_status(&identity_hints).boxed()
+            }
+            Method::Get if path == "/api/models/endpoints" => {
+                self.handle_model_endpoints(&identity_hints).boxed()
+            }
+            Method::Get if path == "/api/feature-availability" => {
+                self.handle_feature_availability(&identity_hints).boxed()
+            }
+            Method::Get if path == "/api/models/policies" => {
+                self.handle_model_policies(&identity_hints).boxed()
+            }
+            Method::Get if path == "/admin/models" => {
+                self.handle_models_page(&identity_hints).boxed()
+            }
             Method::Get if path == "/api/access/members" => {
                 self.handle_access_members(&identity_hints).boxed()
             }
@@ -266,6 +508,9 @@ impl AdminApi {
             }
             Method::Get if path == "/api/tasks/approvals" => {
                 self.handle_pending_approvals(&identity_hints).boxed()
+            }
+            Method::Get if path == "/api/admin/notification-targets" => {
+                self.handle_notification_targets(&identity_hints).boxed()
             }
             Method::Get if path == "/api/binding/qr.svg" => {
                 self.handle_binding_qr_svg(&identity_hints).boxed()
@@ -303,8 +548,26 @@ impl AdminApi {
             Method::Post if path == "/api/binding/test-bind" => {
                 self.handle_test_bind(&mut request, &identity_hints).boxed()
             }
+            Method::Post if path == "/api/admin/notification-targets" => self
+                .handle_upsert_notification_target(&mut request, &headers)
+                .boxed(),
+            Method::Post if path == "/api/admin/notification-targets/default" => self
+                .handle_set_default_notification_target(&mut request, &identity_hints)
+                .boxed(),
+            Method::Post if path == "/api/models/endpoints" => self
+                .handle_create_model_endpoint(&mut request, &identity_hints)
+                .boxed(),
+            Method::Post
+                if path.starts_with("/api/models/endpoints/") && path.ends_with("/test") =>
+            {
+                self.handle_test_model_endpoint(path.as_str(), &identity_hints)
+                    .boxed()
+            }
             Method::Post if path == "/api/bridge/configure" => self
                 .handle_configure_bridge(&mut request, &identity_hints)
+                .boxed(),
+            Method::Patch if path.starts_with("/api/models/endpoints/") => self
+                .handle_patch_model_endpoint(path.as_str(), &mut request, &identity_hints)
                 .boxed(),
             Method::Post
                 if path.starts_with("/api/tasks/approvals/") && path.ends_with("/approve") =>
@@ -315,6 +578,17 @@ impl AdminApi {
             Method::Post if path.starts_with("/api/access/members/") && path.ends_with("/role") => {
                 self.handle_update_member_role(path.as_str(), &mut request, &identity_hints)
                     .boxed()
+            }
+            Method::Post
+                if path.starts_with("/api/access/members/")
+                    && path.ends_with("/default-delivery-surface") =>
+            {
+                self.handle_update_member_default_delivery_surface(
+                    path.as_str(),
+                    &mut request,
+                    &identity_hints,
+                )
+                .boxed()
             }
             Method::Post
                 if path.starts_with("/api/tasks/approvals/") && path.ends_with("/reject") =>
@@ -346,6 +620,15 @@ impl AdminApi {
             Method::Post if path == "/api/defaults" => self
                 .handle_save_defaults(&mut request, &identity_hints)
                 .boxed(),
+            Method::Put if path == "/api/models/policies" => self
+                .handle_save_model_policies(&mut request, &identity_hints)
+                .boxed(),
+            Method::Delete if path.starts_with("/api/admin/notification-targets/") => self
+                .handle_delete_notification_target(path.as_str(), &identity_hints)
+                .boxed(),
+            Method::Get if is_harbordesk_surface_path(path.as_str()) => self
+                .handle_harbordesk(path.as_str(), &identity_hints)
+                .boxed(),
             Method::Options => no_content().boxed(),
             _ => error_json(StatusCode(404), "route not found").boxed(),
         };
@@ -357,9 +640,280 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
             return error_json(StatusCode(403), &error);
         }
-        match self.current_state() {
-            Ok(payload) => ok_json(&redact_state_snapshot(payload)),
+        self.refresh_gateway_projection_best_effort();
+        let live_bridge_provider = fetch_remote_gateway_status()
+            .ok()
+            .and_then(|payload| live_bridge_provider_from_setup_status(&payload));
+        match self.admin_store.load_or_create_state() {
+            Ok(state) => match self.current_state() {
+                Ok(mut payload) => {
+                    let mut account_management =
+                        account_management_snapshot(&state, Some(&self.public_origin));
+                    if let Some(provider) = live_bridge_provider.as_ref() {
+                        apply_bridge_provider_projection_to_state(&mut payload, provider);
+                        apply_bridge_provider_projection_to_gateway_summary(
+                            &mut account_management.gateway,
+                            provider,
+                        );
+                    }
+                    ok_json(&AdminStateResponse {
+                        state: redact_state_snapshot(payload),
+                        account_management: redact_account_management_snapshot(account_management),
+                    })
+                }
+                Err(error) => error_json(StatusCode(500), &error),
+            },
             Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_account_management(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+
+        self.refresh_gateway_projection_best_effort();
+        let live_bridge_provider = fetch_remote_gateway_status()
+            .ok()
+            .and_then(|payload| live_bridge_provider_from_setup_status(&payload));
+        match self.admin_store.load_or_create_state() {
+            Ok(state) => {
+                let mut snapshot = account_management_snapshot(&state, Some(&self.public_origin));
+                if let Some(provider) = live_bridge_provider.as_ref() {
+                    apply_bridge_provider_projection_to_gateway_summary(
+                        &mut snapshot.gateway,
+                        provider,
+                    );
+                }
+                ok_json(&redact_account_management_snapshot(snapshot))
+            }
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_gateway_status(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+
+        self.refresh_gateway_projection_best_effort();
+        match self.admin_store.load_or_create_state() {
+            Ok(state) => {
+                if let Ok(payload) = fetch_remote_gateway_status() {
+                    ok_json(&payload)
+                } else {
+                    ok_json(&redact_gateway_status_summary(
+                        account_management_snapshot(&state, Some(&self.public_origin)).gateway,
+                    ))
+                }
+            }
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_model_endpoints(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        match self.admin_store.load_or_create_state() {
+            Ok(state) => {
+                let runtime_projection = probe_local_model_runtime(&state.models.endpoints);
+                let endpoints = overlay_model_endpoints_with_runtime_truth(
+                    &state.models.endpoints,
+                    &runtime_projection,
+                );
+                ok_json(&ModelEndpointsResponse {
+                    endpoints: endpoints.iter().map(redact_model_endpoint).collect(),
+                })
+            }
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_feature_availability(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+
+        self.refresh_gateway_projection_best_effort();
+        let live_gateway_status = fetch_remote_gateway_status().ok();
+        let live_bridge_provider = live_gateway_status
+            .as_ref()
+            .and_then(live_bridge_provider_from_setup_status);
+
+        match self.admin_store.load_or_create_state() {
+            Ok(state) => {
+                let runtime_projection = probe_local_model_runtime(&state.models.endpoints);
+                let endpoints = overlay_model_endpoints_with_runtime_truth(
+                    &state.models.endpoints,
+                    &runtime_projection,
+                );
+                let mut account_management =
+                    account_management_snapshot(&state, Some(&self.public_origin));
+                if let Some(provider) = live_bridge_provider.as_ref() {
+                    apply_bridge_provider_projection_to_gateway_summary(
+                        &mut account_management.gateway,
+                        provider,
+                    );
+                }
+                let response = build_feature_availability_response(
+                    &endpoints,
+                    &state.models.route_policies,
+                    &account_management,
+                    live_gateway_status.as_ref(),
+                    &runtime_projection,
+                );
+                ok_json(&response)
+            }
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_model_policies(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        match self.admin_store.load_or_create_state() {
+            Ok(state) => ok_json(&ModelPoliciesResponse {
+                route_policies: state.models.route_policies,
+            }),
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_models_page(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let mut response =
+            Response::from_string(render_models_admin_page()).with_status_code(StatusCode(200));
+        add_common_headers(&mut response);
+        response.add_header(
+            Header::from_bytes(
+                b"Content-Type".as_slice(),
+                b"text/html; charset=utf-8".as_slice(),
+            )
+            .expect("header"),
+        );
+        response
+    }
+
+    fn handle_create_model_endpoint(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        let endpoint: ModelEndpoint = match read_json_body(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        match self.admin_store.save_model_endpoint(endpoint) {
+            Ok(state) => ok_json(&redact_model_endpoint_response(&state.models.endpoints)),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_patch_model_endpoint(
+        &self,
+        path: &str,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        let endpoint_id = match parse_model_endpoint_path(path) {
+            Some(endpoint_id) => endpoint_id,
+            None => return error_json(StatusCode(400), "invalid model endpoint path"),
+        };
+        let patch: Value = match read_json_body(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        match self.admin_store.patch_model_endpoint(&endpoint_id, patch) {
+            Ok(state) => ok_json(&redact_model_endpoint_response(&state.models.endpoints)),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_test_model_endpoint(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        let endpoint_id = match parse_model_endpoint_test_path(path) {
+            Some(endpoint_id) => endpoint_id,
+            None => return error_json(StatusCode(400), "invalid model endpoint test path"),
+        };
+        let state = match self.admin_store.load_or_create_state() {
+            Ok(state) => state,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let Some(endpoint) = state
+            .models
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == endpoint_id)
+        else {
+            return error_json(StatusCode(404), &format!("未找到模型端点 {endpoint_id}"));
+        };
+        let result: ModelEndpointTestResult = test_model_endpoint(endpoint);
+        if let Err(error) = self.admin_store.record_model_endpoint_test_result(
+            &endpoint_id,
+            result.ok,
+            &result.status,
+            &result.summary,
+            result.details.clone(),
+        ) {
+            return error_json(StatusCode(500), &error);
+        }
+        ok_json(&result)
+    }
+
+    fn handle_save_model_policies(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        let payload: ModelPoliciesRequest = match read_json_body(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        match self
+            .admin_store
+            .save_model_route_policies(payload.route_policies)
+        {
+            Ok(state) => ok_json(&ModelPoliciesResponse {
+                route_policies: state.models.route_policies,
+            }),
+            Err(error) => error_json(StatusCode(422), &error),
         }
     }
 
@@ -514,6 +1068,132 @@ impl AdminApi {
         }
     }
 
+    fn handle_update_member_default_delivery_surface(
+        &self,
+        path: &str,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+
+        let user_id = match parse_member_default_delivery_surface_update_path(path) {
+            Some(user_id) => user_id,
+            None => {
+                return error_json(
+                    StatusCode(400),
+                    "invalid member default delivery surface path",
+                )
+            }
+        };
+        let body: DefaultDeliverySurfaceUpdateRequest = match read_json_body(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        let surface = match normalize_delivery_surface(&body.surface) {
+            Some(surface) => surface,
+            None => return error_json(StatusCode(400), "surface 只能是 feishu 或 weixin"),
+        };
+
+        match self
+            .admin_store
+            .set_member_default_delivery_surface(&user_id, &surface)
+            .map(|state| build_access_member_summaries(&state))
+        {
+            Ok(payload) => ok_json(&payload),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_notification_targets(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        match self.admin_store.load_or_create_state() {
+            Ok(state) => ok_json(&NotificationTargetsResponse {
+                targets: state.notification_targets,
+            }),
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_upsert_notification_target(
+        &self,
+        request: &mut Request,
+        headers: &[Header],
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = authorize_gateway_service_request(headers) {
+            return error_json(StatusCode(401), &error);
+        }
+
+        let body: NotificationTargetUpsertRequest = match read_json_body(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        match self
+            .admin_store
+            .upsert_notification_target(
+                body.target_id.as_deref(),
+                &body.label,
+                &body.route_key,
+                &body.platform_hint,
+                body.is_default,
+            )
+            .map(|state| NotificationTargetsResponse {
+                targets: state.notification_targets,
+            })
+        {
+            Ok(payload) => ok_json(&payload),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_set_default_notification_target(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        let body: NotificationTargetDefaultRequest = match read_json_body(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        match self
+            .admin_store
+            .set_default_notification_target(&body.target_id)
+            .map(|state| NotificationTargetsResponse {
+                targets: state.notification_targets,
+            })
+        {
+            Ok(payload) => ok_json(&payload),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_delete_notification_target(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        let target_id = match parse_notification_target_delete_path(path) {
+            Some(target_id) => target_id,
+            None => return error_json(StatusCode(400), "invalid notification target path"),
+        };
+        match self.admin_store.delete_notification_target(&target_id) {
+            Ok(_) => no_content(),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
     fn handle_binding_qr_svg(
         &self,
         hints: &AccessIdentityHints,
@@ -521,28 +1201,7 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
             return error_json(StatusCode(403), &error);
         }
-        let state = match self.current_state() {
-            Ok(state) => state,
-            Err(error) => return error_json(StatusCode(500), &error),
-        };
-        let setup_url = state.binding.setup_url.clone();
-        let qr = match QrCode::encode_text(&setup_url, QrCodeEcc::Medium) {
-            Ok(qr) => qr,
-            Err(error) => {
-                return error_json(StatusCode(500), &format!("qr encode failed: {error}"))
-            }
-        };
-        let svg = qr_to_svg(&qr, 4);
-        let mut response = Response::from_string(svg).with_status_code(StatusCode(200));
-        add_common_headers(&mut response);
-        response.add_header(
-            Header::from_bytes(
-                b"Content-Type".as_slice(),
-                b"image/svg+xml; charset=utf-8".as_slice(),
-            )
-            .expect("header"),
-        );
-        response
+        deprecated_im_binding_response_json(&self.current_gateway_manage_url())
     }
 
     fn handle_static_binding_qr_svg(
@@ -552,60 +1211,18 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
             return error_json(StatusCode(403), &error);
         }
-        let state = match self.current_state() {
-            Ok(state) => state,
-            Err(error) => return error_json(StatusCode(500), &error),
-        };
-        let setup_url = state.binding.static_setup_url.clone();
-        let qr = match QrCode::encode_text(&setup_url, QrCodeEcc::Medium) {
-            Ok(qr) => qr,
-            Err(error) => {
-                return error_json(StatusCode(500), &format!("qr encode failed: {error}"))
-            }
-        };
-        let svg = qr_to_svg(&qr, 4);
-        let mut response = Response::from_string(svg).with_status_code(StatusCode(200));
-        add_common_headers(&mut response);
-        response.add_header(
-            Header::from_bytes(
-                b"Content-Type".as_slice(),
-                b"image/svg+xml; charset=utf-8".as_slice(),
-            )
-            .expect("header"),
-        );
-        response
+        deprecated_im_binding_response_json(&self.current_gateway_manage_url())
     }
 
     fn handle_mobile_setup_page(
         &self,
-        url: &str,
+        _url: &str,
         hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
             return error_json(StatusCode(403), &error);
         }
-        let state = match self.admin_store.load_or_create_state() {
-            Ok(payload) => payload,
-            Err(error) => return error_json(StatusCode(500), &error),
-        };
-        let session_code =
-            parse_query_param(url, "session").unwrap_or_else(|| state.binding.session_code.clone());
-        let body = render_mobile_setup_page(
-            &state,
-            &build_mobile_setup_url(&self.public_origin, Some(&session_code)),
-            &build_mobile_setup_url(&self.public_origin, None),
-            &session_code,
-        );
-        let mut response = Response::from_string(body).with_status_code(StatusCode(200));
-        add_common_headers(&mut response);
-        response.add_header(
-            Header::from_bytes(
-                b"Content-Type".as_slice(),
-                b"text/html; charset=utf-8".as_slice(),
-            )
-            .expect("header"),
-        );
-        response
+        deprecated_im_binding_response_html(&self.current_gateway_manage_url())
     }
 
     fn handle_live_view_page(
@@ -689,93 +1306,25 @@ impl AdminApi {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
             return error_json(StatusCode(403), &error);
         }
-        match self
-            .admin_store
-            .refresh_binding_qr()
-            .and_then(|_| self.current_state())
-        {
-            Ok(payload) => ok_json(&payload),
-            Err(error) => error_json(StatusCode(500), &error),
-        }
+        deprecated_im_binding_response_json(&self.current_gateway_manage_url())
     }
 
     fn handle_demo_bind(&self, hints: &AccessIdentityHints) -> Response<std::io::Cursor<Vec<u8>>> {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
             return error_json(StatusCode(403), &error);
         }
-        match self
-            .admin_store
-            .mark_demo_bound("Bean / 本地管理员")
-            .and_then(|_| self.current_state())
-        {
-            Ok(payload) => ok_json(&payload),
-            Err(error) => error_json(StatusCode(500), &error),
-        }
+        deprecated_im_binding_response_json(&self.current_gateway_manage_url())
     }
 
     fn handle_test_bind(
         &self,
-        request: &mut Request,
+        _request: &mut Request,
         hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
         if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
             return error_json(StatusCode(403), &error);
         }
-        let body: BindingTestRequest = match read_json_body(request) {
-            Ok(payload) => payload,
-            Err(error) => return error_json(StatusCode(400), &error),
-        };
-
-        let display_name = body.display_name.trim();
-        if display_name.is_empty() {
-            return error_json(StatusCode(400), "display_name 不能为空");
-        }
-
-        let state = match self.admin_store.load_or_create_state() {
-            Ok(state) => state,
-            Err(error) => return error_json(StatusCode(500), &error),
-        };
-
-        let binding_code = body
-            .binding_code
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(state.binding.session_code.as_str())
-            .to_string();
-        let open_id = body
-            .open_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| slugify_identity(display_name));
-
-        let user = IdentityBindingRecord {
-            open_id,
-            user_id: body
-                .user_id
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
-            union_id: body
-                .union_id
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
-            display_name: display_name.to_string(),
-            chat_id: body
-                .chat_id
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
-        };
-
-        match self
-            .admin_store
-            .bind_identity_user(&binding_code, user)
-            .and_then(|_| self.current_state())
-        {
-            Ok(payload) => ok_json(&payload),
-            Err(error) => error_json(StatusCode(422), &error),
-        }
+        deprecated_im_binding_response_json(&self.current_gateway_manage_url())
     }
 
     fn handle_configure_bridge(
@@ -791,11 +1340,12 @@ impl AdminApi {
             Err(error) => return error_json(StatusCode(400), &error),
         };
 
-        match self.hub().configure_bridge_provider(
-            &body.app_id,
-            &body.app_secret,
-            Some(&self.public_origin),
-        ) {
+        let _ = body;
+
+        match self
+            .hub()
+            .refresh_bridge_provider_status(Some(&self.public_origin))
+        {
             Ok(payload) => ok_json(&payload),
             Err(error) => error_json(StatusCode(422), &error),
         }
@@ -806,7 +1356,7 @@ impl AdminApi {
         request: &mut Request,
         hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
-        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+        let principal = match self.authorize_workspace_camera_action(hints) {
             Ok(principal) => principal,
             Err(error) => return error_json(StatusCode(403), &error),
         };
@@ -826,7 +1376,7 @@ impl AdminApi {
         request: &mut Request,
         hints: &AccessIdentityHints,
     ) -> Response<std::io::Cursor<Vec<u8>>> {
-        let principal = match self.authorize_admin_action(hints, AccessAction::AdminManage) {
+        let principal = match self.authorize_workspace_camera_action(hints) {
             Ok(principal) => principal,
             Err(error) => return error_json(StatusCode(403), &error),
         };
@@ -865,6 +1415,17 @@ impl AdminApi {
             rtsp_password: body.rtsp_password,
             rtsp_port: body.rtsp_port.unwrap_or(554),
             rtsp_paths: body.rtsp_paths,
+            selected_camera_device_id: body.selected_camera_device_id,
+            capture_subdirectory: body
+                .capture_subdirectory
+                .unwrap_or_else(default_capture_subdirectory),
+            clip_length_seconds: body
+                .clip_length_seconds
+                .unwrap_or_else(default_clip_length_seconds),
+            keyframe_count: body.keyframe_count.unwrap_or_else(default_keyframe_count),
+            keyframe_interval_seconds: body
+                .keyframe_interval_seconds
+                .unwrap_or_else(default_keyframe_interval_seconds),
         };
 
         match self
@@ -1094,6 +1655,32 @@ impl AdminApi {
         self.hub().state_snapshot(Some(&self.public_origin))
     }
 
+    fn current_gateway_manage_url(&self) -> String {
+        self.admin_store
+            .load_or_create_state()
+            .map(|state| {
+                harborbeacon_local_agent::runtime::admin_console::gateway_manage_url(
+                    &state.bridge_provider.gateway_base_url,
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    fn refresh_gateway_projection_best_effort(&self) {
+        if self
+            .hub()
+            .refresh_bridge_provider_status(Some(&self.public_origin))
+            .is_ok()
+        {
+            return;
+        }
+        if let Ok(payload) = fetch_remote_gateway_status() {
+            if let Some(provider) = live_bridge_provider_from_setup_status(&payload) {
+                let _ = self.admin_store.save_bridge_provider_status(provider);
+            }
+        }
+    }
+
     fn scan(
         &self,
         principal: &AccessPrincipal,
@@ -1138,8 +1725,17 @@ impl AdminApi {
         principal: &AccessPrincipal,
         request: ManualAddRequest,
     ) -> Result<ManualAddResponse, String> {
-        let path_candidates = request
-            .path
+        let ManualAddRequest {
+            name,
+            room,
+            ip,
+            path,
+            snapshot_url,
+            username,
+            password,
+            port,
+        } = request;
+        let path_candidates = path
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -1153,6 +1749,25 @@ impl AdminApi {
             .map(|value| vec![value])
             .unwrap_or_default();
 
+        if principal_skips_manual_camera_connect_approval(principal) {
+            return self.hub().manual_add(
+                CameraConnectRequest {
+                    name,
+                    room,
+                    ip,
+                    path_candidates,
+                    username,
+                    password,
+                    port,
+                    snapshot_url,
+                    discovery_source: "admin_console_manual_add".to_string(),
+                    vendor: None,
+                    model: None,
+                },
+                Some(&self.public_origin),
+            );
+        }
+
         let response = self
             .task_service
             .handle_task(self.build_camera_task_request(
@@ -1160,13 +1775,14 @@ impl AdminApi {
                 "connect",
                 "手动接入摄像头",
                 json!({
-                    "name": request.name,
-                    "room": request.room,
-                    "ip": request.ip,
+                    "name": name,
+                    "room": room,
+                    "ip": ip,
                     "path_candidates": path_candidates,
-                    "username": request.username,
-                    "password": request.password,
-                    "port": request.port,
+                    "snapshot_url": snapshot_url,
+                    "username": username,
+                    "password": password,
+                    "port": port,
                     "discovery_source": "admin_console_manual_add",
                 }),
             ));
@@ -1228,7 +1844,7 @@ impl AdminApi {
     fn load_camera_device(
         &self,
         device_id: &str,
-    ) -> Result<harbornas_local_agent::runtime::registry::CameraDevice, String> {
+    ) -> Result<harborbeacon_local_agent::runtime::registry::CameraDevice, String> {
         self.hub()
             .load_registered_cameras()?
             .into_iter()
@@ -1358,6 +1974,7 @@ impl AdminApi {
                 conversation_id: format!("admin-console:{}", principal.user_id),
                 user_id: principal.user_id.clone(),
                 session_id: format!("admin-console:{}", principal.user_id),
+                route_key: String::new(),
             },
             intent: TaskIntent {
                 domain: "camera".to_string(),
@@ -1367,33 +1984,47 @@ impl AdminApi {
             entity_refs: Value::Null,
             args,
             autonomy: Default::default(),
+            message: None,
         }
     }
 }
 
+fn principal_skips_manual_camera_connect_approval(principal: &AccessPrincipal) -> bool {
+    matches!(principal.role_kind, RoleKind::Owner | RoleKind::Admin)
+}
+
 fn main() {
     let cli = Cli::parse();
-    let registry_store = DeviceRegistryStore::new(cli.device_registry);
-    let admin_store = AdminConsoleStore::new(cli.admin_state, registry_store);
-    let conversation_store = TaskConversationStore::new(cli.conversations);
+    let device_registry_path = resolve_state_path(&cli.device_registry);
+    let admin_state_path = resolve_state_path(&cli.admin_state);
+    let conversation_path = resolve_state_path(&cli.conversations);
+    let registry_store = DeviceRegistryStore::new(device_registry_path);
+    let admin_store = AdminConsoleStore::new(admin_state_path, registry_store);
+    let conversation_store = TaskConversationStore::new(conversation_path);
     let task_service = TaskApiService::new(admin_store.clone(), conversation_store);
-    let api = AdminApi::new(admin_store, task_service, cli.public_origin);
+    let api = AdminApi::new(
+        admin_store,
+        task_service,
+        cli.harbordesk_dist,
+        cli.public_origin,
+    );
 
     let server = Server::http(&cli.bind).unwrap_or_else(|error| {
         eprintln!("failed to start admin api on {}: {}", cli.bind, error);
         std::process::exit(1);
     });
 
-    println!(
-        "HarborNAS Agent Hub admin API listening on http://{}",
-        cli.bind
-    );
+    println!("HarborBeacon admin API listening on http://{}", cli.bind);
     for request in server.incoming_requests() {
         let api = api.clone();
         thread::spawn(move || {
             api.handle(request);
         });
     }
+}
+
+fn resolve_state_path(preferred: &Path) -> PathBuf {
+    preferred.to_path_buf()
 }
 
 fn parse_query_param(url: &str, key: &str) -> Option<String> {
@@ -1415,6 +2046,11 @@ fn request_identity_hints(url: &str, headers: &[Header]) -> AccessIdentityHints 
         open_id: header_value(headers, "X-Harbor-Open-Id")
             .or_else(|| parse_query_param(url, "open_id"))
             .and_then(percent_decode_optional_query_value),
+        harboros_user_id: header_value(headers, "X-HarborOS-User")
+            .or_else(|| header_value(headers, "X-Harbor-OS-User"))
+            .or_else(|| parse_query_param(url, "harboros_user"))
+            .and_then(percent_decode_optional_query_value)
+            .or_else(|| std::env::var("HARBOR_HARBOROS_USER").ok()),
     }
 }
 
@@ -1462,6 +2098,45 @@ fn parse_member_role_update_path(path: &str) -> Option<String> {
         None
     } else {
         percent_decode_path_segment(user_id).ok()
+    }
+}
+
+fn parse_member_default_delivery_surface_update_path(path: &str) -> Option<String> {
+    let trimmed = path.strip_prefix("/api/access/members/")?;
+    let user_id = trimmed.strip_suffix("/default-delivery-surface")?.trim();
+    if user_id.is_empty() {
+        None
+    } else {
+        percent_decode_path_segment(user_id).ok()
+    }
+}
+
+fn parse_notification_target_delete_path(path: &str) -> Option<String> {
+    let trimmed = path.strip_prefix("/api/admin/notification-targets/")?.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        percent_decode_path_segment(trimmed).ok()
+    }
+}
+
+fn parse_model_endpoint_path(path: &str) -> Option<String> {
+    let trimmed = path.strip_prefix("/api/models/endpoints/")?;
+    if trimmed.trim().is_empty() || trimmed.ends_with("/test") {
+        return None;
+    }
+    percent_decode_path_segment(trimmed.trim()).ok()
+}
+
+fn parse_model_endpoint_test_path(path: &str) -> Option<String> {
+    let endpoint_id = path
+        .strip_prefix("/api/models/endpoints/")?
+        .strip_suffix("/test")?
+        .trim();
+    if endpoint_id.is_empty() {
+        None
+    } else {
+        percent_decode_path_segment(endpoint_id).ok()
     }
 }
 
@@ -1526,6 +2201,24 @@ fn build_access_member_summaries(state: &AdminConsoleState) -> Vec<AccessMemberS
                 can_edit: membership.user_id != owner_user_id,
                 is_owner: membership.user_id == owner_user_id
                     || membership.role_kind == RoleKind::Owner,
+                proactive_delivery_surface: user
+                    .and_then(user_default_delivery_surface)
+                    .unwrap_or_else(|| "feishu".to_string()),
+                proactive_delivery_default: true,
+                binding_availability: if identity_binding.is_some() {
+                    "available".to_string()
+                } else {
+                    "blocked".to_string()
+                },
+                binding_available: identity_binding.is_some(),
+                binding_availability_note: if identity_binding.is_some() {
+                    "HarborGate identity binding is available for member-default proactive delivery."
+                        .to_string()
+                } else {
+                    "HarborGate identity binding is missing; proactive delivery will remain queued until a binding exists."
+                        .to_string()
+                },
+                recent_interactive_surface: user.and_then(user_recent_interactive_surface),
             }
         })
         .collect();
@@ -1558,103 +2251,299 @@ fn membership_status_value(status: MembershipStatus) -> &'static str {
     }
 }
 
-fn render_mobile_setup_page(
-    state: &AdminConsoleState,
-    setup_url: &str,
-    static_setup_url: &str,
-    session_code: &str,
-) -> String {
-    let app_id = html_escape(&state.bridge_provider.app_id);
-    let bot_name = if state.bridge_provider.app_name.trim().is_empty() {
-        "尚未配置".to_string()
-    } else {
-        html_escape(&state.bridge_provider.app_name)
-    };
-    let status = html_escape(&state.binding.metric);
-    let session_code = html_escape(session_code);
-    let setup_url = html_escape(setup_url);
-    let static_setup_url = html_escape(static_setup_url);
-    format!(
-        r#"<!DOCTYPE html>
+fn render_models_admin_page() -> String {
+    r#"<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>HarborNAS IM Bridge 配置</title>
+  <title>HarborBeacon 模型中心</title>
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #f4efe7; color: #1e1b18; margin: 0; }}
-    .wrap {{ max-width: 560px; margin: 0 auto; padding: 24px 18px 40px; }}
-    .card {{ background: rgba(255,255,255,0.9); border-radius: 20px; padding: 20px; box-shadow: 0 18px 48px rgba(51,36,18,0.12); }}
-    h1 {{ margin: 0 0 8px; font-size: 28px; }}
-    p {{ line-height: 1.5; }}
-    .meta {{ color: #6b5a49; font-size: 14px; margin-bottom: 18px; }}
-    label {{ display: block; margin: 14px 0 8px; font-weight: 600; }}
-    input {{ width: 100%; box-sizing: border-box; padding: 14px 12px; border-radius: 12px; border: 1px solid #d9c6ae; font-size: 16px; }}
-    button {{ width: 100%; margin-top: 18px; padding: 14px 16px; border: 0; border-radius: 999px; background: #1f7a6f; color: white; font-size: 16px; font-weight: 700; }}
-    .status {{ margin: 16px 0; padding: 12px 14px; border-radius: 14px; background: #f6f2ec; }}
-    .hint {{ font-size: 13px; color: #766757; }}
-    .ok {{ color: #1f7a6f; }}
-    .err {{ color: #b94739; }}
+    :root {
+      color-scheme: light;
+      --bg: #f4efe7;
+      --card: rgba(255,255,255,0.9);
+      --line: #d9c6ae;
+      --text: #1e1b18;
+      --muted: #6b5a49;
+      --accent: #1f7a6f;
+      --danger: #b94739;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif; background: var(--bg); color: var(--text); }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 24px 18px 48px; }
+    .grid { display: grid; gap: 18px; grid-template-columns: 1.3fr 1fr; }
+    .card { background: var(--card); border-radius: 22px; padding: 18px; box-shadow: 0 18px 48px rgba(51,36,18,0.12); }
+    h1, h2 { margin: 0 0 10px; }
+    .meta { color: var(--muted); font-size: 14px; line-height: 1.6; margin-bottom: 14px; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid #eadcca; vertical-align: top; }
+    th { color: var(--muted); font-weight: 600; }
+    .chip { display: inline-block; padding: 4px 9px; border-radius: 999px; background: #f6f2ec; border: 1px solid #eadcca; margin-right: 6px; margin-bottom: 6px; font-size: 12px; }
+    label { display: block; margin: 12px 0 6px; font-weight: 600; }
+    input, select, textarea { width: 100%; padding: 11px 12px; border-radius: 12px; border: 1px solid var(--line); background: white; font: inherit; }
+    textarea { min-height: 96px; resize: vertical; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    button { border: 0; border-radius: 999px; padding: 11px 16px; background: var(--accent); color: white; font-weight: 700; font-size: 14px; cursor: pointer; }
+    button.secondary { background: #f6f2ec; color: var(--text); border: 1px solid var(--line); }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+    pre { background: #181512; color: #f5efe7; border-radius: 16px; padding: 14px; overflow: auto; font-size: 12px; }
+    .ok { color: var(--accent); }
+    .err { color: var(--danger); }
+    @media (max-width: 860px) {
+      .grid { grid-template-columns: 1fr; }
+      .row { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="card">
-      <div class="meta">HarborNAS Agent Hub · 手机配置页</div>
-      <h1>配置消息桥接 Provider</h1>
-      <p>在这台手机上填入外部消息桥接应用的 <code>app_id</code> 和 <code>app_secret</code>。保存成功后，这台 Agent Hub 就能记录统一的 bridge/provider 凭据。</p>
-      <div class="status">
-        <div><strong>当前状态：</strong><span id="status-text">{status}</span></div>
-        <div><strong>当前会话：</strong>{session_code}</div>
-        <div><strong>已连接 Provider：</strong><span id="bot-name">{bot_name}</span></div>
+    <div class="card" style="margin-bottom:18px;">
+      <h1>模型中心</h1>
+      <div class="meta">HarborBeacon 负责 OCR / embedder / LLM / VLM 的路由与红acted 管理。前端只看到脱敏状态，secret 只保存在后端状态文件里。</div>
+      <div class="actions">
+        <button id="refresh-btn" class="secondary">刷新状态</button>
       </div>
-      <p class="hint">当前打开的是本地配置入口：<code>{setup_url}</code></p>
-      <label for="app-id">App ID</label>
-      <input id="app-id" value="{app_id}" autocomplete="off" />
-      <label for="app-secret">App Secret</label>
-      <input id="app-secret" type="password" value="" autocomplete="off" placeholder="为安全起见，这里不会回显已保存的 secret" />
-      <button id="submit-btn">保存并验证 Bridge 连接</button>
-      <p class="hint">保存时会立即校验兼容桥接凭证，并读取应用信息。当前实现仍按飞书 Open API 做兼容验证。成功后桌面端后台会同步显示“Bridge 已连接”。你也可以把这台机器上贴的静态二维码固定为 <code>{static_setup_url}</code>。</p>
-      <p class="hint">如果当前已经配过 bridge provider，但你没有要更换凭证，请不要把空白的 secret 直接提交；这里不会显示历史 secret，是为了避免硬件二维码泄露后被他人看到现有密钥。</p>
-      <p id="result" class="hint"></p>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <h2>端点列表</h2>
+        <div class="meta">默认会显示本地 OCR / OpenAI-compatible 槽位。`api_key_configured=true` 表示后端已持有 secret，但不会回显明文。</div>
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>种类</th>
+              <th>路由</th>
+              <th>状态</th>
+              <th>配置</th>
+            </tr>
+          </thead>
+          <tbody id="endpoint-body">
+            <tr><td colspan="5">加载中...</td></tr>
+          </tbody>
+        </table>
+        <div class="actions" id="endpoint-actions"></div>
+      </div>
+      <div class="card">
+        <h2>新增 / 更新端点</h2>
+        <div class="row">
+          <div>
+            <label for="endpoint-id">Endpoint ID</label>
+            <input id="endpoint-id" placeholder="ocr-local-tesseract" />
+          </div>
+          <div>
+            <label for="model-kind">Model Kind</label>
+            <select id="model-kind">
+              <option value="ocr">ocr</option>
+              <option value="embedder">embedder</option>
+              <option value="llm">llm</option>
+              <option value="vlm">vlm</option>
+            </select>
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label for="endpoint-kind">Endpoint Kind</label>
+            <select id="endpoint-kind">
+              <option value="local">local</option>
+              <option value="sidecar">sidecar</option>
+              <option value="cloud">cloud</option>
+            </select>
+          </div>
+          <div>
+            <label for="provider-key">Provider</label>
+            <input id="provider-key" placeholder="tesseract / ollama / custom" />
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label for="model-name">Model Name</label>
+            <input id="model-name" placeholder="qwen2.5:7b / tesseract-cli" />
+          </div>
+          <div>
+            <label for="status">Status</label>
+            <select id="status">
+              <option value="active">active</option>
+              <option value="degraded">degraded</option>
+              <option value="disabled">disabled</option>
+            </select>
+          </div>
+        </div>
+        <label for="capability-tags">Capability Tags（逗号分隔）</label>
+        <input id="capability-tags" placeholder="ocr,image,local_first" />
+        <label for="base-url">Base URL</label>
+        <input id="base-url" placeholder="http://127.0.0.1:11434/v1" />
+        <label for="api-key">API Key</label>
+        <input id="api-key" placeholder="可留空；只会写入后端，不会回显" />
+        <label for="binary-path">Tesseract Binary</label>
+        <input id="binary-path" placeholder="留空则自动查找 PATH" />
+        <label for="languages">OCR Languages</label>
+        <input id="languages" value="chi_sim+eng" />
+        <label for="metadata-json">Metadata JSON（可选）</label>
+        <textarea id="metadata-json" placeholder='{"mock_text":"front gate"}'></textarea>
+        <div class="actions">
+          <button id="save-endpoint-btn">保存端点</button>
+        </div>
+      </div>
+    </div>
+    <div class="grid" style="margin-top:18px;">
+      <div class="card">
+        <h2>路由策略</h2>
+        <div class="meta">这里直接编辑 `retrieval.ocr / retrieval.embed / retrieval.answer / retrieval.vision_summary` 的 JSON 数组。</div>
+        <textarea id="policies-json" style="min-height:260px;"></textarea>
+        <div class="actions">
+          <button id="save-policies-btn">保存策略</button>
+        </div>
+      </div>
+      <div class="card">
+        <h2>连通性测试</h2>
+        <div class="meta">点击端点表中的测试按钮后，这里会显示结果。</div>
+        <pre id="test-result">等待测试</pre>
+      </div>
     </div>
   </div>
   <script>
-    document.getElementById('submit-btn').addEventListener('click', async () => {{
-      const result = document.getElementById('result');
-      result.className = 'hint';
-      result.textContent = '正在验证 bridge 凭证...';
-      try {{
-        const response = await fetch('/api/bridge/configure', {{
-          method: 'POST',
-          headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{
-            app_id: document.getElementById('app-id').value.trim(),
-            app_secret: document.getElementById('app-secret').value.trim()
-          }})
-        }});
-        const payload = await response.json();
-        if (!response.ok) {{
-          throw new Error(payload.error || '保存失败');
-        }}
-        document.getElementById('status-text').textContent = payload.binding.metric || 'Bridge 已连接';
-        document.getElementById('bot-name').textContent = payload.bridge_provider?.app_name || '已连接';
-        result.className = 'hint ok';
-        result.textContent = 'Bridge provider 已验证成功，后台已经记录了统一 provider 凭据。';
-      }} catch (error) {{
-        result.className = 'hint err';
-        result.textContent = error.message;
-      }}
-    }});
+    const endpointBody = document.getElementById("endpoint-body");
+    const endpointActions = document.getElementById("endpoint-actions");
+    const policiesJson = document.getElementById("policies-json");
+    const testResult = document.getElementById("test-result");
+
+    async function fetchJson(path, options = {}) {
+      const response = await fetch(path, {
+        headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+        ...options,
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.error || payload.message || `Request failed: ${response.status}`);
+      }
+      return payload;
+    }
+
+    function endpointConfigSummary(endpoint) {
+      const metadata = endpoint.metadata || {};
+      const summary = [];
+      if (metadata.base_url) summary.push(`base_url=${metadata.base_url}`);
+      if (metadata.binary_path) summary.push(`binary=${metadata.binary_path}`);
+      if (metadata.languages) summary.push(`langs=${metadata.languages}`);
+      if (metadata.api_key_configured) summary.push("api_key=configured");
+      return summary.join(" | ") || "未配置";
+    }
+
+    function renderEndpoints(endpoints) {
+      endpointBody.innerHTML = "";
+      endpointActions.innerHTML = "";
+      if (!endpoints.length) {
+        endpointBody.innerHTML = '<tr><td colspan="5">还没有模型端点。</td></tr>';
+        return;
+      }
+      for (const endpoint of endpoints) {
+        const row = document.createElement("tr");
+        row.innerHTML = `
+          <td><strong>${endpoint.model_endpoint_id}</strong></td>
+          <td>${endpoint.model_kind}</td>
+          <td>${endpoint.endpoint_kind}<br /><span class="chip">${endpoint.provider_key}</span></td>
+          <td>${endpoint.status}</td>
+          <td>${endpointConfigSummary(endpoint)}</td>
+        `;
+        endpointBody.appendChild(row);
+
+        const button = document.createElement("button");
+        button.className = "secondary";
+        button.textContent = `测试 ${endpoint.model_endpoint_id}`;
+        button.addEventListener("click", async () => {
+          testResult.textContent = "测试中...";
+          try {
+            const payload = await fetchJson(`/api/models/endpoints/${encodeURIComponent(endpoint.model_endpoint_id)}/test`, {
+              method: "POST",
+              body: JSON.stringify({}),
+            });
+            testResult.textContent = JSON.stringify(payload, null, 2);
+          } catch (error) {
+            testResult.textContent = error.message;
+          }
+        });
+        endpointActions.appendChild(button);
+      }
+    }
+
+    async function loadState() {
+      const [endpointPayload, policyPayload] = await Promise.all([
+        fetchJson("/api/models/endpoints"),
+        fetchJson("/api/models/policies"),
+      ]);
+      renderEndpoints(endpointPayload.endpoints || []);
+      policiesJson.value = JSON.stringify(policyPayload.route_policies || [], null, 2);
+    }
+
+    function collectEndpointPayload() {
+      let metadata = {};
+      const rawMetadata = document.getElementById("metadata-json").value.trim();
+      if (rawMetadata) {
+        metadata = JSON.parse(rawMetadata);
+      }
+      const baseUrl = document.getElementById("base-url").value.trim();
+      const apiKey = document.getElementById("api-key").value.trim();
+      const binaryPath = document.getElementById("binary-path").value.trim();
+      const languages = document.getElementById("languages").value.trim();
+      if (baseUrl) metadata.base_url = baseUrl;
+      if (apiKey) metadata.api_key = apiKey;
+      if (binaryPath) metadata.binary_path = binaryPath;
+      if (languages) metadata.languages = languages;
+      return {
+        model_endpoint_id: document.getElementById("endpoint-id").value.trim(),
+        workspace_id: "home-1",
+        provider_account_id: null,
+        model_kind: document.getElementById("model-kind").value,
+        endpoint_kind: document.getElementById("endpoint-kind").value,
+        provider_key: document.getElementById("provider-key").value.trim() || "custom",
+        model_name: document.getElementById("model-name").value.trim() || "custom",
+        capability_tags: document.getElementById("capability-tags").value.split(",").map((item) => item.trim()).filter(Boolean),
+        cost_policy: {},
+        status: document.getElementById("status").value,
+        metadata,
+      };
+    }
+
+    document.getElementById("refresh-btn").addEventListener("click", loadState);
+    document.getElementById("save-endpoint-btn").addEventListener("click", async () => {
+      try {
+        const payload = collectEndpointPayload();
+        await fetchJson("/api/models/endpoints", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        await loadState();
+      } catch (error) {
+        testResult.textContent = error.message;
+      }
+    });
+    document.getElementById("save-policies-btn").addEventListener("click", async () => {
+      try {
+        const route_policies = JSON.parse(policiesJson.value || "[]");
+        await fetchJson("/api/models/policies", {
+          method: "PUT",
+          body: JSON.stringify({ route_policies }),
+        });
+        await loadState();
+      } catch (error) {
+        testResult.textContent = error.message;
+      }
+    });
+    loadState().catch((error) => {
+      endpointBody.innerHTML = `<tr><td colspan="5" class="err">${error.message}</td></tr>`;
+      testResult.textContent = error.message;
+    });
   </script>
 </body>
 </html>"#
-    )
+        .to_string()
 }
 
 fn render_live_view_page(
     public_origin: &str,
-    device: &harbornas_local_agent::runtime::registry::CameraDevice,
+    device: &harborbeacon_local_agent::runtime::registry::CameraDevice,
     identity_query: &str,
 ) -> String {
     let device_label = device.room.as_deref().unwrap_or(device.name.as_str());
@@ -1829,7 +2718,7 @@ fn render_live_view_page(
       </div>
 
       <div class="hint">
-        如果画面没有出来，先确认手机和 HarborNAS Agent Hub 在同一个局域网，再点击“重连画面”。
+        如果画面没有出来，先确认手机和 HarborBeacon 在同一个局域网，再点击“重连画面”。
         这个页面只负责看实时视频；拍照、录像、云台控制仍然建议继续在统一 IM 入口里完成。
       </div>
     </div>
@@ -1871,7 +2760,7 @@ fn render_live_view_page(
 
 fn render_shared_live_view_page(
     share_token: &str,
-    device: &harbornas_local_agent::runtime::registry::CameraDevice,
+    device: &harborbeacon_local_agent::runtime::registry::CameraDevice,
 ) -> String {
     let device_label = html_escape(device.room.as_deref().unwrap_or(device.name.as_str()));
     let device_name = html_escape(&device.name);
@@ -2075,41 +2964,6 @@ fn html_escape(value: &str) -> String {
     escaped
 }
 
-fn qr_to_svg(qr: &QrCode, border: i32) -> String {
-    let size = qr.size();
-    let dimension = size + border * 2;
-    let mut path = String::new();
-    for y in 0..size {
-        for x in 0..size {
-            if qr.get_module(x, y) {
-                let _ = write!(&mut path, "M{},{}h1v1h-1z ", x + border, y + border);
-            }
-        }
-    }
-    format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {d} {d}" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="#f8f3ec"/><path d="{path}" fill="#1b1814"/></svg>"##,
-        d = dimension,
-        path = path.trim()
-    )
-}
-
-fn slugify_identity(value: &str) -> String {
-    let mut slug = String::new();
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch.to_ascii_lowercase());
-        } else if ch.is_whitespace() || ch == '-' || ch == '_' {
-            slug.push('_');
-        }
-    }
-    let slug = slug.trim_matches('_');
-    if slug.is_empty() {
-        format!("ou_local_{}", value.chars().count())
-    } else {
-        format!("ou_local_{slug}")
-    }
-}
-
 fn read_json_body<T: for<'de> Deserialize<'de>>(request: &mut Request) -> Result<T, String> {
     let mut body = String::new();
     request
@@ -2161,6 +3015,91 @@ fn error_json(status: StatusCode, message: &str) -> Response<std::io::Cursor<Vec
     json_response(status, &json!({ "error": message }))
 }
 
+fn deprecated_im_binding_message() -> &'static str {
+    "IM configuration has moved to HarborGate. HarborBeacon no longer serves IM setup, binding, or QR flows."
+}
+
+fn deprecated_im_binding_response_json(
+    manage_url: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    json_response(
+        StatusCode(410),
+        &json!({
+            "error": deprecated_im_binding_message(),
+            "manage_url": manage_url,
+        }),
+    )
+}
+
+fn deprecated_im_binding_response_html(
+    manage_url: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let manage_url = html_escape(manage_url);
+    let body = format!(
+        r#"<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>IM 配置已迁移</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #f4efe7; color: #1e1b18; margin: 0; }}
+    .wrap {{ max-width: 560px; margin: 0 auto; padding: 36px 18px 48px; }}
+    .card {{ background: rgba(255,255,255,0.92); border-radius: 20px; padding: 24px; box-shadow: 0 18px 48px rgba(51,36,18,0.12); }}
+    h1 {{ margin-top: 0; }}
+    code, a {{ word-break: break-all; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>IM 配置已迁移到 HarborGate</h1>
+      <p>{}</p>
+      <p>HarborBeacon 现在只保留业务后台与 HarborGate 状态读取，不再提供任何 IM 扫码、绑定或登录入口。</p>
+      <p>HarborGate 管理页：<a href="{manage_url}">{manage_url}</a></p>
+    </div>
+  </div>
+</body>
+</html>"#,
+        html_escape(deprecated_im_binding_message())
+    );
+    let mut response = Response::from_string(body).with_status_code(StatusCode(410));
+    add_common_headers(&mut response);
+    response.add_header(
+        Header::from_bytes(
+            b"Content-Type".as_slice(),
+            b"text/html; charset=utf-8".as_slice(),
+        )
+        .expect("header"),
+    );
+    response
+}
+
+fn authorize_gateway_service_request(headers: &[Header]) -> Result<(), String> {
+    let expected = env_var_with_legacy_alias("HARBORGATE_BEARER_TOKEN", "HARBOR_IM_GATEWAY_BEARER_TOKEN")
+        .or_else(|| env::var("IM_AGENT_SERVICE_TOKEN").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "gateway service token is not configured".to_string())?;
+    let actual = header_value(headers, "Authorization")
+        .and_then(|value| parse_bearer_token(&value))
+        .ok_or_else(|| "missing or invalid bearer token".to_string())?;
+    if actual != expected {
+        return Err("missing or invalid bearer token".to_string());
+    }
+    Ok(())
+}
+
+fn parse_bearer_token(value: &str) -> Option<String> {
+    let prefix = "bearer ";
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .strip_prefix(prefix)
+        .map(|_| value.trim()[prefix.len()..].trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
 fn json_response(
     status: StatusCode,
     payload: &impl Serialize,
@@ -2183,7 +3122,10 @@ fn add_common_headers<R: Read>(response: &mut Response<R>) {
     for header in [
         ("Access-Control-Allow-Origin", "*"),
         ("Access-Control-Allow-Headers", "Content-Type"),
-        ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
+        (
+            "Access-Control-Allow-Methods",
+            "GET, POST, PATCH, PUT, OPTIONS",
+        ),
         ("Cache-Control", "no-store"),
     ] {
         response.add_header(
@@ -2194,6 +3136,11 @@ fn add_common_headers<R: Read>(response: &mut Response<R>) {
 
 fn is_admin_surface_path(path: &str) -> bool {
     path == "/api/state"
+        || path == "/api/account-management"
+        || path == "/api/gateway/status"
+        || path == "/api/models/endpoints"
+        || path == "/api/models/policies"
+        || path == "/admin/models"
         || path == "/api/access/members"
         || path == "/api/share-links"
         || path == "/api/binding/qr.svg"
@@ -2204,6 +3151,7 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/binding/test-bind"
         || path == "/api/bridge/configure"
         || (path.starts_with("/api/access/members/") && path.ends_with("/role"))
+        || (path.starts_with("/api/access/members/") && path.ends_with("/default-delivery-surface"))
         || path == "/api/tasks/approvals"
         || path.starts_with("/api/tasks/approvals/")
         || path == "/api/discovery/scan"
@@ -2213,6 +3161,121 @@ fn is_admin_surface_path(path: &str) -> bool {
         || (path.starts_with("/api/cameras/") && path.ends_with("/snapshot"))
         || (path.starts_with("/api/cameras/") && path.ends_with("/analyze"))
         || path == "/api/defaults"
+        || path.starts_with("/api/models/endpoints/")
+}
+
+fn is_harbordesk_client_route(path: &str) -> bool {
+    matches!(
+        path,
+        "/" | "/overview"
+            | "/im-gateway"
+            | "/account-management"
+            | "/tasks-approvals"
+            | "/devices-aiot"
+            | "/harboros"
+            | "/models-policies"
+            | "/system-settings"
+    )
+}
+
+fn looks_like_harbordesk_asset_path(path: &str) -> bool {
+    path.starts_with("/assets/")
+        || [
+            ".js",
+            ".css",
+            ".map",
+            ".json",
+            ".png",
+            ".svg",
+            ".ico",
+            ".txt",
+            ".webmanifest",
+            ".woff",
+            ".woff2",
+        ]
+        .iter()
+        .any(|extension| path.ends_with(extension))
+}
+
+fn is_harbordesk_surface_path(path: &str) -> bool {
+    is_harbordesk_client_route(path) || looks_like_harbordesk_asset_path(path)
+}
+
+fn resolve_harbordesk_asset_path(dist_root: &Path, request_path: &str) -> Option<PathBuf> {
+    if !looks_like_harbordesk_asset_path(request_path) {
+        return None;
+    }
+
+    let relative = request_path.trim_start_matches('/');
+    if relative.is_empty() {
+        return None;
+    }
+
+    let mut resolved = dist_root.to_path_buf();
+    for component in Path::new(relative).components() {
+        match component {
+            std::path::Component::Normal(segment) => resolved.push(segment),
+            _ => return None,
+        }
+    }
+    Some(resolved)
+}
+
+fn mime_type_for_path(path: &Path) -> &'static str {
+    match path.extension().and_then(|value| value.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "application/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("ico") => "image/x-icon",
+        Some("txt") => "text/plain; charset=utf-8",
+        Some("map") => "application/json; charset=utf-8",
+        Some("webmanifest") => "application/manifest+json; charset=utf-8",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
+        _ => "application/octet-stream",
+    }
+}
+
+fn static_file_response(path: &Path) -> Response<std::io::Cursor<Vec<u8>>> {
+    let body = match fs::read(path) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return error_json(
+                StatusCode(500),
+                &format!("failed to read static file {}: {error}", path.display()),
+            )
+        }
+    };
+    let mut response = Response::from_data(body).with_status_code(StatusCode(200));
+    add_common_headers(&mut response);
+    response.add_header(
+        Header::from_bytes(
+            b"Content-Type".as_slice(),
+            mime_type_for_path(path).as_bytes(),
+        )
+        .expect("header"),
+    );
+    response
+}
+
+fn harbordesk_build_missing_response(dist_root: &Path) -> Response<std::io::Cursor<Vec<u8>>> {
+    let body = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>HarborDesk build missing</title></head><body><h1>HarborDesk build missing</h1><p>Angular build output was not found at <code>{}</code>.</p><p>Run <code>npm install</code> and <code>npm run build</code> under <code>frontend/harbordesk</code>, or pass <code>--harbordesk-dist</code>.</p></body></html>",
+        dist_root.display()
+    );
+    let mut response = Response::from_string(body).with_status_code(StatusCode(503));
+    add_common_headers(&mut response);
+    response.add_header(
+        Header::from_bytes(
+            b"Content-Type".as_slice(),
+            b"text/html; charset=utf-8".as_slice(),
+        )
+        .expect("header"),
+    );
+    response
 }
 
 fn build_share_link_summary(
@@ -2339,12 +3402,1083 @@ fn has_forwarding_headers(headers: &[Header]) -> bool {
 
 fn redact_state_snapshot(mut state: StateResponse) -> StateResponse {
     state.defaults.rtsp_password.clear();
+    state.binding.session_code.clear();
+    state.binding.qr_token.clear();
+    state.binding.setup_url.clear();
+    state.binding.static_setup_url.clear();
     state.bridge_provider = redact_bridge_provider_config(state.bridge_provider);
     state
 }
 
+fn redact_account_management_snapshot(
+    mut snapshot: AccountManagementSnapshot,
+) -> AccountManagementSnapshot {
+    snapshot.gateway = redact_gateway_status_summary(snapshot.gateway);
+    snapshot
+}
+
+fn redact_gateway_status_summary(mut gateway: GatewayStatusSummary) -> GatewayStatusSummary {
+    gateway.setup_url.clear();
+    gateway.static_setup_url.clear();
+    gateway.bridge_provider = redact_bridge_provider_config(gateway.bridge_provider);
+    gateway
+}
+
+fn apply_bridge_provider_binding_projection(
+    status: &mut String,
+    metric: &mut String,
+    bound_user: &mut Option<String>,
+    provider: &BridgeProviderConfig,
+) {
+    if provider.connected {
+        *status = "Gateway 已连接".to_string();
+        *metric = "Gateway 在线".to_string();
+    } else if provider.configured {
+        *status = "Gateway 已启用".to_string();
+        *metric = "Gateway 未连通".to_string();
+    } else {
+        *status = "等待 Gateway".to_string();
+        *metric = "Gateway 未配置".to_string();
+    }
+
+    *bound_user = if !provider.app_name.trim().is_empty() {
+        Some(provider.app_name.clone())
+    } else if !provider.platform.trim().is_empty() {
+        Some(format!("{} gateway", provider.platform))
+    } else {
+        None
+    };
+}
+
+fn apply_bridge_provider_projection_to_state(
+    state: &mut StateResponse,
+    provider: &BridgeProviderConfig,
+) {
+    state.bridge_provider = provider.clone();
+    apply_bridge_provider_binding_projection(
+        &mut state.binding.status,
+        &mut state.binding.metric,
+        &mut state.binding.bound_user,
+        provider,
+    );
+}
+
+fn apply_bridge_provider_projection_to_gateway_summary(
+    gateway: &mut GatewayStatusSummary,
+    provider: &BridgeProviderConfig,
+) {
+    gateway.bridge_provider = provider.clone();
+    apply_bridge_provider_binding_projection(
+        &mut gateway.binding_status,
+        &mut gateway.binding_metric,
+        &mut gateway.binding_bound_user,
+        provider,
+    );
+}
+
+fn bridge_provider_config_from_platforms(
+    gateway_base_url: &str,
+    platforms: &[GatewayPlatformStatus],
+) -> BridgeProviderConfig {
+    let selected = platforms
+        .iter()
+        .find(|platform| platform.connected)
+        .or_else(|| platforms.iter().find(|platform| platform.enabled))
+        .or_else(|| platforms.first());
+    let mut provider = BridgeProviderConfig {
+        gateway_base_url: gateway_base_url.trim().to_string(),
+        ..Default::default()
+    };
+    let Some(selected) = selected else {
+        provider.status = "HarborGate 未配置平台".to_string();
+        return provider;
+    };
+
+    provider.configured = selected.enabled;
+    provider.connected = selected.connected;
+    provider.platform = selected.platform.trim().to_string();
+    provider.app_name = selected.display_name.trim().to_string();
+    provider.status = if selected.connected {
+        "已连接".to_string()
+    } else if selected.enabled {
+        "已启用，待连接".to_string()
+    } else {
+        "未启用".to_string()
+    };
+    provider.capabilities.reply = selected.capabilities.reply;
+    provider.capabilities.update = selected.capabilities.update;
+    provider.capabilities.attachments = selected.capabilities.attachments;
+    provider
+}
+
+fn env_var_with_legacy_alias(primary: &str, legacy: &str) -> Option<String> {
+    if let Ok(value) = env::var(primary) {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    if let Ok(value) = env::var(legacy) {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    None
+}
+
+fn gateway_status_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.ends_with("/api/gateway/status") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/api/gateway/status")
+    }
+}
+
+fn live_bridge_provider_from_setup_status(payload: &Value) -> Option<BridgeProviderConfig> {
+    const PRIMARY_BASE_URL: &str = "HARBORGATE_BASE_URL";
+    const LEGACY_BASE_URL: &str = "HARBOR_IM_GATEWAY_BASE_URL";
+
+    let channels = payload
+        .get("channels")
+        .cloned()
+        .or_else(|| payload.pointer("/gateway_status/channels").cloned())?;
+    let platforms: Vec<GatewayPlatformStatus> = serde_json::from_value(channels).ok()?;
+    if platforms.is_empty() {
+        return None;
+    }
+
+    let gateway_base_url = env_var_with_legacy_alias(PRIMARY_BASE_URL, LEGACY_BASE_URL)
+        .or_else(|| {
+            payload
+                .get("public_origin")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
+        .unwrap_or_default();
+    Some(bridge_provider_config_from_platforms(
+        &gateway_base_url,
+        &platforms,
+    ))
+}
+
+fn fetch_remote_gateway_status() -> Result<Value, String> {
+    const PRIMARY_BASE_URL: &str = "HARBORGATE_BASE_URL";
+    const LEGACY_BASE_URL: &str = "HARBOR_IM_GATEWAY_BASE_URL";
+    const PRIMARY_TOKEN: &str = "HARBORGATE_BEARER_TOKEN";
+    const LEGACY_TOKEN: &str = "HARBOR_IM_GATEWAY_BEARER_TOKEN";
+
+    let base_url = env_var_with_legacy_alias(PRIMARY_BASE_URL, LEGACY_BASE_URL)
+        .ok_or_else(|| format!("missing required env var {PRIMARY_BASE_URL}"))?;
+    let endpoint = gateway_status_endpoint(&base_url);
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|error| format!("failed to build HarborGate status client: {error}"))?;
+
+    let mut request = client.get(endpoint).header("X-Contract-Version", "2.0");
+    if let Some(token) = env_var_with_legacy_alias(PRIMARY_TOKEN, LEGACY_TOKEN) {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+
+    let response = request
+        .send()
+        .map_err(|error| format!("HarborGate status request failed: {error}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .map_err(|error| format!("failed to read HarborGate status response: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "HarborGate status request failed with HTTP {}: {}",
+            status.as_u16(),
+            body
+        ));
+    }
+
+    serde_json::from_str(&body)
+        .map_err(|error| format!("failed to parse HarborGate status response: {error}"))
+}
+
+fn probe_local_model_runtime(endpoints: &[ModelEndpoint]) -> LocalModelRuntimeProjection {
+    let builtin_defaults = default_model_endpoints();
+    let preferred = endpoints
+        .iter()
+        .find(|endpoint| is_builtin_local_openai_endpoint(endpoint))
+        .cloned()
+        .or_else(|| builtin_defaults.iter().find(|endpoint| is_builtin_local_openai_endpoint(endpoint)).cloned());
+    let Some(template) = preferred else {
+        return LocalModelRuntimeProjection {
+            error: Some("local OpenAI-compatible runtime is not configured".to_string()),
+            ..Default::default()
+        };
+    };
+    let fallback = builtin_defaults
+        .iter()
+        .find(|endpoint| endpoint.model_endpoint_id == template.model_endpoint_id)
+        .or_else(|| {
+            builtin_defaults
+                .iter()
+                .find(|endpoint| is_builtin_local_openai_endpoint(endpoint))
+        });
+
+    let base_url = metadata_string_value(&template.metadata, "base_url")
+        .or_else(|| fallback.and_then(|endpoint| metadata_string_value(&endpoint.metadata, "base_url")))
+        .unwrap_or_default();
+    let healthz_url = metadata_string_value(&template.metadata, "healthz_url")
+        .or_else(|| {
+            fallback.and_then(|endpoint| metadata_string_value(&endpoint.metadata, "healthz_url"))
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| infer_healthz_url(&base_url));
+    let api_key_configured = metadata_bool_value(&template.metadata, "api_key_configured")
+        || metadata_string_value(&template.metadata, "api_key")
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+    let api_key_configured = api_key_configured
+        || fallback
+            .map(|endpoint| {
+                metadata_bool_value(&endpoint.metadata, "api_key_configured")
+                    || metadata_string_value(&endpoint.metadata, "api_key")
+                        .map(|value| !value.trim().is_empty())
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false);
+
+    if healthz_url.trim().is_empty() {
+        return LocalModelRuntimeProjection {
+            base_url,
+            healthz_url,
+            api_key_configured,
+            error: Some("local model healthz URL is not configured".to_string()),
+            ..Default::default()
+        };
+    }
+
+    let client = match Client::builder().timeout(Duration::from_secs(3)).build() {
+        Ok(client) => client,
+        Err(error) => {
+            return LocalModelRuntimeProjection {
+                base_url,
+                healthz_url,
+                api_key_configured,
+                error: Some(format!("failed to build local runtime probe client: {error}")),
+                ..Default::default()
+            }
+        }
+    };
+
+    let response = match client.get(&healthz_url).send() {
+        Ok(response) => response,
+        Err(error) => {
+            return LocalModelRuntimeProjection {
+                base_url,
+                healthz_url,
+                api_key_configured,
+                error: Some(format!("local model healthz request failed: {error}")),
+                ..Default::default()
+            }
+        }
+    };
+    let body = match response.text() {
+        Ok(body) => body,
+        Err(error) => {
+            return LocalModelRuntimeProjection {
+                base_url,
+                healthz_url,
+                api_key_configured,
+                error: Some(format!("failed to read local model healthz response: {error}")),
+                ..Default::default()
+            }
+        }
+    };
+    let payload = match serde_json::from_str::<Value>(&body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return LocalModelRuntimeProjection {
+                base_url,
+                healthz_url,
+                api_key_configured,
+                error: Some(format!("local model healthz returned invalid JSON: {error}")),
+                ..Default::default()
+            }
+        }
+    };
+
+    LocalModelRuntimeProjection {
+        base_url,
+        healthz_url,
+        api_key_configured,
+        ready: payload.get("ready").and_then(Value::as_bool).unwrap_or(false),
+        backend_ready: payload
+            .get("backend")
+            .and_then(|value| value.get("ready"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        backend_kind: payload
+            .get("backend")
+            .and_then(|value| value.get("kind"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        chat_model: payload
+            .get("chat_model")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        embedding_model: payload
+            .get("embedding_model")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        note: payload.get("note").and_then(Value::as_str).map(str::to_string),
+        error: None,
+    }
+}
+
+fn overlay_model_endpoints_with_runtime_truth(
+    endpoints: &[ModelEndpoint],
+    runtime: &LocalModelRuntimeProjection,
+) -> Vec<ModelEndpoint> {
+    let builtin_defaults = default_model_endpoints()
+        .into_iter()
+        .map(|endpoint| (endpoint.model_endpoint_id.clone(), endpoint))
+        .collect::<HashMap<_, _>>();
+
+    endpoints
+        .iter()
+        .map(|endpoint| {
+            let mut overlayed = endpoint.clone();
+            let original_status = overlayed.status;
+            let mut projection_mismatch = false;
+
+            if let Some(default_endpoint) = builtin_defaults.get(&overlayed.model_endpoint_id) {
+                if is_builtin_local_openai_endpoint(default_endpoint) {
+                    if metadata_missing_or_empty(&overlayed.metadata, "base_url") {
+                        if let Some(base_url) =
+                            metadata_string_value(&default_endpoint.metadata, "base_url")
+                        {
+                            set_metadata_string(&mut overlayed.metadata, "base_url", base_url);
+                            projection_mismatch = true;
+                        }
+                    }
+                    if metadata_missing_or_empty(&overlayed.metadata, "healthz_url") {
+                        if let Some(healthz_url) =
+                            metadata_string_value(&default_endpoint.metadata, "healthz_url")
+                        {
+                            set_metadata_string(
+                                &mut overlayed.metadata,
+                                "healthz_url",
+                                healthz_url,
+                            );
+                            projection_mismatch = true;
+                        }
+                    }
+                    if metadata_missing_or_empty(&overlayed.metadata, "api_key") {
+                        if let Some(api_key) =
+                            metadata_string_value(&default_endpoint.metadata, "api_key")
+                        {
+                            set_metadata_string(&mut overlayed.metadata, "api_key", api_key);
+                            projection_mismatch = true;
+                        }
+                    }
+                    if !metadata_bool_value(&overlayed.metadata, "api_key_configured")
+                        && metadata_bool_value(&default_endpoint.metadata, "api_key_configured")
+                    {
+                        set_metadata_bool(&mut overlayed.metadata, "api_key_configured", true);
+                        projection_mismatch = true;
+                    }
+
+                    set_metadata_string(
+                        &mut overlayed.metadata,
+                        "projection_source",
+                        "local_runtime_overlay".to_string(),
+                    );
+                    set_metadata_bool(
+                        &mut overlayed.metadata,
+                        "runtime_ready",
+                        runtime.ready && runtime.backend_ready,
+                    );
+                    if let Some(kind) = runtime.backend_kind.as_ref() {
+                        set_metadata_string(
+                            &mut overlayed.metadata,
+                            "runtime_backend_kind",
+                            kind.clone(),
+                        );
+                    }
+                    if let Some(chat_model) = runtime.chat_model.as_ref() {
+                        set_metadata_string(
+                            &mut overlayed.metadata,
+                            "runtime_chat_model",
+                            chat_model.clone(),
+                        );
+                    }
+                    if let Some(embedding_model) = runtime.embedding_model.as_ref() {
+                        set_metadata_string(
+                            &mut overlayed.metadata,
+                            "runtime_embedding_model",
+                            embedding_model.clone(),
+                        );
+                    }
+                    if let Some(note) = runtime.note.as_ref() {
+                        set_metadata_string(
+                            &mut overlayed.metadata,
+                            "runtime_note",
+                            note.clone(),
+                        );
+                    }
+                    if let Some(error) = runtime.error.as_ref() {
+                        set_metadata_string(
+                            &mut overlayed.metadata,
+                            "runtime_error",
+                            error.clone(),
+                        );
+                    }
+
+                    if matches!(overlayed.model_kind, ModelKind::Llm | ModelKind::Embedder)
+                        && runtime.ready
+                        && runtime.backend_ready
+                    {
+                        overlayed.status = ModelEndpointStatus::Active;
+                    }
+                }
+            }
+
+            if overlayed.status != original_status {
+                projection_mismatch = true;
+            }
+            if projection_mismatch {
+                set_metadata_bool(&mut overlayed.metadata, "projection_mismatch", true);
+                set_metadata_string(
+                    &mut overlayed.metadata,
+                    "projection_mismatch_reason",
+                    "runtime truth overrode stale admin endpoint state".to_string(),
+                );
+            }
+
+            overlayed
+        })
+        .collect()
+}
+
+fn build_feature_availability_response(
+    endpoints: &[ModelEndpoint],
+    route_policies: &[ModelRoutePolicy],
+    account_management: &AccountManagementSnapshot,
+    gateway_status: Option<&Value>,
+    runtime: &LocalModelRuntimeProjection,
+) -> FeatureAvailabilityResponse {
+    let retrieval_group = FeatureAvailabilityGroup {
+        group_id: "retrieval".to_string(),
+        label: "Retrieval & Models".to_string(),
+        items: vec![
+            build_ocr_feature(endpoints, route_policies),
+            build_embed_feature(endpoints, route_policies, runtime),
+            build_answer_feature(endpoints, route_policies, runtime),
+            build_vision_summary_feature(endpoints, route_policies),
+        ],
+    };
+    let delivery_group = FeatureAvailabilityGroup {
+        group_id: "delivery".to_string(),
+        label: "Interaction & Delivery".to_string(),
+        items: vec![
+            build_interactive_reply_feature(account_management),
+            build_proactive_delivery_feature(account_management, gateway_status),
+        ],
+    };
+    let binding_group = FeatureAvailabilityGroup {
+        group_id: "binding".to_string(),
+        label: "Binding & Access".to_string(),
+        items: vec![build_binding_availability_feature(account_management, gateway_status)],
+    };
+
+    FeatureAvailabilityResponse {
+        groups: vec![retrieval_group, delivery_group, binding_group],
+    }
+}
+
+fn build_ocr_feature(
+    endpoints: &[ModelEndpoint],
+    route_policies: &[ModelRoutePolicy],
+) -> FeatureAvailabilityItem {
+    let policy = find_route_policy(route_policies, "retrieval.ocr");
+    let endpoint = select_model_endpoint(endpoints, "ocr-local-tesseract", ModelKind::Ocr);
+    let fallback_order = policy_fallback_order(policy);
+    let endpoint_status = endpoint
+        .map(|value| value.status.as_str().to_string())
+        .unwrap_or_else(|| "missing".to_string());
+    let status = match endpoint {
+        Some(value) if value.status == ModelEndpointStatus::Active => "available",
+        Some(_) => "degraded",
+        None => "not_configured",
+    };
+    let blocker = if status == "available" {
+        String::new()
+    } else if endpoint.is_none() {
+        "No OCR endpoint is configured.".to_string()
+    } else {
+        "OCR route is present, but the local tesseract path still needs verification.".to_string()
+    };
+
+    FeatureAvailabilityItem {
+        feature_id: "retrieval.ocr".to_string(),
+        label: "OCR extraction".to_string(),
+        owner_lane: "harbor-framework".to_string(),
+        status: status.to_string(),
+        source_of_truth: "route_policy + model_endpoint".to_string(),
+        current_option: endpoint
+            .map(|value| format!("{} / {}", value.model_endpoint_id, value.provider_key))
+            .unwrap_or_else(|| "unconfigured".to_string()),
+        fallback_order,
+        blocker,
+        evidence: vec![
+            format!("route_policy_status={}", policy_status_value(policy)),
+            format!("endpoint_status={endpoint_status}"),
+            format!(
+                "provider={}",
+                endpoint
+                    .map(|value| value.provider_key.clone())
+                    .unwrap_or_else(|| "none".to_string())
+            ),
+        ],
+    }
+}
+
+fn build_embed_feature(
+    endpoints: &[ModelEndpoint],
+    route_policies: &[ModelRoutePolicy],
+    runtime: &LocalModelRuntimeProjection,
+) -> FeatureAvailabilityItem {
+    let policy = find_route_policy(route_policies, "retrieval.embed");
+    let endpoint = select_model_endpoint(
+        endpoints,
+        "embed-local-openai-compatible",
+        ModelKind::Embedder,
+    );
+    let runtime_ready = runtime.ready && runtime.backend_ready;
+    let projection_mismatch = endpoint.is_some_and(has_projection_mismatch);
+    let status = if runtime_ready {
+        "available"
+    } else if endpoint.is_some() {
+        "degraded"
+    } else {
+        "not_configured"
+    };
+    let blocker = if runtime_ready {
+        String::new()
+    } else if let Some(error) = runtime.error.as_ref() {
+        error.clone()
+    } else {
+        "Local embeddings runtime is not ready.".to_string()
+    };
+
+    let mut evidence = vec![
+        format!("route_policy_status={}", policy_status_value(policy)),
+        format!("runtime_ready={runtime_ready}"),
+    ];
+    if let Some(kind) = runtime.backend_kind.as_ref() {
+        evidence.push(format!("4176.backend.kind={kind}"));
+    }
+    if let Some(model) = runtime.embedding_model.as_ref() {
+        evidence.push(format!("embedding_model={model}"));
+    }
+    if let Some(endpoint) = endpoint {
+        evidence.push(format!(
+            "endpoint={} status={}",
+            endpoint.model_endpoint_id,
+            endpoint.status.as_str()
+        ));
+        if projection_mismatch {
+            evidence.push("projection_mismatch=runtime_overrode_stale_admin_state".to_string());
+        }
+    }
+
+    FeatureAvailabilityItem {
+        feature_id: "retrieval.embed".to_string(),
+        label: "Embedding retrieval".to_string(),
+        owner_lane: "harbor-framework".to_string(),
+        status: status.to_string(),
+        source_of_truth: "4176 /healthz + route_policy".to_string(),
+        current_option: endpoint
+            .map(|value| {
+                format!(
+                    "{} / {}",
+                    value.model_endpoint_id,
+                    runtime
+                        .backend_kind
+                        .clone()
+                        .unwrap_or_else(|| value.provider_key.clone())
+                )
+            })
+            .unwrap_or_else(|| {
+                runtime
+                    .backend_kind
+                    .as_deref()
+                    .map(|kind| format!("local runtime / {kind}"))
+                    .unwrap_or_else(|| "unconfigured".to_string())
+            }),
+        fallback_order: policy_fallback_order(policy),
+        blocker,
+        evidence,
+    }
+}
+
+fn build_answer_feature(
+    endpoints: &[ModelEndpoint],
+    route_policies: &[ModelRoutePolicy],
+    runtime: &LocalModelRuntimeProjection,
+) -> FeatureAvailabilityItem {
+    let policy = find_route_policy(route_policies, "retrieval.answer");
+    let endpoint =
+        select_model_endpoint(endpoints, "llm-local-openai-compatible", ModelKind::Llm);
+    let runtime_ready = runtime.ready && runtime.backend_ready;
+    let projection_mismatch = endpoint.is_some_and(has_projection_mismatch);
+    let status = if runtime_ready {
+        "available"
+    } else if endpoint.is_some() {
+        "degraded"
+    } else {
+        "not_configured"
+    };
+    let blocker = if runtime_ready {
+        String::new()
+    } else if let Some(error) = runtime.error.as_ref() {
+        error.clone()
+    } else {
+        "Local answer runtime is not ready.".to_string()
+    };
+
+    let mut evidence = vec![
+        format!("route_policy_status={}", policy_status_value(policy)),
+        format!("runtime_ready={runtime_ready}"),
+    ];
+    if let Some(kind) = runtime.backend_kind.as_ref() {
+        evidence.push(format!("4176.backend.kind={kind}"));
+    }
+    if let Some(model) = runtime.chat_model.as_ref() {
+        evidence.push(format!("chat_model={model}"));
+    }
+    if let Some(endpoint) = endpoint {
+        evidence.push(format!(
+            "endpoint={} status={}",
+            endpoint.model_endpoint_id,
+            endpoint.status.as_str()
+        ));
+        if projection_mismatch {
+            evidence.push("projection_mismatch=runtime_overrode_stale_admin_state".to_string());
+        }
+    }
+
+    FeatureAvailabilityItem {
+        feature_id: "retrieval.answer".to_string(),
+        label: "Retrieval answer synthesis".to_string(),
+        owner_lane: "harbor-framework".to_string(),
+        status: status.to_string(),
+        source_of_truth: "4176 /healthz + route_policy".to_string(),
+        current_option: endpoint
+            .map(|value| {
+                format!(
+                    "{} / {}",
+                    value.model_endpoint_id,
+                    runtime
+                        .backend_kind
+                        .clone()
+                        .unwrap_or_else(|| value.provider_key.clone())
+                )
+            })
+            .unwrap_or_else(|| {
+                runtime
+                    .backend_kind
+                    .as_deref()
+                    .map(|kind| format!("local runtime / {kind}"))
+                    .unwrap_or_else(|| "unconfigured".to_string())
+            }),
+        fallback_order: policy_fallback_order(policy),
+        blocker,
+        evidence,
+    }
+}
+
+fn build_vision_summary_feature(
+    endpoints: &[ModelEndpoint],
+    route_policies: &[ModelRoutePolicy],
+) -> FeatureAvailabilityItem {
+    let policy = find_route_policy(route_policies, "retrieval.vision_summary");
+    let endpoint =
+        select_model_endpoint(endpoints, "vlm-local-openai-compatible", ModelKind::Vlm);
+    let status = match endpoint {
+        Some(value) if value.status == ModelEndpointStatus::Active => "available",
+        Some(value) if value.status == ModelEndpointStatus::Degraded => "degraded",
+        Some(_) if policy.is_some_and(|value| value.status.eq_ignore_ascii_case("degraded")) => {
+            "degraded"
+        }
+        _ if policy.is_some_and(|value| value.status.eq_ignore_ascii_case("degraded")) => {
+            "degraded"
+        }
+        _ => "not_configured",
+    };
+    let blocker = if status == "available" {
+        String::new()
+    } else {
+        "No live VLM endpoint is enabled for still-image summary.".to_string()
+    };
+
+    FeatureAvailabilityItem {
+        feature_id: "retrieval.vision_summary".to_string(),
+        label: "Still-image vision summary".to_string(),
+        owner_lane: "harbor-framework".to_string(),
+        status: status.to_string(),
+        source_of_truth: "route_policy + vlm endpoint".to_string(),
+        current_option: endpoint
+            .map(|value| format!("{} / {}", value.model_endpoint_id, value.provider_key))
+            .unwrap_or_else(|| "unconfigured".to_string()),
+        fallback_order: policy_fallback_order(policy),
+        blocker,
+        evidence: vec![
+            format!("route_policy_status={}", policy_status_value(policy)),
+            format!(
+                "endpoint_status={}",
+                endpoint
+                    .map(|value| value.status.as_str().to_string())
+                    .unwrap_or_else(|| "missing".to_string())
+            ),
+        ],
+    }
+}
+
+fn build_interactive_reply_feature(
+    account_management: &AccountManagementSnapshot,
+) -> FeatureAvailabilityItem {
+    let delivery_policy = &account_management.delivery_policy.interactive_reply;
+    let gateway = &account_management.gateway;
+    let configured = gateway.bridge_provider.configured;
+    let connected = gateway.bridge_provider.connected;
+    let status = if delivery_policy.eq_ignore_ascii_case("source_bound") && connected {
+        "available"
+    } else if delivery_policy.eq_ignore_ascii_case("source_bound") && configured {
+        "degraded"
+    } else if delivery_policy.trim().is_empty() {
+        "not_configured"
+    } else {
+        "blocked"
+    };
+    let blocker = match status {
+        "available" => String::new(),
+        "degraded" => "Gateway is configured but not fully connected.".to_string(),
+        "not_configured" => "Interactive reply policy is not configured.".to_string(),
+        _ => format!(
+            "Interactive reply must stay source_bound, but current option is {}.",
+            to_non_empty_option(delivery_policy)
+        ),
+    };
+
+    FeatureAvailabilityItem {
+        feature_id: "interactive_reply".to_string(),
+        label: "Interaction-linked reply".to_string(),
+        owner_lane: "harbor-im-gateway".to_string(),
+        status: status.to_string(),
+        source_of_truth: "delivery_policy + gateway_status".to_string(),
+        current_option: to_non_empty_option(delivery_policy),
+        fallback_order: Vec::new(),
+        blocker,
+        evidence: vec![
+            format!("binding_channel={}", to_non_empty_option(&gateway.binding_channel)),
+            format!("gateway_configured={}", yes_no(configured)),
+            format!("gateway_connected={}", yes_no(connected)),
+        ],
+    }
+}
+
+fn build_proactive_delivery_feature(
+    account_management: &AccountManagementSnapshot,
+    gateway_status: Option<&Value>,
+) -> FeatureAvailabilityItem {
+    let delivery_policy = &account_management.delivery_policy.proactive_delivery;
+    let default_target = account_management
+        .notification_targets
+        .iter()
+        .find(|target| target.is_default)
+        .or_else(|| account_management.notification_targets.first());
+    let gateway_blocker = gateway_platform_blocker(gateway_status, "weixin");
+    let status = if gateway_blocker.is_some() {
+        "blocked"
+    } else if default_target.is_none() {
+        "not_configured"
+    } else if account_management.gateway.bridge_provider.connected {
+        "available"
+    } else if account_management.gateway.bridge_provider.configured {
+        "degraded"
+    } else {
+        "not_configured"
+    };
+    let blocker = if let Some(blocker) = gateway_blocker.clone() {
+        blocker
+    } else if default_target.is_none() {
+        "No default notification target is configured.".to_string()
+    } else if status == "degraded" {
+        "Bridge provider is configured but not yet connected for proactive delivery.".to_string()
+    } else {
+        String::new()
+    };
+
+    let mut evidence = vec![
+        format!("delivery_policy={}", to_non_empty_option(delivery_policy)),
+        format!(
+            "default_target={}",
+            default_target
+                .map(|target| format!("{} / {}", target.label, target.route_key))
+                .unwrap_or_else(|| "none".to_string())
+        ),
+    ];
+    if let Some(record_count) = gateway_delivery_record_count(gateway_status) {
+        evidence.push(format!("delivery_observability.record_count={record_count}"));
+    }
+
+    FeatureAvailabilityItem {
+        feature_id: "proactive_delivery".to_string(),
+        label: "Proactive delivery".to_string(),
+        owner_lane: "harbor-im-gateway".to_string(),
+        status: status.to_string(),
+        source_of_truth: "delivery_policy + notification_targets + gateway_status".to_string(),
+        current_option: to_non_empty_option(delivery_policy),
+        fallback_order: Vec::new(),
+        blocker,
+        evidence,
+    }
+}
+
+fn build_binding_availability_feature(
+    account_management: &AccountManagementSnapshot,
+    gateway_status: Option<&Value>,
+) -> FeatureAvailabilityItem {
+    let bindings = &account_management.identity_bindings;
+    let available_count = bindings.iter().filter(|binding| binding.binding_available).count();
+    let status = if bindings.is_empty() {
+        "not_configured"
+    } else if available_count == bindings.len() {
+        "available"
+    } else if available_count > 0 {
+        "degraded"
+    } else {
+        "blocked"
+    };
+    let blocker = if bindings.is_empty() {
+        "No HarborGate-owned identity bindings are projected yet.".to_string()
+    } else {
+        bindings
+            .iter()
+            .find(|binding| !binding.binding_available)
+            .map(|binding| binding.binding_availability_note.clone())
+            .or_else(|| gateway_platform_blocker(gateway_status, "weixin"))
+            .unwrap_or_default()
+    };
+
+    FeatureAvailabilityItem {
+        feature_id: "binding_availability".to_string(),
+        label: "Binding availability".to_string(),
+        owner_lane: "harbor-im-gateway".to_string(),
+        status: status.to_string(),
+        source_of_truth: "account_management.identity_bindings + gateway_status".to_string(),
+        current_option: format!("identity_bindings={}", bindings.len()),
+        fallback_order: Vec::new(),
+        blocker,
+        evidence: vec![
+            format!("available_bindings={available_count}"),
+            format!(
+                "binding_surfaces={}",
+                if bindings.is_empty() {
+                    "none".to_string()
+                } else {
+                    bindings
+                        .iter()
+                        .map(|binding| binding.proactive_delivery_surface.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            ),
+        ],
+    }
+}
+
+fn find_route_policy<'a>(
+    route_policies: &'a [ModelRoutePolicy],
+    route_policy_id: &str,
+) -> Option<&'a ModelRoutePolicy> {
+    route_policies
+        .iter()
+        .find(|policy| policy.route_policy_id == route_policy_id)
+}
+
+fn select_model_endpoint<'a>(
+    endpoints: &'a [ModelEndpoint],
+    preferred_id: &str,
+    model_kind: ModelKind,
+) -> Option<&'a ModelEndpoint> {
+    endpoints
+        .iter()
+        .find(|endpoint| endpoint.model_endpoint_id == preferred_id)
+        .or_else(|| {
+            endpoints
+                .iter()
+                .filter(|endpoint| endpoint.model_kind == model_kind)
+                .min_by_key(|endpoint| {
+                    (
+                        model_endpoint_status_rank(endpoint.status),
+                        endpoint.model_endpoint_id.clone(),
+                    )
+                })
+        })
+}
+
+fn model_endpoint_status_rank(status: ModelEndpointStatus) -> usize {
+    match status {
+        ModelEndpointStatus::Active => 0,
+        ModelEndpointStatus::Degraded => 1,
+        ModelEndpointStatus::Disabled => 2,
+    }
+}
+
+fn is_builtin_local_openai_endpoint(endpoint: &ModelEndpoint) -> bool {
+    endpoint.endpoint_kind == ModelEndpointKind::Local
+        && endpoint.provider_key.eq_ignore_ascii_case("openai_compatible")
+        && matches!(
+            endpoint.model_kind,
+            ModelKind::Llm | ModelKind::Embedder | ModelKind::Vlm
+        )
+}
+
+fn infer_healthz_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if let Some(prefix) = trimmed.strip_suffix("/v1") {
+        format!("{prefix}/healthz")
+    } else if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("{trimmed}/healthz")
+    }
+}
+
+fn metadata_missing_or_empty(metadata: &Value, key: &str) -> bool {
+    metadata_string_value(metadata, key)
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true)
+}
+
+fn metadata_string_value(metadata: &Value, key: &str) -> Option<String> {
+    metadata
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn metadata_bool_value(metadata: &Value, key: &str) -> bool {
+    metadata
+        .get(key)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn ensure_metadata_object(metadata: &mut Value) -> &mut serde_json::Map<String, Value> {
+    if !metadata.is_object() {
+        *metadata = json!({});
+    }
+    metadata.as_object_mut().expect("metadata object")
+}
+
+fn set_metadata_string(metadata: &mut Value, key: &str, value: String) {
+    ensure_metadata_object(metadata).insert(key.to_string(), Value::String(value));
+}
+
+fn set_metadata_bool(metadata: &mut Value, key: &str, value: bool) {
+    ensure_metadata_object(metadata).insert(key.to_string(), Value::Bool(value));
+}
+
+fn has_projection_mismatch(endpoint: &ModelEndpoint) -> bool {
+    metadata_bool_value(&endpoint.metadata, "projection_mismatch")
+}
+
+fn policy_fallback_order(policy: Option<&ModelRoutePolicy>) -> Vec<String> {
+    policy
+        .map(|value| value.fallback_order.clone())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            vec![
+                "local".to_string(),
+                "sidecar".to_string(),
+                "cloud".to_string(),
+            ]
+        })
+}
+
+fn policy_status_value(policy: Option<&ModelRoutePolicy>) -> String {
+    policy
+        .map(|value| value.status.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "missing".to_string())
+}
+
+fn gateway_platform_blocker(payload: Option<&Value>, platform: &str) -> Option<String> {
+    let from_platform_summary = payload
+        .and_then(|value| value.get(platform))
+        .and_then(|platform_value| {
+            platform_value
+                .get("blocker_category")
+                .and_then(Value::as_str)
+                .or_else(|| platform_value.get("blocker").and_then(Value::as_str))
+                .or_else(|| platform_value.get("error").and_then(Value::as_str))
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if from_platform_summary.is_some() {
+        return from_platform_summary;
+    }
+
+    let release_v1_key = format!("{platform}_blocker_category");
+    payload
+        .and_then(|value| value.get("release_v1"))
+        .and_then(|value| value.get(release_v1_key.as_str()))
+        .and_then(Value::as_str)
+        .or_else(|| payload.and_then(|value| value.get(release_v1_key.as_str())).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn gateway_delivery_record_count(payload: Option<&Value>) -> Option<u64> {
+    payload
+        .and_then(|value| value.get("delivery_observability"))
+        .and_then(|value| value.get("record_count"))
+        .and_then(Value::as_u64)
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
+fn to_non_empty_option(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        "unconfigured".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn redact_model_endpoint_response(endpoints: &[ModelEndpoint]) -> ModelEndpointsResponse {
+    ModelEndpointsResponse {
+        endpoints: endpoints.iter().map(redact_model_endpoint).collect(),
+    }
+}
+
 fn redact_bridge_provider_config(mut config: BridgeProviderConfig) -> BridgeProviderConfig {
+    config.app_id.clear();
     config.app_secret.clear();
+    config.bot_open_id.clear();
     config
 }
 
@@ -2358,7 +4492,7 @@ fn task_error_message(response: &TaskResponse) -> String {
 
 fn parse_scan_results(
     data: &Value,
-) -> Result<Vec<harbornas_local_agent::runtime::hub::HubScanResultItem>, String> {
+) -> Result<Vec<harborbeacon_local_agent::runtime::hub::HubScanResultItem>, String> {
     let value = data
         .pointer("/candidates")
         .cloned()
@@ -2514,11 +4648,10 @@ struct FfmpegMjpegStream {
 
 impl FfmpegMjpegStream {
     fn spawn(stream_url: &str) -> Result<Self, String> {
-        if which::which("ffmpeg").is_err() {
-            return Err("当前机器缺少 ffmpeg".to_string());
-        }
+        let ffmpeg_bin = resolve_ffmpeg_bin()
+            .ok_or_else(|| format!("当前机器缺少 ffmpeg，{}", ffmpeg_resolution_hint()))?;
 
-        let mut child = Command::new("ffmpeg")
+        let mut child = Command::new(&ffmpeg_bin)
             .args([
                 "-hide_banner",
                 "-loglevel",
@@ -2574,29 +4707,52 @@ impl Drop for FfmpegMjpegStream {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_local_admin_access, ensure_local_camera_access, has_forwarding_headers,
-        identity_query_suffix, is_admin_surface_path, parse_approval_decision_path,
-        parse_camera_analyze_path, parse_camera_live_page_path, parse_camera_live_stream_path,
-        parse_camera_share_link_path, parse_camera_snapshot_path, parse_camera_task_snapshot_path,
-        parse_member_role_update_path, parse_share_link_revoke_path,
-        parse_shared_camera_live_page_path, parse_shared_camera_live_stream_path,
-        percent_decode_path_segment, redact_bridge_provider_config, request_identity_hints,
+        apply_bridge_provider_binding_projection, authorize_gateway_service_request,
+        build_feature_availability_response,
+        ensure_local_admin_access,
+        ensure_local_camera_access, harbordesk_build_missing_response, has_forwarding_headers,
+        identity_query_suffix, is_admin_surface_path, is_harbordesk_client_route,
+        is_harbordesk_surface_path, live_bridge_provider_from_setup_status, mime_type_for_path,
+        LocalModelRuntimeProjection, ManualAddRequest,
+        overlay_model_endpoints_with_runtime_truth, probe_local_model_runtime,
+        parse_approval_decision_path, parse_camera_analyze_path, parse_camera_live_page_path,
+        parse_camera_live_stream_path, parse_camera_share_link_path, parse_camera_snapshot_path,
+        parse_camera_task_snapshot_path, parse_member_default_delivery_surface_update_path,
+        parse_member_role_update_path, parse_model_endpoint_path, parse_model_endpoint_test_path,
+        parse_notification_target_delete_path, parse_share_link_revoke_path,
+        parse_shared_camera_live_page_path,
+        parse_shared_camera_live_stream_path, percent_decode_path_segment,
+        redact_account_management_snapshot, redact_bridge_provider_config,
+        redact_model_endpoint_response, request_identity_hints, resolve_harbordesk_asset_path,
         url_encode_path_segment, AdminApi,
     };
-    use harbornas_local_agent::control_plane::media::{
+    use harborbeacon_local_agent::control_plane::media::{
         MediaDeliveryMode, MediaSession, MediaSessionKind, MediaSessionStatus, ShareAccessScope,
         ShareLink,
     };
-    use harbornas_local_agent::runtime::admin_console::{AdminConsoleStore, RemoteViewConfig};
-    use harbornas_local_agent::runtime::registry::DeviceRegistryStore;
-    use harbornas_local_agent::runtime::remote_view;
-    use harbornas_local_agent::runtime::task_api::TaskApiService;
-    use harbornas_local_agent::runtime::task_session::TaskConversationStore;
+    use harborbeacon_local_agent::control_plane::models::{
+        ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind,
+    };
+    use harborbeacon_local_agent::control_plane::users::{MembershipStatus, RoleKind};
+    use harborbeacon_local_agent::runtime::access_control::{
+        AccessAction, AccessIdentityHints, AccessPrincipal,
+    };
+    use harborbeacon_local_agent::runtime::admin_console::{
+        AdminConsoleStore, BridgeProviderConfig, RemoteViewConfig,
+    };
+    use harborbeacon_local_agent::runtime::registry::DeviceRegistryStore;
+    use harborbeacon_local_agent::runtime::remote_view;
+    use harborbeacon_local_agent::runtime::task_api::TaskApiService;
+    use harborbeacon_local_agent::runtime::task_session::TaskConversationStore;
     use serde_json::json;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::fs;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::path::{Path, PathBuf};
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tiny_http::Header;
+    use tiny_http::{Header, StatusCode};
 
     fn unique_store_path(prefix: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
@@ -2604,6 +4760,217 @@ mod tests {
             .expect("clock")
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{unique}.json"))
+    }
+
+    struct EnvGuard {
+        key: String,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self {
+                key: key.to_string(),
+                original,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => unsafe {
+                    std::env::set_var(&self.key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(&self.key);
+                },
+            }
+        }
+    }
+
+    fn build_manual_add_request(ip: &str) -> ManualAddRequest {
+        ManualAddRequest {
+            name: "Test Camera".to_string(),
+            room: None,
+            ip: ip.to_string(),
+            path: None,
+            snapshot_url: None,
+            username: None,
+            password: None,
+            port: None,
+        }
+    }
+
+    #[test]
+    fn owner_and_admin_manual_add_skip_camera_connect_approval_queue() {
+        for (role_kind, user_id) in [
+            (RoleKind::Owner, "local-owner"),
+            (RoleKind::Admin, "admin-1"),
+        ] {
+            let admin_path = unique_store_path("harborbeacon-manual-add-state");
+            let registry_path = unique_store_path("harborbeacon-manual-add-registry");
+            let conversation_path = unique_store_path("harborbeacon-manual-add-runtime");
+            let registry_store = DeviceRegistryStore::new(registry_path.clone());
+            let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
+            let conversation_store = TaskConversationStore::new(conversation_path.clone());
+            let task_service = TaskApiService::new(admin_store.clone(), conversation_store.clone());
+            let api = AdminApi::new(
+                admin_store,
+                task_service,
+                PathBuf::from("frontend/harbordesk/dist/harbordesk"),
+                "http://harborbeacon.local:4174".to_string(),
+            );
+
+            let error = api
+                .manual_add(
+                    &AccessPrincipal {
+                        workspace_id: "home-1".to_string(),
+                        user_id: user_id.to_string(),
+                        display_name: user_id.to_string(),
+                        role_kind,
+                    },
+                    build_manual_add_request(""),
+                )
+                .expect_err("owner/admin manual add should fail validation before approval");
+
+            assert_eq!(error, "IP 地址不能为空");
+            assert!(
+                conversation_store
+                    .pending_approvals()
+                    .expect("load pending approvals")
+                    .is_empty()
+            );
+
+            let _ = fs::remove_file(admin_path);
+            let _ = fs::remove_file(registry_path);
+            let _ = fs::remove_file(conversation_path);
+        }
+    }
+
+    #[test]
+    fn operator_manual_add_still_routes_into_camera_connect_approval_queue() {
+        let admin_path = unique_store_path("harborbeacon-operator-add-state");
+        let registry_path = unique_store_path("harborbeacon-operator-add-registry");
+        let conversation_path = unique_store_path("harborbeacon-operator-add-runtime");
+        let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let task_service = TaskApiService::new(admin_store.clone(), conversation_store.clone());
+        let api = AdminApi::new(
+            admin_store,
+            task_service,
+            PathBuf::from("frontend/harbordesk/dist/harbordesk"),
+            "http://harborbeacon.local:4174".to_string(),
+        );
+
+        let error = api
+            .manual_add(
+                &AccessPrincipal {
+                    workspace_id: "home-1".to_string(),
+                    user_id: "operator-1".to_string(),
+                    display_name: "operator-1".to_string(),
+                    role_kind: RoleKind::Operator,
+                },
+                build_manual_add_request(""),
+            )
+            .expect_err("operator manual add should still require approval");
+
+        assert!(error.contains("approval_token"));
+        let approvals = conversation_store
+            .pending_approvals()
+            .expect("load pending approvals");
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].policy_ref, "camera.connect");
+        assert_eq!(approvals[0].requester_user_id, "operator-1");
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn operator_camera_workspace_authorization_reaches_manual_add_approval_path() {
+        let admin_path = unique_store_path("harborbeacon-operator-http-state");
+        let registry_path = unique_store_path("harborbeacon-operator-http-registry");
+        let conversation_path = unique_store_path("harborbeacon-operator-http-runtime");
+        let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
+        let conversation_store = TaskConversationStore::new(conversation_path.clone());
+        let task_service = TaskApiService::new(admin_store.clone(), conversation_store.clone());
+
+        let mut state = admin_store.load_or_create_state().expect("state");
+        state
+            .platform
+            .users
+            .push(harborbeacon_local_agent::control_plane::users::UserAccount {
+                user_id: "operator-1".to_string(),
+                display_name: "operator-1".to_string(),
+                email: None,
+                phone: None,
+                status: harborbeacon_local_agent::control_plane::users::UserStatus::Active,
+                default_workspace_id: Some("home-1".to_string()),
+                preferences: json!({
+                    "auth_source": "harbor_os",
+                    "channel": "harbor_os",
+                }),
+            });
+        state
+            .platform
+            .memberships
+            .push(harborbeacon_local_agent::control_plane::users::Membership {
+                membership_id: "membership-operator-1".to_string(),
+                workspace_id: "home-1".to_string(),
+                user_id: "operator-1".to_string(),
+                role_kind: RoleKind::Operator,
+                status: MembershipStatus::Active,
+                granted_by_user_id: Some("local-owner".to_string()),
+                granted_at: None,
+            });
+        fs::write(
+            &admin_path,
+            serde_json::to_vec_pretty(&state).expect("serialize state"),
+        )
+        .expect("write state");
+
+        let api = AdminApi::new(
+            admin_store,
+            task_service,
+            PathBuf::from("frontend/harbordesk/dist/harbordesk"),
+            "http://harborbeacon.local:4174".to_string(),
+        );
+        let hints = AccessIdentityHints {
+            user_id: Some("operator-1".to_string()),
+            ..AccessIdentityHints::default()
+        };
+
+        let principal = api
+            .authorize_workspace_camera_action(&hints)
+            .expect("operator should be allowed to operate cameras");
+        assert_eq!(principal.user_id, "operator-1");
+        assert_eq!(principal.role_kind, RoleKind::Operator);
+        assert!(api
+            .authorize_admin_action(&hints, AccessAction::AdminManage)
+            .is_err());
+
+        let error = api
+            .manual_add(&principal, build_manual_add_request(""))
+            .expect_err("operator manual add should still require approval");
+        assert!(error.contains("approval_token"));
+        let approvals = conversation_store
+            .pending_approvals()
+            .expect("load pending approvals");
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].policy_ref, "camera.connect");
+        assert_eq!(approvals[0].requester_user_id, "operator-1");
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
     }
 
     #[test]
@@ -2683,16 +5050,91 @@ mod tests {
     #[test]
     fn bridge_provider_config_redacts_secret() {
         let redacted = redact_bridge_provider_config(
-            harbornas_local_agent::runtime::admin_console::BridgeProviderConfig {
+            harborbeacon_local_agent::runtime::admin_console::BridgeProviderConfig {
                 configured: true,
+                connected: true,
+                platform: "feishu".to_string(),
+                gateway_base_url: "http://gateway.local:4180".to_string(),
                 app_id: "cli_xxx".to_string(),
                 app_secret: "super-secret".to_string(),
-                app_name: "HarborNAS Bot".to_string(),
+                app_name: "HarborBeacon Bot".to_string(),
                 bot_open_id: "ou_xxx".to_string(),
                 status: "已连接".to_string(),
+                last_checked_at: "2026-04-18T10:00:00Z".to_string(),
+                capabilities:
+                    harborbeacon_local_agent::runtime::admin_console::BridgeProviderCapabilities {
+                        reply: true,
+                        update: true,
+                        attachments: true,
+                    },
             },
         );
+        assert_eq!(redacted.app_id, "");
         assert_eq!(redacted.app_secret, "");
+        assert_eq!(redacted.bot_open_id, "");
+    }
+
+    #[test]
+    fn live_bridge_provider_from_setup_status_prefers_connected_channel() {
+        let payload = json!({
+            "public_origin": "http://192.168.3.169:8787",
+            "channels": [
+                {
+                    "platform": "webhook",
+                    "enabled": true,
+                    "connected": false,
+                    "display_name": "Webhook",
+                    "capabilities": {
+                        "reply": true,
+                        "update": false,
+                        "attachments": true
+                    }
+                },
+                {
+                    "platform": "weixin",
+                    "enabled": true,
+                    "connected": true,
+                    "display_name": "Weixin",
+                    "capabilities": {
+                        "reply": true,
+                        "update": false,
+                        "attachments": false
+                    }
+                }
+            ]
+        });
+
+        let provider = live_bridge_provider_from_setup_status(&payload).expect("provider");
+        assert!(provider.configured);
+        assert!(provider.connected);
+        assert_eq!(provider.platform, "weixin");
+        assert_eq!(provider.app_name, "Weixin");
+        assert_eq!(provider.status, "已连接");
+    }
+
+    #[test]
+    fn bridge_provider_binding_projection_marks_connected_gateway() {
+        let provider = harborbeacon_local_agent::runtime::admin_console::BridgeProviderConfig {
+            configured: true,
+            connected: true,
+            platform: "weixin".to_string(),
+            app_name: "Weixin".to_string(),
+            ..Default::default()
+        };
+        let mut status = String::new();
+        let mut metric = String::new();
+        let mut bound_user = None;
+
+        apply_bridge_provider_binding_projection(
+            &mut status,
+            &mut metric,
+            &mut bound_user,
+            &provider,
+        );
+
+        assert_eq!(status, "Gateway 已连接");
+        assert_eq!(metric, "Gateway 在线");
+        assert_eq!(bound_user, Some("Weixin".to_string()));
     }
 
     #[test]
@@ -2718,8 +5160,20 @@ mod tests {
     fn approval_routes_are_admin_surface_paths() {
         assert!(is_admin_surface_path("/api/tasks/approvals"));
         assert!(is_admin_surface_path("/api/access/members"));
+        assert!(is_admin_surface_path("/api/account-management"));
+        assert!(is_admin_surface_path("/api/gateway/status"));
         assert!(is_admin_surface_path("/api/share-links"));
+        assert!(is_admin_surface_path("/api/models/endpoints"));
+        assert!(is_admin_surface_path("/api/models/policies"));
+        assert!(is_admin_surface_path("/admin/models"));
+        assert!(is_admin_surface_path("/api/models/endpoints/ocr-local"));
+        assert!(is_admin_surface_path(
+            "/api/models/endpoints/ocr-local/test"
+        ));
         assert!(is_admin_surface_path("/api/access/members/user-1/role"));
+        assert!(is_admin_surface_path(
+            "/api/access/members/user-1/default-delivery-surface"
+        ));
         assert!(is_admin_surface_path(
             "/api/tasks/approvals/approval-1/approve"
         ));
@@ -2735,6 +5189,73 @@ mod tests {
     }
 
     #[test]
+    fn harbordesk_client_routes_are_identified() {
+        assert!(is_harbordesk_client_route("/"));
+        assert!(is_harbordesk_client_route("/overview"));
+        assert!(is_harbordesk_client_route("/models-policies"));
+        assert!(is_harbordesk_surface_path("/assets/runtime.js"));
+        assert!(is_harbordesk_surface_path("/main.js"));
+        assert!(!is_harbordesk_surface_path("/api/state"));
+        assert!(!is_harbordesk_surface_path("/setup/mobile"));
+    }
+
+    #[test]
+    fn harbordesk_asset_paths_reject_parent_segments() {
+        let root = PathBuf::from("C:/harbordesk-dist");
+        assert_eq!(
+            resolve_harbordesk_asset_path(&root, "/assets/main.js"),
+            Some(root.join("assets").join("main.js"))
+        );
+        assert_eq!(resolve_harbordesk_asset_path(&root, "/../secret.txt"), None);
+        assert_eq!(resolve_harbordesk_asset_path(&root, "/overview"), None);
+    }
+
+    #[test]
+    fn static_file_helpers_set_expected_mime_types() {
+        assert_eq!(
+            mime_type_for_path(Path::new("C:/tmp/index.html")),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            mime_type_for_path(Path::new("C:/tmp/main.js")),
+            "application/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            mime_type_for_path(Path::new("C:/tmp/icon.svg")),
+            "image/svg+xml"
+        );
+    }
+
+    #[test]
+    fn harbordesk_build_missing_response_mentions_dist_path() {
+        let response =
+            harbordesk_build_missing_response(Path::new("frontend/harbordesk/dist/harbordesk"));
+        assert_eq!(response.status_code(), StatusCode(503));
+    }
+
+    #[test]
+    fn account_management_redaction_clears_gateway_credentials() {
+        let registry_path = unique_store_path("harborbeacon-account-registry");
+        let admin_path = unique_store_path("harborbeacon-account-state");
+        let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
+        let state = admin_store.load_or_create_state().expect("state");
+        let snapshot =
+            harborbeacon_local_agent::runtime::admin_console::account_management_snapshot(
+                &state,
+                Some("http://harborbeacon.local:4174"),
+            );
+        let redacted = redact_account_management_snapshot(snapshot);
+
+        assert_eq!(redacted.gateway.bridge_provider.app_id, "");
+        assert_eq!(redacted.gateway.bridge_provider.app_secret, "");
+        assert_eq!(redacted.gateway.bridge_provider.bot_open_id, "");
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+    }
+
+    #[test]
     fn member_role_paths_decode_ids() {
         let encoded = "user%2F1";
         assert_eq!(
@@ -2744,20 +5265,561 @@ mod tests {
     }
 
     #[test]
+    fn member_default_delivery_surface_paths_decode_ids() {
+        let encoded = "user%2F1";
+        assert_eq!(
+            parse_member_default_delivery_surface_update_path(&format!(
+                "/api/access/members/{encoded}/default-delivery-surface"
+            )),
+            Some("user/1".to_string())
+        );
+    }
+
+    #[test]
+    fn notification_target_delete_paths_decode_ids() {
+        let encoded = "target%2F1";
+        assert_eq!(
+            parse_notification_target_delete_path(&format!(
+                "/api/admin/notification-targets/{encoded}"
+            )),
+            Some("target/1".to_string())
+        );
+    }
+
+    #[test]
+    fn model_endpoint_paths_decode_ids() {
+        let encoded = "ocr%2Flocal";
+        assert_eq!(
+            parse_model_endpoint_path(&format!("/api/models/endpoints/{encoded}")),
+            Some("ocr/local".to_string())
+        );
+        assert_eq!(
+            parse_model_endpoint_test_path(&format!("/api/models/endpoints/{encoded}/test")),
+            Some("ocr/local".to_string())
+        );
+    }
+
+    #[test]
+    fn model_endpoint_response_redacts_secret_metadata() {
+        let payload = redact_model_endpoint_response(&[ModelEndpoint {
+            model_endpoint_id: "llm-cloud".to_string(),
+            workspace_id: Some("home-1".to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Llm,
+            endpoint_kind: ModelEndpointKind::Cloud,
+            provider_key: "custom".to_string(),
+            model_name: "demo".to_string(),
+            capability_tags: vec!["chat".to_string()],
+            cost_policy: json!({}),
+            status: ModelEndpointStatus::Active,
+            metadata: json!({
+                "base_url": "https://api.example.com/v1",
+                "api_key": "super-secret",
+                "nested": {
+                    "token": "hidden-token"
+                }
+            }),
+        }]);
+
+        assert_eq!(payload.endpoints.len(), 1);
+        assert_eq!(payload.endpoints[0].metadata["api_key"], json!(""));
+        assert_eq!(
+            payload.endpoints[0].metadata["api_key_configured"],
+            json!(true)
+        );
+        assert_eq!(payload.endpoints[0].metadata["nested"]["token"], json!(""));
+        assert_eq!(
+            payload.endpoints[0].metadata["nested"]["token_configured"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn runtime_overlay_promotes_live_local_llm_and_embedder_rows() {
+        let mut endpoints = harborbeacon_local_agent::runtime::admin_console::default_model_endpoints();
+        for endpoint in &mut endpoints {
+            if matches!(endpoint.model_kind, ModelKind::Llm | ModelKind::Embedder | ModelKind::Vlm)
+            {
+                endpoint.status = ModelEndpointStatus::Disabled;
+                endpoint.metadata = json!({
+                    "builtin": true,
+                    "base_url": "",
+                    "healthz_url": "",
+                    "api_key": "",
+                    "api_key_configured": false,
+                });
+            }
+        }
+
+        let overlayed = overlay_model_endpoints_with_runtime_truth(
+            &endpoints,
+            &LocalModelRuntimeProjection {
+                ready: true,
+                backend_ready: true,
+                backend_kind: Some("candle".to_string()),
+                chat_model: Some("/models/qwen".to_string()),
+                embedding_model: Some("/models/jina".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let llm = overlayed
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "llm-local-openai-compatible")
+            .expect("llm endpoint");
+        assert_eq!(llm.status, ModelEndpointStatus::Active);
+        assert_eq!(llm.metadata["projection_mismatch"], json!(true));
+        assert_ne!(llm.metadata["base_url"], json!(""));
+        assert_eq!(llm.metadata["runtime_backend_kind"], json!("candle"));
+
+        let embedder = overlayed
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "embed-local-openai-compatible")
+            .expect("embedder endpoint");
+        assert_eq!(embedder.status, ModelEndpointStatus::Active);
+        assert_eq!(embedder.metadata["api_key_configured"], json!(true));
+
+        let vlm = overlayed
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "vlm-local-openai-compatible")
+            .expect("vlm endpoint");
+        assert_eq!(vlm.status, ModelEndpointStatus::Disabled);
+    }
+
+    #[test]
+    fn runtime_probe_falls_back_to_builtin_local_endpoint_urls() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let body = json!({
+                "service": "harbor-model-api",
+                "status": "ok",
+                "backend": {
+                    "kind": "candle",
+                    "ready": true
+                },
+                "chat_model": "/models/qwen",
+                "embedding_model": "/models/jina",
+                "ready": true
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+
+        let _base_url = EnvGuard::set(
+            "HARBOR_MODEL_API_BASE_URL",
+            &format!("http://{addr}/v1"),
+        );
+        let mut endpoints =
+            harborbeacon_local_agent::runtime::admin_console::default_model_endpoints();
+        for endpoint in &mut endpoints {
+            if matches!(endpoint.model_kind, ModelKind::Llm | ModelKind::Embedder) {
+                endpoint.metadata = json!({
+                    "builtin": true,
+                    "base_url": "",
+                    "healthz_url": "",
+                    "api_key": "",
+                    "api_key_configured": false
+                });
+            }
+        }
+
+        let projection = probe_local_model_runtime(&endpoints);
+
+        assert!(projection.ready);
+        assert!(projection.backend_ready);
+        assert_eq!(projection.backend_kind.as_deref(), Some("candle"));
+        assert_eq!(projection.chat_model.as_deref(), Some("/models/qwen"));
+        assert_eq!(projection.embedding_model.as_deref(), Some("/models/jina"));
+        assert!(projection.api_key_configured);
+        assert_eq!(
+            projection.healthz_url,
+            format!("http://{addr}/healthz")
+        );
+
+        server.join().expect("server join");
+    }
+
+    #[test]
+    fn feature_availability_prefers_runtime_truth_for_embed_and_answer() {
+        let registry_path = unique_store_path("harborbeacon-feature-runtime-registry");
+        let admin_path = unique_store_path("harborbeacon-feature-runtime-state");
+        let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
+        let mut state = admin_store.load_or_create_state().expect("state");
+        for endpoint in &mut state.models.endpoints {
+            if matches!(endpoint.model_kind, ModelKind::Llm | ModelKind::Embedder) {
+                endpoint.status = ModelEndpointStatus::Disabled;
+                endpoint.metadata = json!({
+                    "builtin": true,
+                    "base_url": "",
+                    "healthz_url": "",
+                    "api_key": "",
+                    "api_key_configured": false,
+                });
+            }
+        }
+        let account_management =
+            harborbeacon_local_agent::runtime::admin_console::account_management_snapshot(
+                &state,
+                Some("http://harborbeacon.local:4174"),
+            );
+        let overlayed = overlay_model_endpoints_with_runtime_truth(
+            &state.models.endpoints,
+            &LocalModelRuntimeProjection {
+                ready: true,
+                backend_ready: true,
+                backend_kind: Some("candle".to_string()),
+                chat_model: Some("/models/qwen".to_string()),
+                embedding_model: Some("/models/jina".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let response = build_feature_availability_response(
+            &overlayed,
+            &state.models.route_policies,
+            &account_management,
+            None,
+            &LocalModelRuntimeProjection {
+                ready: true,
+                backend_ready: true,
+                backend_kind: Some("candle".to_string()),
+                chat_model: Some("/models/qwen".to_string()),
+                embedding_model: Some("/models/jina".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let embed = response
+            .groups
+            .iter()
+            .flat_map(|group| group.items.iter())
+            .find(|item| item.feature_id == "retrieval.embed")
+            .expect("embed feature");
+        assert_eq!(embed.status, "available");
+        assert!(embed
+            .evidence
+            .iter()
+            .any(|entry| entry.contains("projection_mismatch")));
+
+        let answer = response
+            .groups
+            .iter()
+            .flat_map(|group| group.items.iter())
+            .find(|item| item.feature_id == "retrieval.answer")
+            .expect("answer feature");
+        assert_eq!(answer.status, "available");
+        assert!(answer
+            .evidence
+            .iter()
+            .any(|entry| entry.contains("4176.backend.kind=candle")));
+
+        let vision = response
+            .groups
+            .iter()
+            .flat_map(|group| group.items.iter())
+            .find(|item| item.feature_id == "retrieval.vision_summary")
+            .expect("vision feature");
+        assert_ne!(vision.status, "available");
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn feature_availability_surfaces_weixin_blocker_without_secret_material() {
+        let registry_path = unique_store_path("harborbeacon-feature-weixin-registry");
+        let admin_path = unique_store_path("harborbeacon-feature-weixin-state");
+        let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
+        let state = admin_store.load_or_create_state().expect("state");
+        let account_management =
+            harborbeacon_local_agent::runtime::admin_console::account_management_snapshot(
+                &state,
+                Some("http://harborbeacon.local:4174"),
+            );
+        let gateway_payload = json!({
+            "ok": true,
+            "channels": [
+                {
+                    "platform": "weixin",
+                    "connected": false,
+                    "transport": {
+                        "status": "error"
+                    }
+                }
+            ],
+            "weixin": {
+                "blocker_category": "weixin_dns_resolution",
+                "ingress_blocker_category": "getupdates",
+                "status": "error",
+                "poll": {
+                    "status": "error",
+                    "error": "<urlopen error [Errno 11001] getaddrinfo failed>"
+                },
+                "delivery_observability": {
+                    "last_send_status": ""
+                },
+                "app_secret": "should-not-leak"
+            },
+            "release_v1": {
+                "weixin_blocker_category": "getupdates"
+            },
+            "delivery_observability": {
+                "record_count": 0
+            }
+        });
+
+        let response = build_feature_availability_response(
+            &state.models.endpoints,
+            &state.models.route_policies,
+            &account_management,
+            Some(&gateway_payload),
+            &LocalModelRuntimeProjection::default(),
+        );
+
+        let proactive = response
+            .groups
+            .iter()
+            .flat_map(|group| group.items.iter())
+            .find(|item| item.feature_id == "proactive_delivery")
+            .expect("proactive delivery");
+        assert_eq!(proactive.status, "blocked");
+        assert_eq!(proactive.blocker, "weixin_dns_resolution");
+        assert!(proactive
+            .evidence
+            .iter()
+            .any(|entry| entry.contains("delivery_observability.record_count=0")));
+        assert!(!proactive.blocker.contains("should-not-leak"));
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn feature_availability_keeps_runtime_features_available_while_weixin_blocker_isolated() {
+        let registry_path = unique_store_path("harborbeacon-feature-isolated-runtime-registry");
+        let admin_path = unique_store_path("harborbeacon-feature-isolated-runtime-state");
+        let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
+        let mut state = admin_store.load_or_create_state().expect("state");
+        for endpoint in &mut state.models.endpoints {
+            if matches!(endpoint.model_kind, ModelKind::Llm | ModelKind::Embedder) {
+                endpoint.status = ModelEndpointStatus::Disabled;
+                endpoint.metadata = json!({
+                    "builtin": true,
+                    "base_url": "",
+                    "healthz_url": "",
+                    "api_key": "",
+                    "api_key_configured": false,
+                });
+            }
+        }
+        let account_management =
+            harborbeacon_local_agent::runtime::admin_console::account_management_snapshot(
+                &state,
+                Some("http://harborbeacon.local:4174"),
+            );
+        let runtime = LocalModelRuntimeProjection {
+            ready: true,
+            backend_ready: true,
+            backend_kind: Some("candle".to_string()),
+            chat_model: Some("/models/qwen".to_string()),
+            embedding_model: Some("/models/jina".to_string()),
+            ..Default::default()
+        };
+        let overlayed = overlay_model_endpoints_with_runtime_truth(&state.models.endpoints, &runtime);
+        let gateway_payload = json!({
+            "ok": true,
+            "channels": [
+                {
+                    "platform": "weixin",
+                    "connected": false,
+                    "transport": {
+                        "status": "error"
+                    }
+                }
+            ],
+            "weixin": {
+                "blocker_category": "weixin_dns_resolution",
+                "ingress_blocker_category": "getupdates",
+                "status": "error",
+                "poll": {
+                    "status": "error",
+                    "error": "<urlopen error [Errno 11001] getaddrinfo failed>"
+                }
+            },
+            "release_v1": {
+                "weixin_blocker_category": "getupdates"
+            },
+            "delivery_observability": {
+                "record_count": 0
+            }
+        });
+
+        let response = build_feature_availability_response(
+            &overlayed,
+            &state.models.route_policies,
+            &account_management,
+            Some(&gateway_payload),
+            &runtime,
+        );
+
+        let answer = response
+            .groups
+            .iter()
+            .flat_map(|group| group.items.iter())
+            .find(|item| item.feature_id == "retrieval.answer")
+            .expect("answer feature");
+        assert_eq!(answer.status, "available");
+        assert!(answer.blocker.is_empty());
+        assert!(answer
+            .evidence
+            .iter()
+            .any(|entry| entry.contains("4176.backend.kind=candle")));
+
+        let proactive = response
+            .groups
+            .iter()
+            .flat_map(|group| group.items.iter())
+            .find(|item| item.feature_id == "proactive_delivery")
+            .expect("proactive delivery");
+        assert_eq!(proactive.status, "blocked");
+        assert_eq!(proactive.blocker, "weixin_dns_resolution");
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn feature_availability_falls_back_to_release_v1_weixin_blocker_category() {
+        let registry_path = unique_store_path("harborbeacon-feature-release-v1-weixin-registry");
+        let admin_path = unique_store_path("harborbeacon-feature-release-v1-weixin-state");
+        let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
+        let state = admin_store.load_or_create_state().expect("state");
+        let account_management =
+            harborbeacon_local_agent::runtime::admin_console::account_management_snapshot(
+                &state,
+                Some("http://harborbeacon.local:4174"),
+            );
+        let gateway_payload = json!({
+            "ok": true,
+            "channels": [
+                {
+                    "platform": "weixin",
+                    "connected": false,
+                    "transport": {
+                        "status": "error"
+                    }
+                }
+            ],
+            "release_v1": {
+                "weixin_blocker_category": "getupdates"
+            },
+            "delivery_observability": {
+                "record_count": 0
+            }
+        });
+
+        let response = build_feature_availability_response(
+            &state.models.endpoints,
+            &state.models.route_policies,
+            &account_management,
+            Some(&gateway_payload),
+            &LocalModelRuntimeProjection::default(),
+        );
+
+        let proactive = response
+            .groups
+            .iter()
+            .flat_map(|group| group.items.iter())
+            .find(|item| item.feature_id == "proactive_delivery")
+            .expect("proactive delivery");
+        assert_eq!(proactive.status, "blocked");
+        assert_eq!(proactive.blocker, "getupdates");
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+    }
+
+    #[test]
     fn request_identity_hints_prefer_headers_then_query() {
         let headers = vec![
             Header::from_bytes(b"X-Harbor-Open-Id".as_slice(), b"ou_header".as_slice())
                 .expect("header"),
             Header::from_bytes(b"X-Harbor-User-Id".as_slice(), b"user-header".as_slice())
                 .expect("header"),
+            Header::from_bytes(b"X-HarborOS-User".as_slice(), b"harbor".as_slice())
+                .expect("header"),
         ];
 
         let hints = request_identity_hints(
-            "/live/cameras/cam-1?open_id=ou_query&user_id=user-query",
+            "/live/cameras/cam-1?open_id=ou_query&user_id=user-query&harboros_user=harbor-query",
             &headers,
         );
         assert_eq!(hints.open_id.as_deref(), Some("ou_header"));
         assert_eq!(hints.user_id.as_deref(), Some("user-header"));
+        assert_eq!(hints.harboros_user_id.as_deref(), Some("harbor"));
+    }
+
+    #[test]
+    fn deprecated_binding_routes_return_gone() {
+        let admin_path = unique_store_path("harborbeacon-binding-gone-state");
+        let registry_path = unique_store_path("harborbeacon-binding-gone-registry");
+        let conversation_path = unique_store_path("harborbeacon-binding-gone-runtime");
+        let registry_store = DeviceRegistryStore::new(registry_path.clone());
+        let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
+        admin_store
+            .save_bridge_provider_status(BridgeProviderConfig {
+                gateway_base_url: "http://gateway.local:8787".to_string(),
+                ..Default::default()
+            })
+            .expect("save bridge provider");
+        let task_service = TaskApiService::new(
+            admin_store.clone(),
+            TaskConversationStore::new(conversation_path.clone()),
+        );
+        let api = AdminApi::new(
+            admin_store,
+            task_service,
+            PathBuf::from("frontend/harbordesk/dist/harbordesk"),
+            "http://harborbeacon.local:4174".to_string(),
+        );
+
+        let qr_response = api.handle_binding_qr_svg(&AccessIdentityHints::default());
+        let page_response = api.handle_mobile_setup_page("/setup/mobile", &AccessIdentityHints::default());
+
+        assert_eq!(qr_response.status_code(), StatusCode(410));
+        assert_eq!(page_response.status_code(), StatusCode(410));
+
+        let _ = fs::remove_file(admin_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(conversation_path);
+    }
+
+    #[test]
+    fn gateway_service_request_requires_matching_bearer_token() {
+        let headers = vec![Header::from_bytes(
+            b"Authorization".as_slice(),
+            b"Bearer shared-token".as_slice(),
+        )
+        .expect("header")];
+        let _guard = EnvGuard::set("HARBORGATE_BEARER_TOKEN", "shared-token");
+
+        assert!(authorize_gateway_service_request(&headers).is_ok());
+        assert!(authorize_gateway_service_request(&[]).is_err());
     }
 
     #[test]
@@ -2771,9 +5833,9 @@ mod tests {
 
     #[test]
     fn verify_shared_camera_token_requires_persisted_active_share_link() {
-        let admin_path = unique_store_path("harbornas-admin-state");
-        let registry_path = unique_store_path("harbornas-device-registry");
-        let conversation_path = unique_store_path("harbornas-task-runtime");
+        let admin_path = unique_store_path("harborbeacon-admin-state");
+        let registry_path = unique_store_path("harborbeacon-device-registry");
+        let conversation_path = unique_store_path("harborbeacon-task-runtime");
         let registry_store = DeviceRegistryStore::new(registry_path.clone());
         let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
         admin_store
@@ -2787,7 +5849,8 @@ mod tests {
         let api = AdminApi::new(
             admin_store,
             task_service,
-            "http://harbornas.local:4174".to_string(),
+            PathBuf::from("frontend/harbordesk/dist/harbordesk"),
+            "http://harborbeacon.local:4174".to_string(),
         );
 
         let issued = remote_view::issue_camera_share_token("platform-share-secret", "cam-1", 15)
@@ -2839,9 +5902,9 @@ mod tests {
 
     #[test]
     fn list_share_links_surfaces_registered_status() {
-        let admin_path = unique_store_path("harbornas-admin-state");
-        let registry_path = unique_store_path("harbornas-device-registry");
-        let conversation_path = unique_store_path("harbornas-task-runtime");
+        let admin_path = unique_store_path("harborbeacon-admin-state");
+        let registry_path = unique_store_path("harborbeacon-device-registry");
+        let conversation_path = unique_store_path("harborbeacon-task-runtime");
         let registry_store = DeviceRegistryStore::new(registry_path.clone());
         let admin_store = AdminConsoleStore::new(admin_path.clone(), registry_store);
         let conversation_store = TaskConversationStore::new(conversation_path.clone());
@@ -2849,7 +5912,8 @@ mod tests {
         let api = AdminApi::new(
             admin_store,
             task_service,
-            "http://harbornas.local:4174".to_string(),
+            PathBuf::from("frontend/harbordesk/dist/harbordesk"),
+            "http://harborbeacon.local:4174".to_string(),
         );
 
         conversation_store

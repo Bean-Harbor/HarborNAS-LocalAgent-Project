@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RELEASE_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+ENV_FILE="${HARBOR_ENV_FILE:-/etc/default/harborbeacon-agent-hub}"
+
+if [[ -f "${ENV_FILE}" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "${ENV_FILE}"
+  set +a
+fi
+
+exec "${HARBOR_MODEL_API_BIN:-${RELEASE_ROOT}/bin/harbor-model-api}" \
+  --bind "${HARBOR_MODEL_API_BIND:-127.0.0.1:4176}" \
+  --backend "${HARBOR_MODEL_API_BACKEND:-openai_proxy}" \
+  --upstream-base-url "${HARBOR_MODEL_API_UPSTREAM_BASE_URL:-http://127.0.0.1:11434/v1}" \
+  --chat-model "${HARBOR_MODEL_API_CHAT_MODEL:-harbor-local-chat}" \
+  --embedding-model "${HARBOR_MODEL_API_EMBEDDING_MODEL:-harbor-local-embed}" \
+  --request-timeout-ms "${HARBOR_MODEL_API_REQUEST_TIMEOUT_MS:-30000}" \
+  "$@"

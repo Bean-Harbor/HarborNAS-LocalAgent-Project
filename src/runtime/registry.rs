@@ -82,6 +82,8 @@ pub struct CameraDevice {
     pub discovery_source: String,
     pub primary_stream: CameraStreamRef,
     #[serde(default)]
+    pub snapshot_url: Option<String>,
+    #[serde(default)]
     pub onvif_device_service_url: Option<String>,
     #[serde(default)]
     pub ezviz_device_serial: Option<String>,
@@ -115,6 +117,7 @@ impl CameraDevice {
                 url: url.into(),
                 requires_auth: false,
             },
+            snapshot_url: None,
             onvif_device_service_url: None,
             ezviz_device_serial: None,
             ezviz_camera_no: None,
@@ -146,6 +149,8 @@ pub struct ResolvedCameraTarget {
     pub discovery_source: String,
     pub primary_stream: CameraStreamRef,
     #[serde(default)]
+    pub snapshot_url: Option<String>,
+    #[serde(default)]
     pub onvif_device_service_url: Option<String>,
     #[serde(default)]
     pub ezviz_device_serial: Option<String>,
@@ -171,6 +176,7 @@ impl From<ResolvedCameraTarget> for CameraDevice {
             mac_address: target.mac_address,
             discovery_source: target.discovery_source,
             primary_stream: target.primary_stream,
+            snapshot_url: target.snapshot_url,
             onvif_device_service_url: target.onvif_device_service_url,
             ezviz_device_serial: target.ezviz_device_serial,
             ezviz_camera_no: target.ezviz_camera_no,
@@ -178,6 +184,103 @@ impl From<ResolvedCameraTarget> for CameraDevice {
             last_seen_at: target.last_seen_at,
         }
     }
+}
+
+fn is_tp_link_tapo_vendor(vendor: Option<&str>, model: Option<&str>) -> bool {
+    let vendor = vendor.unwrap_or_default().to_ascii_lowercase();
+    let model = model.unwrap_or_default().to_ascii_lowercase();
+    vendor.contains("tapo")
+        || vendor.contains("tp-link")
+        || vendor.contains("tplink")
+        || model.contains("tapo")
+}
+
+fn normalize_optional_string(value: Option<&str>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+}
+
+fn normalize_rtsp_candidate(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Some(if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    })
+}
+
+fn merge_tapo_rtsp_path_candidates(existing: Option<&Value>) -> Value {
+    let mut candidates = Vec::<String>::new();
+    let mut push_candidate = |candidate: Option<String>| {
+        if let Some(candidate) = candidate {
+            if !candidates.iter().any(|existing| existing == &candidate) {
+                candidates.push(candidate);
+            }
+        }
+    };
+
+    push_candidate(normalize_rtsp_candidate("/stream1"));
+    push_candidate(normalize_rtsp_candidate("/stream2"));
+
+    if let Some(existing_candidates) = existing
+        .and_then(Value::as_object)
+        .and_then(|map| map.get("rtsp_path_candidates"))
+        .and_then(Value::as_array)
+    {
+        for entry in existing_candidates {
+            if let Some(candidate) = entry.as_str() {
+                push_candidate(normalize_rtsp_candidate(candidate));
+            }
+        }
+    }
+
+    Value::Array(candidates.into_iter().map(Value::String).collect())
+}
+
+fn tapo_vendor_features(camera: &CameraDevice, existing: Option<&Value>) -> Value {
+    let mut features = existing
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    if is_tp_link_tapo_vendor(camera.vendor.as_deref(), camera.model.as_deref()) {
+        features.insert("profile".to_string(), json!("tp-link/tapo"));
+        features.insert(
+            "rtsp_path_candidates".to_string(),
+            merge_tapo_rtsp_path_candidates(existing),
+        );
+    }
+
+    if let Some(snapshot_url) = normalize_optional_string(camera.snapshot_url.as_deref()) {
+        features.insert("native_snapshot_url".to_string(), json!(snapshot_url));
+    }
+
+    Value::Object(features)
+}
+
+fn native_snapshot_url_from_camera_profile(
+    camera_profile: Option<&CameraProfile>,
+) -> Option<String> {
+    camera_profile.and_then(|profile| {
+        profile
+            .vendor_features
+            .get("native_snapshot_url")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                profile
+                    .vendor_features
+                    .pointer("/native_snapshot/url")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -277,7 +380,7 @@ impl DeviceRegistrySnapshot {
                 privacy_supported: false,
                 playback_supported: false,
                 recording_policy_id: None,
-                vendor_features: json!({}),
+                vendor_features: tapo_vendor_features(camera, None),
             });
 
             snapshot
@@ -420,6 +523,22 @@ impl DeviceRegistrySnapshot {
                 url: stream_url_from_endpoint(endpoint),
                 requires_auth: endpoint.requires_auth,
             },
+            snapshot_url: binding_set
+                .iter()
+                .find(|binding| {
+                    matches!(
+                        binding.provider_key.as_str(),
+                        "rtsp" | "hls" | "webrtc" | "stream"
+                    )
+                })
+                .and_then(|binding| {
+                    binding
+                        .metadata
+                        .get("snapshot_url")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .or_else(|| native_snapshot_url_from_camera_profile(camera_profile)),
             onvif_device_service_url: binding_set
                 .iter()
                 .find(|binding| binding.provider_key == "onvif")
@@ -595,9 +714,12 @@ impl DeviceRegistrySnapshot {
             .iter_mut()
             .find(|profile| profile.device_id == camera.device_id)
         {
+            let existing_vendor_features = existing.vendor_features.clone();
             existing.default_stream_profile_id = Some(primary_stream_profile_id);
             existing.audio_supported = existing.audio_supported || camera.capabilities.audio;
             existing.ptz_supported = existing.ptz_supported || camera.capabilities.ptz;
+            existing.vendor_features =
+                tapo_vendor_features(camera, Some(&existing_vendor_features));
         } else {
             self.camera_profiles.push(CameraProfile {
                 device_id: camera.device_id.clone(),
@@ -607,7 +729,7 @@ impl DeviceRegistrySnapshot {
                 privacy_supported: false,
                 playback_supported: false,
                 recording_policy_id: None,
-                vendor_features: json!({}),
+                vendor_features: tapo_vendor_features(camera, None),
             });
         }
     }
@@ -963,6 +1085,7 @@ fn provider_bindings_from_camera(camera: &CameraDevice) -> Vec<ProviderBinding> 
         metadata: json!({
             "discovery_source": camera.discovery_source,
             "transport": legacy_stream_transport_scheme(camera.primary_stream.transport),
+            "snapshot_url": camera.snapshot_url,
         }),
         last_sync_at: camera.last_seen_at.clone(),
     }];
@@ -1136,6 +1259,10 @@ fn normalize_camera_metadata(mut device: CameraDevice) -> CameraDevice {
     if matches!(device.primary_stream.transport, StreamTransport::Unknown) {
         device.primary_stream.transport = StreamTransport::Rtsp;
     }
+    device.snapshot_url = device.snapshot_url.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    });
     device
 }
 
@@ -1157,6 +1284,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
+    use serde_json::Value;
 
     use crate::control_plane::credentials::ProviderKind;
     use crate::control_plane::devices::{
@@ -1188,7 +1316,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("harbornas-device-registry-{unique}.json"));
+        let path = std::env::temp_dir().join(format!("harborbeacon-device-registry-{unique}.json"));
         let store = DeviceRegistryStore::new(&path);
         let mut device = CameraDevice::new("cam-1", "Front Door", "rtsp://192.168.1.10/live");
         device.capabilities.stream = true;
@@ -1212,6 +1340,7 @@ mod tests {
         device.model = Some("X1".to_string());
         device.ip_address = Some("192.168.1.10".to_string());
         device.discovery_source = "onvif".to_string();
+        device.snapshot_url = Some("http://192.168.1.10/snapshot.jpg".to_string());
         device.onvif_device_service_url =
             Some("http://192.168.1.10/onvif/device_service".to_string());
         device.capabilities.stream = true;
@@ -1249,6 +1378,7 @@ mod tests {
                 mac_address: None,
                 discovery_source: "onvif".to_string(),
                 primary_stream: device.primary_stream.clone(),
+                snapshot_url: None,
                 onvif_device_service_url: None,
                 ezviz_device_serial: None,
                 ezviz_camera_no: None,
@@ -1259,13 +1389,83 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_round_trip_preserves_native_snapshot_url() {
+        let mut device = CameraDevice::new("cam-1", "Front Door", "rtsp://192.168.1.10/live");
+        device.snapshot_url = Some("http://192.168.1.10/snapshot.jpg".to_string());
+        device.capabilities.stream = true;
+        device.capabilities.snapshot = true;
+
+        let snapshot = DeviceRegistrySnapshot::from_camera_devices(std::slice::from_ref(&device));
+        let round_tripped = snapshot.camera_target("cam-1").expect("camera target");
+
+        assert_eq!(
+            round_tripped.snapshot_url.as_deref(),
+            Some("http://192.168.1.10/snapshot.jpg")
+        );
+    }
+
+    #[test]
+    fn snapshot_round_trip_uses_profile_native_snapshot_url_when_binding_missing() {
+        let mut device = CameraDevice::new("cam-1", "Front Door", "rtsp://192.168.1.10/live");
+        device.vendor = Some("TP-Link".to_string());
+        device.model = Some("Tapo C200".to_string());
+        device.capabilities.stream = true;
+        device.capabilities.snapshot = true;
+        device.snapshot_url = Some("http://192.168.1.10/snapshot.jpg".to_string());
+
+        let mut snapshot =
+            DeviceRegistrySnapshot::from_camera_devices(std::slice::from_ref(&device));
+        snapshot.provider_bindings.clear();
+        snapshot.camera_profiles[0].vendor_features = json!({
+            "profile": "tp-link/tapo",
+            "native_snapshot_url": "http://192.168.1.10/snapshot.jpg"
+        });
+
+        let round_tripped = snapshot.camera_target("cam-1").expect("camera target");
+
+        assert_eq!(
+            round_tripped.snapshot_url.as_deref(),
+            Some("http://192.168.1.10/snapshot.jpg")
+        );
+    }
+
+    #[test]
+    fn tapo_vendor_features_keep_stream_candidates_first_and_deduplicate() {
+        let mut device = CameraDevice::new("cam-1", "Front Door", "rtsp://192.168.1.10/live");
+        device.vendor = Some("TP-Link".to_string());
+        device.model = Some("Tapo C200".to_string());
+        device.capabilities.stream = true;
+        device.capabilities.snapshot = true;
+
+        let mut snapshot = DeviceRegistrySnapshot::from_camera_devices(std::slice::from_ref(&device));
+        snapshot.camera_profiles[0].vendor_features = json!({
+            "profile": "custom",
+            "rtsp_path_candidates": ["/custom", "stream2", "/stream1", "/custom"]
+        });
+        snapshot.upsert_camera_devices_preserving_platform_records(std::slice::from_ref(&device));
+
+        let profile = &snapshot.camera_profiles[0];
+        let rtsp_paths = profile
+            .vendor_features
+            .get("rtsp_path_candidates")
+            .and_then(|value| value.as_array())
+            .expect("rtsp path candidates")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+
+        assert_eq!(profile.vendor_features["profile"], json!("tp-link/tapo"));
+        assert_eq!(rtsp_paths, vec!["/stream1", "/stream2", "/custom"]);
+    }
+
+    #[test]
     fn load_snapshot_accepts_legacy_camera_array_payload() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
         let path =
-            std::env::temp_dir().join(format!("harbornas-device-registry-legacy-{unique}.json"));
+            std::env::temp_dir().join(format!("harborbeacon-device-registry-legacy-{unique}.json"));
         let store = DeviceRegistryStore::new(&path);
         let legacy_payload = json!([
             {
@@ -1314,8 +1514,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("harbornas-device-registry-preserve-{unique}.json"));
+        let path = std::env::temp_dir().join(format!(
+            "harborbeacon-device-registry-preserve-{unique}.json"
+        ));
         let store = DeviceRegistryStore::new(&path);
 
         let snapshot = DeviceRegistrySnapshot {
@@ -1536,7 +1737,7 @@ mod tests {
             .expect("clock")
             .as_nanos();
         let path =
-            std::env::temp_dir().join(format!("harbornas-device-registry-upsert-{unique}.json"));
+            std::env::temp_dir().join(format!("harborbeacon-device-registry-upsert-{unique}.json"));
         let store = DeviceRegistryStore::new(&path);
 
         let mut existing_a = CameraDevice::new("cam-a", "Front Door", "rtsp://192.168.1.10/live");

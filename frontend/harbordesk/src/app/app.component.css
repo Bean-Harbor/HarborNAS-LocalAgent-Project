@@ -1,0 +1,156 @@
+:host {
+  display: block;
+  min-height: 100vh;
+}
+
+.app-shell {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 320px minmax(0, 1fr);
+  gap: 24px;
+  padding: 24px;
+}
+
+.nav-rail,
+.workspace {
+  min-width: 0;
+}
+
+.nav-rail {
+  display: grid;
+  gap: 20px;
+  align-content: start;
+}
+
+.brand-card,
+.build-card,
+.workspace-header,
+.workspace-body {
+  background: linear-gradient(180deg, var(--surface), rgba(10, 20, 32, 0.7));
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(18px);
+}
+
+.brand-card,
+.build-card {
+  padding: 22px;
+}
+
+.brand-kicker,
+.workspace-kicker,
+.build-label {
+  margin: 0 0 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.brand-card h1,
+.workspace-header h2 {
+  margin: 0;
+  line-height: 1.02;
+}
+
+.brand-card h1 {
+  font-size: 2.4rem;
+}
+
+.brand-copy,
+.build-copy,
+.nav-meta {
+  margin: 0;
+  color: var(--muted);
+}
+
+.page-nav {
+  display: grid;
+  gap: 10px;
+}
+
+.nav-item {
+  display: grid;
+  gap: 6px;
+  padding: 16px 18px;
+  border-radius: var(--radius-lg);
+  border: 1px solid transparent;
+  background: rgba(8, 14, 24, 0.46);
+  transition:
+    transform 140ms ease,
+    border-color 140ms ease,
+    background 140ms ease;
+}
+
+.nav-item:hover {
+  transform: translateY(-1px);
+  border-color: rgba(77, 214, 196, 0.35);
+  background: rgba(12, 24, 38, 0.68);
+}
+
+.nav-item.is-active {
+  border-color: rgba(77, 214, 196, 0.52);
+  background: linear-gradient(135deg, rgba(20, 60, 64, 0.82), rgba(14, 26, 42, 0.88));
+}
+
+.nav-label {
+  font-weight: 700;
+}
+
+.workspace {
+  display: grid;
+  gap: 20px;
+  align-content: start;
+}
+
+.workspace-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 22px 24px;
+}
+
+.workspace-header h2 {
+  font-size: 1.45rem;
+  max-width: 20ch;
+}
+
+.workspace-badge {
+  align-self: start;
+  padding: 10px 14px;
+  border-radius: 999px;
+  border: 1px solid rgba(77, 214, 196, 0.28);
+  background: rgba(10, 24, 32, 0.7);
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.workspace-body {
+  padding: 20px;
+}
+
+@media (max-width: 1120px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .nav-rail {
+    order: 2;
+  }
+}
+
+@media (max-width: 720px) {
+  .app-shell {
+    padding: 16px;
+    gap: 16px;
+  }
+
+  .workspace-header {
+    flex-direction: column;
+  }
+
+  .workspace-header h2 {
+    max-width: none;
+  }
+}

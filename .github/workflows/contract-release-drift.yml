@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       harbor_ref:
-        description: HarborNAS reference to compare
+        description: HarborBeacon reference to compare
         required: false
         default: develop
       upstream_ref:

@@ -454,6 +454,39 @@ class TestCameraDomainFlow:
         assert "分析完成" in sent[0].text
         assert fake_task_api.calls[0].resource["device_hint"] == "客厅"
 
+    def test_camera_canary_journey_covers_scan_connect_resume_and_analyze(self):
+        dispatcher, sent, fake_task_api = _build_camera_stack()
+
+        dispatcher.handle(_inbound("扫描摄像头"))
+        assert len(sent) == 1
+        assert "待你确认" in sent[0].text
+
+        sent.clear()
+        dispatcher.handle(_inbound("接入 1"))
+        assert len(sent) == 1
+        assert "需要密码" in sent[0].text
+
+        sent.clear()
+        dispatcher.handle(_inbound("密码 hunter2"))
+        assert len(sent) == 1
+        assert "密码已收到" in sent[0].text
+
+        sent.clear()
+        dispatcher.handle(_inbound("分析客厅摄像头"))
+        assert len(sent) == 1
+        assert "分析完成" in sent[0].text
+
+        assert [call.operation for call in fake_task_api.calls] == [
+            "scan",
+            "connect",
+            "connect",
+            "analyze",
+        ]
+        assert fake_task_api.calls[2].args["resume_token"] == "resume-1"
+        assert fake_task_api.calls[2].args["password"] == "hunter2"
+        assert fake_task_api.calls[3].resource["device_hint"] == "客厅"
+        assert all(call.args["_source"]["surface"] == "harborbeacon" for call in fake_task_api.calls)
+
 
 # ---------------------------------------------------------------------------
 # Multi-channel

@@ -136,13 +136,13 @@ export interface ConnectivityResult {
   tested_at: string;  // ISO 8601
 }
 
-export interface FeishuOneClickSetupRequest {
+export interface FeishuConfigApplyRequest {
   app_id: string;
   app_secret: string;
   webhook_url?: string;
 }
 
-export interface FeishuOneClickSetupResult {
+export interface FeishuConfigApplyResult {
   success: boolean;
   message: string;
   settings_updated: boolean;
@@ -150,47 +150,6 @@ export interface FeishuOneClickSetupResult {
   bot_info: Record<string, unknown>;
   next_steps: string[];
   settings?: HarborBeaconSettings;
-}
-
-// ---------------------------------------------------------------------------
-// Browser-assisted Feishu setup
-// ---------------------------------------------------------------------------
-
-export type SetupStepStatus = 'pending' | 'running' | 'wait_user' | 'success' | 'failed' | 'skipped';
-
-export interface SetupStep {
-  key: string;
-  label: string;
-  label_zh: string;
-  status: SetupStepStatus;
-  detail: string;
-  started_at: string;
-  finished_at: string;
-}
-
-export interface FeishuBrowserSetupSession {
-  session_id: string;
-  status: string;  // created | running | wait_user | done | error
-  current_step: string;
-  steps: SetupStep[];
-  app_id: string;
-  app_secret: string;
-  app_name: string;
-  error: string;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface FeishuBrowserSetupStartRequest {
-  callback_url?: string;
-  app_name?: string;
-  use_playwright?: boolean;
-}
-
-export interface FeishuBrowserSetupResumeRequest {
-  session_id: string;
-  callback_url?: string;
-  use_playwright?: boolean;
 }
 
 // ---------------------------------------------------------------------------

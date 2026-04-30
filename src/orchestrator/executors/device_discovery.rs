@@ -260,7 +260,18 @@ impl Executor for DeviceDiscoveryExecutor {
                     serde_json::from_value(merge_resource_and_args(action))
                         .map_err(|e| format!("invalid snapshot args: {e}"))?;
                 let device = self.find_device(&args.device_id)?;
-                let snapshot = self.service.capture_snapshot(&args.into_request(&device))?;
+                let snapshot = self
+                    .service
+                    .capture_snapshot(&args.into_request(&device))?
+                    .with_device_context(
+                        Some(device.name.clone()),
+                        device.room.clone(),
+                        device.vendor.clone(),
+                        device.model.clone(),
+                        Some(device.discovery_source.clone()),
+                        Some(format!("{:?}", device.primary_stream.transport).to_lowercase()),
+                        Some(device.primary_stream.requires_auth),
+                    );
                 serde_json::to_value(DeviceSnapshotPayload { snapshot })
                     .map_err(|e| format!("snapshot payload serialize failed: {e}"))?
             }
@@ -269,7 +280,18 @@ impl Executor for DeviceDiscoveryExecutor {
                     serde_json::from_value(merge_resource_and_args(action))
                         .map_err(|e| format!("invalid open_stream args: {e}"))?;
                 let device = self.find_device(&args.device_id)?;
-                let stream = self.service.open_stream(&args.into_request(&device))?;
+                let stream = self
+                    .service
+                    .open_stream(&args.into_request(&device))?
+                    .with_device_context(
+                        Some(device.name.clone()),
+                        device.room.clone(),
+                        device.vendor.clone(),
+                        device.model.clone(),
+                        Some(device.discovery_source.clone()),
+                        Some(format!("{:?}", device.primary_stream.transport).to_lowercase()),
+                        Some(device.primary_stream.requires_auth),
+                    );
                 serde_json::to_value(DeviceOpenStreamPayload { stream })
                     .map_err(|e| format!("open_stream payload serialize failed: {e}"))?
             }
@@ -677,6 +699,18 @@ mod tests {
             snapshot_result.result_payload["snapshot"]["storage"]["target"],
             json!(StorageTarget::LocalDisk)
         );
+        assert_eq!(
+            snapshot_result.result_payload["snapshot"]["ingest_metadata"]["provenance"],
+            "media"
+        );
+        assert_eq!(
+            snapshot_result.result_payload["snapshot"]["ingest_metadata"]["ingest_disposition"],
+            "knowledge_index_candidate"
+        );
+        assert_eq!(
+            snapshot_result.result_payload["snapshot"]["ingest_metadata"]["stream_transport"],
+            "rtsp"
+        );
     }
 
     #[test]
@@ -701,6 +735,107 @@ mod tests {
         assert_eq!(open_result.result_payload["stream"]["device_id"], "cam-1");
         assert_eq!(open_result.result_payload["stream"]["player"], "mpv");
         assert_eq!(open_result.result_payload["stream"]["process_id"], 5151);
+        assert_eq!(
+            open_result.result_payload["stream"]["ingest_metadata"]["provenance"],
+            "control"
+        );
+        assert_eq!(
+            open_result.result_payload["stream"]["ingest_metadata"]["ingest_disposition"],
+            "runtime_only"
+        );
+        assert_eq!(
+            open_result.result_payload["stream"]["ingest_metadata"]["stream_transport"],
+            "rtsp"
+        );
+    }
+
+    #[test]
+    fn snapshot_and_open_stream_keep_media_and_control_paths_separate() {
+        let mut device = CameraDevice::new("cam-1", "Front Door", "rtsp://192.168.1.50/live");
+        device.capabilities.snapshot = true;
+        device.capabilities.stream = true;
+        device.capabilities.ptz = true;
+        let executor = DeviceDiscoveryExecutor::new(Box::new(StaticRtspAdapter), None, None, None)
+            .with_devices(vec![device]);
+
+        let snapshot_action = Action {
+            domain: "device".to_string(),
+            operation: "snapshot".to_string(),
+            resource: json!({"device_id":"cam-1"}),
+            args: json!({"storage_target":"local_disk"}),
+            risk_level: crate::orchestrator::contracts::RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+        let snapshot_result = executor
+            .execute(&snapshot_action, "t1", "s4")
+            .expect("snapshot result");
+        assert_eq!(
+            snapshot_result.result_payload["snapshot"]["storage"]["target"],
+            json!(StorageTarget::LocalDisk)
+        );
+        assert!(
+            snapshot_result.result_payload["snapshot"]["storage"]["relative_path"]
+                .as_str()
+                .expect("snapshot path")
+                .starts_with("snapshots/cam-1/")
+        );
+        assert_eq!(
+            snapshot_result.result_payload["snapshot"]["ingest_metadata"]["device_name"],
+            "Front Door"
+        );
+        assert_eq!(
+            snapshot_result.result_payload["snapshot"]["ingest_metadata"]["room"],
+            json!(null)
+        );
+
+        let open_action = Action {
+            domain: "device".to_string(),
+            operation: "open_stream".to_string(),
+            resource: json!({"device_id":"cam-1"}),
+            args: json!({"preferred_player":"mpv"}),
+            risk_level: crate::orchestrator::contracts::RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+        let open_result = executor
+            .execute(&open_action, "t1", "s5")
+            .expect("open stream result");
+        assert_eq!(open_result.result_payload["stream"]["player"], "mpv");
+        assert_eq!(open_result.result_payload["stream"]["device_id"], "cam-1");
+        assert_eq!(
+            open_result.result_payload["stream"]["ingest_metadata"]["provenance"],
+            "control"
+        );
+        assert_eq!(
+            open_result.result_payload["stream"]["ingest_metadata"]["device_name"],
+            "Front Door"
+        );
+        assert_eq!(
+            open_result.result_payload["stream"]["ingest_metadata"]["stream_transport"],
+            "rtsp"
+        );
+
+        let list_action = Action {
+            domain: "device".to_string(),
+            operation: "list".to_string(),
+            resource: json!({}),
+            args: json!({}),
+            risk_level: crate::orchestrator::contracts::RiskLevel::Low,
+            requires_approval: false,
+            dry_run: false,
+        };
+        let list_result = executor
+            .execute(&list_action, "t1", "s6")
+            .expect("list result");
+        assert_eq!(
+            list_result.result_payload["devices"][0]["capabilities"]["snapshot"],
+            true
+        );
+        assert_eq!(
+            list_result.result_payload["devices"][0]["capabilities"]["ptz"],
+            true
+        );
     }
 
     #[test]
@@ -709,7 +844,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("harbornas-device-executor-{unique}.json"));
+        let path = std::env::temp_dir().join(format!("harborbeacon-device-executor-{unique}.json"));
         let store = DeviceRegistryStore::new(&path);
         let executor = DeviceDiscoveryExecutor::new(
             Box::new(StaticRtspAdapter),
@@ -746,8 +881,9 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("harbornas-device-executor-platform-{unique}.json"));
+        let path = std::env::temp_dir().join(format!(
+            "harborbeacon-device-executor-platform-{unique}.json"
+        ));
         let store = DeviceRegistryStore::new(&path);
         store
             .save_snapshot(&DeviceRegistrySnapshot {
