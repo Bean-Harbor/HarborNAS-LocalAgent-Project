@@ -2569,13 +2569,13 @@ impl TaskApiService {
             );
         };
         let (include_documents, include_images) = knowledge_modalities(request);
-        let search_request = KnowledgeSearchRequest {
-            query,
-            roots: knowledge_search_roots(request),
-            include_documents,
-            include_images,
-            limit: knowledge_result_limit(request),
-        };
+        let roots = knowledge_search_roots(request);
+        let mut search_request = KnowledgeSearchRequest::new(query);
+        search_request.configured_roots = roots.clone();
+        search_request.roots = roots;
+        search_request.include_documents = include_documents;
+        search_request.include_images = include_images;
+        search_request.limit = knowledge_result_limit(request);
 
         match KnowledgeSearchService::search(search_request) {
             Ok(result) => self.completed(
