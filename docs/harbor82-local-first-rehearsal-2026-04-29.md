@@ -10,6 +10,9 @@ rehearsal, not a claim that the final architecture is cloud-first.
 Current verified baseline on `2026-04-30`:
 
 - target host: `192.168.3.82`
+- current backend release:
+  `20260430-rc2-beacona5f6da0-gate57ff759`
+- current WebUI release source: HarborNAS WebUI `develop` at `8e3f04d`
 - HarborDesk page entry: `http://192.168.3.82/ui/harbordesk`
 - HarborBot user retrieval entry: `http://192.168.3.82/ui/harborbot`
 - HarborDesk public admin API proxy: `http://192.168.3.82/api/harbordesk/*`
@@ -17,7 +20,8 @@ Current verified baseline on `2026-04-30`:
 - task runtime still runs on host-local `http://127.0.0.1:4175/api/turns`
 - GPU detected: `NVIDIA GeForce RTX 3070`, `8192 MiB`
 - cloud fallback is connected through `https://api.siliconflow.cn/v1`
-- RAG demo source root is configured at `/var/lib/harborbeacon-agent-ci/writable/knowledge-demo`
+- RAG smoke source root is configured under
+  `/var/lib/harborbeacon-agent-ci/writable/knowledge-mmrag-smoke`
 
 Important current truth:
 
@@ -40,14 +44,14 @@ Important current truth:
   - `GET /api/harbordesk/rag/readiness` works
   - `GET /api/harbordesk/knowledge/settings` works
 - External `.82` HarborBot recovery deploy on `2026-04-30`:
-  - installed backend release `20260430-harborbot-recovery-r2`
+  - superseded by backend release
+    `20260430-rc2-beacona5f6da0-gate57ff759`
   - deployed native WebUI release
-    `/var/lib/harbordesk-webui/releases/harborbot-20260430-local-r1`
+    based on HarborNAS WebUI `8e3f04d`
   - `POST /api/harbordesk/knowledge/search` returns `status=completed`
   - `GET /api/harbordesk/knowledge/preview` returns text and image previews
-  - low-confidence semantic-only image hits are filtered; `春天的照片` no
-    longer returns the unrelated Harbor demo image when no spring photo is
-    indexed
+  - `春天的照片` returns one real VLM content-indexed image with
+    `content_match_used=true` and `filename_match_used=false`
 
 ## What To Say In The Demo
 
@@ -106,6 +110,14 @@ The HarborDesk page should be treated as:
 
 HarborBot is now deployed on `.82` and should be treated as the live user-facing
 multimodal retrieval page for waterfall rehearsal.
+
+RC2 runtime turn proof:
+
+- `帮我找春天的照片` returns `turn.status=completed`, one image artifact, and
+  one delivery hint.
+- `解释一下 HarborBeacon 和 HarborGate 现在的 local-first 架构，以及云端 fallback 是怎么受控的`
+  returns `turn.status=completed` and the local-first / policy-controlled
+  fallback explanation.
 
 ## Current Fallback Baseline
 
@@ -173,17 +185,17 @@ Use at least one from each bucket.
 
 Content retrieval:
 
+- "帮我找春天的照片"
 - "搜索已有内容：根据当前知识库，总结 Harbor 82 的演示环境。"
-- "搜索已有内容：82 这台机器当前有什么 GPU 和知识源样例？"
 
 Architecture explanation:
 
-- "搜索已有内容：HarborBeacon 为什么说是 local first，而不是 cloud first？"
-- "搜索已有内容：当前 82 的本地能力和云端 fallback 分别是什么？"
+- "解释一下 HarborBeacon 和 HarborGate 现在的 local-first 架构，以及云端 fallback 是怎么受控的"
+- "当前 82 的本地能力和云端 fallback 分别是什么？"
 
-The `搜索已有内容：` prefix is intentional. On the current runtime, shorter
-phrasing can be routed into the general clarify controller and ask whether the
-user wants to take a photo, record a clip, or search existing content.
+The `搜索已有内容：` prefix is still useful when the intent must force RAG over
+general conversation, but RC2 no longer requires a prefix for the local-first
+architecture explanation case.
 
 ## Follow-Up After The Rehearsal
 

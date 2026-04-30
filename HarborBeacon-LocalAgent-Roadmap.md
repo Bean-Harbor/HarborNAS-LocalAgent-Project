@@ -1,16 +1,21 @@
 # HarborBeacon Local Agent V2 路线图与任务分配
 
-> 当前定位说明（2026-04-26）
-> 本文档当前执行线切换为 `HarborBeacon x HarborGate Contract v2.0 upgrade`。
+> 当前定位说明（2026-04-30）
+> 本文档当前执行线已从 `HarborBeacon x HarborGate Contract v2.0 upgrade`
+> 进入 post-RC2 收口与下一阶段规划。
 > 双仓边界已经明确：IM 仓库负责 `adapter/gateway/route/平台凭据/delivery`，HarborBeacon 负责 `conversation turn/business state/active frame/approval/artifact/audit`。
 > 两边只通过 HTTP/JSON contract 通信，不互相 import，也不共享 `.harborbeacon/*.json`。  
 > 本仓库只负责 HarborBeacon 侧工作项；IM 仓库能力只作为外部依赖与联调对象跟踪。  
 > 协作术语统一以 `HarborBeacon-Harbor-Collaboration-Contract-v2` 与 `harbor-*` lane 命名为准。
 >
-> 当前进展快照（2026-04-26）
-> 已批准：直接升级到 v2.0，不做 v1.5/v2.0 runtime 双栈兼容。
-> 进行中：control pack、v2.0 contract、runbook、drift guard。
-> 待完成：Beacon `/api/turns`、`TaskTurnEnvelope`、`ActiveDialogueFrame`、Gate v2 turn client、Weixin live matrix。
+> 当前进展快照（2026-04-30）
+> 已合并：HarborBeacon v2.0 turn core、MMRAG/knowledge search/preview、VLM sidecar packaging、HarborDesk validation/docs、HarborGate v2.0 delivery guard、HarborNAS WebUI HarborDesk/HarborBot native pages。
+> 已部署：`.82` post-merge RC2
+> `20260430-rc2-beacona5f6da0-gate57ff759`。
+> 已验证：`/ui/harbordesk`、`/ui/harborbot`、knowledge search/preview、protected
+> `POST /api/turns` content retrieval and local-first architecture explanation。
+> 下一阶段：先补 release evidence/rollback notes，再推进 local model promotion
+> gate，最后恢复 Home Agent Hub / AIoT MVP 队列。
 >
 > 本文后续早期 v1.5 phase 描述保留为历史上下文；当前执行、验收与回滚以
 > `HarborBeacon-HarborGate-v2.0-Upgrade-Runbook.md` 和外部 v2.0 contract 为准。
@@ -232,23 +237,23 @@
 
 ---
 
-## 7. 当前建议优先级（立刻执行）
+## 7. 当前建议优先级（post-RC2）
 
 P0:
 
-1. 完成 `POST /api/tasks` 的 v1.5 入站对齐：`message`、`route_key`、鉴权、版本头、幂等、错误信封
-2. 固化 HarborBeacon 作为 business state / approval / artifact / audit 的唯一事实源
-3. 将通知链路改为 HarborBeacon → HarborGate HTTP intent，停止 HarborBeacon 直连平台发送
-4. 推进管理台去凭据化，移除 HarborBeacon 对 IM 原始凭据的长期 ownership
+1. Land the post-RC2 docs-only closeout: RC2 evidence, rollback notes, current `.82/.197` targets, and the next-stage backlog.
+2. Keep the v2.0 seam frozen: no v1.5/v2.0 runtime dual stack, no `/api/tasks` active fallback, no public `args.resume_token`.
+3. Promote RC2 toward a GA candidate from merged mainline code only.
+4. Run the `.82` local model promotion gate before claiming active local runtime execution.
 
 P1:
 
-1. 补齐双仓 contract / E2E / observability 回归
-2. 清理 HarborBeacon 内残留 HarborBeacon / Feishu / 直连 IM 代码路径
-3. 为 cutover 增加灰度、特性开关与回滚开关
+1. Harden HarborDesk and HarborBot as product surfaces while keeping them on real `/api/harbordesk/*` APIs.
+2. Extend release packaging toward HarborNAS ISO integration without changing the v2.0 public contract.
+3. Add local-first observability: fallback ratio, local/backend readiness, policy decision evidence, and failed-promotion reasons.
 
 P2:
 
-1. cutover 稳定后再恢复更长期的 RAG / assistant backlog
-2. Browser/MCP fallback 场景继续优化
-3. 编排策略、成本与缓存层按 cutover 后优先级重排
+1. Resume Home Agent Hub / AIoT MVP after GA and local model gate decisions.
+2. Continue Browser/MCP fallback optimization inside the HarborOS System Domain.
+3. Re-rank orchestration, cost, cache, OCR/ASR, and multimodal expansion work after the local runtime proof.

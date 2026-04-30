@@ -1,6 +1,6 @@
 # HarborOS Release Packaging / Install Runbook
 
-更新时间：2026-04-23
+更新时间：2026-04-30
 
 ## 1. 目的
 
@@ -26,12 +26,18 @@ release-v1 的默认形态固定为：
 
 当前默认 builder：
 
-- Debian verifier `192.168.3.223`
+- HarborBeacon build host `192.168.1.197`
 - non-root builder bootstrap 入口：`tools/bootstrap_release_builder.sh`
 
 当前默认 HarborOS 目标机：
 
-- `192.168.3.182`
+- `192.168.3.82`
+
+历史参考：
+
+- `192.168.3.223` 曾作为 Debian verifier / builder baseline。
+- `192.168.3.182` 曾作为 HarborOS live target；当前 `.82` 替代它作为
+  RC/GA target。
 
 当前默认 install root：
 
@@ -39,7 +45,18 @@ release-v1 的默认形态固定为：
 
 当前 verified writable root：
 
-- `/mnt/software/harborbeacon-agent-ci`
+- `/var/lib/harborbeacon-agent-ci/writable` on the current `.82` RC2 install.
+  `/mnt/software/harborbeacon-agent-ci` remains a supported writable-root
+  target when present.
+
+当前 RC baseline：
+
+- HarborBeacon: `a5f6da0`
+- HarborGate: `57ff759`
+- RC2 bundle:
+  `harbor-release-20260430-rc2-beacona5f6da0-gate57ff759.tar.gz`
+- SHA256:
+  `7119842506d38aac82c7e236b7f96a054244bb50be07c5e6b001ac7b0683484c`
 
 ## 3. 发布物结构
 
@@ -171,9 +188,9 @@ cargo run --bin benchmark-local-model-backend -- \
   --output /tmp/local-model-benchmark-candle.json
 ```
 
-只有当报告里的 `gate.promotable=true`，才允许把 env 里的
-`HARBOR_MODEL_API_BACKEND` 改成 `candle`。否则保持 `openai_proxy`，
-HarborBeacon 的 local OpenAI-compatible seam 不变。
+只有当报告里的 `gate.promotable=true`，才允许规划把 env 里的
+`HARBOR_MODEL_API_BACKEND` 改成 `candle` 的单独 cutover rehearsal。否则保持
+`openai_proxy`，HarborBeacon 的 local OpenAI-compatible seam 不变。
 
 补充说明：
 
