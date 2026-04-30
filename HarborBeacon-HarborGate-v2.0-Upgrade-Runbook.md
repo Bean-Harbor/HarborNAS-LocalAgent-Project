@@ -5,6 +5,12 @@
 This is the active control pack entry for the HarborBeacon side of the v2.0
 upgrade.
 
+As of 2026-04-30, the v2.0 implementation train has been merged and deployed as
+the `.82` post-merge RC2:
+`20260430-rc2-beacona5f6da0-gate57ff759`. The runbook now functions as the
+drift/rollback reference for GA promotion and future changes, not as an
+unfinished implementation queue.
+
 Authoritative contract:
 
 - `C:\Users\beanw\OpenSource\HarborGate\HarborBeacon-HarborGate-Agent-Contract-v2.0.md`
@@ -61,6 +67,16 @@ At the start of each session:
 - Write rollback notes.
 - Sync both repos to GitHub.
 - Leave exact next steps for the next session.
+
+### Phase 6: Post-RC2 GA And Local Runtime Proof
+
+- Keep `POST /api/turns` and response semantics frozen.
+- Promote RC2 toward GA only from merged mainline code and matching Gate
+  artifacts.
+- Run the local model promotion benchmark on `.82` before claiming active local
+  runtime execution.
+- Keep HarborDesk and HarborBot on the real same-origin
+  `/api/harbordesk/*` surfaces; do not add a demo-only turn page.
 
 ## Drift Guards
 
@@ -136,3 +152,23 @@ Do not report a release-ready state while any drift guard still fails.
   real Weixin private-DM evidence still requires a user-side message run.
 - Next exact step: run the Weixin private-DM v2.0 matrix before merge
   readiness.
+
+## 2026-04-30 Post-RC2 Closeout
+
+- Completed: merged the Beacon, Gate, and WebUI release trains; installed RC2
+  on `.82`; verified `/ui/harbordesk`, `/ui/harborbot`, knowledge
+  search/preview, and protected `POST /api/turns` content retrieval plus
+  local-first architecture explanation.
+- Artifact: `harbor-release-20260430-rc2-beacona5f6da0-gate57ff759.tar.gz`.
+- SHA256:
+  `7119842506d38aac82c7e236b7f96a054244bb50be07c5e6b001ac7b0683484c`.
+- Current targets: `.197` remains the release builder; `.82` is the RC/GA
+  HarborOS target.
+- Drift check: v2.0 remains the only active IM seam; no active `/api/tasks`,
+  no public `args.resume_token`, no HarborBeacon direct platform delivery, no
+  HarborBeacon IM raw credential ownership, and no group-chat readiness claim.
+- Known residual gap: `.82` still needs a local model promotion report before
+  `local-first` can be claimed as active default runtime execution rather than
+  policy plus controlled fallback.
+- Next exact step: land post-RC2 docs-only closeout, then run the `.82` local
+  model promotion gate without changing the default backend.

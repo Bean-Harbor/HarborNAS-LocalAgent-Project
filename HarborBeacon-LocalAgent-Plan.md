@@ -1,11 +1,15 @@
 # HarborBeacon 本地智能体规划文档
 
-> 当前执行更新（2026-04-26）
-> 当前落地重点不是继续收口 v1.5，而是按 `HarborBeacon-HarborGate-Agent-Contract-v2.0` 直接升级双仓边界。
+> 当前执行更新（2026-04-30）
+> 当前落地重点已从 v2.0 双仓升级进入 post-RC2 收口。
 > IM 仓库负责 `adapter/gateway/route/平台凭据/delivery`；HarborBeacon 负责 `conversation turn/business state/active frame/approval/artifact/audit`。
 > 两边只通过 HTTP/JSON contract 通信，不互相 import，也不共享 `.harborbeacon/*.json`。  
 > 本文档以下实施阶段与近期行动，均以 HarborBeacon 侧可执行工作为准。  
 > 协作术语统一以 `HarborBeacon-Harbor-Collaboration-Contract-v2` 与 `harbor-*` lane 命名为准。
+> 已验证 baseline：HarborBeacon `a5f6da0` + HarborGate `57ff759`
+> 已打包为 `.82` RC2
+> `20260430-rc2-beacona5f6da0-gate57ff759`，并通过 HarborDesk、HarborBot、knowledge search/preview、protected
+> `POST /api/turns` live smoke。
 >
 > 本文后续早期 v1.5 task-contract 描述保留为历史上下文；当前执行、验收与回滚以
 > `HarborBeacon-HarborGate-v2.0-Upgrade-Runbook.md` 和外部 v2.0 contract 为准。
@@ -39,6 +43,15 @@
 - ✅ **本地优先策略** - 隐私优先，敏感任务不出本地
 - ✅ **云边协作** - 复杂任务脱敏后调用云模型
 - ✅ **可观测性** - 任务流转过程完全可追溯
+
+当前 post-RC2 执行顺序:
+
+1. 补齐 release evidence、rollback notes、daily closeout、ISO integration checklist。
+2. 在 `.82` 上跑 local model promotion gate；只有 `gate.promotable=true`
+   才规划默认 backend cutover。
+3. 继续硬化 HarborDesk / HarborBot 产品面，保持真实同源 API。
+4. 恢复 Home Agent Hub / AIoT MVP 队列，不把 Home Device Domain 折叠进
+   HarborOS System Domain。
 
 ---
 

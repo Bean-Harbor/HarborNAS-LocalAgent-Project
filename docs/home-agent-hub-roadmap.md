@@ -1,8 +1,12 @@
 # Home Agent Hub Roadmap
 
-> 当前定位说明（2026-04-13）  
+> 当前定位说明（2026-04-30）
 > 本文档是当前正在执行的产品路线，属于 HarborBeacon 平台主干下的首个垂直域。  
 > 长期平台骨干仍由 `HarborBeacon-LocalAgent-Roadmap.md` 定义；Home Agent Hub 不再作为旁路 demo，而是要通过统一 Task API / Runtime / Audit 入轨平台。
+> post-RC2 顺序：先完成 HarborBeacon/Gate/WebUI RC2 release evidence 和
+> `.82` local model promotion gate，再恢复 Home Agent Hub / AIoT MVP 队列。
+> AIoT camera/device 控制仍归 Home Device Domain，不能折叠进 HarborOS
+> System Domain。
 
 更新时间：2026-04-10
 
