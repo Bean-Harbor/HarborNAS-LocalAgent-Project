@@ -88,6 +88,7 @@ CORE_SERVICES=(
   harborgate.service
 )
 OPTIONAL_WEIXIN_SERVICE="harborgate-weixin-runner.service"
+OPTIONAL_VLM_SERVICE="harbor-vlm-sidecar.service"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -235,6 +236,16 @@ EXISTING_HUGGING_FACE_HUB_TOKEN="${HUGGING_FACE_HUB_TOKEN:-}"
 EXISTING_HTTP_PROXY="${HTTP_PROXY:-}"
 EXISTING_HTTPS_PROXY="${HTTPS_PROXY:-}"
 EXISTING_NO_PROXY="${NO_PROXY:-}"
+EXISTING_VLM_SIDECAR_ENABLE="${HARBOR_VLM_SIDECAR_ENABLE:-}"
+EXISTING_VLM_BIND="${HARBOR_VLM_BIND:-}"
+EXISTING_VLM_MODEL_ID="${HARBOR_VLM_MODEL_ID:-}"
+EXISTING_VLM_MODEL_PATH="${HARBOR_VLM_MODEL_PATH:-}"
+EXISTING_VLM_DEVICE="${HARBOR_VLM_DEVICE:-}"
+EXISTING_VLM_MAX_NEW_TOKENS="${HARBOR_VLM_MAX_NEW_TOKENS:-}"
+EXISTING_VLM_LOCAL_FILES_ONLY="${HARBOR_VLM_LOCAL_FILES_ONLY:-}"
+EXISTING_VLM_PRELOAD="${HARBOR_VLM_PRELOAD:-}"
+EXISTING_VLM_PYTHON="${HARBOR_VLM_PYTHON:-}"
+EXISTING_VLM_SIDECAR_SCRIPT="${HARBOR_VLM_SIDECAR_SCRIPT:-}"
 
 if [[ "${INSTALL_ROOT_SET}" -ne 1 && -n "${EXISTING_RELEASE_INSTALL_ROOT}" ]]; then
   INSTALL_ROOT="${EXISTING_RELEASE_INSTALL_ROOT}"
@@ -326,6 +337,7 @@ PY
 render_template "${RELEASE_DIR}/templates/systemd/assistant-task-api.service.template" "/etc/systemd/system/assistant-task-api.service"
 render_template "${RELEASE_DIR}/templates/systemd/agent-hub-admin-api.service.template" "/etc/systemd/system/agent-hub-admin-api.service"
 render_template "${RELEASE_DIR}/templates/systemd/harbor-model-api.service.template" "/etc/systemd/system/harbor-model-api.service"
+render_template "${RELEASE_DIR}/templates/systemd/harbor-vlm-sidecar.service.template" "/etc/systemd/system/harbor-vlm-sidecar.service"
 render_template "${RELEASE_DIR}/templates/systemd/harborgate.service.template" "/etc/systemd/system/harborgate.service"
 render_template "${RELEASE_DIR}/templates/systemd/harborgate-weixin-runner.service.template" "/etc/systemd/system/harborgate-weixin-runner.service"
 
@@ -356,6 +368,15 @@ HARBOR_MODEL_API_UPSTREAM_BASE_URL=${EXISTING_MODEL_API_UPSTREAM_BASE_URL:-http:
 HARBOR_MODEL_API_CHAT_MODEL=${EXISTING_MODEL_API_CHAT_MODEL:-harbor-local-chat}
 HARBOR_MODEL_API_EMBEDDING_MODEL=${EXISTING_MODEL_API_EMBEDDING_MODEL:-harbor-local-embed}
 HARBOR_MODEL_API_REQUEST_TIMEOUT_MS=${EXISTING_MODEL_API_REQUEST_TIMEOUT_MS:-30000}
+
+HARBOR_VLM_SIDECAR_ENABLE=${EXISTING_VLM_SIDECAR_ENABLE:-0}
+HARBOR_VLM_BIND=${EXISTING_VLM_BIND:-127.0.0.1:4196}
+HARBOR_VLM_MODEL_ID=${EXISTING_VLM_MODEL_ID:-HuggingFaceTB/SmolVLM-256M-Instruct}
+HARBOR_VLM_MODEL_PATH=${EXISTING_VLM_MODEL_PATH:-${MODEL_CACHE_DIR}/huggingfacetb-smolvlm-256m-instruct}
+HARBOR_VLM_DEVICE=${EXISTING_VLM_DEVICE:-cpu}
+HARBOR_VLM_MAX_NEW_TOKENS=${EXISTING_VLM_MAX_NEW_TOKENS:-96}
+HARBOR_VLM_LOCAL_FILES_ONLY=${EXISTING_VLM_LOCAL_FILES_ONLY:-1}
+HARBOR_VLM_PRELOAD=${EXISTING_VLM_PRELOAD:-1}
 
 HARBOR_TASK_API_BIND=127.0.0.1:4175
 HARBOR_TASK_API_URL=http://127.0.0.1:4175
@@ -400,12 +421,15 @@ append_optional_env "HUGGING_FACE_HUB_TOKEN" "${EXISTING_HUGGING_FACE_HUB_TOKEN}
 append_optional_env "HTTP_PROXY" "${EXISTING_HTTP_PROXY}"
 append_optional_env "HTTPS_PROXY" "${EXISTING_HTTPS_PROXY}"
 append_optional_env "NO_PROXY" "${EXISTING_NO_PROXY}"
+append_optional_env "HARBOR_VLM_PYTHON" "${EXISTING_VLM_PYTHON}"
+append_optional_env "HARBOR_VLM_SIDECAR_SCRIPT" "${EXISTING_VLM_SIDECAR_SCRIPT}"
 
 chmod 0644 \
   "${ENV_FILE}" \
   /etc/systemd/system/harbor-model-api.service \
   /etc/systemd/system/assistant-task-api.service \
   /etc/systemd/system/agent-hub-admin-api.service \
+  /etc/systemd/system/harbor-vlm-sidecar.service \
   /etc/systemd/system/harborgate.service \
   /etc/systemd/system/harborgate-weixin-runner.service
 find "${RELEASE_DIR}/templates/bin" -type f -exec chmod 0755 {} +
@@ -436,6 +460,22 @@ else
   fi
 fi
 
+if [[ "${EXISTING_VLM_SIDECAR_ENABLE:-0}" == "1" ]]; then
+  systemctl enable "${OPTIONAL_VLM_SERVICE}"
+  if [[ "${SKIP_START}" -ne 1 ]]; then
+    systemctl restart "${OPTIONAL_VLM_SERVICE}"
+    VLM_SIDECAR_STATUS="enabled and restarted"
+  else
+    VLM_SIDECAR_STATUS="enabled, start skipped"
+  fi
+else
+  systemctl disable "${OPTIONAL_VLM_SERVICE}" >/dev/null 2>&1 || true
+  if [[ "${SKIP_START}" -ne 1 ]]; then
+    systemctl stop "${OPTIONAL_VLM_SERVICE}" >/dev/null 2>&1 || true
+  fi
+  VLM_SIDECAR_STATUS="installed, disabled until HARBOR_VLM_SIDECAR_ENABLE=1"
+fi
+
 echo
 echo "HarborOS release installed."
 echo "Version      : ${VERSION}"
@@ -447,5 +487,6 @@ echo "Env file     : ${ENV_FILE}"
 echo "Service user : ${SERVICE_USER}"
 echo "Core services: ${CORE_SERVICE_STATUS}"
 echo "Optional     : harborgate-weixin-runner -> ${WEIXIN_RUNNER_STATUS}"
+echo "Optional     : harbor-vlm-sidecar -> ${VLM_SIDECAR_STATUS}"
 echo "Helper       : ${STATUS_HELPER_LINK}"
 echo "Quick checks : ${STATUS_HELPER_LINK} status | ${STATUS_HELPER_LINK} health | ${STATUS_HELPER_LINK} logs gateway"

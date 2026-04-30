@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import base64
+import json
+import os
+import sys
+import threading
+import time
+import traceback
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+
+DEFAULT_MODEL_ID = "HuggingFaceTB/SmolVLM-256M-Instruct"
+DEFAULT_MODEL_PATH = "/mnt/software/harborbeacon-models/huggingfacetb-smolvlm-256m-instruct"
+DEFAULT_BIND = "127.0.0.1:4196"
+DEFAULT_PROMPT = (
+    "Describe the actual visual content of this photo in concise Chinese. "
+    "Mention visible season, plants, flowers, weather, indoor/outdoor setting, "
+    "objects, people, and any readable text. Do not infer from the file name."
+)
+
+
+def parse_bool(value: str | None, default: bool) -> bool:
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def parse_bind(value: str) -> tuple[str, int]:
+    text = (value or DEFAULT_BIND).strip()
+    if ":" not in text:
+        return text, 4196
+    host, raw_port = text.rsplit(":", 1)
+    return host or "127.0.0.1", int(raw_port)
+
+
+def json_bytes(payload: dict[str, Any]) -> bytes:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def error_payload(message: str, *, code: str = "vlm_sidecar_error") -> dict[str, Any]:
+    return {"status": "error", "ready": False, "code": code, "error": message}
+
+
+def extract_prompt_and_image_url(payload: dict[str, Any]) -> tuple[str, str]:
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        raise ValueError("OpenAI-compatible payload must contain messages[]")
+    prompt_parts: list[str] = []
+    image_url = ""
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role") or "").strip().lower() == "system":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            prompt_parts.append(content)
+            continue
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = str(part.get("type") or "").strip()
+            if part_type == "text":
+                text = part.get("text")
+                if isinstance(text, str):
+                    prompt_parts.append(text)
+            elif part_type in {"image_url", "input_image"}:
+                candidate = part.get("image_url")
+                if isinstance(candidate, dict):
+                    candidate = candidate.get("url")
+                if isinstance(candidate, str) and candidate.strip():
+                    image_url = candidate.strip()
+    if not image_url:
+        raise ValueError("OpenAI-compatible payload must include an image_url content part")
+    prompt = "\n".join(part.strip() for part in prompt_parts if part.strip()) or DEFAULT_PROMPT
+    return prompt, image_url
+
+
+def decode_data_url(data_url: str) -> tuple[str, bytes]:
+    prefix, separator, encoded = data_url.partition(",")
+    if separator != "," or not prefix.startswith("data:image/") or ";base64" not in prefix:
+        raise ValueError("image_url must be a base64 data:image URL")
+    mime_type = prefix[len("data:") :].split(";", 1)[0]
+    return mime_type, base64.b64decode(encoded, validate=True)
+
+
+def clean_generated_text(text: str) -> str:
+    cleaned = (text or "").strip()
+    markers = ["<|assistant|>", "Assistant:", "assistant\n", "assistant:"]
+    for marker in markers:
+        index = cleaned.lower().rfind(marker.lower())
+        if index >= 0:
+            cleaned = cleaned[index + len(marker) :].strip()
+    return cleaned or "Unable to generate an image description."
+
+
+def openai_chat_response(model_id: str, content: str) -> dict[str, Any]:
+    created = int(time.time())
+    return {
+        "id": f"chatcmpl-harbor-vlm-{created}",
+        "object": "chat.completion",
+        "created": created,
+        "model": model_id,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+
+@dataclass
+class RuntimeConfig:
+    bind: str
+    model_id: str
+    model_path: str
+    device: str
+    max_new_tokens: int
+    local_files_only: bool
+    preload: bool
+
+    @classmethod
+    def from_env(cls) -> "RuntimeConfig":
+        return cls(
+            bind=os.getenv("HARBOR_VLM_BIND", DEFAULT_BIND),
+            model_id=os.getenv("HARBOR_VLM_MODEL_ID", DEFAULT_MODEL_ID),
+            model_path=os.getenv("HARBOR_VLM_MODEL_PATH", DEFAULT_MODEL_PATH),
+            device=os.getenv("HARBOR_VLM_DEVICE", "cpu"),
+            max_new_tokens=int(os.getenv("HARBOR_VLM_MAX_NEW_TOKENS", "96")),
+            local_files_only=parse_bool(os.getenv("HARBOR_VLM_LOCAL_FILES_ONLY"), True),
+            preload=parse_bool(os.getenv("HARBOR_VLM_PRELOAD"), True),
+        )
+
+
+class SmolVlmBackend:
+    def __init__(self, config: RuntimeConfig) -> None:
+        self.config = config
+        self._lock = threading.Lock()
+        self._loading = False
+        self._loaded = False
+        self._error = ""
+        self._processor: Any = None
+        self._model: Any = None
+        self._torch: Any = None
+        self._image_cls: Any = None
+
+    def status(self) -> dict[str, Any]:
+        model_path = Path(self.config.model_path)
+        payload: dict[str, Any] = {
+            "status": "ready" if self._loaded else ("loading" if self._loading else "not_ready"),
+            "ready": self._loaded,
+            "loading": self._loading,
+            "model_id": self.config.model_id,
+            "model_path": str(model_path),
+            "model_path_exists": model_path.exists(),
+            "device": self.config.device,
+            "local_files_only": self.config.local_files_only,
+        }
+        if self._error:
+            payload["status"] = "error"
+            payload["error"] = self._error
+        return payload
+
+    def start_preload(self) -> None:
+        if not self.config.preload:
+            return
+        thread = threading.Thread(target=self.ensure_loaded, name="harbor-vlm-load", daemon=True)
+        thread.start()
+
+    def ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        with self._lock:
+            if self._loaded:
+                return
+            self._loading = True
+            self._error = ""
+            try:
+                model_path = Path(self.config.model_path)
+                if self.config.local_files_only and not model_path.exists():
+                    raise RuntimeError(f"model path does not exist: {model_path}")
+
+                import torch  # type: ignore
+                from PIL import Image  # type: ignore
+                from transformers import AutoProcessor  # type: ignore
+
+                try:
+                    from transformers import AutoModelForImageTextToText as AutoVlmModel  # type: ignore
+                except ImportError:
+                    from transformers import AutoModelForVision2Seq as AutoVlmModel  # type: ignore
+
+                model_ref = str(model_path) if model_path.exists() else self.config.model_id
+                dtype_name = os.getenv("HARBOR_VLM_TORCH_DTYPE", "auto").strip().lower()
+                torch_dtype = None
+                if dtype_name == "auto":
+                    torch_dtype = torch.float32 if self.config.device == "cpu" else torch.bfloat16
+                elif dtype_name == "float32":
+                    torch_dtype = torch.float32
+                elif dtype_name == "bfloat16":
+                    torch_dtype = torch.bfloat16
+
+                kwargs: dict[str, Any] = {
+                    "local_files_only": self.config.local_files_only,
+                    "trust_remote_code": parse_bool(os.getenv("HARBOR_VLM_TRUST_REMOTE_CODE"), False),
+                }
+                if torch_dtype is not None:
+                    kwargs["torch_dtype"] = torch_dtype
+                if os.getenv("HARBOR_VLM_ATTN_IMPLEMENTATION", "eager"):
+                    kwargs["_attn_implementation"] = os.getenv("HARBOR_VLM_ATTN_IMPLEMENTATION", "eager")
+
+                processor = AutoProcessor.from_pretrained(model_ref, local_files_only=self.config.local_files_only)
+                model = AutoVlmModel.from_pretrained(model_ref, **kwargs)
+                model.to(self.config.device)
+                model.eval()
+
+                self._torch = torch
+                self._image_cls = Image
+                self._processor = processor
+                self._model = model
+                self._loaded = True
+            except Exception as exc:  # pragma: no cover - depends on live model/runtime
+                self._error = f"{type(exc).__name__}: {exc}"
+                traceback.print_exc()
+                raise
+            finally:
+                self._loading = False
+
+    def generate(self, prompt: str, image_url: str) -> str:
+        self.ensure_loaded()
+        _mime_type, image_bytes = decode_data_url(image_url)
+        image = self._image_cls.open(BytesIO(image_bytes)).convert("RGB")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": prompt or DEFAULT_PROMPT},
+                ],
+            }
+        ]
+        text_prompt = self._processor.apply_chat_template(messages, add_generation_prompt=True)
+        inputs = self._processor(text=text_prompt, images=[image], return_tensors="pt")
+        if hasattr(inputs, "to"):
+            inputs = inputs.to(self.config.device)
+        else:
+            inputs = {
+                key: value.to(self.config.device) if hasattr(value, "to") else value
+                for key, value in inputs.items()
+            }
+        with self._torch.inference_mode():
+            generated_ids = self._model.generate(**inputs, max_new_tokens=self.config.max_new_tokens)
+        decoded = self._processor.batch_decode(generated_ids, skip_special_tokens=True)
+        return clean_generated_text(decoded[0] if decoded else "")
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "HarborVlmSidecar/1.0"
+
+    def _write_json(self, status: int, payload: dict[str, Any]) -> None:
+        body = json_bytes(payload)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    @property
+    def backend(self) -> SmolVlmBackend:
+        return self.server.backend  # type: ignore[attr-defined]
+
+    def do_GET(self) -> None:  # noqa: N802
+        path = urlparse(self.path).path
+        if path == "/healthz":
+            status = self.backend.status()
+            self._write_json(200 if status.get("ready") else 503, status)
+            return
+        self._write_json(404, error_payload("not found", code="not_found"))
+
+    def do_POST(self) -> None:  # noqa: N802
+        path = urlparse(self.path).path
+        if path != "/v1/chat/completions":
+            self._write_json(404, error_payload("not found", code="not_found"))
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("request body must be a JSON object")
+            prompt, image_url = extract_prompt_and_image_url(payload)
+            caption = self.backend.generate(prompt, image_url)
+            self._write_json(200, openai_chat_response(self.backend.config.model_id, caption))
+        except Exception as exc:
+            self._write_json(503, error_payload(f"{type(exc).__name__}: {exc}"))
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+
+def main() -> int:
+    config = RuntimeConfig.from_env()
+    host, port = parse_bind(config.bind)
+    backend = SmolVlmBackend(config)
+    server = ThreadingHTTPServer((host, port), Handler)
+    server.backend = backend  # type: ignore[attr-defined]
+    backend.start_preload()
+    sys.stderr.write(f"harbor-vlm-sidecar listening on {host}:{port} for {config.model_id}\n")
+    server.serve_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

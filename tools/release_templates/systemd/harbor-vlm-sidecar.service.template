@@ -1,0 +1,16 @@
+[Unit]
+Description=HarborBeacon CPU VLM Sidecar
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__SERVICE_USER__
+WorkingDirectory=__INSTALL_ROOT__/current
+EnvironmentFile=-__ENV_FILE__
+ExecStart=__INSTALL_ROOT__/current/templates/bin/run-harbor-vlm-sidecar
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
