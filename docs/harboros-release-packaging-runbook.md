@@ -18,11 +18,14 @@ release-v1 的默认形态固定为：
 - Linux builder 负责预构建 HarborBeacon Rust 二进制，包括统一入口 `harborbeacon-service`
 - Linux builder 负责预构建 HarborBeacon 单端口推理 facade 所需的内部模型 backend
 - Linux builder 负责构建 HarborDesk Angular `dist`
-- Linux builder 负责组装 HarborGate Python 运行包
+- Linux builder 负责预构建 HarborGate Rust binary；HarborGate 主线不再打包 Python runtime fallback
 - HarborOS 目标机只负责部署与运行，不在机上执行 `cargo`、`rustc`、`node`、`npm` 或 `pip`
 - HarborBeacon Rust Linux 默认目标为 `x86_64-unknown-linux-musl`
 - 当目标为 musl 时，builder 使用 `cargo zigbuild --release --target <target>`，并要求 builder 上已有 `cargo-zigbuild` 与 `zig`
 - HarborBeacon 单端口封装本地 OpenAI-compatible 模型服务；`harbor-model-api`/Candle/VLM 只作为内部或过渡 backend，不再成为对外 systemd/API 契约
+- Model Center 是共享能力层：release 默认保持 local-first，云端只作为 `semantic.router` 与 `retrieval.answer` 的受控 fallback
+- `llm-cloud-siliconflow` preset 使用 `https://api.siliconflow.cn/v1`，API key 由 endpoint metadata secret 保存并通过 admin API redaction 返回
+- 本地模型下载默认 mirror 为 `https://hf-mirror.com`；实际优先级为 HarborDesk 输入 mirror -> `HF_ENDPOINT` -> 默认 mirror
 
 当前默认 builder：
 
@@ -70,7 +73,6 @@ harbor-release-<version>/
     run-e2e-suite
   harbordesk/dist/harbordesk/
   harborgate/bin/harborgate
-  harborgate/site-packages/
   install/
     install_harboros_release.sh
     rollback_harboros_release.sh
@@ -147,8 +149,7 @@ builder 结果至少应包含：
 
 - `harborbeacon-service` Linux release binary
 - HarborDesk Angular dist
-- HarborGate Rust binary slot and Python fallback runtime
-- HarborGate vendored site-packages
+- HarborGate Rust runtime binary: `harborgate/bin/harborgate`
 - `manifest.json`
 - `checksums.sha256`
 - `harbor-release-<version>.tar.gz`
@@ -299,6 +300,10 @@ sudo bash ./rollback_harboros_release.sh \
 - 重启 2 个 core systemd 服务
 - 回滚前停用旧 unit，保持双服务拓扑
 
+HarborGate 不再在同一个 release 内提供 `python|rust` runtime selector。
+如果确实需要回到 Python-capable HarborGate，只能切回上一个已验证的旧 release
+artifact，而不是在当前 release 里改 env 开关。
+
 ## 7. 安装后验收
 
 安装完成后，继续用现有 HarborOS smoke 做验收，而不是让安装脚本自己冒充 smoke。
@@ -362,7 +367,7 @@ bash ./tools/run_harboros_vm_smoke.sh \
 3. IM runtime configuration absence
    - clean install 没有 Weixin 凭据，因此 `harborgate.service` 内部 Weixin runtime 应被视为 skipped，而不是 bundle 损坏
 4. bundle incompleteness
-   - 缺 HarborGate Python 运行包
+   - 缺 HarborGate Rust binary `harborgate/bin/harborgate`
    - 缺 HarborDesk dist
    - 缺 systemd units / env-file / install script
 5. builder / host dependency gap

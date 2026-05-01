@@ -41,11 +41,9 @@ def test_release_bundle_builder_covers_expected_artifacts() -> None:
         "validate-contract-schemas",
         "run-e2e-suite",
         "frontend/harbordesk",
-        "harborgate/site-packages",
+        "build_harborgate_rust_binary",
         "HARBORGATE_RUST_BINARY",
         "harborgate/bin/harborgate",
-        '"python_fallback"',
-        '"runtime_selector_env"',
         "manifest.json",
         '"helper_scripts"',
         "harbor-agent-hub-helper",
@@ -59,6 +57,9 @@ def test_release_bundle_builder_covers_expected_artifacts() -> None:
         '"harborgate.service"',
     ]
     assert all(phrase in content for phrase in required_phrases)
+    assert "harborgate/site-packages" not in content
+    assert '"python_fallback"' not in content
+    assert '"runtime_selector_env"' not in content
 
 
 def test_harboros_installer_manages_release_layout_and_services() -> None:
@@ -108,8 +109,6 @@ def test_harboros_installer_manages_release_layout_and_services() -> None:
         "HARBOR_TASK_API_URL=http://127.0.0.1:4174",
         "HARBORBEACON_WEB_API_URL=http://127.0.0.1:4174",
         "HARBORBEACON_WEB_API_TOKEN",
-        "HARBORGATE_RUNTIME=${EXISTING_HARBORGATE_RUNTIME:-python}",
-        "HARBORGATE_RUST_BIN",
         "HARBORBEACON_ADMIN_API_URL=http://127.0.0.1:4174",
         "HARBORBEACON_ADMIN_API_TOKEN",
         "IM_AGENT_CONTRACT_VERSION=2.0",
@@ -118,6 +117,9 @@ def test_harboros_installer_manages_release_layout_and_services() -> None:
         "Legacy units : disabled/removed",
     ]
     assert all(phrase in content for phrase in required_phrases)
+    assert "HARBORGATE_RUNTIME=" not in content
+    assert "HARBORGATE_RUST_BIN" not in content
+    assert "HARBORGATE_PYTHON_BIN" not in content
     assert "CORE_SERVICES=(\n  harborbeacon.service\n  harborgate.service\n)" in content
     for legacy_template in [
         "harbor-model-api.service.template",
@@ -164,8 +166,6 @@ def test_harboros_rollback_script_switches_current_release() -> None:
         "harborbeacon.service",
         "harborgate.service",
         "LEGACY_SERVICES",
-        "--harborgate-runtime",
-        "HARBORGATE_RUNTIME",
         "harbor-model-api.service",
         "harbor-vlm-sidecar.service",
         "harborgate-weixin-runner.service",
@@ -173,6 +173,8 @@ def test_harboros_rollback_script_switches_current_release() -> None:
         "systemctl disable --now",
     ]
     assert all(phrase in content for phrase in required_phrases)
+    assert "--harborgate-runtime" not in content
+    assert "HARBORGATE_RUNTIME" not in content
     assert "CORE_SERVICES=(\n  harborbeacon.service\n  harborgate.service\n)" in content
 
 
@@ -182,7 +184,7 @@ def test_release_packaging_runbook_records_builder_target_and_install_shape() ->
         "192.168.3.223",
         "192.168.3.182",
         "HarborDesk Angular `dist`",
-        "HarborGate Python 运行包",
+        "HarborGate Rust binary",
         "不在机上执行 `cargo`、`rustc`、`node`、`npm` 或 `pip`",
         "bootstrap_release_builder.sh",
         "BOOTSTRAP_BUILDER_IF_NEEDED",

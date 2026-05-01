@@ -56,7 +56,6 @@ LINUX_PORTABILITY_EXPECTATION="${LINUX_PORTABILITY_EXPECTATION:-$(default_portab
 VERSION="${RELEASE_VERSION:-$(date -u +%Y%m%d-%H%M%S)-$(git_short_ref_or_snapshot "${REPO_ROOT}")}"
 BUNDLE_NAME="harbor-release-${VERSION}"
 BUNDLE_ROOT="${OUT_DIR}/${BUNDLE_NAME}"
-PYBUILD_VENV="${OUT_DIR}/.pybuild-${VERSION}"
 
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -153,6 +152,25 @@ build_rust_binaries() {
   fi
 }
 
+build_harborgate_rust_binary() {
+  if [[ -n "${HARBORGATE_RUST_BINARY}" ]]; then
+    return 0
+  fi
+  local cargo_args=(
+    --release
+    --bin harborgate
+  )
+  (
+    cd "${HARBORGATE_REPO}"
+    prepare_builder_tool_path
+    if [[ "${RUST_TARGET}" == *-musl ]]; then
+      cargo zigbuild "${cargo_args[@]}" --target "${RUST_TARGET}"
+    else
+      cargo build "${cargo_args[@]}"
+    fi
+  )
+}
+
 assert_binary_linkage() {
   local binary_path="$1"
   local file_output
@@ -213,12 +231,11 @@ else
 fi
 
 mkdir -p "${OUT_DIR}"
-rm -rf "${BUNDLE_ROOT}" "${PYBUILD_VENV}"
+rm -rf "${BUNDLE_ROOT}"
 mkdir -p \
   "${BUNDLE_ROOT}/bin" \
   "${BUNDLE_ROOT}/harbordesk/dist" \
   "${BUNDLE_ROOT}/harborgate/bin" \
-  "${BUNDLE_ROOT}/harborgate/site-packages" \
   "${BUNDLE_ROOT}/install" \
   "${BUNDLE_ROOT}/templates"
 
@@ -251,18 +268,18 @@ else
 fi
 
 echo
-echo "==> Vendoring HarborGate Python runtime"
-python3 -m venv "${PYBUILD_VENV}"
-"${PYBUILD_VENV}/bin/python" -m pip install --upgrade pip setuptools wheel
-"${PYBUILD_VENV}/bin/python" -m pip install --no-compile --target "${BUNDLE_ROOT}/harborgate/site-packages" "${HARBORGATE_REPO}"
-find "${BUNDLE_ROOT}/harborgate/site-packages" -type d -name "__pycache__" -prune -exec rm -rf {} +
+echo "==> Building HarborGate Rust runtime"
+build_harborgate_rust_binary
 HARBORGATE_RUST_BUNDLE_PATH=""
 if HARBORGATE_RUST_SOURCE="$(resolve_harborgate_rust_binary)"; then
+  assert_binary_linkage "${HARBORGATE_RUST_SOURCE}"
   cp "${HARBORGATE_RUST_SOURCE}" "${BUNDLE_ROOT}/harborgate/bin/harborgate"
   chmod 0755 "${BUNDLE_ROOT}/harborgate/bin/harborgate"
   HARBORGATE_RUST_BUNDLE_PATH="harborgate/bin/harborgate"
 else
-  echo "==> HarborGate Rust binary not found; bundle will use Python fallback unless HARBORGATE_RUNTIME=rust is configured"
+  echo "HarborGate Rust binary is required for release bundle but was not found." >&2
+  echo "Build HarborGate first or set HARBORGATE_RUST_BINARY=/path/to/harborgate." >&2
+  exit 1
 fi
 
 echo
@@ -352,14 +369,8 @@ payload = {
         "harborgate": {
             "git_ref": sys.argv[5],
             "rust_binary": sys.argv[11],
-            "site_packages": "harborgate/site-packages",
-            "python_fallback": "harborgate/site-packages",
-            "runtime_selector_env": "HARBORGATE_RUNTIME",
             "launchers": [
                 "templates/bin/harborgate",
-                "templates/bin/harborgate-weixin-runner",
-                "templates/bin/harborgate-weixin-login",
-                "templates/bin/harborgate-weixin-ingress-probe",
             ],
         },
     },
@@ -392,8 +403,6 @@ tar -C "${OUT_DIR}" -czf "${TARBALL_PATH}" "${BUNDLE_NAME}"
   cd "${OUT_DIR}"
   sha256sum "${BUNDLE_NAME}.tar.gz" > "${BUNDLE_NAME}.tar.gz.sha256"
 )
-
-rm -rf "${PYBUILD_VENV}"
 
 echo
 echo "Release bundle ready:"
