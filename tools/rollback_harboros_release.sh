@@ -9,6 +9,8 @@ Options:
   --install-root PATH  Install root (default: /var/lib/harborbeacon-agent-ci)
   --env-file PATH      Environment file to keep release metadata aligned (default: /etc/default/harborbeacon-agent-hub)
   --version VERSION    Explicit release version to reactivate
+  --harborgate-runtime python|rust|auto
+                      Update HARBORGATE_RUNTIME while rolling back
   --skip-start         Update current symlink only; do not restart services
   -h, --help           Show help
 EOF
@@ -17,15 +19,19 @@ EOF
 INSTALL_ROOT="/var/lib/harborbeacon-agent-ci"
 ENV_FILE="/etc/default/harborbeacon-agent-hub"
 TARGET_VERSION=""
+HARBORGATE_RUNTIME=""
 SKIP_START=0
 CORE_SERVICES=(
+  harborbeacon.service
+  harborgate.service
+)
+LEGACY_SERVICES=(
   harbor-model-api.service
   assistant-task-api.service
   agent-hub-admin-api.service
-  harborgate.service
+  harbor-vlm-sidecar.service
+  harborgate-weixin-runner.service
 )
-OPTIONAL_WEIXIN_SERVICE="harborgate-weixin-runner.service"
-OPTIONAL_VLM_SERVICE="harbor-vlm-sidecar.service"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -39,6 +45,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --version)
       TARGET_VERSION="$2"
+      shift 2
+      ;;
+    --harborgate-runtime)
+      HARBORGATE_RUNTIME="$2"
+      if [[ "${HARBORGATE_RUNTIME}" != "python" && "${HARBORGATE_RUNTIME}" != "rust" && "${HARBORGATE_RUNTIME}" != "auto" ]]; then
+        echo "--harborgate-runtime must be python, rust, or auto" >&2
+        exit 2
+      fi
       shift 2
       ;;
     --skip-start)
@@ -104,18 +118,21 @@ ln -sfn "${TARGET_DIR}" "${CURRENT_LINK}"
 
 if [[ -f "${ENV_FILE}" ]]; then
   require_command python3
-  python3 - "${ENV_FILE}" "${TARGET_VERSION}" "${INSTALL_ROOT}" <<'PY'
+  python3 - "${ENV_FILE}" "${TARGET_VERSION}" "${INSTALL_ROOT}" "${HARBORGATE_RUNTIME}" <<'PY'
 from pathlib import Path
 import sys
 
 env_path = Path(sys.argv[1])
 release_version = sys.argv[2]
 install_root = sys.argv[3]
+harborgate_runtime = sys.argv[4].strip()
 lines = env_path.read_text(encoding="utf-8").splitlines()
 updates = {
     "HARBOR_RELEASE_VERSION": release_version,
     "HARBOR_RELEASE_INSTALL_ROOT": install_root,
 }
+if harborgate_runtime:
+    updates["HARBORGATE_RUNTIME"] = harborgate_runtime
 seen = set()
 rewritten = []
 for line in lines:
@@ -137,13 +154,11 @@ fi
 
 if [[ "${SKIP_START}" -ne 1 ]]; then
   systemctl daemon-reload
+  for legacy_service in "${LEGACY_SERVICES[@]}"; do
+    systemctl disable --now "${legacy_service}" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/${legacy_service}"
+  done
   systemctl restart "${CORE_SERVICES[@]}"
-  if systemctl is-enabled "${OPTIONAL_WEIXIN_SERVICE}" >/dev/null 2>&1; then
-    systemctl restart "${OPTIONAL_WEIXIN_SERVICE}"
-  fi
-  if systemctl is-enabled "${OPTIONAL_VLM_SERVICE}" >/dev/null 2>&1; then
-    systemctl restart "${OPTIONAL_VLM_SERVICE}"
-  fi
 fi
 
 echo

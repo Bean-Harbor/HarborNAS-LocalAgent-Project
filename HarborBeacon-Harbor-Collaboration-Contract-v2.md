@@ -190,7 +190,8 @@ Meaning:
 The following are frozen by the active external IM contract and MUST NOT change
 without explicit multi-lane sign-off:
 
-- `POST /api/turns`
+- `POST /api/web/turns`
+- `POST /api/turns` only as a deprecated HarborBeacon compatibility alias
 - `TaskTurnEnvelope` and turn response semantics visible to IM callers
 - `conversation.handle`
 - `transport.route_key`

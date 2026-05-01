@@ -134,7 +134,7 @@ impl Default for ModelApiConfig {
 }
 
 impl ModelApiConfig {
-    pub fn from_env_and_args() -> Self {
+    pub fn from_env() -> Self {
         let mut config = Self::default();
         let legacy_candle_model_id = env::var("HARBOR_MODEL_API_CANDLE_MODEL_ID")
             .ok()
@@ -157,13 +157,12 @@ impl ModelApiConfig {
         )
         .parse::<u64>()
         .unwrap_or_else(|error| fail(&format!("invalid request timeout: {error}")));
-        config.candle.chat_model_id =
-            env::var("HARBOR_MODEL_API_CANDLE_CHAT_MODEL_ID")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .or_else(|| legacy_candle_model_id.clone())
-                .unwrap_or_else(|| config.candle.chat_model_id.clone());
+        config.candle.chat_model_id = env::var("HARBOR_MODEL_API_CANDLE_CHAT_MODEL_ID")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| legacy_candle_model_id.clone())
+            .unwrap_or_else(|| config.candle.chat_model_id.clone());
         config.candle.embedding_model_id = env_or_default(
             "HARBOR_MODEL_API_CANDLE_EMBEDDING_MODEL_ID",
             &config.candle.embedding_model_id,
@@ -182,6 +181,11 @@ impl ModelApiConfig {
         )
         .parse::<f64>()
         .unwrap_or_else(|error| fail(&format!("invalid candle temperature: {error}")));
+        config
+    }
+
+    pub fn from_env_and_args() -> Self {
+        let mut config = Self::from_env();
         config.apply_cli_args();
         config
     }

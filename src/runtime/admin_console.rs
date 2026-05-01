@@ -551,7 +551,7 @@ const DEFAULT_HARBOROS_WRITABLE_ROOT: &str = "/mnt/software/harborbeacon-agent-c
 const DEFAULT_KNOWLEDGE_INDEX_SUBDIR: &str = "knowledge-index";
 const MODEL_API_BASE_URL_ENV: &str = "HARBOR_MODEL_API_BASE_URL";
 const MODEL_API_TOKEN_ENV: &str = "HARBOR_MODEL_API_TOKEN";
-const DEFAULT_MODEL_API_BASE_URL: &str = "http://127.0.0.1:4176/v1";
+const DEFAULT_MODEL_API_BASE_URL: &str = "http://127.0.0.1:4174/api/inference/v1";
 const DEFAULT_MODEL_API_TOKEN: &str = "harbor-local-model-token";
 
 impl AdminConsoleStore {

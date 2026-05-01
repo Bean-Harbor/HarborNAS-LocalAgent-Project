@@ -11,7 +11,7 @@ The active HarborBeacon <-> HarborGate seam is the v2.0 upgrade control pack.
 - Cutover gates: `docs/im-v2.0-cutover-rollback-observability-gates.md`
 
 The previous v1.5 seam is historical only. Current implementation work should
-move toward `POST /api/turns`, `conversation.handle`, `active_frame`,
+move toward `POST /api/web/turns`, `conversation.handle`, `active_frame`,
 `continuation`, `delivery_hints`, and `X-Contract-Version: 2.0`.
 
 ## Rust Runtime (New)
@@ -148,7 +148,7 @@ Current defaults:
 Runtime-truth rule:
 
 - `GET /api/feature-availability` is the grouped read-model for runtime truth, route policy, account management, and gateway status
-- local runtime truth from `4176 /healthz` may override stale stored endpoint projection for the built-in LLM/embedder rows
+- local runtime truth from `/api/inference/healthz` may override stale stored endpoint projection for the built-in LLM/embedder rows
 - HarborDesk keeps `projection_mismatch` visible instead of silently flattening runtime truth back into stored admin state
 
 ## Executable CI Scaffold
@@ -195,7 +195,7 @@ Release/install note:
 HarborOS `.182` resident stack checks:
 
 - after install, use `/var/lib/harborbeacon-agent-ci/bin/harbor-agent-hub-helper status`
-- use `/var/lib/harborbeacon-agent-ci/bin/harbor-agent-hub-helper health` to probe `4174/4175/4176/8787` plus `GET /api/gateway/status`
+- use `/var/lib/harborbeacon-agent-ci/bin/harbor-agent-hub-helper health` to probe HarborBeacon, HarborBeacon inference, HarborGate, and `GET /api/gateway/status`
 - use `sudo /var/lib/harborbeacon-agent-ci/bin/harbor-agent-hub-helper logs gateway --lines 120` for the HarborGate journal when `.182` keeps journald access restricted
 
 Typical usage:

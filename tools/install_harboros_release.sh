@@ -82,13 +82,16 @@ INSTALL_ROOT_SET=0
 WRITABLE_ROOT_SET=0
 
 CORE_SERVICES=(
+  harborbeacon.service
+  harborgate.service
+)
+LEGACY_SERVICES=(
   harbor-model-api.service
   assistant-task-api.service
   agent-hub-admin-api.service
-  harborgate.service
+  harbor-vlm-sidecar.service
+  harborgate-weixin-runner.service
 )
-OPTIONAL_WEIXIN_SERVICE="harborgate-weixin-runner.service"
-OPTIONAL_VLM_SERVICE="harbor-vlm-sidecar.service"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -236,6 +239,8 @@ EXISTING_HUGGING_FACE_HUB_TOKEN="${HUGGING_FACE_HUB_TOKEN:-}"
 EXISTING_HTTP_PROXY="${HTTP_PROXY:-}"
 EXISTING_HTTPS_PROXY="${HTTPS_PROXY:-}"
 EXISTING_NO_PROXY="${NO_PROXY:-}"
+EXISTING_HARBORGATE_RUNTIME="${HARBORGATE_RUNTIME:-}"
+EXISTING_HARBORGATE_RUST_BIN="${HARBORGATE_RUST_BIN:-}"
 EXISTING_VLM_SIDECAR_ENABLE="${HARBOR_VLM_SIDECAR_ENABLE:-}"
 EXISTING_VLM_BIND="${HARBOR_VLM_BIND:-}"
 EXISTING_VLM_MODEL_ID="${HARBOR_VLM_MODEL_ID:-}"
@@ -334,12 +339,8 @@ output_path.write_text(payload, encoding="utf-8")
 PY
 }
 
-render_template "${RELEASE_DIR}/templates/systemd/assistant-task-api.service.template" "/etc/systemd/system/assistant-task-api.service"
-render_template "${RELEASE_DIR}/templates/systemd/agent-hub-admin-api.service.template" "/etc/systemd/system/agent-hub-admin-api.service"
-render_template "${RELEASE_DIR}/templates/systemd/harbor-model-api.service.template" "/etc/systemd/system/harbor-model-api.service"
-render_template "${RELEASE_DIR}/templates/systemd/harbor-vlm-sidecar.service.template" "/etc/systemd/system/harbor-vlm-sidecar.service"
+render_template "${RELEASE_DIR}/templates/systemd/harborbeacon.service.template" "/etc/systemd/system/harborbeacon.service"
 render_template "${RELEASE_DIR}/templates/systemd/harborgate.service.template" "/etc/systemd/system/harborgate.service"
-render_template "${RELEASE_DIR}/templates/systemd/harborgate-weixin-runner.service.template" "/etc/systemd/system/harborgate-weixin-runner.service"
 
 append_optional_env() {
   local key="$1"
@@ -360,8 +361,7 @@ HARBOR_HARBOROS_WRITABLE_ROOT=${WRITABLE_ROOT}
 HARBOR_KNOWLEDGE_INDEX_ROOT=${EXISTING_KNOWLEDGE_INDEX_ROOT:-${WRITABLE_ROOT}/knowledge-index}
 HARBOR_MODEL_CACHE_DIR=${MODEL_CACHE_DIR}
 
-HARBOR_MODEL_API_BIND=127.0.0.1:4176
-HARBOR_MODEL_API_BASE_URL=http://127.0.0.1:4176/v1
+HARBOR_MODEL_API_BASE_URL=http://127.0.0.1:4174/api/inference/v1
 HARBOR_MODEL_API_TOKEN=${SERVICE_TOKEN}
 HARBOR_MODEL_API_BACKEND=${EXISTING_MODEL_API_BACKEND:-openai_proxy}
 HARBOR_MODEL_API_UPSTREAM_BASE_URL=${EXISTING_MODEL_API_UPSTREAM_BASE_URL:-http://127.0.0.1:11434/v1}
@@ -378,8 +378,7 @@ HARBOR_VLM_MAX_NEW_TOKENS=${EXISTING_VLM_MAX_NEW_TOKENS:-96}
 HARBOR_VLM_LOCAL_FILES_ONLY=${EXISTING_VLM_LOCAL_FILES_ONLY:-1}
 HARBOR_VLM_PRELOAD=${EXISTING_VLM_PRELOAD:-1}
 
-HARBOR_TASK_API_BIND=127.0.0.1:4175
-HARBOR_TASK_API_URL=http://127.0.0.1:4175
+HARBOR_TASK_API_URL=http://127.0.0.1:4174
 HARBOR_TASK_API_ADMIN_STATE=${RUNTIME_DIR}/admin-console.json
 HARBOR_TASK_API_DEVICE_REGISTRY=${RUNTIME_DIR}/device-registry.json
 HARBOR_TASK_API_CONVERSATIONS=${RUNTIME_DIR}/task-api-conversations.json
@@ -387,6 +386,8 @@ HARBOR_TASK_API_BEARER_TOKEN=${SERVICE_TOKEN}
 
 HARBORGATE_BASE_URL=http://127.0.0.1:8787
 HARBORGATE_BEARER_TOKEN=${SERVICE_TOKEN}
+HARBORGATE_RUNTIME=${EXISTING_HARBORGATE_RUNTIME:-python}
+HARBORGATE_RUST_BIN=${EXISTING_HARBORGATE_RUST_BIN:-${CURRENT_LINK}/harborgate/bin/harborgate}
 IM_AGENT_SERVICE_TOKEN=${SERVICE_TOKEN}
 IM_AGENT_CONTRACT_VERSION=2.0
 IM_AGENT_HOST=127.0.0.1
@@ -396,7 +397,9 @@ IM_AGENT_STATE_DIR=${RUNTIME_DIR}/harborgate
 IM_AGENT_PUBLIC_ORIGIN=${GATEWAY_PUBLIC_ORIGIN}
 WEIXIN_STATE_DIR=${RUNTIME_DIR}/harborgate/weixin
 
-HARBORBEACON_TASK_API_URL=http://127.0.0.1:4175
+HARBORBEACON_WEB_API_URL=http://127.0.0.1:4174
+HARBORBEACON_WEB_API_TOKEN=${SERVICE_TOKEN}
+HARBORBEACON_TASK_API_URL=http://127.0.0.1:4174
 HARBORBEACON_TASK_API_TOKEN=${SERVICE_TOKEN}
 HARBORBEACON_ADMIN_API_URL=http://127.0.0.1:4174
 HARBORBEACON_ADMIN_API_TOKEN=${SERVICE_TOKEN}
@@ -426,14 +429,15 @@ append_optional_env "HARBOR_VLM_SIDECAR_SCRIPT" "${EXISTING_VLM_SIDECAR_SCRIPT}"
 
 chmod 0644 \
   "${ENV_FILE}" \
-  /etc/systemd/system/harbor-model-api.service \
-  /etc/systemd/system/assistant-task-api.service \
-  /etc/systemd/system/agent-hub-admin-api.service \
-  /etc/systemd/system/harbor-vlm-sidecar.service \
-  /etc/systemd/system/harborgate.service \
-  /etc/systemd/system/harborgate-weixin-runner.service
+  /etc/systemd/system/harborbeacon.service \
+  /etc/systemd/system/harborgate.service
 find "${RELEASE_DIR}/templates/bin" -type f -exec chmod 0755 {} +
 
+systemctl daemon-reload
+for legacy_service in "${LEGACY_SERVICES[@]}"; do
+  systemctl disable --now "${legacy_service}" >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/${legacy_service}"
+done
 systemctl daemon-reload
 systemctl enable "${CORE_SERVICES[@]}"
 
@@ -442,38 +446,6 @@ if [[ "${SKIP_START}" -ne 1 ]]; then
   CORE_SERVICE_STATUS="enabled and restarted"
 else
   CORE_SERVICE_STATUS="enabled, start skipped"
-fi
-
-systemctl enable "${OPTIONAL_WEIXIN_SERVICE}"
-if [[ "${SKIP_START}" -ne 1 ]]; then
-  systemctl restart "${OPTIONAL_WEIXIN_SERVICE}"
-  if [[ -n "${EXISTING_WEIXIN_ACCOUNT_ID}" ]]; then
-    WEIXIN_RUNNER_STATUS="configured, enabled and restarted"
-  else
-    WEIXIN_RUNNER_STATUS="waiting for QR login credentials, enabled and restarted"
-  fi
-else
-  if [[ -n "${EXISTING_WEIXIN_ACCOUNT_ID}" ]]; then
-    WEIXIN_RUNNER_STATUS="configured, enabled, start skipped"
-  else
-    WEIXIN_RUNNER_STATUS="waiting for QR login credentials, enabled, start skipped"
-  fi
-fi
-
-if [[ "${EXISTING_VLM_SIDECAR_ENABLE:-0}" == "1" ]]; then
-  systemctl enable "${OPTIONAL_VLM_SERVICE}"
-  if [[ "${SKIP_START}" -ne 1 ]]; then
-    systemctl restart "${OPTIONAL_VLM_SERVICE}"
-    VLM_SIDECAR_STATUS="enabled and restarted"
-  else
-    VLM_SIDECAR_STATUS="enabled, start skipped"
-  fi
-else
-  systemctl disable "${OPTIONAL_VLM_SERVICE}" >/dev/null 2>&1 || true
-  if [[ "${SKIP_START}" -ne 1 ]]; then
-    systemctl stop "${OPTIONAL_VLM_SERVICE}" >/dev/null 2>&1 || true
-  fi
-  VLM_SIDECAR_STATUS="installed, disabled until HARBOR_VLM_SIDECAR_ENABLE=1"
 fi
 
 echo
@@ -486,7 +458,6 @@ echo "Current link : ${CURRENT_LINK}"
 echo "Env file     : ${ENV_FILE}"
 echo "Service user : ${SERVICE_USER}"
 echo "Core services: ${CORE_SERVICE_STATUS}"
-echo "Optional     : harborgate-weixin-runner -> ${WEIXIN_RUNNER_STATUS}"
-echo "Optional     : harbor-vlm-sidecar -> ${VLM_SIDECAR_STATUS}"
+echo "Legacy units : disabled/removed (${LEGACY_SERVICES[*]})"
 echo "Helper       : ${STATUS_HELPER_LINK}"
 echo "Quick checks : ${STATUS_HELPER_LINK} status | ${STATUS_HELPER_LINK} health | ${STATUS_HELPER_LINK} logs gateway"

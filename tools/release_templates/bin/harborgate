@@ -12,6 +12,20 @@ if [[ -f "${ENV_FILE}" ]]; then
   set +a
 fi
 
+HARBORGATE_RUNTIME="${HARBORGATE_RUNTIME:-python}"
+HARBORGATE_RUST_BIN="${HARBORGATE_RUST_BIN:-${RELEASE_ROOT}/harborgate/bin/harborgate}"
+
+if [[ "${HARBORGATE_RUNTIME}" == "rust" || "${HARBORGATE_RUNTIME}" == "auto" ]]; then
+  if [[ -x "${HARBORGATE_RUST_BIN}" ]]; then
+    cd "${RELEASE_ROOT}"
+    exec "${HARBORGATE_RUST_BIN}" "$@"
+  fi
+  if [[ "${HARBORGATE_RUNTIME}" == "rust" ]]; then
+    echo "HarborGate Rust runtime requested but binary is missing or not executable: ${HARBORGATE_RUST_BIN}" >&2
+    exit 127
+  fi
+fi
+
 export PYTHONPATH="${RELEASE_ROOT}/harborgate/site-packages${PYTHONPATH:+:${PYTHONPATH}}"
 cd "${RELEASE_ROOT}"
 exec "${HARBORGATE_PYTHON_BIN:-python3}" -m im_agent.server "$@"

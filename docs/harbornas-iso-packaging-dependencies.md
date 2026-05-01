@@ -64,26 +64,18 @@ v2.0 禁止回退项：
 
 ## 3. 服务拓扑、端口与 systemd 单元
 
-建议 ISO 预置以下服务：
+建议 ISO 预置以下主服务：
 
 | 服务 | 默认监听 | 必需性 | 说明 |
 |---|---:|---|---|
-| `agent-hub-admin-api.service` | `0.0.0.0:4174` | 必需 | HarborDesk / HarborBot / 管理面 API |
-| `assistant-task-api.service` | `127.0.0.1:4175` | 必需 | HarborBeacon v2.0 turn / conversation / continuation API |
-| `harbor-model-api.service` | `127.0.0.1:4176` | 建议 | OpenAI-compatible 本地模型代理 |
-| `harborgate.service` | `127.0.0.1:8787` | 必需 | HarborGate IM Gateway |
-| `harborgate-weixin-runner.service` | 无固定 HTTP | 可选启用 | Weixin long-poll runner |
-| `harbor-vlm-sidecar.service` | `127.0.0.1:4196` | 可选 | VLM 图像描述 sidecar，默认可禁用 |
+| `harborbeacon.service` | `0.0.0.0:4174` | 必需 | HarborDesk / HarborBot / `/api/web/turns` / `/api/inference/*` 单端口 API |
+| `harborgate.service` | `127.0.0.1:8787` | 必需 | HarborGate IM Gateway 与进程内 adapter runtime |
 
 建议启动顺序：
 
 ```text
-harbor-model-api
-assistant-task-api
-agent-hub-admin-api
+harborbeacon
 harborgate
-harborgate-weixin-runner
-harbor-vlm-sidecar
 ```
 
 HarborNAS WebUI 本身不新增 HarborDesk / HarborBot 后端服务；两者作为 HarborNAS WebUI 页面发布。
@@ -236,9 +228,7 @@ HarborBeacon 需要作为 ISO 内的业务核心 runtime 发布。
 核心 Rust binaries：
 
 ```text
-agent-hub-admin-api
-assistant-task-api
-harbor-model-api
+harborbeacon-service
 validate-contract-schemas
 run-e2e-suite
 ```
@@ -256,18 +246,21 @@ benchmark-local-model-backend
 
 | Surface | 地址 | 说明 |
 |---|---|---|
-| Admin API | `http://127.0.0.1:4174` 或 `0.0.0.0:4174` | HarborDesk / HarborBot / 管理面 API |
-| Task API | `http://127.0.0.1:4175` | v2.0 `POST /api/turns` |
-| Model API | `http://127.0.0.1:4176/v1` | OpenAI-compatible local model proxy |
+| HarborBeacon API | `http://127.0.0.1:4174` 或 `0.0.0.0:4174` | `/api/admin/*`、`/api/web/*`、`/api/inference/*` |
+| HarborGate API | `http://127.0.0.1:8787` | IM Gateway、setup、status、delivery |
 
-Task API active endpoint：
+HarborBeacon active endpoints：
 
 ```text
 GET  /healthz
-POST /api/turns
+POST /api/web/turns
+POST /api/turns       # deprecated alias only
+GET  /api/inference/healthz
+POST /api/inference/v1/chat/completions
+POST /api/inference/v1/embeddings
 ```
 
-Task API 要求：
+HarborBeacon service-to-service turn API 要求：
 
 - `Authorization: Bearer <shared-token>`
 - `X-Contract-Version: 2.0`
@@ -320,7 +313,6 @@ wecom
 ```text
 harborgate
 harborgate-weixin-login
-harborgate-weixin-runner
 harborgate-weixin-ingress-probe
 ```
 
@@ -329,7 +321,6 @@ harborgate-weixin-ingress-probe
 ```text
 im-agent
 im-agent-weixin-login
-im-agent-weixin-runner
 im-agent-weixin-ingress-probe
 ```
 
@@ -425,9 +416,7 @@ zig 0.15.1
 `tools/build_release_bundle.sh` 当前会构建：
 
 ```text
-harbor-model-api
-assistant-task-api
-agent-hub-admin-api
+harborbeacon-service
 validate-contract-schemas
 run-e2e-suite
 ```
@@ -518,7 +507,7 @@ VLM 默认配置：
 
 ```text
 HARBOR_VLM_SIDECAR_ENABLE=0
-HARBOR_VLM_BIND=127.0.0.1:4196
+HARBOR_VLM_BIND=<internal-loopback-bind>
 HARBOR_VLM_MODEL_ID=HuggingFaceTB/SmolVLM-256M-Instruct
 HARBOR_VLM_MODEL_PATH=<writable-root>/models/huggingfacetb-smolvlm-256m-instruct
 HARBOR_VLM_DEVICE=cpu
@@ -539,7 +528,7 @@ yolov8n.pt
 - HarborBeacon Rust release binaries。
 - HarborNAS WebUI production dist。
 - `yolov8n.pt`，如果启用 YOLO。
-- VLM model directory，如果启用 `harbor-vlm-sidecar`。
+- VLM model directory，如果启用内部 VLM backend。
 
 ## 12. 安装目录与状态目录
 
@@ -592,15 +581,16 @@ HARBOR_HARBOROS_USER=<service-user>
 HARBOR_HARBOROS_WRITABLE_ROOT=/mnt/software/harborbeacon-agent-ci
 HARBOR_KNOWLEDGE_INDEX_ROOT=/mnt/software/harborbeacon-agent-ci/knowledge-index
 
-HARBOR_TASK_API_BIND=127.0.0.1:4175
-HARBOR_TASK_API_URL=http://127.0.0.1:4175
 HARBOR_TASK_API_ADMIN_STATE=/var/lib/harborbeacon-agent-ci/runtime/admin-console.json
 HARBOR_TASK_API_DEVICE_REGISTRY=/var/lib/harborbeacon-agent-ci/runtime/device-registry.json
 HARBOR_TASK_API_CONVERSATIONS=/var/lib/harborbeacon-agent-ci/runtime/task-api-conversations.json
 HARBOR_TASK_API_BEARER_TOKEN=<shared-token>
 
-HARBOR_MODEL_API_BIND=127.0.0.1:4176
-HARBOR_MODEL_API_BASE_URL=http://127.0.0.1:4176/v1
+HARBOR_TASK_API_URL=http://127.0.0.1:4174
+HARBORBEACON_WEB_API_URL=http://127.0.0.1:4174
+HARBORBEACON_WEB_API_TOKEN=<shared-token>
+
+HARBOR_MODEL_API_BASE_URL=http://127.0.0.1:4174/api/inference/v1
 HARBOR_MODEL_API_TOKEN=<shared-token>
 HARBOR_MODEL_API_BACKEND=openai_proxy
 HARBOR_MODEL_API_UPSTREAM_BASE_URL=http://127.0.0.1:11434/v1
@@ -618,8 +608,6 @@ IM_AGENT_STATE_DIR=/var/lib/harborbeacon-agent-ci/runtime/harborgate
 IM_AGENT_PUBLIC_ORIGIN=http://harborbeacon.local:8787
 WEIXIN_STATE_DIR=/var/lib/harborbeacon-agent-ci/runtime/harborgate/weixin
 
-HARBORBEACON_TASK_API_URL=http://127.0.0.1:4175
-HARBORBEACON_TASK_API_TOKEN=<shared-token>
 HARBORBEACON_ADMIN_API_URL=http://127.0.0.1:4174
 HARBORBEACON_ADMIN_API_TOKEN=<shared-token>
 
@@ -654,7 +642,7 @@ WEIXIN_BASE_URL=https://ilinkai.weixin.qq.com
 
 ```bash
 harborgate-weixin-login
-systemctl restart harborgate-weixin-runner.service
+systemctl restart harborgate.service
 ```
 
 ## 14. Release bundle 建议内容
@@ -663,13 +651,12 @@ systemctl restart harborgate-weixin-runner.service
 
 ```text
 bin/
-  agent-hub-admin-api
-  assistant-task-api
-  harbor-model-api
+  harborbeacon-service
   validate-contract-schemas
   run-e2e-suite
 
 harborgate/
+  bin/harborgate
   site-packages/
 
 templates/
@@ -677,19 +664,11 @@ templates/
     harbor-agent-hub-helper
     harborgate
     harborgate-weixin-login
-    harborgate-weixin-runner
     harborgate-weixin-ingress-probe
-    run-agent-hub-admin-api
-    run-assistant-task-api
-    run-harbor-model-api
-    run-harbor-vlm-sidecar
+    run-harborbeacon-service
   systemd/
-    agent-hub-admin-api.service.template
-    assistant-task-api.service.template
-    harbor-model-api.service.template
-    harbor-vlm-sidecar.service.template
+    harborbeacon.service.template
     harborgate.service.template
-    harborgate-weixin-runner.service.template
   harborbeacon-agent-hub.env.template
 
 install/
@@ -721,23 +700,15 @@ HarborNAS WebUI dist 建议由 HarborNAS ISO 自身 WebUI 打包流程产出，�
 - `systemctl daemon-reload`。
 - enable core services。
 - 默认启动 core services。
-- `harborgate-weixin-runner` 可安装但不强制启动，直到 Weixin 已登录并配置 account id。
-- `harbor-vlm-sidecar` 默认安装但 disabled，直到 `HARBOR_VLM_SIDECAR_ENABLE=1`。
+- disable/remove legacy units：`agent-hub-admin-api.service`、`assistant-task-api.service`、
+  `harbor-model-api.service`、`harbor-vlm-sidecar.service`、`harborgate-weixin-runner.service`。
+- Weixin / Feishu 等 adapter runtime 由 `harborgate.service` 按配置在进程内启动。
 
 Core services：
 
 ```text
-harbor-model-api.service
-assistant-task-api.service
-agent-hub-admin-api.service
+harborbeacon.service
 harborgate.service
-```
-
-Optional services：
-
-```text
-harborgate-weixin-runner.service
-harbor-vlm-sidecar.service
 ```
 
 ## 16. 安装后验证命令
@@ -745,9 +716,7 @@ harbor-vlm-sidecar.service
 基础服务状态：
 
 ```bash
-systemctl status harbor-model-api.service
-systemctl status assistant-task-api.service
-systemctl status agent-hub-admin-api.service
+systemctl status harborbeacon.service
 systemctl status harborgate.service
 ```
 
@@ -763,8 +732,7 @@ systemctl status harborgate.service
 
 ```bash
 curl http://127.0.0.1:4174/healthz
-curl http://127.0.0.1:4175/healthz
-curl http://127.0.0.1:4176/healthz
+curl http://127.0.0.1:4174/api/inference/healthz
 curl http://127.0.0.1:8787/health
 ```
 
@@ -776,10 +744,10 @@ curl http://127.0.0.1:8787/api/gateway/status \
   -H "Authorization: Bearer <shared-token>"
 ```
 
-Task API v2.0 smoke：
+HarborBeacon turn API v2.0 smoke：
 
 ```bash
-curl -X POST http://127.0.0.1:4175/api/turns \
+curl -X POST http://127.0.0.1:4174/api/web/turns \
   -H "Content-Type: application/json" \
   -H "X-Contract-Version: 2.0" \
   -H "Authorization: Bearer <shared-token>" \
@@ -828,6 +796,7 @@ ISO 集成验收时必须确认：
 - HarborDesk `/ui/harbordesk` 通过 `/api/harbordesk/**` 访问 HarborBeacon Admin API。
 - HarborBot `/ui/harborbot` 通过真实 `/api/harbordesk/knowledge/search` 获取索引结果。
 - HarborNAS WebUI `/api/harbordesk/**` proxy 不覆盖 HarborOS 原生 `/api/**`。
+- HarborDesk Overview 显示 HarborBeacon unified inference health，不直接访问模型 sidecar 端口。
 - Weixin group chat 不出现在本轮 readiness claim 中。
 
 RC2 live smoke 参考：
@@ -837,8 +806,8 @@ RC2 live smoke 参考：
 - `POST /api/harbordesk/knowledge/search` query `春天的照片` -> one VLM
   content-indexed image, `filename_match_used=false`
 - `GET /api/harbordesk/knowledge/preview` for that image -> `image/jpeg`
-- protected `POST /api/turns` content retrieval -> `turn.status=completed`
-- protected `POST /api/turns` local-first architecture explanation ->
+- protected `POST /api/web/turns` content retrieval -> `turn.status=completed`
+- protected `POST /api/web/turns` local-first architecture explanation ->
   `turn.status=completed`
 
 ## 18. Local-First Promotion Gate

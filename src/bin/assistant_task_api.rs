@@ -117,26 +117,28 @@ struct SharedHttpErrorEnvelope {
 }
 
 #[derive(Debug, Clone)]
-struct TaskApiHttpServer {
+pub struct TaskApiHttpServer {
     service: TaskApiService,
     service_token: String,
 }
 
 impl TaskApiHttpServer {
-    fn new(service: TaskApiService, service_token: String) -> Self {
+    pub fn new(service: TaskApiService, service_token: String) -> Self {
         Self {
             service,
             service_token,
         }
     }
 
-    fn handle(&self, mut request: Request) {
+    pub fn handle(&self, mut request: Request) {
         let method = request.method().clone();
         let path = request.url().split('?').next().unwrap_or("/").to_string();
 
         let response = match method {
             Method::Get if path == "/healthz" => ok_json(&json!({"status":"ok"})).boxed(),
-            Method::Post if path == "/api/turns" => self.handle_turn(&mut request).boxed(),
+            Method::Post if path == "/api/turns" || path == "/api/web/turns" => {
+                self.handle_turn(&mut request).boxed()
+            }
             Method::Options => no_content().boxed(),
             _ => shared_error_json(
                 StatusCode(404),

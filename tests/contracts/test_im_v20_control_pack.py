@@ -20,7 +20,9 @@ def test_v20_control_pack_documents_exist_and_are_active() -> None:
 
     beacon_docs = "\n".join(_read(path) for path in required_beacon)
     assert "HarborBeacon-HarborGate-Agent-Contract-v2.0.md" in beacon_docs
+    assert "POST /api/web/turns" in beacon_docs
     assert "POST /api/turns" in beacon_docs
+    assert "deprecated" in beacon_docs.lower()
     assert "conversation.handle" in beacon_docs
     assert "active_frame" in beacon_docs
     assert "continuation" in beacon_docs
@@ -38,7 +40,8 @@ def test_v20_control_pack_documents_exist_and_are_active() -> None:
     assert not missing_gate
 
     contract = _read(GATE_ROOT / "HarborBeacon-HarborGate-Agent-Contract-v2.0.md")
-    assert "POST /api/turns" in contract
+    assert "POST /api/web/turns" in contract
+    assert "`POST /api/turns` remains a deprecated compatibility alias" in contract
     assert "conversation.handle" in contract
     assert "active_frame" in contract
     assert "continuation" in contract
@@ -65,6 +68,7 @@ def test_beacon_entry_docs_point_to_v20_control_pack() -> None:
     for content in (agents, readme, collaboration):
         assert "HarborBeacon-HarborGate-Agent-Contract-v2.0.md" in content
     assert "HarborBeacon-HarborGate-v2.0-Upgrade-Runbook.md" in agents
+    assert "POST /api/web/turns" in collaboration
     assert "POST /api/turns" in collaboration
 
 

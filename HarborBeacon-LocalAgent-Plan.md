@@ -9,7 +9,7 @@
 > 已验证 baseline：HarborBeacon `a5f6da0` + HarborGate `57ff759`
 > 已打包为 `.82` RC2
 > `20260430-rc2-beacona5f6da0-gate57ff759`，并通过 HarborDesk、HarborBot、knowledge search/preview、protected
-> `POST /api/turns` live smoke。
+> `POST /api/web/turns` live smoke，`/api/turns` 仅保留为 deprecated alias。
 >
 > 本文后续早期 v1.5 task-contract 描述保留为历史上下文；当前执行、验收与回滚以
 > `HarborBeacon-HarborGate-v2.0-Upgrade-Runbook.md` 和外部 v2.0 contract 为准。
@@ -66,7 +66,7 @@
 │  platform credentials / outbound delivery / attachment proxy │
 └──────────────────────┬───────────────────────────────────────┘
                        │  HTTP/JSON contract only
-                       │  POST /api/turns
+                       │  POST /api/web/turns
                        │  POST /api/notifications/deliveries
                        │  GET  /api/gateway/status (optional)
 ┌──────────────────────▼───────────────────────────────────────┐

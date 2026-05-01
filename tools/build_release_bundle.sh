@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 HARBORGATE_REPO="${HARBORGATE_REPO:-$(cd "${REPO_ROOT}/../HarborGate" && pwd)}"
 HARBORDESK_DIST_SOURCE="${HARBORDESK_DIST_SOURCE:-}"
+HARBORGATE_RUST_BINARY="${HARBORGATE_RUST_BINARY:-}"
 OUT_DIR="${OUT_DIR:-${REPO_ROOT}/dist/release-bundles}"
 RUST_TARGET="${RUST_TARGET:-x86_64-unknown-linux-musl}"
 RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-stable}"
@@ -71,6 +72,23 @@ require_directory() {
   fi
 }
 
+resolve_harborgate_rust_binary() {
+  local candidate
+  if [[ -n "${HARBORGATE_RUST_BINARY}" && -f "${HARBORGATE_RUST_BINARY}" ]]; then
+    echo "${HARBORGATE_RUST_BINARY}"
+    return 0
+  fi
+  for candidate in \
+    "${HARBORGATE_REPO}/target/${RUST_TARGET}/release/harborgate" \
+    "${HARBORGATE_REPO}/target/release/harborgate"; do
+    if [[ -f "${candidate}" ]]; then
+      echo "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 append_path_front() {
   local entry="$1"
   if [[ -n "${entry}" && -d "${entry}" ]]; then
@@ -121,6 +139,7 @@ build_rust_binaries() {
   local cargo_args=(
     --release
     --target "${RUST_TARGET}"
+    --bin harborbeacon-service
     --bin harbor-model-api
     --bin assistant-task-api
     --bin agent-hub-admin-api
@@ -198,6 +217,7 @@ rm -rf "${BUNDLE_ROOT}" "${PYBUILD_VENV}"
 mkdir -p \
   "${BUNDLE_ROOT}/bin" \
   "${BUNDLE_ROOT}/harbordesk/dist" \
+  "${BUNDLE_ROOT}/harborgate/bin" \
   "${BUNDLE_ROOT}/harborgate/site-packages" \
   "${BUNDLE_ROOT}/install" \
   "${BUNDLE_ROOT}/templates"
@@ -211,7 +231,7 @@ echo "==> Building HarborBeacon release binaries (${RUST_TARGET}, ${RUST_LINKAGE
 )
 
 RUST_RELEASE_DIR="$(rust_release_dir)"
-for binary in harbor-model-api assistant-task-api agent-hub-admin-api validate-contract-schemas run-e2e-suite; do
+for binary in harborbeacon-service harbor-model-api assistant-task-api agent-hub-admin-api validate-contract-schemas run-e2e-suite; do
   assert_binary_linkage "${RUST_RELEASE_DIR}/${binary}"
 done
 
@@ -236,9 +256,18 @@ python3 -m venv "${PYBUILD_VENV}"
 "${PYBUILD_VENV}/bin/python" -m pip install --upgrade pip setuptools wheel
 "${PYBUILD_VENV}/bin/python" -m pip install --no-compile --target "${BUNDLE_ROOT}/harborgate/site-packages" "${HARBORGATE_REPO}"
 find "${BUNDLE_ROOT}/harborgate/site-packages" -type d -name "__pycache__" -prune -exec rm -rf {} +
+HARBORGATE_RUST_BUNDLE_PATH=""
+if HARBORGATE_RUST_SOURCE="$(resolve_harborgate_rust_binary)"; then
+  cp "${HARBORGATE_RUST_SOURCE}" "${BUNDLE_ROOT}/harborgate/bin/harborgate"
+  chmod 0755 "${BUNDLE_ROOT}/harborgate/bin/harborgate"
+  HARBORGATE_RUST_BUNDLE_PATH="harborgate/bin/harborgate"
+else
+  echo "==> HarborGate Rust binary not found; bundle will use Python fallback unless HARBORGATE_RUNTIME=rust is configured"
+fi
 
 echo
 echo "==> Assembling bundle layout"
+cp "${RUST_RELEASE_DIR}/harborbeacon-service" "${BUNDLE_ROOT}/bin/harborbeacon-service"
 cp "${RUST_RELEASE_DIR}/assistant-task-api" "${BUNDLE_ROOT}/bin/assistant-task-api"
 cp "${RUST_RELEASE_DIR}/agent-hub-admin-api" "${BUNDLE_ROOT}/bin/agent-hub-admin-api"
 cp "${RUST_RELEASE_DIR}/harbor-model-api" "${BUNDLE_ROOT}/bin/harbor-model-api"
@@ -286,7 +315,8 @@ python3 \
   "${RUST_LINKAGE}" \
   "${LINUX_PORTABILITY_EXPECTATION}" \
   "${INSTALL_ROOT_DEFAULT}" \
-  "${WRITABLE_ROOT_DEFAULT}" <<'PY'
+  "${WRITABLE_ROOT_DEFAULT}" \
+  "${HARBORGATE_RUST_BUNDLE_PATH}" <<'PY'
 import json
 import pathlib
 import sys
@@ -303,6 +333,7 @@ payload = {
             "linkage": sys.argv[7],
             "linux_portability_expectation": sys.argv[8],
             "binaries": [
+                "bin/harborbeacon-service",
                 "bin/harbor-model-api",
                 "bin/assistant-task-api",
                 "bin/agent-hub-admin-api",
@@ -310,6 +341,7 @@ payload = {
                 "bin/run-e2e-suite",
             ],
             "runtime_launchers": [
+                "templates/bin/run-harborbeacon-service",
                 "templates/bin/run-harbor-vlm-sidecar",
                 "templates/bin/harbor-vlm-sidecar",
             ],
@@ -319,7 +351,10 @@ payload = {
         },
         "harborgate": {
             "git_ref": sys.argv[5],
+            "rust_binary": sys.argv[11],
             "site_packages": "harborgate/site-packages",
+            "python_fallback": "harborgate/site-packages",
+            "runtime_selector_env": "HARBORGATE_RUNTIME",
             "launchers": [
                 "templates/bin/harborgate",
                 "templates/bin/harborgate-weixin-runner",
@@ -337,12 +372,8 @@ payload = {
             "templates/bin/harbor-agent-hub-helper",
         ],
         "service_names": [
-            "harbor-model-api.service",
-            "assistant-task-api.service",
-            "agent-hub-admin-api.service",
-            "harbor-vlm-sidecar.service",
+            "harborbeacon.service",
             "harborgate.service",
-            "harborgate-weixin-runner.service",
         ],
     },
 }

@@ -180,7 +180,7 @@ impl Cli {
 }
 
 #[derive(Debug, Clone)]
-struct AdminApi {
+pub struct AdminApi {
     admin_store: AdminConsoleStore,
     task_service: TaskApiService,
     harbordesk_dist: PathBuf,
@@ -901,7 +901,7 @@ type ScanResponse = HubScanSummary;
 type ManualAddResponse = HubManualAddSummary;
 
 impl AdminApi {
-    fn new(
+    pub fn new(
         admin_store: AdminConsoleStore,
         task_service: TaskApiService,
         harbordesk_dist: PathBuf,
@@ -988,9 +988,9 @@ impl AdminApi {
         error_json(StatusCode(404), "route not found")
     }
 
-    fn handle(&self, mut request: Request) {
+    pub fn handle(&self, mut request: Request) {
         let method = request.method().clone();
-        let raw_url = request.url().to_string();
+        let raw_url = normalize_unified_admin_url(&request.url().to_string());
         let path = raw_url.split('?').next().unwrap_or("/").to_string();
         let remote_addr = request.remote_addr().copied();
         let headers = request.headers().to_vec();
@@ -3802,6 +3802,32 @@ fn main() {
 
 fn resolve_state_path(preferred: &Path) -> PathBuf {
     preferred.to_path_buf()
+}
+
+fn normalize_unified_admin_url(raw_url: &str) -> String {
+    let (path, query) = raw_url
+        .split_once('?')
+        .map(|(path, query)| (path, Some(query)))
+        .unwrap_or((raw_url, None));
+    let normalized_path = normalize_unified_admin_path(path);
+    match query {
+        Some(query) => format!("{normalized_path}?{query}"),
+        None => normalized_path,
+    }
+}
+
+fn normalize_unified_admin_path(path: &str) -> String {
+    let Some(tail) = path.strip_prefix("/api/admin") else {
+        return path.to_string();
+    };
+    let tail = tail.trim_start_matches('/');
+    if tail.is_empty() {
+        return "/api/state".to_string();
+    }
+    if tail == "notification-targets" || tail.starts_with("notification-targets/") {
+        return path.to_string();
+    }
+    format!("/api/{tail}")
 }
 
 fn parse_query_param(url: &str, key: &str) -> Option<String> {

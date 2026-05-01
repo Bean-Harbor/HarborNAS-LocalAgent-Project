@@ -49,27 +49,27 @@
 
 ## 服务建议
 
-建议至少长期运行两个本地服务：
+建议长期运行统一 Beacon 服务：
 
-- `assistant-task-api`
-- `agent-hub-admin-api`
+- `harborbeacon.service`
 
-现在 `assistant-task-api` 会常驻在本机 `127.0.0.1:4175`，作为 HarborBeacon -> Home Agent Hub 的本地任务桥接层。外部 IM / 飞书桥接已迁到其他项目，不再作为这个仓库的常驻服务。
+现在 `harborbeacon.service` 会常驻在本机 `0.0.0.0:4174`，同时承载管理端 API、前台/任务 API 和本地推理 API。外部 IM / 飞书桥接已迁到 HarborGate，不再作为这个仓库的常驻服务。
 
 其中：
 
-- `assistant-task-api` 负责 HarborBeacon 的 camera domain task 请求、补参续执行和会话状态持久化
-- `agent-hub-admin-api` 负责二维码、手机配置页、默认策略和设备库
+- `/api/admin/*` 负责二维码、手机配置页、默认策略和设备库
+- `/api/web/turns` 负责 camera domain turn 请求、补参续执行和会话状态持久化
+- `/api/inference/*` 负责本地 OpenAI-compatible 推理封装
 
-外部 HarborBeacon / IM bridge 现在需要单独部署，并把它的 Task API 基地址指向：
+外部 HarborGate 现在需要单独部署，并把 HarborBeacon web API 基地址指向：
 
-- `http://127.0.0.1:4175`
+- `http://127.0.0.1:4174`
 
-本仓库的 Debian 安装脚本不再额外安装旧 `feishu-harbor-bot` systemd 服务。
+本仓库的 Debian 安装脚本不再额外安装旧 `assistant-task-api`、`agent-hub-admin-api` 或 `feishu-harbor-bot` systemd 服务。
 
 当前仓库提供了一个最小 bridge 参考启动器：
 
-- `python3 tools/run_harborbeacon_bridge.py --channels-config /etc/harborbeacon/channels.yaml --task-api-url http://127.0.0.1:4175`
+- `python3 tools/run_harborbeacon_bridge.py --channels-config /etc/harborbeacon/channels.yaml --task-api-url http://127.0.0.1:4174`
 
 这个 runner 现在已经内置：
 
@@ -126,6 +126,6 @@
 1. Debian 13 上启用固定主机名与 Avahi
 2. 用静态二维码访问 `harborbeacon.local`
 3. 在手机页填写并保存飞书 Bot 凭证
-4. 启动 `assistant-task-api` 与 `agent-hub-admin-api`，确认本机服务正常
-5. 部署外部 HarborBeacon / IM bridge，并把它指向 `http://<Debian 机器>:4175`
+4. 启动 `harborbeacon.service`，确认本机服务正常
+5. 部署外部 HarborGate，并把它指向 `http://<Debian 机器>:4174`
 6. 从 IM 中执行 `扫描摄像头`，再用 `接入 1` / `密码 xxxxxx` 完成首台摄像头接入

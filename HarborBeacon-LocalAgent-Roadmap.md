@@ -13,7 +13,8 @@
 > 已部署：`.82` post-merge RC2
 > `20260430-rc2-beacona5f6da0-gate57ff759`。
 > 已验证：`/ui/harbordesk`、`/ui/harborbot`、knowledge search/preview、protected
-> `POST /api/turns` content retrieval and local-first architecture explanation。
+> `POST /api/web/turns` content retrieval and local-first architecture explanation；
+> `/api/turns` 仅作为 deprecated alias 保留。
 > 下一阶段：先补 release evidence/rollback notes，再推进 local model promotion
 > gate，最后恢复 Home Agent Hub / AIoT MVP 队列。
 >
