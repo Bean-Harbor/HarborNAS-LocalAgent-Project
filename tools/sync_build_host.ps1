@@ -313,7 +313,8 @@ try {
     Set-SFTPItem -SessionId $sftpSession.SessionId -Path $harborGateArchive.ArchivePath -Destination $remoteUploadDir -Force | Out-Null
 
     $remoteScript = @'
-set -euo pipefail
+set -eu
+set -o pipefail
 
 timestamp=__TIMESTAMP__
 keep_backup_count=__KEEP_BACKUPS__
@@ -391,14 +392,17 @@ activate_repo() {
 
   if [[ "$repo_name" == "HarborBeacon" ]]; then
     if [[ -d "$active_dir/tools" ]]; then
+      find "$active_dir/tools" -type f -name '*.sh' -exec sed -i 's/\r$//' {} +
       find "$active_dir/tools" -type f -name '*.sh' -exec chmod 755 {} +
     fi
     if [[ -d "$active_dir/scripts" ]]; then
+      find "$active_dir/scripts" -type f -name '*.sh' -exec sed -i 's/\r$//' {} +
       find "$active_dir/scripts" -type f -name '*.sh' -exec chmod 755 {} +
     fi
   fi
 
   if [[ "$repo_name" == "HarborGate" && -d "$active_dir/tools" ]]; then
+    find "$active_dir/tools" -type f -name '*.sh' -exec sed -i 's/\r$//' {} +
     find "$active_dir/tools" -type f -name '*.sh' -exec chmod 755 {} +
   fi
 
@@ -435,8 +439,10 @@ echo "SYNC_CHECK_HARBORGATE_PYPROJECT=present"
     $remoteScript = $remoteScript.Replace("__KEEP_BACKUPS__", $KeepBackupCount.ToString())
     $remoteScript = $remoteScript.Replace("__HB_ARCHIVE__", (Convert-ToShellLiteral "$remoteUploadDir/$([IO.Path]::GetFileName($harborBeaconArchive.ArchivePath))"))
     $remoteScript = $remoteScript.Replace("__HG_ARCHIVE__", (Convert-ToShellLiteral "$remoteUploadDir/$([IO.Path]::GetFileName($harborGateArchive.ArchivePath))"))
+    $remoteScript = $remoteScript.Replace("`r`n", "`n").Replace("`r", "`n")
 
-    $remoteResult = Invoke-SSHCommand -SessionId $sshSession.SessionId -Command $remoteScript -TimeOut 1800
+    $remoteCommand = "bash -lc " + (Convert-ToShellLiteral $remoteScript)
+    $remoteResult = Invoke-SSHCommand -SessionId $sshSession.SessionId -Command $remoteCommand -TimeOut 1800
     if ($remoteResult.ExitStatus -ne 0) {
         $stderr = if ($remoteResult.Error) { $remoteResult.Error } else { $remoteResult.Output }
         throw "Remote sync failed on $($buildHostConfig.host)`n$($stderr -join [Environment]::NewLine)"
