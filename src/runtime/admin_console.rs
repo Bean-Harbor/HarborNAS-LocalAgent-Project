@@ -544,6 +544,10 @@ const DEFAULT_POLICY_RETRIEVAL_OCR: &str = "retrieval.ocr";
 const DEFAULT_POLICY_RETRIEVAL_EMBED: &str = "retrieval.embed";
 const DEFAULT_POLICY_RETRIEVAL_ANSWER: &str = "retrieval.answer";
 const DEFAULT_POLICY_RETRIEVAL_VISION_SUMMARY: &str = "retrieval.vision_summary";
+const DEFAULT_POLICY_SEMANTIC_ROUTER: &str = "semantic.router";
+const DEFAULT_SILICONFLOW_ENDPOINT_ID: &str = "llm-cloud-siliconflow";
+const DEFAULT_SILICONFLOW_BASE_URL: &str = "https://api.siliconflow.cn/v1";
+const DEFAULT_SILICONFLOW_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 const DEFAULT_PROACTIVE_DELIVERY_SURFACE: &str = "feishu";
 const HARBOROS_CURRENT_USER_ENV: &str = "HARBOR_HARBOROS_USER";
 const HARBOROS_WRITABLE_ROOT_ENV: &str = "HARBOR_HARBOROS_WRITABLE_ROOT";
@@ -1184,13 +1188,14 @@ impl AdminConsoleStore {
         endpoint: ModelEndpoint,
     ) -> Result<AdminConsoleState, String> {
         let mut state = self.load_or_create_state()?;
-        let endpoint = sanitize_model_endpoint(endpoint)?;
+        let mut endpoint = sanitize_model_endpoint(endpoint)?;
         if let Some(existing) = state
             .models
             .endpoints
             .iter_mut()
             .find(|existing| existing.model_endpoint_id == endpoint.model_endpoint_id)
         {
+            preserve_model_endpoint_secret_metadata(existing, &mut endpoint);
             *existing = endpoint;
         } else {
             state.models.endpoints.push(endpoint);
@@ -1218,6 +1223,7 @@ impl AdminConsoleStore {
             .iter_mut()
             .find(|existing| existing.model_endpoint_id == endpoint_id)
             .ok_or_else(|| format!("未找到模型端点 {endpoint_id}"))?;
+        let existing_snapshot = endpoint.clone();
 
         if let Some(value) = patch_object.get("workspace_id") {
             endpoint.workspace_id = optional_trimmed_string(value);
@@ -1253,6 +1259,7 @@ impl AdminConsoleStore {
             endpoint.metadata = merge_json_object(endpoint.metadata.clone(), value.clone())?;
         }
 
+        preserve_model_endpoint_secret_metadata(&existing_snapshot, endpoint);
         let sanitized = sanitize_model_endpoint(endpoint.clone())?;
         *endpoint = sanitized;
         self.save_projected_state(state)
@@ -1995,6 +2002,18 @@ pub fn sanitize_model_center_state(state: AdminModelCenterState) -> AdminModelCe
             endpoints.push(endpoint);
         }
     }
+    let existing_endpoint_ids = endpoints
+        .iter()
+        .map(|endpoint| endpoint.model_endpoint_id.clone())
+        .collect::<HashSet<_>>();
+    for endpoint in default_model_endpoints() {
+        if existing_endpoint_ids.contains(&endpoint.model_endpoint_id) {
+            continue;
+        }
+        if let Ok(endpoint) = sanitize_model_endpoint(endpoint) {
+            endpoints.push(endpoint);
+        }
+    }
     endpoints.sort_by(|left, right| {
         left.model_kind
             .as_str()
@@ -2011,7 +2030,21 @@ pub fn sanitize_model_center_state(state: AdminModelCenterState) -> AdminModelCe
 
     if route_policies.is_empty() {
         route_policies = default_model_route_policies();
+    } else {
+        let existing_policy_ids = route_policies
+            .iter()
+            .map(|policy| policy.route_policy_id.clone())
+            .collect::<HashSet<_>>();
+        for policy in default_model_route_policies() {
+            if existing_policy_ids.contains(&policy.route_policy_id) {
+                continue;
+            }
+            if let Ok(policy) = sanitize_model_route_policy(policy) {
+                route_policies.push(policy);
+            }
+        }
     }
+    route_policies.sort_by(|left, right| left.route_policy_id.cmp(&right.route_policy_id));
 
     AdminModelCenterState {
         endpoints,
@@ -2170,6 +2203,39 @@ pub fn default_model_endpoints() -> Vec<ModelEndpoint> {
             }),
         },
         ModelEndpoint {
+            model_endpoint_id: DEFAULT_SILICONFLOW_ENDPOINT_ID.to_string(),
+            workspace_id: Some(DEFAULT_MODEL_WORKSPACE_ID.to_string()),
+            provider_account_id: None,
+            model_kind: ModelKind::Llm,
+            endpoint_kind: ModelEndpointKind::Cloud,
+            provider_key: "openai_compatible".to_string(),
+            model_name: DEFAULT_SILICONFLOW_MODEL.to_string(),
+            capability_tags: vec![
+                "chat".to_string(),
+                "cloud_fallback".to_string(),
+                "openai_compatible".to_string(),
+            ],
+            cost_policy: json!({
+                "cost_hint": "cloud_metered",
+                "provider": "siliconflow",
+            }),
+            status: ModelEndpointStatus::Disabled,
+            metadata: json!({
+                "builtin": true,
+                "provider_label": "SiliconFlow",
+                "base_url": DEFAULT_SILICONFLOW_BASE_URL,
+                "healthz_url": "https://api.siliconflow.cn/v1/models",
+                "api_key": "",
+                "api_key_configured": false,
+                "model": DEFAULT_SILICONFLOW_MODEL,
+                "fallback_scope": [
+                    DEFAULT_POLICY_SEMANTIC_ROUTER,
+                    DEFAULT_POLICY_RETRIEVAL_ANSWER,
+                ],
+                "secret_redaction": "endpoint_metadata",
+            }),
+        },
+        ModelEndpoint {
             model_endpoint_id: "vlm-local-openai-compatible".to_string(),
             workspace_id: Some(DEFAULT_MODEL_WORKSPACE_ID.to_string()),
             provider_account_id: None,
@@ -2255,6 +2321,26 @@ pub fn default_model_route_policies() -> Vec<ModelRoutePolicy> {
             metadata: json!({"capability": "embed"}),
         },
         ModelRoutePolicy {
+            route_policy_id: DEFAULT_POLICY_SEMANTIC_ROUTER.to_string(),
+            workspace_id: DEFAULT_MODEL_WORKSPACE_ID.to_string(),
+            domain_scope: "semantic".to_string(),
+            modality: "text".to_string(),
+            privacy_level: PrivacyLevel::AllowRedactedCloud,
+            local_preferred: true,
+            max_cost_per_run: None,
+            fallback_order: vec![
+                "local".to_string(),
+                "sidecar".to_string(),
+                "cloud".to_string(),
+            ],
+            status: "active".to_string(),
+            metadata: json!({
+                "capability": "router",
+                "cloud_fallback_scope": "semantic_router_only",
+                "redaction_required": true,
+            }),
+        },
+        ModelRoutePolicy {
             route_policy_id: DEFAULT_POLICY_RETRIEVAL_ANSWER.to_string(),
             workspace_id: DEFAULT_MODEL_WORKSPACE_ID.to_string(),
             domain_scope: "retrieval".to_string(),
@@ -2275,16 +2361,15 @@ pub fn default_model_route_policies() -> Vec<ModelRoutePolicy> {
             workspace_id: DEFAULT_MODEL_WORKSPACE_ID.to_string(),
             domain_scope: "retrieval".to_string(),
             modality: "multimodal".to_string(),
-            privacy_level: PrivacyLevel::AllowRedactedCloud,
+            privacy_level: PrivacyLevel::StrictLocal,
             local_preferred: true,
             max_cost_per_run: None,
-            fallback_order: vec![
-                "local".to_string(),
-                "sidecar".to_string(),
-                "cloud".to_string(),
-            ],
+            fallback_order: vec!["local".to_string(), "sidecar".to_string()],
             status: "degraded".to_string(),
-            metadata: json!({"capability": "vision_summary"}),
+            metadata: json!({
+                "capability": "vision_summary",
+                "cloud_fallback": false,
+            }),
         },
     ]
 }
@@ -2328,6 +2413,44 @@ fn merge_json_object(existing: Value, patch: Value) -> Result<Value, String> {
             Ok(Value::Object(merged))
         }
         _ => Err("metadata patch 必须是 JSON object".to_string()),
+    }
+}
+
+fn preserve_model_endpoint_secret_metadata(existing: &ModelEndpoint, incoming: &mut ModelEndpoint) {
+    let Value::Object(existing_metadata) = &existing.metadata else {
+        return;
+    };
+    if !incoming.metadata.is_object() {
+        incoming.metadata = json!({});
+    }
+    let Some(incoming_metadata) = incoming.metadata.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "api_key",
+        "token",
+        "secret",
+        "password",
+        "authorization",
+        "bearer_token",
+    ] {
+        let incoming_value = incoming_metadata
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        let Some(existing_value) = existing_metadata
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if incoming_value.is_empty() {
+            incoming_metadata.insert(key.to_string(), json!(existing_value));
+            incoming_metadata.insert(format!("{key}_configured"), json!(true));
+        }
     }
 }
 
@@ -4052,7 +4175,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        account_management_snapshot, build_platform_state, dedupe_rtsp_paths, default_rtsp_paths,
+        account_management_snapshot, build_platform_state, dedupe_rtsp_paths,
+        default_model_endpoints, default_model_route_policies, default_rtsp_paths,
         derive_rtsp_hints, normalize_binding_code, normalize_loaded_admin_state, parse_rtsp_auth,
         parse_rtsp_path, resolved_identity_binding_records, resolved_remote_view_config,
         sanitize_bridge_provider_config, user_default_delivery_surface,
@@ -4699,6 +4823,104 @@ mod tests {
             endpoint.metadata["last_test"]["details"]["http_status"],
             json!(502)
         );
+
+        let _ = std::fs::remove_file(admin_path);
+        let _ = std::fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn default_model_center_includes_siliconflow_cloud_fallback_preset() {
+        let endpoints = default_model_endpoints();
+        let endpoint = endpoints
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "llm-cloud-siliconflow")
+            .expect("siliconflow endpoint");
+        assert_eq!(endpoint.endpoint_kind, ModelEndpointKind::Cloud);
+        assert_eq!(endpoint.provider_key, "openai_compatible");
+        assert_eq!(endpoint.status, ModelEndpointStatus::Disabled);
+        assert_eq!(
+            endpoint.metadata["base_url"],
+            json!("https://api.siliconflow.cn/v1")
+        );
+        assert_eq!(endpoint.metadata["api_key_configured"], json!(false));
+
+        let policies = default_model_route_policies();
+        let router_policy = policies
+            .iter()
+            .find(|policy| policy.route_policy_id == "semantic.router")
+            .expect("semantic router policy");
+        assert_eq!(
+            router_policy.privacy_level,
+            crate::control_plane::models::PrivacyLevel::AllowRedactedCloud
+        );
+        assert!(router_policy
+            .fallback_order
+            .iter()
+            .any(|kind| kind == "cloud"));
+
+        let vlm_policy = policies
+            .iter()
+            .find(|policy| policy.route_policy_id == "retrieval.vision_summary")
+            .expect("vlm policy");
+        assert!(!vlm_policy.fallback_order.iter().any(|kind| kind == "cloud"));
+    }
+
+    #[test]
+    fn save_model_endpoint_preserves_existing_secret_when_api_key_is_blank() {
+        let registry_path = temp_path("registry-model-secret");
+        let admin_path = temp_path("admin-model-secret");
+        let registry = crate::runtime::registry::DeviceRegistryStore::new(registry_path.clone());
+        let store = AdminConsoleStore::new(admin_path.clone(), registry);
+
+        let mut endpoint = default_model_endpoints()
+            .into_iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "llm-cloud-siliconflow")
+            .expect("siliconflow endpoint");
+        endpoint.status = ModelEndpointStatus::Active;
+        endpoint.metadata["api_key"] = json!("sk-secret");
+        endpoint.metadata["api_key_configured"] = json!(true);
+        store
+            .save_model_endpoint(endpoint)
+            .expect("save configured endpoint");
+
+        let mut redacted_payload = default_model_endpoints()
+            .into_iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "llm-cloud-siliconflow")
+            .expect("siliconflow endpoint");
+        redacted_payload.status = ModelEndpointStatus::Active;
+        redacted_payload.metadata["api_key"] = json!("");
+        redacted_payload.metadata["api_key_configured"] = json!(true);
+        redacted_payload.metadata["model"] = json!("deepseek-ai/DeepSeek-V4-Flash");
+        let updated = store
+            .save_model_endpoint(redacted_payload)
+            .expect("save redacted payload");
+        let endpoint = updated
+            .models
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "llm-cloud-siliconflow")
+            .expect("saved endpoint");
+        assert_eq!(endpoint.metadata["api_key"], json!("sk-secret"));
+        assert_eq!(endpoint.metadata["api_key_configured"], json!(true));
+
+        let patched = store
+            .patch_model_endpoint(
+                "llm-cloud-siliconflow",
+                json!({
+                    "metadata": {
+                        "api_key": "",
+                        "model": "deepseek-ai/DeepSeek-V4-Flash",
+                    }
+                }),
+            )
+            .expect("patch redacted payload");
+        let endpoint = patched
+            .models
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.model_endpoint_id == "llm-cloud-siliconflow")
+            .expect("patched endpoint");
+        assert_eq!(endpoint.metadata["api_key"], json!("sk-secret"));
 
         let _ = std::fs::remove_file(admin_path);
         let _ = std::fs::remove_file(registry_path);

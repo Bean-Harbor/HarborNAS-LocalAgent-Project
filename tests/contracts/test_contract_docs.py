@@ -128,6 +128,36 @@ def test_model_center_runtime_truth_surface_stays_consistent_across_backend_and_
     assert "projection mismatches" in docs_app_content
 
 
+def test_model_architecture_docs_keep_local_first_cloud_fallback_scope() -> None:
+    collaboration = read_doc("HarborBeacon-Harbor-Collaboration-Contract-v2.md")
+    plan = read_doc("HarborBeacon-LocalAgent-Plan.md")
+    roadmap = read_doc("HarborBeacon-LocalAgent-Roadmap.md")
+    readme = read_doc("README.md")
+    webui = read_doc("docs/webui-information-architecture.md")
+    packaging = read_doc("docs/harboros-release-packaging-runbook.md")
+    iso = read_doc("docs/harbornas-iso-packaging-dependencies.md")
+    benchmark_gate = read_doc("docs/local-model-backend-benchmark-gate.md")
+    rehearsal = read_doc("docs/harbor82-local-first-rehearsal-2026-04-29.md")
+    index = read_doc("HarborBeacon-LocalAgent-DocumentIndex.md")
+
+    for content in (collaboration, plan, roadmap, readme, webui, packaging, iso, benchmark_gate, index):
+        assert "local-first" in content
+        assert "semantic.router" in content
+        assert "retrieval.answer" in content
+
+    assert "Model execution is a shared capability layer, not a business domain" in collaboration
+    assert "模型是 HarborBeacon 的共享能力层，不是独立业务域" in plan
+    assert "llm-cloud-siliconflow" in readme
+    assert "endpoint secret redaction" in webui
+    assert "https://hf-mirror.com" in packaging
+    assert "https://hf-mirror.com" in iso
+    assert "Mistral, sidecar, Candle, and future backends compete behind the same local OpenAI-compatible seam" in benchmark_gate
+    assert "SiliconFlow remains" in rehearsal
+    assert "OpenAI-compatible cloud fallback preset" in rehearsal
+    assert '"SiliconFlow is the default architecture"' in rehearsal
+    assert "Candle 不是唯一方向" in index
+
+
 def test_runtime_truth_closeout_tracks_verification_matrix_and_blocker_owner() -> None:
     content = read_doc("docs/harbordesk-runtime-truth-closeout-2026-04-25.md")
 

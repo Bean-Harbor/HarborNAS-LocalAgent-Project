@@ -18,6 +18,7 @@ import {
   LocalModelDownloadStatusResponse,
   ManualDevicePayload,
   MetricTone,
+  ModelEndpointRecord,
   ModelEndpointTestResult,
   PageState,
   RagPrivacyLevel,
@@ -71,6 +72,7 @@ export class PageStatePanelComponent {
   @Output() readonly notificationTargetDefaultChange = new EventEmitter<string>();
   @Output() readonly notificationTargetDelete = new EventEmitter<string>();
   @Output() readonly endpointTestRequested = new EventEmitter<string>();
+  @Output() readonly cloudModelEndpointSaveRequested = new EventEmitter<ModelEndpointRecord>();
   @Output() readonly deviceScanRequested = new EventEmitter<DiscoveryScanPayload>();
   @Output() readonly manualDeviceAddRequested = new EventEmitter<ManualDevicePayload>();
   @Output() readonly defaultCameraChange = new EventEmitter<string>();
@@ -90,7 +92,10 @@ export class PageStatePanelComponent {
   @Output() readonly knowledgeSettingsSave = new EventEmitter<KnowledgeSettings>();
   @Output() readonly knowledgeIndexRunRequested = new EventEmitter<void>();
   @Output() readonly knowledgeIndexJobCancelRequested = new EventEmitter<string>();
-  @Output() readonly localModelDownloadRequested = new EventEmitter<LocalModelCatalogItem>();
+  @Output() readonly localModelDownloadRequested = new EventEmitter<{
+    model: LocalModelCatalogItem;
+    hfEndpoint?: string | null;
+  }>();
   @Output() readonly localModelDownloadCancelRequested = new EventEmitter<string>();
   @Output() readonly filesBrowseRequested = new EventEmitter<string | null>();
   @Output() readonly knowledgeSearchRequested = new EventEmitter<KnowledgeSearchRequestPayload>();
@@ -206,6 +211,62 @@ export class PageStatePanelComponent {
 
   protected requestEndpointTest(modelEndpointId: string): void {
     this.endpointTestRequested.emit(modelEndpointId);
+  }
+
+  protected siliconFlowEndpoint(): ModelEndpointRecord | null {
+    return (
+      this.state?.data.modelEndpoints?.find(
+        (endpoint) => endpoint.model_endpoint_id === 'llm-cloud-siliconflow'
+      ) ?? null
+    );
+  }
+
+  protected metadataString(endpoint: ModelEndpointRecord | null | undefined, key: string): string {
+    const value = endpoint?.metadata?.[key];
+    return typeof value === 'string' ? value : '';
+  }
+
+  protected metadataBoolean(endpoint: ModelEndpointRecord | null | undefined, key: string): boolean {
+    return endpoint?.metadata?.[key] === true;
+  }
+
+  protected requestCloudModelEndpointSave(
+    baseUrl: string,
+    modelName: string,
+    apiKey: string,
+    enabled: boolean
+  ): void {
+    const existing = this.siliconFlowEndpoint();
+    const normalizedBaseUrl = baseUrl.trim() || 'https://api.siliconflow.cn/v1';
+    const normalizedModel = modelName.trim() || 'deepseek-ai/DeepSeek-V4-Flash';
+    this.cloudModelEndpointSaveRequested.emit({
+      model_endpoint_id: 'llm-cloud-siliconflow',
+      workspace_id: existing?.workspace_id ?? 'home-1',
+      provider_account_id: existing?.provider_account_id ?? null,
+      model_kind: 'llm',
+      endpoint_kind: 'cloud',
+      provider_key: 'openai_compatible',
+      model_name: normalizedModel,
+      capability_tags: existing?.capability_tags?.length
+        ? existing.capability_tags
+        : ['chat', 'cloud_fallback', 'openai_compatible'],
+      cost_policy: existing?.cost_policy ?? {
+        cost_hint: 'cloud_metered',
+        provider: 'siliconflow'
+      },
+      status: enabled ? 'active' : 'disabled',
+      metadata: {
+        ...(existing?.metadata ?? {}),
+        builtin: true,
+        provider_label: 'SiliconFlow',
+        base_url: normalizedBaseUrl,
+        healthz_url: `${normalizedBaseUrl.replace(/\/$/, '')}/models`,
+        model: normalizedModel,
+        api_key: apiKey.trim(),
+        fallback_scope: ['semantic.router', 'retrieval.answer'],
+        secret_redaction: 'endpoint_metadata'
+      }
+    });
   }
 
   protected requestNotificationTargetDefaultChange(targetId: string): void {
@@ -355,8 +416,11 @@ export class PageStatePanelComponent {
     this.knowledgeIndexJobCancelRequested.emit(jobId);
   }
 
-  protected requestLocalModelDownload(model: LocalModelCatalogItem): void {
-    this.localModelDownloadRequested.emit(model);
+  protected requestLocalModelDownload(model: LocalModelCatalogItem, hfEndpoint?: string | null): void {
+    this.localModelDownloadRequested.emit({
+      model,
+      hfEndpoint: (hfEndpoint ?? model.default_hf_endpoint ?? '').trim() || null
+    });
   }
 
   protected requestLocalModelDownloadCancel(jobId: string): void {
@@ -383,6 +447,10 @@ export class PageStatePanelComponent {
 
   protected canCancelLocalModelDownload(status: string | undefined | null): boolean {
     return ['queued', 'running', 'downloading'].includes(String(status ?? '').trim().toLowerCase());
+  }
+
+  protected defaultHfEndpoint(model: LocalModelCatalogItem): string {
+    return model.default_hf_endpoint || 'https://hf-mirror.com';
   }
 
   protected modelDownloadToneClass(status: string | undefined | null): string {

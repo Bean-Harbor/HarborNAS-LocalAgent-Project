@@ -48,7 +48,9 @@ use harborbeacon_local_agent::runtime::hub::{
     CameraConnectRequest, CameraHubService, HubManualAddSummary, HubScanRequest, HubScanSummary,
     HubStateSnapshot,
 };
-use harborbeacon_local_agent::runtime::knowledge::{KnowledgeSearchRequest, KnowledgeSearchService};
+use harborbeacon_local_agent::runtime::knowledge::{
+    KnowledgeSearchRequest, KnowledgeSearchService,
+};
 use harborbeacon_local_agent::runtime::knowledge_index::{
     load_embedding_store, KnowledgeIndexConfig, KnowledgeIndexManifest, KnowledgeIndexService,
     KnowledgeModality,
@@ -66,6 +68,8 @@ use harborbeacon_local_agent::runtime::task_api::{
     TaskStatus,
 };
 use harborbeacon_local_agent::runtime::task_session::TaskConversationStore;
+
+const DEFAULT_HF_ENDPOINT: &str = "https://hf-mirror.com";
 
 #[derive(Debug, Clone)]
 struct Cli {
@@ -703,6 +707,7 @@ struct LocalModelCatalogItem {
     repo_id: Option<String>,
     revision: Option<String>,
     file_policy: String,
+    default_hf_endpoint: Option<String>,
     runtime_profiles: Vec<String>,
     expected_capabilities: Vec<String>,
     acceptance_note: Option<String>,
@@ -765,6 +770,8 @@ struct ModelDownloadRequest {
     provider_key: Option<String>,
     #[serde(default)]
     target_path: Option<String>,
+    #[serde(default)]
+    hf_endpoint: Option<String>,
     #[serde(default)]
     metadata: Value,
 }
@@ -2040,6 +2047,14 @@ impl AdminApi {
         };
         if let Some(catalog_item) = catalog_item {
             enrich_model_download_metadata(&mut metadata, catalog_item);
+        }
+        if let Some(hf_endpoint) = body.hf_endpoint.as_deref().and_then(non_empty_string) {
+            if !metadata.is_object() {
+                metadata = json!({});
+            }
+            if let Some(object) = metadata.as_object_mut() {
+                object.insert("hf_endpoint".to_string(), json!(hf_endpoint));
+            }
         }
         match self.admin_store.create_model_download_job(
             &body.model_id,
@@ -6248,10 +6263,10 @@ fn resolve_knowledge_preview_path(
             "No enabled knowledge source roots are configured.",
         ));
     }
-    if !allowed_roots.iter().any(|root| path_is_same_or_inside(
-        &requested.to_string_lossy(),
-        &root.to_string_lossy()
-    )) {
+    if !allowed_roots
+        .iter()
+        .any(|root| path_is_same_or_inside(&requested.to_string_lossy(), &root.to_string_lossy()))
+    {
         return Err(KnowledgePreviewError::new(
             StatusCode(403),
             format!(
@@ -6713,9 +6728,8 @@ fn build_rag_capability_profiles(
     let mut image_blockers = Vec::new();
     let mut image_warnings = Vec::new();
     if !vlm_ready {
-        image_blockers.push(
-            "VLM endpoint is required for content-level natural photo indexing.".to_string(),
-        );
+        image_blockers
+            .push("VLM endpoint is required for content-level natural photo indexing.".to_string());
     }
     if !storage_writable {
         image_blockers.push("RAG index storage is not writable.".to_string());
@@ -6726,7 +6740,8 @@ fn build_rag_capability_profiles(
         );
     }
     if !ocr_ready {
-        image_warnings.push("OCR endpoint is not ready; OCR can only be used as a supplement.".to_string());
+        image_warnings
+            .push("OCR endpoint is not ready; OCR can only be used as a supplement.".to_string());
     }
     if !media_parser_ready {
         image_warnings.push("No local media parser binary was detected.".to_string());
@@ -6745,7 +6760,10 @@ fn build_rag_capability_profiles(
         ));
     }
     if default_profile == RagResourceProfile::CpuOnly {
-        image_warnings.push("CPU-only VLM indexing may be slow, but it must still produce image-derived content.".to_string());
+        image_warnings.push(
+            "CPU-only VLM indexing may be slow, but it must still produce image-derived content."
+                .to_string(),
+        );
     }
     let image_status = if !image_blockers.is_empty() {
         "blocked"
@@ -7547,7 +7565,8 @@ fn local_model_catalog_specs() -> Vec<LocalModelCatalogSpec> {
             display_name: "SmolVLM 256M Instruct",
             provider_key: "huggingfacetb",
             model_kind: "vlm",
-            recommended_hardware: "CPU smoke VLM; slow but suitable for VM content-index validation",
+            recommended_hardware:
+                "CPU smoke VLM; slow but suitable for VM content-index validation",
             download_size_hint: "1-2 GB",
             source_kind: "huggingface",
             repo_id: Some("HuggingFaceTB/SmolVLM-256M-Instruct"),
@@ -7668,6 +7687,8 @@ fn local_model_catalog_item(
         repo_id: spec.repo_id.map(str::to_string),
         revision: Some(spec.revision.to_string()),
         file_policy: spec.file_policy.to_string(),
+        default_hf_endpoint: (spec.source_kind == "huggingface")
+            .then(|| DEFAULT_HF_ENDPOINT.to_string()),
         runtime_profiles: spec
             .runtime_profiles
             .iter()
@@ -8077,6 +8098,7 @@ fn run_huggingface_snapshot_download(
         .ok_or_else(|| "huggingface repo_id is required for snapshot download".to_string())?;
     let revision = model_download_metadata_string(&job.metadata, "revision")
         .unwrap_or_else(|| "main".to_string());
+    let hf_endpoint = model_download_huggingface_endpoint(&job.metadata);
     let file_policy = model_download_metadata_string(&job.metadata, "file_policy")
         .unwrap_or_else(|| "runtime_snapshot".to_string());
     let allow_patterns = model_download_allow_patterns(&job.metadata);
@@ -8121,7 +8143,7 @@ fn run_huggingface_snapshot_download(
         Some(1),
         Some(0),
         None,
-        format!("resolving Hugging Face snapshot {repo_id}@{revision}"),
+        format!("resolving Hugging Face snapshot {repo_id}@{revision} via {hf_endpoint}"),
     );
 
     let mut builder = HfApiBuilder::from_cache(HfCache::new(hf_cache_dir))
@@ -8130,11 +8152,7 @@ fn run_huggingface_snapshot_download(
     if let Some(token) = huggingface_token_from_env() {
         builder = builder.with_token(Some(token));
     }
-    if let Ok(endpoint) = env::var("HF_ENDPOINT") {
-        if let Some(endpoint) = non_empty_string(&endpoint) {
-            builder = builder.with_endpoint(endpoint);
-        }
-    }
+    builder = builder.with_endpoint(hf_endpoint.clone());
     let api = builder
         .build()
         .map_err(|error| format!("failed to initialize Hugging Face client: {error}"))?;
@@ -8205,6 +8223,7 @@ fn run_huggingface_snapshot_download(
                     filename.clone(),
                 );
                 download_huggingface_file_via_plain_http(
+                    &hf_endpoint,
                     &repo_id,
                     &revision,
                     filename,
@@ -8262,6 +8281,7 @@ fn run_huggingface_snapshot_download(
 
     let manifest = json!({
         "source_kind": "huggingface",
+        "hf_endpoint": hf_endpoint,
         "repo_id": repo_id,
         "revision": revision,
         "resolved_sha": resolved_sha,
@@ -8300,17 +8320,14 @@ fn huggingface_download_should_fallback_to_plain_http(error_message: &str) -> bo
 }
 
 fn download_huggingface_file_via_plain_http(
+    endpoint: &str,
     repo_id: &str,
     revision: &str,
     filename: &str,
     destination: &Path,
     mut progress: HfModelDownloadProgress,
 ) -> Result<(), String> {
-    let endpoint = env::var("HF_ENDPOINT")
-        .ok()
-        .and_then(|value| non_empty_string(&value))
-        .unwrap_or_else(|| "https://huggingface.co".to_string());
-    let url = huggingface_resolve_url(&endpoint, repo_id, revision, filename)?;
+    let url = huggingface_resolve_url(endpoint, repo_id, revision, filename)?;
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(30))
         .build()
@@ -8326,7 +8343,10 @@ fn download_huggingface_file_via_plain_http(
         .map_err(|error| format!("plain HTTP request failed: {error}"))?;
     let status = response.status();
     if !status.is_success() {
-        return Err(format!("plain HTTP request failed with HTTP {}", status.as_u16()));
+        return Err(format!(
+            "plain HTTP request failed with HTTP {}",
+            status.as_u16()
+        ));
     }
 
     let total = response.content_length().unwrap_or(0);
@@ -8375,8 +8395,8 @@ fn huggingface_resolve_url(
     filename: &str,
 ) -> Result<Url, String> {
     let base = format!("{}/", endpoint.trim_end_matches('/'));
-    let mut url =
-        Url::parse(&base).map_err(|error| format!("invalid Hugging Face endpoint {endpoint}: {error}"))?;
+    let mut url = Url::parse(&base)
+        .map_err(|error| format!("invalid Hugging Face endpoint {endpoint}: {error}"))?;
     {
         let mut segments = url
             .path_segments_mut()
@@ -8506,6 +8526,16 @@ fn model_download_huggingface_repo_id(job: &ModelDownloadJobRecord) -> Option<St
             .to_ascii_lowercase();
         (source_kind == "huggingface" && job.model_id.contains('/')).then(|| job.model_id.clone())
     })
+}
+
+fn model_download_huggingface_endpoint(metadata: &Value) -> String {
+    model_download_metadata_string(metadata, "hf_endpoint")
+        .or_else(|| {
+            env::var("HF_ENDPOINT")
+                .ok()
+                .and_then(|value| non_empty_string(&value))
+        })
+        .unwrap_or_else(|| DEFAULT_HF_ENDPOINT.to_string())
 }
 
 fn model_download_metadata_string(metadata: &Value, key: &str) -> Option<String> {
@@ -10765,16 +10795,16 @@ mod tests {
         build_feature_availability_response, build_files_browse_response,
         build_harboros_im_capability_map, build_harboros_status_response,
         build_hardware_readiness_response, build_knowledge_index_job,
-        build_knowledge_index_status_response,
-        build_local_model_catalog, build_rag_readiness_response, build_release_readiness_response,
-        build_rtsp_url_from_patch, default_model_download_target_path, default_model_endpoints,
-        ensure_local_admin_access, ensure_local_camera_access, harbordesk_build_missing_response,
-        has_forwarding_headers, huggingface_download_should_fallback_to_plain_http,
-        huggingface_resolve_url, identity_query_suffix, is_admin_surface_path,
-        is_harbordesk_client_route, is_harbordesk_surface_path, local_model_catalog_item,
-        knowledge_preview_mime_supported, local_model_catalog_specs,
-        live_bridge_provider_from_setup_status, mime_type_for_path, model_download_jobs_status,
-        model_snapshot_file_allowed,
+        build_knowledge_index_status_response, build_local_model_catalog,
+        build_rag_readiness_response, build_release_readiness_response, build_rtsp_url_from_patch,
+        default_model_download_target_path, default_model_endpoints, ensure_local_admin_access,
+        ensure_local_camera_access, harbordesk_build_missing_response, has_forwarding_headers,
+        huggingface_download_should_fallback_to_plain_http, huggingface_resolve_url,
+        identity_query_suffix, is_admin_surface_path, is_harbordesk_client_route,
+        is_harbordesk_surface_path, knowledge_preview_mime_supported,
+        live_bridge_provider_from_setup_status, local_model_catalog_item,
+        local_model_catalog_specs, mime_type_for_path, model_download_huggingface_endpoint,
+        model_download_jobs_status, model_snapshot_file_allowed,
         overlay_model_endpoints_with_runtime_truth, parse_approval_decision_path,
         parse_camera_analyze_path, parse_camera_live_page_path, parse_camera_live_stream_path,
         parse_camera_share_link_path, parse_camera_snapshot_path, parse_camera_task_snapshot_path,
@@ -10792,7 +10822,7 @@ mod tests {
         redact_value_stream_credentials, release_item, request_identity_hints,
         resolve_harbordesk_asset_path, resolve_knowledge_preview_path, run_knowledge_index_jobs,
         run_model_download_transfer, url_encode_path_segment, AdminApi, KnowledgeSearchApiRequest,
-        LocalModelRuntimeProjection, ManualAddRequest,
+        LocalModelRuntimeProjection, ManualAddRequest, DEFAULT_HF_ENDPOINT,
     };
     use harborbeacon_local_agent::control_plane::media::{
         MediaDeliveryMode, MediaSession, MediaSessionKind, MediaSessionStatus, ShareAccessScope,
@@ -10824,8 +10854,14 @@ mod tests {
     use std::net::TcpListener;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn hf_endpoint_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
     use tiny_http::{Header, StatusCode};
 
     fn unique_store_path(prefix: &str) -> std::path::PathBuf {
@@ -10846,6 +10882,17 @@ mod tests {
             let original = std::env::var(key).ok();
             unsafe {
                 std::env::set_var(key, value);
+            }
+            Self {
+                key: key.to_string(),
+                original,
+            }
+        }
+
+        fn remove(key: &str) -> Self {
+            let original = std::env::var(key).ok();
+            unsafe {
+                std::env::remove_var(key);
             }
             Self {
                 key: key.to_string(),
@@ -11459,10 +11506,18 @@ mod tests {
             mime_type_for_path(Path::new("C:/tmp/clip.webm")),
             "video/webm"
         );
-        assert!(knowledge_preview_mime_supported(Path::new("C:/tmp/photo.webp")));
-        assert!(knowledge_preview_mime_supported(Path::new("C:/tmp/clip.mp4")));
-        assert!(knowledge_preview_mime_supported(Path::new("C:/tmp/note.txt")));
-        assert!(!knowledge_preview_mime_supported(Path::new("C:/tmp/data.json")));
+        assert!(knowledge_preview_mime_supported(Path::new(
+            "C:/tmp/photo.webp"
+        )));
+        assert!(knowledge_preview_mime_supported(Path::new(
+            "C:/tmp/clip.mp4"
+        )));
+        assert!(knowledge_preview_mime_supported(Path::new(
+            "C:/tmp/note.txt"
+        )));
+        assert!(!knowledge_preview_mime_supported(Path::new(
+            "C:/tmp/data.json"
+        )));
     }
 
     #[test]
@@ -11694,30 +11749,27 @@ mod tests {
 
     #[test]
     fn model_download_status_uses_latest_job_per_model() {
-        let job = |job_id: &str,
-                   model_id: &str,
-                   status: &str,
-                   requested_at: &str,
-                   updated_at: &str| {
-            ModelDownloadJobRecord {
-                job_id: job_id.to_string(),
-                model_id: model_id.to_string(),
-                display_name: model_id.to_string(),
-                provider_key: "qwen".to_string(),
-                status: status.to_string(),
-                requested_at: requested_at.to_string(),
-                updated_at: updated_at.to_string(),
-                target_path: None,
-                progress_percent: None,
-                bytes_downloaded: None,
-                total_bytes: None,
-                started_at: None,
-                completed_at: None,
-                error_message: None,
-                message: String::new(),
-                metadata: json!({}),
-            }
-        };
+        let job =
+            |job_id: &str, model_id: &str, status: &str, requested_at: &str, updated_at: &str| {
+                ModelDownloadJobRecord {
+                    job_id: job_id.to_string(),
+                    model_id: model_id.to_string(),
+                    display_name: model_id.to_string(),
+                    provider_key: "qwen".to_string(),
+                    status: status.to_string(),
+                    requested_at: requested_at.to_string(),
+                    updated_at: updated_at.to_string(),
+                    target_path: None,
+                    progress_percent: None,
+                    bytes_downloaded: None,
+                    total_bytes: None,
+                    started_at: None,
+                    completed_at: None,
+                    error_message: None,
+                    message: String::new(),
+                    metadata: json!({}),
+                }
+            };
 
         let failed_old = job("job-1", "Qwen/Qwen3.5-4B", "failed", "1", "1");
         let completed_new = job("job-2", "Qwen/Qwen3.5-4B", "completed", "2", "2");
@@ -11728,11 +11780,9 @@ mod tests {
 
         let running_other = job("job-3", "Qwen/Qwen3.5-9B", "running", "3", "3");
         assert_eq!(
-            model_download_jobs_status(&[
-                failed_old.clone(),
-                completed_new.clone(),
-                running_other,
-            ]),
+            model_download_jobs_status(
+                &[failed_old.clone(), completed_new.clone(), running_other,]
+            ),
             "running"
         );
 
@@ -11869,10 +11919,7 @@ mod tests {
             .runtime_profiles
             .iter()
             .any(|profile| profile == "cpu-vlm-sidecar"));
-        assert_eq!(
-            smolvlm.acceptance_note.as_deref(),
-            Some("vm-cpu-photo-rag")
-        );
+        assert_eq!(smolvlm.acceptance_note.as_deref(), Some("vm-cpu-photo-rag"));
     }
 
     #[test]
@@ -11917,6 +11964,33 @@ mod tests {
             url.as_str(),
             "https://hf-mirror.com/Qwen/Qwen3.5-4B/resolve/main/nested/config.json"
         );
+    }
+
+    #[test]
+    fn huggingface_endpoint_prefers_job_metadata_then_env_then_default_mirror() {
+        let _guard = hf_endpoint_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let env_guard = EnvGuard::set("HF_ENDPOINT", "https://env-mirror.example");
+
+        assert_eq!(
+            model_download_huggingface_endpoint(&json!({
+                "hf_endpoint": "https://user-mirror.example"
+            })),
+            "https://user-mirror.example"
+        );
+        assert_eq!(
+            model_download_huggingface_endpoint(&json!({})),
+            "https://env-mirror.example"
+        );
+
+        drop(env_guard);
+        let remove_guard = EnvGuard::remove("HF_ENDPOINT");
+        assert_eq!(
+            model_download_huggingface_endpoint(&json!({})),
+            DEFAULT_HF_ENDPOINT
+        );
+        drop(remove_guard);
     }
 
     #[test]
@@ -12095,8 +12169,8 @@ mod tests {
             index_root: index_root.to_string_lossy().into_owned(),
             ..Default::default()
         };
-        let endpoint = |model_kind: ModelKind, model_endpoint_id: &str, model_name: &str| {
-            ModelEndpoint {
+        let endpoint =
+            |model_kind: ModelKind, model_endpoint_id: &str, model_name: &str| ModelEndpoint {
                 model_endpoint_id: model_endpoint_id.to_string(),
                 workspace_id: Some("home-1".to_string()),
                 provider_account_id: None,
@@ -12108,8 +12182,7 @@ mod tests {
                 cost_policy: json!({}),
                 status: ModelEndpointStatus::Active,
                 metadata: json!({}),
-            }
-        };
+            };
         let response = build_rag_readiness_response(
             &LocalModelRuntimeProjection {
                 ready: true,
@@ -12291,9 +12364,10 @@ mod tests {
         fs::create_dir_all(&index_root).expect("create index root");
         let indexed_path = source_root.join("indexed.md");
         fs::write(&indexed_path, "HarborBot indexed preview").expect("write indexed file");
-        let service =
-            KnowledgeIndexService::from_config(KnowledgeIndexConfig::new(index_root.clone()).unwrap())
-                .expect("index service");
+        let service = KnowledgeIndexService::from_config(
+            KnowledgeIndexConfig::new(index_root.clone()).unwrap(),
+        )
+        .expect("index service");
         service
             .load_or_refresh(&source_root)
             .expect("write index manifest");
@@ -12311,11 +12385,13 @@ mod tests {
             ..Default::default()
         };
 
-        let resolved =
-            resolve_knowledge_preview_path(&indexed_path.to_string_lossy(), &settings)
-                .expect("preview path");
+        let resolved = resolve_knowledge_preview_path(&indexed_path.to_string_lossy(), &settings)
+            .expect("preview path");
 
-        assert_eq!(resolved, indexed_path.canonicalize().expect("canonical path"));
+        assert_eq!(
+            resolved,
+            indexed_path.canonicalize().expect("canonical path")
+        );
         let _ = fs::remove_dir_all(source_root);
         let _ = fs::remove_dir_all(index_root);
     }
@@ -12330,9 +12406,10 @@ mod tests {
         fs::create_dir_all(&index_root).expect("create index root");
         let indexed_path = source_root.join("indexed.md");
         fs::write(&indexed_path, "indexed").expect("write indexed file");
-        let service =
-            KnowledgeIndexService::from_config(KnowledgeIndexConfig::new(index_root.clone()).unwrap())
-                .expect("index service");
+        let service = KnowledgeIndexService::from_config(
+            KnowledgeIndexConfig::new(index_root.clone()).unwrap(),
+        )
+        .expect("index service");
         service
             .load_or_refresh(&source_root)
             .expect("write index manifest");

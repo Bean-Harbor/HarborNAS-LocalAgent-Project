@@ -48,6 +48,24 @@ The intended operating model for this phase is:
 - southbound work is domain-split, not one generic adapter bucket
 - each lane owns implementation inside a frozen collaboration boundary
 
+## Model Capability Layer
+
+Model execution is a shared capability layer, not a business domain. HarborBeacon
+owns model-center orchestration, endpoint policy, redaction, and audit evidence;
+HarborGate does not own model choice, model credentials, or retrieval semantics.
+
+The current model architecture is local-first. Cloud endpoints are allowed only
+as controlled fallback for explicitly cloud-enabled route policies. The first
+cloud fallback scope is limited to:
+
+- `semantic.router`
+- `retrieval.answer`
+
+Cloud fallback must not become the default path for HarborOS command execution,
+AIoT control, OCR, VLM, or embedding routes. Each LLM fallback attempt must
+record the selected endpoint, attempted endpoints, and fallback reason without
+persisting plaintext API keys or full sensitive prompts.
+
 ## Team Topology
 
 ### `harbor-architect`

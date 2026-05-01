@@ -119,6 +119,17 @@ export class HarborDeskAdminApiService {
     );
   }
 
+  saveModelEndpoint(endpoint: ModelEndpointRecord): Observable<ModelEndpointsResponse> {
+    return this.http.post<ModelEndpointsResponse>(this.apiUrl('/models/endpoints'), endpoint);
+  }
+
+  patchModelEndpoint(modelEndpointId: string, patch: Partial<ModelEndpointRecord>): Observable<ModelEndpointsResponse> {
+    return this.http.patch<ModelEndpointsResponse>(
+      this.apiUrl(`/models/endpoints/${encodeURIComponent(modelEndpointId)}`),
+      patch
+    );
+  }
+
   scanDevices(payload: DiscoveryScanPayload): Observable<unknown> {
     return this.http.post<unknown>(this.apiUrl('/discovery/scan'), payload);
   }

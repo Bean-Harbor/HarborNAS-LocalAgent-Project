@@ -17,10 +17,11 @@ use crate::connectors::ai_provider::{
     OpenAiCompatibleTextClient, OpenAiCompatibleVisionClient, TextCompletionRequest,
     VisionSummaryRequest,
 };
-use crate::control_plane::models::{ModelEndpoint, ModelEndpointStatus, ModelKind};
+use crate::control_plane::models::{
+    ModelEndpoint, ModelEndpointKind, ModelEndpointStatus, ModelKind, PrivacyLevel,
+};
 use crate::runtime::admin_console::{
-    default_model_endpoints, sanitize_model_center_state, AdminConsoleState,
-    AdminModelCenterState,
+    default_model_endpoints, sanitize_model_center_state, AdminConsoleState, AdminModelCenterState,
 };
 
 pub const ADMIN_STATE_PATH_ENV: &str = "HARBOR_ADMIN_STATE_PATH";
@@ -29,6 +30,7 @@ pub const OCR_TESSERACT_LANGS_ENV: &str = "HARBOR_OCR_LANGS";
 const OCR_POLICY_ID: &str = "retrieval.ocr";
 const EMBED_POLICY_ID: &str = "retrieval.embed";
 const LLM_POLICY_ID: &str = "retrieval.answer";
+const SEMANTIC_ROUTER_POLICY_ID: &str = "semantic.router";
 const VLM_POLICY_ID: &str = "retrieval.vision_summary";
 const DEFAULT_ADMIN_STATE_PATH: &str = ".harborbeacon/admin-console.json";
 const DEFAULT_TESSERACT_LANGS: &str = "chi_sim+eng";
@@ -472,7 +474,9 @@ pub fn run_llm_text_with_state_and_options(
     state: &AdminModelCenterState,
     options: &LlmTextOptions,
 ) -> LlmTextExecution {
-    let Some(endpoint) = resolve_endpoint(state, ModelKind::Llm, LLM_POLICY_ID) else {
+    let route_policy_id = llm_route_policy_id(options);
+    let candidates = resolve_endpoint_candidates(state, ModelKind::Llm, route_policy_id);
+    if candidates.is_empty() {
         return LlmTextExecution {
             available: false,
             status: "disabled".to_string(),
@@ -480,10 +484,126 @@ pub fn run_llm_text_with_state_and_options(
             provider_key: String::new(),
             model_endpoint_id: None,
             text: String::new(),
-            details: json!({}),
+            details: json!({
+                "route_policy_id": route_policy_id,
+                "attempted_endpoints": [],
+            }),
         };
     };
 
+    let mut attempted_endpoints = Vec::new();
+    let mut attempt_summaries = Vec::new();
+    let mut fallback_reason = None;
+    let first_endpoint_id = candidates
+        .first()
+        .map(|endpoint| endpoint.model_endpoint_id.clone());
+    let mut last_result = None;
+
+    for endpoint in candidates {
+        attempted_endpoints.push(endpoint.model_endpoint_id.clone());
+        let mut result = run_llm_text_on_endpoint(prompt, &endpoint, options);
+        attempt_summaries.push(json!({
+            "endpoint": endpoint.model_endpoint_id,
+            "endpoint_kind": endpoint.endpoint_kind.as_str(),
+            "status": result.status,
+            "available": result.available,
+            "summary": result.summary,
+        }));
+        if result.available {
+            let selected_endpoint_id = result.model_endpoint_id.clone();
+            let selected_endpoint_kind = endpoint.endpoint_kind.as_str();
+            let fallback_used = selected_endpoint_id.as_ref() != first_endpoint_id.as_ref()
+                || attempted_endpoints.len() > 1;
+            merge_llm_execution_details(
+                &mut result,
+                route_policy_id,
+                &attempted_endpoints,
+                fallback_reason.as_deref(),
+                fallback_used,
+                selected_endpoint_kind,
+                attempt_summaries,
+            );
+            return result;
+        }
+        if fallback_reason.is_none() {
+            fallback_reason = Some(result.summary.clone());
+        }
+        last_result = Some(result);
+    }
+
+    let mut result = last_result.unwrap_or_default();
+    result.available = false;
+    result.status = if result.status.trim().is_empty() {
+        "degraded".to_string()
+    } else {
+        result.status
+    };
+    result.summary = format!(
+        "All LLM endpoints failed for route_policy={route_policy_id}; last error: {}",
+        result.summary
+    );
+    merge_llm_execution_details(
+        &mut result,
+        route_policy_id,
+        &attempted_endpoints,
+        fallback_reason.as_deref(),
+        attempted_endpoints.len() > 1,
+        "",
+        attempt_summaries,
+    );
+    result
+}
+
+fn llm_route_policy_id(options: &LlmTextOptions) -> &'static str {
+    match options.purpose.as_deref().map(str::trim) {
+        Some("router") | Some("semantic.router") => SEMANTIC_ROUTER_POLICY_ID,
+        _ => LLM_POLICY_ID,
+    }
+}
+
+fn merge_llm_execution_details(
+    result: &mut LlmTextExecution,
+    route_policy_id: &str,
+    attempted_endpoints: &[String],
+    fallback_reason: Option<&str>,
+    fallback_used: bool,
+    selected_endpoint_kind: &str,
+    attempt_summaries: Vec<Value>,
+) {
+    let mut details = match result.details.clone() {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    details.insert("route_policy_id".to_string(), json!(route_policy_id));
+    details.insert(
+        "attempted_endpoints".to_string(),
+        json!(attempted_endpoints),
+    );
+    details.insert("fallback_used".to_string(), json!(fallback_used));
+    details.insert(
+        "attempt_summaries".to_string(),
+        Value::Array(attempt_summaries),
+    );
+    if let Some(reason) = fallback_reason.filter(|value| !value.trim().is_empty()) {
+        details.insert("fallback_reason".to_string(), json!(reason));
+    }
+    if let Some(endpoint_id) = result.model_endpoint_id.as_ref() {
+        details.insert("selected_endpoint".to_string(), json!(endpoint_id));
+    }
+    if !selected_endpoint_kind.trim().is_empty() {
+        details.insert(
+            "selected_endpoint_kind".to_string(),
+            json!(selected_endpoint_kind),
+        );
+    }
+    result.details = Value::Object(details);
+}
+
+fn run_llm_text_on_endpoint(
+    prompt: &str,
+    endpoint: &ModelEndpoint,
+    options: &LlmTextOptions,
+) -> LlmTextExecution {
     if let Some(mock_text) = metadata_string(&endpoint.metadata, "mock_text") {
         return LlmTextExecution {
             available: !mock_text.trim().is_empty(),
@@ -664,7 +784,8 @@ pub fn run_embedding_with_state(text: &str, state: &AdminModelCenterState) -> Em
         return EmbeddingExecution {
             available: false,
             status: "degraded".to_string(),
-            summary: "Embedding endpoint base_url / api_key / model_name are not configured.".to_string(),
+            summary: "Embedding endpoint base_url / api_key / model_name are not configured."
+                .to_string(),
             provider_key: endpoint.provider_key.clone(),
             model_endpoint_id: Some(endpoint.model_endpoint_id.clone()),
             model_name: Some(endpoint.model_name.clone()),
@@ -772,6 +893,16 @@ fn resolve_endpoint(
     model_kind: ModelKind,
     route_policy_id: &str,
 ) -> Option<ModelEndpoint> {
+    resolve_endpoint_candidates(state, model_kind, route_policy_id)
+        .into_iter()
+        .next()
+}
+
+fn resolve_endpoint_candidates(
+    state: &AdminModelCenterState,
+    model_kind: ModelKind,
+    route_policy_id: &str,
+) -> Vec<ModelEndpoint> {
     let state = runtime_wired_model_center_state(state);
     let policy = state
         .route_policies
@@ -786,6 +917,9 @@ fn resolve_endpoint(
                 "cloud".to_string(),
             ]
         });
+    let cloud_allowed = policy
+        .map(|policy| policy.privacy_level != PrivacyLevel::StrictLocal)
+        .unwrap_or(true);
 
     let mut candidates = state
         .endpoints
@@ -793,6 +927,7 @@ fn resolve_endpoint(
         .filter(|endpoint| {
             endpoint.model_kind == model_kind && endpoint.status != ModelEndpointStatus::Disabled
         })
+        .filter(|endpoint| cloud_allowed || endpoint.endpoint_kind != ModelEndpointKind::Cloud)
         .cloned()
         .collect::<Vec<_>>();
 
@@ -803,7 +938,7 @@ fn resolve_endpoint(
             .then(left.model_endpoint_id.cmp(&right.model_endpoint_id))
     });
 
-    candidates.into_iter().next()
+    candidates
 }
 
 fn probe_local_runtime(endpoints: &[ModelEndpoint]) -> LocalRuntimeProjection {
@@ -825,12 +960,11 @@ fn probe_local_runtime(endpoints: &[ModelEndpoint]) -> LocalRuntimeProjection {
     let projection = probe_local_runtime_target(&target);
     *local_runtime_projection_cache()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-        Some(CachedLocalRuntimeProjection {
-            target_cache_key: target.cache_key,
-            expires_at: now + LOCAL_RUNTIME_PROJECTION_CACHE_TTL,
-            projection: projection.clone(),
-        });
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(CachedLocalRuntimeProjection {
+        target_cache_key: target.cache_key,
+        expires_at: now + LOCAL_RUNTIME_PROJECTION_CACHE_TTL,
+        projection: projection.clone(),
+    });
     projection
 }
 
@@ -879,10 +1013,7 @@ fn resolve_local_runtime_probe_target(
     Some(LocalRuntimeProbeTarget {
         cache_key: format!(
             "{}|{}|{}|{}",
-            template.model_endpoint_id,
-            base_url,
-            healthz_url,
-            api_key,
+            template.model_endpoint_id, base_url, healthz_url, api_key,
         ),
         base_url,
         healthz_url,
@@ -962,7 +1093,10 @@ fn probe_local_runtime_target(target: &LocalRuntimeProbeTarget) -> LocalRuntimeP
         healthz_url: target.healthz_url.clone(),
         api_key: target.api_key.clone(),
         api_key_configured: target.api_key_configured,
-        ready: payload.get("ready").and_then(Value::as_bool).unwrap_or(false),
+        ready: payload
+            .get("ready")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         backend_ready: payload
             .get("backend")
             .and_then(|value| value.get("ready"))
@@ -993,7 +1127,9 @@ fn overlay_endpoints_with_runtime_truth(
                             runtime
                                 .base_url
                                 .clone()
-                                .if_empty_then(|| metadata_string(&default_endpoint.metadata, "base_url"))
+                                .if_empty_then(|| {
+                                    metadata_string(&default_endpoint.metadata, "base_url")
+                                })
                                 .unwrap_or_default(),
                         );
                     }
@@ -1017,7 +1153,9 @@ fn overlay_endpoints_with_runtime_truth(
                             runtime
                                 .api_key
                                 .clone()
-                                .if_empty_then(|| metadata_string(&default_endpoint.metadata, "api_key"))
+                                .if_empty_then(|| {
+                                    metadata_string(&default_endpoint.metadata, "api_key")
+                                })
                                 .unwrap_or_default(),
                         );
                     }
@@ -1308,7 +1446,9 @@ fn is_builtin_local_openai_endpoint(endpoint: &ModelEndpoint) -> bool {
         endpoint.model_kind,
         ModelKind::Llm | ModelKind::Embedder | ModelKind::Vlm
     ) && endpoint.endpoint_kind == crate::control_plane::models::ModelEndpointKind::Local
-        && endpoint.provider_key.eq_ignore_ascii_case("openai_compatible")
+        && endpoint
+            .provider_key
+            .eq_ignore_ascii_case("openai_compatible")
         && metadata_bool(&endpoint.metadata, "builtin")
 }
 
@@ -1734,8 +1874,7 @@ mod tests {
                 .as_reader()
                 .read_to_string(&mut body)
                 .expect("read body");
-            let payload: serde_json::Value =
-                serde_json::from_str(&body).expect("payload json");
+            let payload: serde_json::Value = serde_json::from_str(&body).expect("payload json");
             assert_eq!(payload["max_tokens"], json!(12), "{body}");
             request
                 .respond(
@@ -1797,6 +1936,128 @@ mod tests {
         assert!(result.available);
         assert_eq!(result.text, "capability_summary");
         assert_eq!(result.details["max_tokens"], json!(12));
+    }
+
+    #[test]
+    fn run_llm_text_with_state_falls_back_from_local_to_cloud_for_router() {
+        let state = AdminModelCenterState {
+            endpoints: vec![
+                ModelEndpoint {
+                    model_endpoint_id: "llm-local-openai-compatible".to_string(),
+                    workspace_id: Some("home-1".to_string()),
+                    provider_account_id: None,
+                    model_kind: ModelKind::Llm,
+                    endpoint_kind: ModelEndpointKind::Local,
+                    provider_key: "openai_compatible".to_string(),
+                    model_name: "harbor-local-chat".to_string(),
+                    capability_tags: vec!["chat".to_string(), "local_first".to_string()],
+                    cost_policy: json!({}),
+                    status: ModelEndpointStatus::Active,
+                    metadata: json!({
+                        "builtin": false,
+                        "base_url": "http://127.0.0.1:9/v1",
+                        "api_key": "",
+                    }),
+                },
+                ModelEndpoint {
+                    model_endpoint_id: "llm-cloud-siliconflow".to_string(),
+                    workspace_id: Some("home-1".to_string()),
+                    provider_account_id: None,
+                    model_kind: ModelKind::Llm,
+                    endpoint_kind: ModelEndpointKind::Cloud,
+                    provider_key: "openai_compatible".to_string(),
+                    model_name: "deepseek-ai/DeepSeek-V4-Flash".to_string(),
+                    capability_tags: vec![
+                        "chat".to_string(),
+                        "cloud_fallback".to_string(),
+                        "openai_compatible".to_string(),
+                    ],
+                    cost_policy: json!({"cost_hint": "cloud_metered"}),
+                    status: ModelEndpointStatus::Active,
+                    metadata: json!({
+                        "builtin": true,
+                        "base_url": "https://api.siliconflow.cn/v1",
+                        "api_key": "configured",
+                        "mock_text": "rag_answer",
+                    }),
+                },
+            ],
+            route_policies: vec![ModelRoutePolicy {
+                route_policy_id: "semantic.router".to_string(),
+                workspace_id: "home-1".to_string(),
+                domain_scope: "semantic".to_string(),
+                modality: "text".to_string(),
+                privacy_level: PrivacyLevel::AllowRedactedCloud,
+                local_preferred: true,
+                max_cost_per_run: None,
+                fallback_order: vec!["local".to_string(), "cloud".to_string()],
+                status: "active".to_string(),
+                metadata: json!({"capability": "router"}),
+            }],
+        };
+
+        let result = run_llm_text_with_state_and_options(
+            "route this",
+            &state,
+            &LlmTextOptions {
+                purpose: Some("router".to_string()),
+                ..Default::default()
+            },
+        );
+
+        assert!(result.available);
+        assert_eq!(result.text, "rag_answer");
+        assert_eq!(
+            result.model_endpoint_id.as_deref(),
+            Some("llm-cloud-siliconflow")
+        );
+        assert_eq!(result.details["route_policy_id"], json!("semantic.router"));
+        assert_eq!(result.details["fallback_used"], json!(true));
+        assert_eq!(
+            result.details["attempted_endpoints"],
+            json!(["llm-local-openai-compatible", "llm-cloud-siliconflow"])
+        );
+    }
+
+    #[test]
+    fn strict_local_route_policy_blocks_cloud_llm_endpoint() {
+        let state = AdminModelCenterState {
+            endpoints: vec![ModelEndpoint {
+                model_endpoint_id: "llm-cloud-siliconflow".to_string(),
+                workspace_id: Some("home-1".to_string()),
+                provider_account_id: None,
+                model_kind: ModelKind::Llm,
+                endpoint_kind: ModelEndpointKind::Cloud,
+                provider_key: "openai_compatible".to_string(),
+                model_name: "deepseek-ai/DeepSeek-V4-Flash".to_string(),
+                capability_tags: vec!["chat".to_string(), "cloud_fallback".to_string()],
+                cost_policy: json!({}),
+                status: ModelEndpointStatus::Active,
+                metadata: json!({
+                    "base_url": "https://api.siliconflow.cn/v1",
+                    "api_key": "configured",
+                    "mock_text": "rag_answer",
+                }),
+            }],
+            route_policies: vec![ModelRoutePolicy {
+                route_policy_id: "retrieval.answer".to_string(),
+                workspace_id: "home-1".to_string(),
+                domain_scope: "retrieval".to_string(),
+                modality: "text".to_string(),
+                privacy_level: PrivacyLevel::StrictLocal,
+                local_preferred: true,
+                max_cost_per_run: None,
+                fallback_order: vec!["cloud".to_string()],
+                status: "active".to_string(),
+                metadata: json!({}),
+            }],
+        };
+
+        let result = run_llm_text_with_state("answer locally", &state);
+
+        assert!(!result.available);
+        assert_eq!(result.status, "disabled");
+        assert_eq!(result.details["attempted_endpoints"], json!([]));
     }
 
     #[test]

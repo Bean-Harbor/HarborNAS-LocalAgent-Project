@@ -291,6 +291,7 @@ export interface LocalModelCatalogItem {
   repo_id?: string | null;
   revision?: string | null;
   file_policy?: string;
+  default_hf_endpoint?: string | null;
   runtime_profiles?: string[];
   expected_capabilities?: string[];
   acceptance_note?: string | null;
@@ -343,6 +344,7 @@ export interface StartLocalModelDownloadRequest {
   display_name?: string;
   provider_key?: string;
   target_path?: string | null;
+  hf_endpoint?: string | null;
   metadata?: Record<string, unknown>;
 }
 

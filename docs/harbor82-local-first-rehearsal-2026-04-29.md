@@ -7,6 +7,13 @@ models acting as a controlled fallback layer when local capacity is not yet
 sufficient. The current HarborOS host `192.168.3.82` is therefore a strategy
 rehearsal, not a claim that the final architecture is cloud-first.
 
+2026-05-01 update: the current model architecture decision supersedes any
+broader fallback phrasing in this rehearsal. SiliconFlow remains an
+OpenAI-compatible cloud fallback preset for `semantic.router` and
+`retrieval.answer` only. HarborOS commands, AIoT control, OCR, VLM, and
+embedding defaults stay local/sidecar unless a later architecture decision
+expands the policy.
+
 Current verified baseline on `2026-04-30`:
 
 - target host: `192.168.3.82`

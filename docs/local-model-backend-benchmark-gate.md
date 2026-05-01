@@ -28,9 +28,12 @@
 ## 3. Backend Policy
 
 - Candle is a preferred backend candidate, not the frozen contract.
+- Mistral, sidecar, Candle, and future backends compete behind the same local OpenAI-compatible seam; none of them is the business-domain architecture.
 - `4176` 继续运行默认 `openai_proxy` backend。
 - 在没有通过 benchmark gate 之前，必须 keep `openai_proxy` as the default backend。
 - 只有当某个 backend 通过同一套 benchmark gate，才允许把它升成默认实现。
+- Cloud fallback is not backend promotion evidence. The product remains local-first; SiliconFlow may be used only as controlled fallback for `semantic.router` and `retrieval.answer`, and it must not be cited as the default local backend.
+- Model prefetch/download jobs should record the Hugging Face endpoint used. Mirror priority is HarborDesk input -> `HF_ENDPOINT` -> `https://hf-mirror.com`.
 
 ## 4. Required Evidence
 

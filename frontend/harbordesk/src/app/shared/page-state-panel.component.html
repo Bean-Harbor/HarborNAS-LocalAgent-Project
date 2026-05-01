@@ -409,11 +409,17 @@
                       </td>
                       <td>
                         <div class="inline-action">
+                          <input
+                            #hfEndpoint
+                            type="url"
+                            [value]="defaultHfEndpoint(model)"
+                            [attr.aria-label]="text('Hugging Face mirror URL', 'Hugging Face 镜像地址')"
+                          />
                           <button
                             type="button"
                             class="action-button"
                             [disabled]="!canStartLocalModelDownload(model) || modelDownloadBusyId === model.model_id"
-                            (click)="requestLocalModelDownload(model)"
+                            (click)="requestLocalModelDownload(model, hfEndpoint.value)"
                           >
                             {{ modelDownloadBusyId === model.model_id ? text('Starting...', '提交中...') : text('Download', '下载') }}
                           </button>
@@ -1436,6 +1442,66 @@
               </tbody>
             </table>
           </div>
+        </article>
+      }
+
+      @if (state.data.pageId === 'models-policies') {
+        <article class="content-card expanded-card">
+          <div class="section-head">
+            <div>
+              <p class="content-label">SiliconFlow endpoint</p>
+              <p class="table-copy">OpenAI-compatible cloud fallback for semantic.router and retrieval.answer.</p>
+            </div>
+            <span class="setup-step-state" [ngClass]="readinessToneClass(siliconFlowEndpoint()?.status || 'needs-config')">{{ siliconFlowEndpoint()?.status || 'needs-config' }}</span>
+          </div>
+          <form
+            class="form-grid compact-form"
+            (submit)="$event.preventDefault(); requestCloudModelEndpointSave(sfBaseUrl.value, sfModel.value, sfApiKey.value, sfEnabled.value === 'true')"
+          >
+            <label>
+              <span>Base URL</span>
+              <input #sfBaseUrl type="url" [value]="metadataString(siliconFlowEndpoint(), 'base_url') || 'https://api.siliconflow.cn/v1'" />
+            </label>
+            <label>
+              <span>Model</span>
+              <input #sfModel type="text" [value]="siliconFlowEndpoint()?.model_name || metadataString(siliconFlowEndpoint(), 'model') || 'deepseek-ai/DeepSeek-V4-Flash'" />
+            </label>
+            <label>
+              <span>API key</span>
+              <input
+                #sfApiKey
+                type="password"
+                autocomplete="off"
+                [placeholder]="metadataBoolean(siliconFlowEndpoint(), 'api_key_configured') ? text('Configured; leave blank to keep', '已配置，留空保留') : text('Required for cloud fallback', '云端 fallback 需要 API key')"
+              />
+            </label>
+            <label>
+              <span>Status</span>
+              <select #sfEnabled [value]="siliconFlowEndpoint()?.status === 'active' ? 'true' : 'false'">
+                <option value="true">enabled</option>
+                <option value="false">disabled</option>
+              </select>
+            </label>
+            <div class="inline-action">
+              <button type="submit" class="action-button">Save endpoint</button>
+              <button
+                type="button"
+                class="action-button"
+                [disabled]="testingEndpointId === 'llm-cloud-siliconflow' || !siliconFlowEndpoint()"
+                (click)="requestEndpointTest('llm-cloud-siliconflow')"
+              >
+                {{ testingEndpointId === 'llm-cloud-siliconflow' ? 'Testing...' : 'Run test' }}
+              </button>
+              @if (endpointTestResults['llm-cloud-siliconflow']) {
+                <span
+                  class="cell-note"
+                  [ngClass]="endpointTestResults['llm-cloud-siliconflow'].ok ? 'tone-success' : 'tone-danger'"
+                >
+                  {{ endpointTestResults['llm-cloud-siliconflow'].summary }}
+                </span>
+              }
+            </div>
+          </form>
         </article>
       }
 

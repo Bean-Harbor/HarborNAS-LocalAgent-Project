@@ -15,6 +15,7 @@ import {
   KnowledgeSettings,
   LocalModelCatalogItem,
   ManualDevicePayload,
+  ModelEndpointRecord,
   ModelEndpointTestResult,
   RtspCheckPayload,
   RtspCheckResult,
@@ -60,6 +61,7 @@ import { PageStatePanelComponent } from '../shared/page-state-panel.component';
       (notificationTargetDefaultChange)="setDefaultNotificationTarget($event)"
       (notificationTargetDelete)="deleteNotificationTarget($event)"
       (endpointTestRequested)="runEndpointTest($event)"
+      (cloudModelEndpointSaveRequested)="saveCloudModelEndpoint($event)"
       (deviceScanRequested)="scanDevices($event)"
       (manualDeviceAddRequested)="addManualDevice($event)"
       (defaultCameraChange)="setDefaultCamera($event)"
@@ -236,6 +238,33 @@ export class DeskPageComponent implements OnDestroy {
             (error?.error?.message as string | undefined) ??
             error?.message ??
             this.text('Failed to delete the notification target.', '删除通知目标失败。');
+          this.saveSuccess = null;
+        }
+      });
+  }
+
+  protected saveCloudModelEndpoint(endpoint: ModelEndpointRecord): void {
+    const endpointId = endpoint.model_endpoint_id;
+    this.savingMemberId = endpointId;
+    this.saveError = null;
+    this.saveSuccess = null;
+    this.api
+      .saveModelEndpoint(endpoint)
+      .pipe(
+        tap(() => {
+          this.saveSuccess = this.text(
+            `Cloud model endpoint saved: ${endpointId}.`,
+            `云端模型端点已保存：${endpointId}。`
+          );
+          this.refresh$.next(Date.now());
+        }),
+        finalize(() => {
+          this.savingMemberId = null;
+        })
+      )
+      .subscribe({
+        error: (error: unknown) => {
+          this.saveError = this.errorMessage(error, this.text('Failed to save cloud model endpoint.', '保存云端模型端点失败。'));
           this.saveSuccess = null;
         }
       });
@@ -418,18 +447,22 @@ export class DeskPageComponent implements OnDestroy {
       });
   }
 
-  protected startLocalModelDownload(model: LocalModelCatalogItem): void {
+  protected startLocalModelDownload(request: { model: LocalModelCatalogItem; hfEndpoint?: string | null }): void {
+    const model = request.model;
     const modelId = model.model_id;
+    const hfEndpoint = (request.hfEndpoint ?? model.default_hf_endpoint ?? '').trim() || null;
     const payload: StartLocalModelDownloadRequest = {
       model_id: modelId,
       display_name: model.display_name ?? model.label ?? modelId,
       provider_key: model.provider_key ?? model.provider ?? 'local',
       target_path: null,
+      hf_endpoint: hfEndpoint,
       metadata: {
         source_kind: model.source_kind ?? 'huggingface',
         repo_id: model.repo_id ?? model.model_id,
         revision: model.revision ?? 'main',
-        file_policy: model.file_policy ?? 'runtime_snapshot'
+        file_policy: model.file_policy ?? 'runtime_snapshot',
+        ...(hfEndpoint ? { hf_endpoint: hfEndpoint } : {})
       }
     };
     this.modelDownloadBusyId = modelId;
