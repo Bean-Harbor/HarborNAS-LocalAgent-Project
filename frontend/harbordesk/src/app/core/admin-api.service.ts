@@ -20,6 +20,11 @@ import {
   DeskPageModel,
   DeskRow,
   DiscoveryScanPayload,
+  DvrCapacityEstimate,
+  DvrRecordingSettings,
+  DvrRecordingStatus,
+  DvrRecordingStatusResponse,
+  DvrTimelineResponse,
   FeatureAvailabilityGroup,
   FeatureAvailabilityItem,
   FeatureAvailabilityResponse,
@@ -158,6 +163,37 @@ export class HarborDeskAdminApiService {
 
   getDeviceEvidence(deviceId: string): Observable<DeviceEvidenceResponse> {
     return this.http.get<DeviceEvidenceResponse>(this.apiUrl(`/devices/${encodeURIComponent(deviceId)}/evidence`));
+  }
+
+  getDvrRecordingSettings(): Observable<DvrRecordingSettings> {
+    return this.http.get<DvrRecordingSettings>(this.apiUrl('/cameras/recording-settings'));
+  }
+
+  saveDvrRecordingSettings(payload: DvrRecordingSettings): Observable<DvrRecordingSettings> {
+    return this.http.put<DvrRecordingSettings>(this.apiUrl('/cameras/recording-settings'), payload);
+  }
+
+  getDvrRecordingStatus(): Observable<DvrRecordingStatusResponse> {
+    return this.http.get<DvrRecordingStatusResponse>(this.apiUrl('/cameras/recordings/status'));
+  }
+
+  getDvrTimeline(deviceId?: string | null): Observable<DvrTimelineResponse> {
+    const query = deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : '';
+    return this.http.get<DvrTimelineResponse>(`${this.apiUrl('/cameras/recordings/timeline')}${query}`);
+  }
+
+  startDvrRecording(deviceId: string): Observable<DvrRecordingStatus> {
+    return this.http.post<DvrRecordingStatus>(
+      this.apiUrl(`/cameras/${encodeURIComponent(deviceId)}/recordings/start`),
+      {}
+    );
+  }
+
+  stopDvrRecording(deviceId: string): Observable<DvrRecordingStatus> {
+    return this.http.post<DvrRecordingStatus>(
+      this.apiUrl(`/cameras/${encodeURIComponent(deviceId)}/recordings/stop`),
+      {}
+    );
   }
 
   runDeviceValidation(
@@ -328,8 +364,16 @@ export class HarborDeskAdminApiService {
         return this.getState().pipe(
           switchMap((state) => forkJoin({
             shareLinks: this.getShareLinks(),
-            evidence: this.getDeviceEvidenceProjections(state.devices ?? [])
-          }).pipe(map(({ shareLinks, evidence }) => this.buildDevicesState(state, shareLinks ?? [], evidence))))
+            evidence: this.getDeviceEvidenceProjections(state.devices ?? []),
+            dvrStatus: this.readProjection('GET /api/cameras/recordings/status', this.getDvrRecordingStatus()),
+            dvrTimeline: this.readProjection('GET /api/cameras/recordings/timeline', this.getDvrTimeline())
+          }).pipe(map(({ shareLinks, evidence, dvrStatus, dvrTimeline }) => this.buildDevicesState(
+            state,
+            shareLinks ?? [],
+            evidence,
+            dvrStatus,
+            dvrTimeline
+          ))))
         );
       case 'harboros':
         return this.getState().pipe(map((state) => this.buildHarborOsState(state)));
@@ -1446,7 +1490,9 @@ export class HarborDeskAdminApiService {
   private buildDevicesState(
     state: AdminStateResponse,
     shareLinks: ShareLinkSummary[] = [],
-    evidenceProjections: Record<string, EndpointProjection<DeviceEvidenceResponse>> = {}
+    evidenceProjections: Record<string, EndpointProjection<DeviceEvidenceResponse>> = {},
+    dvrStatusProjection?: EndpointProjection<DvrRecordingStatusResponse>,
+    dvrTimelineProjection?: EndpointProjection<DvrTimelineResponse>
   ): PageState<DeskPageModel> {
     const devices = state.devices ?? [];
     const credentialStatuses = state.device_credential_statuses ?? [];
@@ -1456,6 +1502,12 @@ export class HarborDeskAdminApiService {
     const credentialsConfigured = credentialStatuses.filter((status) => status.configured).length;
     const deviceEvidence = this.buildDeviceEvidencePanels(devices, evidenceProjections, credentialStatuses, shareLinks);
     const evidenceAvailable = Object.values(deviceEvidence).filter((panel) => panel.state === 'available').length;
+    const dvrStatus = dvrStatusProjection?.data;
+    const dvrSettings = dvrStatus?.settings ?? state.dvr ?? this.defaultDvrSettings(state);
+    const dvrTimeline = dvrTimelineProjection?.data;
+    const dvrActive = (dvrStatus?.statuses ?? []).filter((status) => status.status === 'recording').length;
+    const dvrTimelineCount = dvrTimeline?.segments?.length ?? 0;
+    const dvrCapacity = dvrStatus?.capacity ?? this.estimateDvrCapacity(dvrSettings, devices.length);
     const kind = devices.length === 0 ? 'empty' : 'success';
     return {
       kind,
@@ -1470,7 +1522,7 @@ export class HarborDeskAdminApiService {
           'Discover, add, select, test, share, and credential-check cameras here without moving AIoT ownership into HarborOS or HarborGate.',
           '在这里完成摄像头发现、手动添加、默认选择、RTSP/快照测试、分享链接和凭据状态管理；AIoT 不进入 HarborOS 或 HarborGate。'
         ),
-        endpoint: 'GET /api/state + POST /api/devices/*',
+        endpoint: 'GET /api/state + /api/cameras/recordings/* + POST /api/devices/*',
         setupFlow: this.setupFlow(
           this.text('Release-v1 AIoT setup flow', 'AIoT 发布前配置流程'),
           this.text(
@@ -1574,12 +1626,36 @@ export class HarborDeskAdminApiService {
             `${evidenceAvailable}/${devices.length}`,
             this.text('Future per-device evidence projections loaded without rendering secrets.', '未来单设备证据投影加载状态；不渲染密钥。'),
             evidenceAvailable > 0 ? 'good' : devices.length > 0 ? 'warn' : 'neutral'
+          ),
+          this.metric(
+            this.text('DVR active', 'DVR 运行中'),
+            `${dvrActive}/${devices.length}`,
+            this.text('Continuous local segment recording processes currently tracked by HarborBeacon.', 'HarborBeacon 当前跟踪的本地连续分段录像进程。'),
+            dvrActive > 0 ? 'good' : devices.length > 0 ? 'warn' : 'neutral'
+          ),
+          this.metric(
+            this.text('DVR storage estimate', 'DVR 容量估算'),
+            this.formatBytes(dvrCapacity.estimated_bytes_enabled_total),
+            dvrCapacity.disk_budget_warning || this.text(
+              `${dvrCapacity.bitrate_mbps} Mbps for ${dvrCapacity.enabled_camera_count} enabled camera(s), retained ${dvrCapacity.retention_days} day(s).`,
+              `${dvrCapacity.bitrate_mbps} Mbps，启用 ${dvrCapacity.enabled_camera_count} 路，保留 ${dvrCapacity.retention_days} 天。`
+            ),
+            dvrCapacity.disk_budget_warning ? 'warn' : dvrCapacity.enabled_camera_count > 0 ? 'good' : 'neutral'
+          ),
+          this.metric(
+            this.text('DVR timeline', 'DVR 时间轴'),
+            `${dvrTimelineCount}`,
+            dvrTimelineProjection?.state === 'error'
+              ? dvrTimelineProjection.error || this.text('Timeline endpoint failed.', '时间轴接口失败。')
+              : this.text('Recent MP4 segments visible to local video search and replay.', '可用于本地视频检索和回放的最近 MP4 分段。'),
+            dvrTimelineProjection?.state === 'error' ? 'warn' : dvrTimelineCount > 0 ? 'good' : 'neutral'
           )
         ],
         highlights: [
           this.text('AIoT device management is in HarborDesk Devices & AIoT.', 'AIoT 设备管理入口在 HarborDesk “设备与 AIoT”。'),
           this.text('HarborOS remains System Domain only.', 'HarborOS 页面只保留 System Domain。'),
-          this.text('Device credentials render only as redacted configured status.', '设备凭据只显示 redacted/configured 状态。')
+          this.text('Device credentials render only as redacted configured status.', '设备凭据只显示 redacted/configured 状态。'),
+          this.text('DVR video sidecars reuse the existing multimodal RAG/VLM indexing path.', 'DVR 视频 sidecar 复用现有多模态 RAG/VLM 索引路径。')
         ],
         blockers: [],
         detailRows: devices.map((device) => ({
@@ -1601,6 +1677,9 @@ export class HarborDeskAdminApiService {
         deviceCredentialStatuses: credentialStatuses,
         deviceEvidence,
         shareLinks,
+        dvrRecordingSettings: dvrSettings,
+        dvrRecordingStatus: dvrStatus,
+        dvrTimeline,
         emptyNote: this.text('No devices are registered yet.', '尚未注册设备。'),
         nextStep: this.text(
           'Run discovery or manually add a camera, then set the default and run RTSP/snapshot checks.',
@@ -2331,6 +2410,62 @@ export class HarborDeskAdminApiService {
       ];
     }
     return [];
+  }
+
+  private defaultDvrSettings(state: AdminStateResponse): DvrRecordingSettings {
+    const writableRoot = state.writable_root || '/mnt/software/harborbeacon-agent-ci';
+    return {
+      recording_root: `${writableRoot.replace(/\/$/, '')}/camera-dvr`,
+      retention_days: 7,
+      segment_seconds: 300,
+      continuous_recording_enabled: true,
+      low_bitrate_stream_preferred: true,
+      continuous_bitrate_mbps: 2,
+      high_res_event_clips_enabled: true,
+      high_res_event_clip_seconds: 30,
+      continuous_stream_path_hint: '/stream2',
+      high_res_stream_path_hint: '/stream1',
+      disk_budget_gb: null,
+      keyframe_count: 5,
+      keyframe_interval_seconds: 60,
+      enabled_device_ids: []
+    };
+  }
+
+  private estimateDvrCapacity(settings: DvrRecordingSettings, cameraCount: number): DvrCapacityEstimate {
+    const enabled = settings.enabled_device_ids?.length ?? 0;
+    const bitrate = Math.max(1, settings.continuous_bitrate_mbps || 2);
+    const retentionDays = Math.max(1, settings.retention_days || 7);
+    const perCamera = Math.round((bitrate * 1_000_000 * retentionDays * 24 * 60 * 60) / 8);
+    const total = perCamera * enabled;
+    const budget = settings.disk_budget_gb ? settings.disk_budget_gb * 1_000_000_000 : null;
+    return {
+      camera_count: cameraCount,
+      enabled_camera_count: enabled,
+      retention_days: retentionDays,
+      bitrate_mbps: bitrate,
+      estimated_bytes_per_camera: perCamera,
+      estimated_bytes_enabled_total: total,
+      disk_budget_bytes: budget,
+      disk_budget_warning: budget && total > budget
+        ? this.text('Estimated DVR usage exceeds the configured disk budget.', 'DVR 估算用量超过配置的磁盘预算。')
+        : null
+    };
+  }
+
+  private formatBytes(bytes: number | undefined | null): string {
+    const value = Number(bytes ?? 0);
+    if (value <= 0) {
+      return '0 B';
+    }
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let size = value;
+    let unit = 0;
+    while (size >= 1000 && unit < units.length - 1) {
+      size /= 1000;
+      unit += 1;
+    }
+    return `${size >= 10 || unit === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unit]}`;
   }
 
   private deviceRtspConfigured(device: { primary_stream?: { url?: string; transport?: string }; profile?: { rtsp_url?: string }; capabilities?: { stream?: boolean } }): boolean {

@@ -2,11 +2,13 @@
 
 ## Purpose
 
-This watchlist defines the device-domain metadata contract for future
-multimodal ingest. It is VLM-first: the first-version input surface is image,
-snapshot, and still-frame content for the HarborDesk device page, while
-continuous video and audio stay follow-up work. It keeps AIoT focused on
-producing index-friendly media artifacts, not search or ranking logic.
+This watchlist defines the device-domain metadata contract for multimodal
+ingest. It is VLM-first: the first-version input surface is image, snapshot,
+still-frame, and local DVR segment content for the HarborDesk device page.
+Continuous video is stored as rolling media segments and summarized through
+keyframe sidecars, while audio transcript extraction stays follow-up work. It
+keeps AIoT focused on producing index-friendly media artifacts, not search or
+ranking logic.
 
 Release-v1 reuses existing camera profile, recording policy, admin defaults,
 and model policy records. The device lane should not invent a new
@@ -28,9 +30,9 @@ keyframe hints.
 
 ## VLM First
 
-This round is VLM-first. The device lane should make image, snapshot, and
-still-frame artifacts easy to ingest later, while leaving continuous video and
-audio as follow-up work.
+This round is VLM-first. The device lane should make image, snapshot,
+still-frame, and DVR segment artifacts easy to ingest through the existing
+knowledge pipeline, while leaving audio transcript extraction as follow-up work.
 
 For the local retrieval demo, the framework should point at the persisted
 snapshot image under `.harborbeacon/vision/snapshots/` plus its sibling
@@ -62,6 +64,14 @@ Current image-side signals already available for framework ingestion:
   - ingest disposition: `knowledge_index_candidate`
   - emit a stable `.json` sidecar next to the clip file with clip timing and
     keyframe hints
+- `dvr_segment`
+  - keep: `started_at`, `ended_at`, `duration_seconds`, `retention_expires_at`,
+    `stream_kind`, `device_id`, `device_name`, `room`, `vendor`, `model`,
+    `discovery_source`
+  - provenance: `media`
+  - ingest disposition: `knowledge_index_candidate`
+  - emit a stable `.json` sidecar next to the segment file with source video,
+    timing, stream kind, retention, and keyframe hints
 - `vision.analyze_camera` snapshot artifact
   - keep the same media metadata as the source snapshot
   - keep `source_storage`, `byte_size`, and the annotated image path when
@@ -126,7 +136,6 @@ Current image-side signals already available for framework ingestion:
 ## Still Missing For Full Multimodal Search
 
 - OCR extraction from image artifacts
-- video clip ingestion and clip-sidecar generation
 - audio transcript or speech segment extraction
 - semantic vision summaries that are separate from the file sidecar
 - query routing, ranking, and answer synthesis, which stay in the framework
@@ -155,8 +164,8 @@ Date: 2026-04-19
 
 Boundary proof:
 
-- VLM-first boundary proof: image, snapshot, and still-frame artifacts remain device-generated inputs for later framework ingestion.
-- continuous video remains follow-up work and does not become part of the first-version input surface.
+- VLM-first boundary proof: image, snapshot, still-frame, clip, and DVR segment artifacts remain device-generated inputs for framework ingestion.
+- continuous video is first represented as rolling media segments with keyframe sidecars; it does not create a DVR-specific VLM, embedding, reranker, or answer chain.
 - `discover`, `connect`, `inspect`, `control`, and `ptz` remain control/runtime artifacts, not citation candidates.
 - `inspect` and `control` stay runtime-only and are not promoted into retrieval ownership.
 - media capture remains separate from control execution and HarborOS system control.

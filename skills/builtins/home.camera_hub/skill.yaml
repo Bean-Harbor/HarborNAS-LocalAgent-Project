@@ -10,6 +10,11 @@ capabilities:
   - camera.share_link
   - camera.live_view
   - camera.analyze
+  - camera.recording_start
+  - camera.recording_stop
+  - camera.recording_status
+  - camera.video_search
+  - camera.daily_report
   - camera.ptz
 executors:
   mcp:

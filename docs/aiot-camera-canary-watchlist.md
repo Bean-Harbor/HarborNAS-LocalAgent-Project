@@ -6,13 +6,14 @@ This watchlist is for the Home Device Domain cutover day. It keeps camera
 journeys observable without widening into IM transport or HarborOS system
 control.
 
-This round is VLM-first for the HarborDesk device page: image, snapshot, and
-still-frame inputs are first-version surfaces, while continuous video stays
-follow-up work.
+This round is VLM-first for the HarborDesk device page: image, snapshot,
+still-frame, and local DVR segment inputs are first-version surfaces. Continuous
+video is stored as low-bitrate rolling segments and indexed through keyframe
+sidecars, not through a DVR-specific model chain.
 
-Release-v1 can add short-clip capture as a media artifact, but the device lane
-must continue to express it through the existing recording policy and camera
-profile records rather than a new use-case profile object.
+Release-v1 adds local DVR capture as media artifacts, but the device lane must
+continue to express it through the existing recording policy, camera profile,
+and HarborDesk DVR settings records rather than a new use-case profile object.
 
 ## Devices & AIoT Admin Summary
 
@@ -23,9 +24,9 @@ profile records rather than a new use-case profile object.
   `needs_input` and `resume_token`, snapshot stays media-only, share output
   stays a signed link artifact, inspect stays read-only, and control stays
   device-native.
-- Clip watch: if release-v1 enables short clips, the device lane only needs to
-  surface clip length and keyframe hints; HarborDesk should continue to use the
-  existing recording policy and camera profile records.
+- DVR watch: release-v1 surfaces segment length, retention, stream kind, and
+  keyframe hints; HarborDesk continues to use the existing recording policy,
+  camera profile records, and DVR settings.
 - Non-regression: `route_key` stays opaque routing metadata, `resume_token`
   stays business-flow continuation, camera control never becomes HarborOS
   system control, and retrieval/control separation stays explicit.
@@ -37,7 +38,7 @@ profile records rather than a new use-case profile object.
 - explicit coverage for `discover`, `snapshot`, `share_link`, `inspect`, and
   `control` while staying inside the device domain
 - snapshot, live view share (`camera.share_link`, with `camera.live_view` accepted as a compatibility alias), and analyze flows where the current codebase supports them
-- image, snapshot, and still-frame inputs are the first-version VLM surface for HarborDesk; continuous video stays follow-up work
+- image, snapshot, still-frame, and local DVR segment inputs are the first-version VLM surface for HarborDesk; video understanding uses keyframe sidecars
 - media/control separation in the device runtime
 - legacy fallback when `route_key` is absent
 
@@ -59,9 +60,9 @@ profile records rather than a new use-case profile object.
 5. `camera.analyze`
    - expected signal: analysis returns text plus artifact references
    - watch fields: `analysis.text`, `artifacts[]`, `source`
-6. `camera.record_clip`
-   - expected signal: clip capture returns a media artifact plus keyframe hints
-   - watch fields: `clip_length_seconds`, `storage.target`, `mime_type`, `byte_size`
+6. `camera.record_clip` / `camera.recording_start`
+   - expected signal: clip or rolling DVR capture returns media artifacts plus keyframe hints
+   - watch fields: `clip_length_seconds`, `segment_seconds`, `stream_kind`, `storage.target`, `mime_type`, `byte_size`
 7. `device.inspect`
    - expected signal: device inspection returns read-only device state and
      metadata without mutating ownership
@@ -103,8 +104,8 @@ Date: 2026-04-19
 Boundary proof:
 
 - `discover`, `snapshot`, `share_link`, `inspect`, and `control` stay owned by the Home Device Domain.
-- HarborDesk's device page treats image, snapshot, and still-frame inputs as the first-version VLM surface, while continuous video remains follow-up work.
-- short clips stay media artifacts with keyframe-derived retrieval evidence, not full continuous-video semantics.
+- HarborDesk's device page treats image, snapshot, still-frame, and DVR segment inputs as the first-version VLM surface.
+- short clips and rolling DVR segments stay media artifacts with keyframe-derived retrieval evidence, not a separate continuous-video model stack.
 - `camera.share_link` remains the canonical device-lane action; `camera.live_view` stays a compatibility alias only.
 - `inspect` stays read-only and device-owned.
 - `control` stays device-native and is not claimed by HarborOS executors or HarborOS system control.

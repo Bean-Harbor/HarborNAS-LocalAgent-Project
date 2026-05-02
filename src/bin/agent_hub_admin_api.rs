@@ -44,6 +44,9 @@ use harborbeacon_local_agent::runtime::admin_console::{
     KnowledgeSettings, KnowledgeSourceRoot, ModelDownloadJobRecord, RagResourceProfile,
 };
 use harborbeacon_local_agent::runtime::discovery::RtspProbeRequest;
+use harborbeacon_local_agent::runtime::dvr::{
+    apply_retention_policy, build_status_response, scan_timeline, DvrRecordingSettings, DvrRuntime,
+};
 use harborbeacon_local_agent::runtime::hub::{
     CameraConnectRequest, CameraHubService, HubManualAddSummary, HubScanRequest, HubScanSummary,
     HubStateSnapshot,
@@ -187,6 +190,7 @@ impl Cli {
 pub struct AdminApi {
     admin_store: AdminConsoleStore,
     task_service: TaskApiService,
+    dvr_runtime: DvrRuntime,
     harbordesk_dist: PathBuf,
     public_origin: String,
 }
@@ -917,6 +921,7 @@ impl AdminApi {
         Self {
             admin_store,
             task_service,
+            dvr_runtime: DvrRuntime::default(),
             harbordesk_dist,
             public_origin,
         }
@@ -1061,6 +1066,18 @@ impl AdminApi {
             Method::Get if path == "/api/files/browse" => {
                 self.handle_files_browse(&raw_url, &identity_hints).boxed()
             }
+            Method::Get if path == "/api/cameras/recording-settings" => {
+                self.handle_dvr_recording_settings(&identity_hints).boxed()
+            }
+            Method::Put if path == "/api/cameras/recording-settings" => self
+                .handle_save_dvr_recording_settings(&mut request, &identity_hints)
+                .boxed(),
+            Method::Get if path == "/api/cameras/recordings/status" => {
+                self.handle_dvr_recordings_status(&identity_hints).boxed()
+            }
+            Method::Get if path == "/api/cameras/recordings/timeline" => self
+                .handle_dvr_recordings_timeline(&raw_url, &identity_hints)
+                .boxed(),
             Method::Get if path == "/api/harboros/status" => {
                 self.handle_harboros_status(&identity_hints).boxed()
             }
@@ -1234,6 +1251,18 @@ impl AdminApi {
             }
             Method::Post if path.starts_with("/api/cameras/") && path.ends_with("/share-link") => {
                 self.handle_camera_share_link(&path, &identity_hints)
+                    .boxed()
+            }
+            Method::Post
+                if path.starts_with("/api/cameras/") && path.ends_with("/recordings/start") =>
+            {
+                self.handle_dvr_recording_start(&path, &identity_hints)
+                    .boxed()
+            }
+            Method::Post
+                if path.starts_with("/api/cameras/") && path.ends_with("/recordings/stop") =>
+            {
+                self.handle_dvr_recording_stop(&path, &identity_hints)
                     .boxed()
             }
             Method::Post if path.starts_with("/api/share-links/") && path.ends_with("/revoke") => {
@@ -1598,6 +1627,101 @@ impl AdminApi {
             Err(error) => return error_json(error.status, &error.message),
         };
         static_file_response(&preview_path)
+    }
+
+    fn handle_dvr_recording_settings(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        match self.admin_store.dvr_recording_settings() {
+            Ok(settings) => ok_json(&settings),
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
+    fn handle_save_dvr_recording_settings(
+        &self,
+        request: &mut Request,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminManage) {
+            return error_json(StatusCode(403), &error);
+        }
+        let settings: DvrRecordingSettings = match read_json_body(request) {
+            Ok(payload) => payload,
+            Err(error) => return error_json(StatusCode(400), &error),
+        };
+        match self.admin_store.save_dvr_recording_settings(settings) {
+            Ok(state) => ok_json(&state.dvr),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_dvr_recordings_status(
+        &self,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let settings = match self.admin_store.dvr_recording_settings() {
+            Ok(settings) => settings,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let devices = match self.hub().load_registered_cameras() {
+            Ok(devices) => devices,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let statuses =
+            match self
+                .dvr_runtime
+                .statuses(&devices, &settings, Some(&self.public_origin))
+            {
+                Ok(statuses) => statuses,
+                Err(error) => return error_json(StatusCode(500), &error),
+            };
+        ok_json(&build_status_response(settings, statuses, devices.len()))
+    }
+
+    fn handle_dvr_recordings_timeline(
+        &self,
+        raw_url: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        if let Err(error) = self.authorize_admin_action(hints, AccessAction::AdminReadState) {
+            return error_json(StatusCode(403), &error);
+        }
+        let settings = match self.admin_store.dvr_recording_settings() {
+            Ok(settings) => settings,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        if let Err(error) = apply_retention_policy(&settings) {
+            return error_json(StatusCode(422), &error);
+        }
+        let devices = match self.hub().load_registered_cameras() {
+            Ok(devices) => devices,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        let device_id = parse_query_param(raw_url, "device_id")
+            .and_then(percent_decode_optional_query_value)
+            .and_then(|value| non_empty_string(&value));
+        let from_secs =
+            parse_query_param(raw_url, "from").and_then(|value| value.parse::<u64>().ok());
+        let to_secs = parse_query_param(raw_url, "to").and_then(|value| value.parse::<u64>().ok());
+        match scan_timeline(
+            &settings,
+            &devices,
+            device_id.as_deref(),
+            from_secs,
+            to_secs,
+            Some(&self.public_origin),
+        ) {
+            Ok(response) => ok_json(&response),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
     }
 
     fn handle_run_knowledge_index(
@@ -2970,6 +3094,91 @@ impl AdminApi {
         })
     }
 
+    fn handle_dvr_recording_start(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let device_id = match parse_camera_recording_start_path(path) {
+            Some(device_id) => device_id,
+            None => return error_json(StatusCode(400), "invalid camera recording start path"),
+        };
+        if let Err(error) =
+            self.authorize_camera_action(hints, &device_id, AccessAction::CameraOperate)
+        {
+            return error_json(StatusCode(403), &error);
+        }
+        let device = match self.load_camera_device(&device_id) {
+            Ok(device) => device,
+            Err(error) if error.contains("device not found") => {
+                return error_json(StatusCode(404), &error)
+            }
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
+        let mut settings = match self.admin_store.dvr_recording_settings() {
+            Ok(settings) => settings,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        if !settings
+            .enabled_device_ids
+            .iter()
+            .any(|enabled| enabled == &device_id)
+        {
+            settings.enabled_device_ids.push(device_id.clone());
+        }
+        let settings = match self.admin_store.save_dvr_recording_settings(settings) {
+            Ok(state) => state.dvr,
+            Err(error) => return error_json(StatusCode(422), &error),
+        };
+        match self
+            .dvr_runtime
+            .start_recording(&device, &settings, Some(&self.public_origin))
+        {
+            Ok(status) => ok_json(&status),
+            Err(error) => error_json(StatusCode(422), &error),
+        }
+    }
+
+    fn handle_dvr_recording_stop(
+        &self,
+        path: &str,
+        hints: &AccessIdentityHints,
+    ) -> Response<std::io::Cursor<Vec<u8>>> {
+        let device_id = match parse_camera_recording_stop_path(path) {
+            Some(device_id) => device_id,
+            None => return error_json(StatusCode(400), "invalid camera recording stop path"),
+        };
+        if let Err(error) =
+            self.authorize_camera_action(hints, &device_id, AccessAction::CameraOperate)
+        {
+            return error_json(StatusCode(403), &error);
+        }
+        if let Err(error) = self.load_camera_device(&device_id) {
+            return if error.contains("device not found") {
+                error_json(StatusCode(404), &error)
+            } else {
+                error_json(StatusCode(422), &error)
+            };
+        }
+        let mut settings = match self.admin_store.dvr_recording_settings() {
+            Ok(settings) => settings,
+            Err(error) => return error_json(StatusCode(500), &error),
+        };
+        settings
+            .enabled_device_ids
+            .retain(|enabled| enabled != &device_id);
+        if let Err(error) = self.admin_store.save_dvr_recording_settings(settings) {
+            return error_json(StatusCode(422), &error);
+        }
+        match self
+            .dvr_runtime
+            .stop_recording(&device_id, Some(&self.public_origin))
+        {
+            Ok(status) => ok_json(&status),
+            Err(error) => error_json(StatusCode(500), &error),
+        }
+    }
+
     fn handle_revoke_share_link(
         &self,
         path: &str,
@@ -3832,6 +4041,13 @@ fn normalize_unified_admin_url(raw_url: &str) -> String {
 }
 
 fn normalize_unified_admin_path(path: &str) -> String {
+    if let Some(tail) = path.strip_prefix("/api/harbordesk") {
+        let tail = tail.trim_start_matches('/');
+        if tail.is_empty() {
+            return "/api/state".to_string();
+        }
+        return format!("/api/{tail}");
+    }
     let Some(tail) = path.strip_prefix("/api/admin") else {
         return path.to_string();
     };
@@ -5001,6 +5217,9 @@ fn is_admin_surface_path(path: &str) -> bool {
         || path == "/api/knowledge/index/jobs"
         || (path.starts_with("/api/knowledge/index/jobs/") && path.ends_with("/cancel"))
         || path == "/api/files/browse"
+        || path == "/api/cameras/recording-settings"
+        || path == "/api/cameras/recordings/status"
+        || path == "/api/cameras/recordings/timeline"
         || path == "/api/harboros/status"
         || path == "/api/harboros/im-capability-map"
         || path == "/api/models/endpoints"
@@ -5028,6 +5247,8 @@ fn is_admin_surface_path(path: &str) -> bool {
         || (path.starts_with("/api/devices/") && path.ends_with("/credential-status"))
         || (path.starts_with("/api/devices/") && path.ends_with("/rtsp-check"))
         || (path.starts_with("/api/cameras/") && path.ends_with("/share-link"))
+        || (path.starts_with("/api/cameras/") && path.ends_with("/recordings/start"))
+        || (path.starts_with("/api/cameras/") && path.ends_with("/recordings/stop"))
         || (path.starts_with("/api/share-links/") && path.ends_with("/revoke"))
         || (path.starts_with("/api/cameras/") && path.ends_with("/snapshot"))
         || (path.starts_with("/api/cameras/") && path.ends_with("/analyze"))
@@ -10604,6 +10825,24 @@ fn parse_camera_share_link_path(path: &str) -> Option<String> {
     }
 }
 
+fn parse_camera_recording_start_path(path: &str) -> Option<String> {
+    parse_camera_recording_action_path(path, "/recordings/start")
+}
+
+fn parse_camera_recording_stop_path(path: &str) -> Option<String> {
+    parse_camera_recording_action_path(path, "/recordings/stop")
+}
+
+fn parse_camera_recording_action_path(path: &str, suffix: &str) -> Option<String> {
+    let trimmed = path.strip_prefix("/api/cameras/")?;
+    let device_id = trimmed.strip_suffix(suffix)?;
+    if device_id.is_empty() {
+        None
+    } else {
+        percent_decode_path_segment(device_id).ok()
+    }
+}
+
 fn parse_device_credentials_path(path: &str) -> Option<String> {
     parse_device_scoped_path(path, "/credentials")
 }
@@ -10804,9 +11043,10 @@ mod tests {
         is_harbordesk_surface_path, knowledge_preview_mime_supported,
         live_bridge_provider_from_setup_status, local_model_catalog_item,
         local_model_catalog_specs, mime_type_for_path, model_download_huggingface_endpoint,
-        model_download_jobs_status, model_snapshot_file_allowed,
+        model_download_jobs_status, model_snapshot_file_allowed, normalize_unified_admin_path,
         overlay_model_endpoints_with_runtime_truth, parse_approval_decision_path,
         parse_camera_analyze_path, parse_camera_live_page_path, parse_camera_live_stream_path,
+        parse_camera_recording_start_path, parse_camera_recording_stop_path,
         parse_camera_share_link_path, parse_camera_snapshot_path, parse_camera_task_snapshot_path,
         parse_device_credential_status_path, parse_device_credentials_path,
         parse_device_evidence_path, parse_device_metadata_patch_path, parse_device_rtsp_check_path,
@@ -11111,6 +11351,14 @@ mod tests {
         );
         assert_eq!(
             parse_camera_live_stream_path(&format!("/api/cameras/{encoded}/live.mjpeg")),
+            Some("camera 1/left".to_string())
+        );
+        assert_eq!(
+            parse_camera_recording_start_path(&format!("/api/cameras/{encoded}/recordings/start")),
+            Some("camera 1/left".to_string())
+        );
+        assert_eq!(
+            parse_camera_recording_stop_path(&format!("/api/cameras/{encoded}/recordings/stop")),
             Some("camera 1/left".to_string())
         );
         assert_eq!(
@@ -11447,11 +11695,32 @@ mod tests {
             "/api/tasks/approvals/approval-1/reject"
         ));
         assert!(is_admin_surface_path("/api/cameras/camera-1/share-link"));
+        assert!(is_admin_surface_path("/api/cameras/recording-settings"));
+        assert!(is_admin_surface_path("/api/cameras/recordings/status"));
+        assert!(is_admin_surface_path("/api/cameras/recordings/timeline"));
+        assert!(is_admin_surface_path(
+            "/api/cameras/camera-1/recordings/start"
+        ));
+        assert!(is_admin_surface_path(
+            "/api/cameras/camera-1/recordings/stop"
+        ));
         assert!(is_admin_surface_path(
             "/api/share-links/share-link-1/revoke"
         ));
         assert!(is_admin_surface_path("/api/cameras/camera-1/snapshot"));
         assert!(is_admin_surface_path("/api/cameras/camera-1/analyze"));
+    }
+
+    #[test]
+    fn harbordesk_api_prefix_normalizes_to_admin_api_routes() {
+        assert_eq!(
+            normalize_unified_admin_path("/api/harbordesk/cameras/recording-settings"),
+            "/api/cameras/recording-settings"
+        );
+        assert_eq!(
+            normalize_unified_admin_path("/api/harbordesk"),
+            "/api/state"
+        );
     }
 
     #[test]

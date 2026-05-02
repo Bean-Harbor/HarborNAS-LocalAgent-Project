@@ -1169,6 +1169,96 @@
             </section>
           </div>
 
+          @if (hydrateDvrForm(state.data.dvrRecordingSettings)) {
+            <section class="device-admin-block dvr-admin-block">
+              <div class="section-head">
+                <div>
+                  <p class="content-label">{{ text('Local camera DVR', '本地摄像头 DVR') }}</p>
+                  <p class="table-copy">{{ text('Continuous recording stores low-bitrate MP4 segments locally; high-resolution remains for event/manual clips and video search reuses the existing multimodal RAG/VLM index.', '连续录像本地保存低码率 MP4 分段；高清保留给事件/手动片段，视频检索复用现有多模态 RAG/VLM 索引。') }}</p>
+                </div>
+                <button type="button" class="action-button" [disabled]="deviceActionBusyKey === 'dvr:settings'" (click)="requestDvrSettingsSave()">
+                  {{ deviceActionBusyKey === 'dvr:settings' ? text('Saving...', '保存中...') : text('Save DVR settings', '保存 DVR 设置') }}
+                </button>
+              </div>
+
+              <div class="form-grid dvr-form-grid">
+                <label class="wide-field">
+                  <span>recording_root</span>
+                  <input name="dvr-root" [(ngModel)]="dvrForm.recording_root" placeholder="/mnt/software/harborbeacon-agent-ci/camera-dvr" />
+                </label>
+                <label>
+                  <span>{{ text('Retention days', '保留天数') }}</span>
+                  <input name="dvr-retention" type="number" min="1" max="365" [(ngModel)]="dvrForm.retention_days" />
+                </label>
+                <label>
+                  <span>{{ text('Segment seconds', '分段秒数') }}</span>
+                  <input name="dvr-segment" type="number" min="30" max="3600" [(ngModel)]="dvrForm.segment_seconds" />
+                </label>
+                <label>
+                  <span>{{ text('Continuous Mbps', '连续码率 Mbps') }}</span>
+                  <input name="dvr-bitrate" type="number" min="1" max="20" [(ngModel)]="dvrForm.continuous_bitrate_mbps" />
+                </label>
+                <label>
+                  <span>{{ text('Disk budget GB', '磁盘预算 GB') }}</span>
+                  <input name="dvr-budget" type="number" min="1" [(ngModel)]="dvrForm.disk_budget_gb" />
+                </label>
+                <label>
+                  <span>{{ text('Substream path', '子码流路径') }}</span>
+                  <input name="dvr-substream" [(ngModel)]="dvrForm.continuous_stream_path_hint" placeholder="/stream2" />
+                </label>
+                <label>
+                  <span>{{ text('Mainstream path', '主码流路径') }}</span>
+                  <input name="dvr-mainstream" [(ngModel)]="dvrForm.high_res_stream_path_hint" placeholder="/stream1" />
+                </label>
+                <label>
+                  <span>{{ text('Event clip seconds', '事件片段秒数') }}</span>
+                  <input name="dvr-event-seconds" type="number" min="3" max="600" [(ngModel)]="dvrForm.high_res_event_clip_seconds" />
+                </label>
+              </div>
+
+              <div class="toggle-grid">
+                <label class="toggle-row">
+                  <input name="dvr-continuous-enabled" type="checkbox" [(ngModel)]="dvrForm.continuous_recording_enabled" />
+                  <span>{{ text('Continuous recording enabled', '启用连续录像') }}</span>
+                </label>
+                <label class="toggle-row">
+                  <input name="dvr-low-bitrate" type="checkbox" [(ngModel)]="dvrForm.low_bitrate_stream_preferred" />
+                  <span>{{ text('Prefer low-bitrate stream', '优先子码流') }}</span>
+                </label>
+                <label class="toggle-row">
+                  <input name="dvr-highres-events" type="checkbox" [(ngModel)]="dvrForm.high_res_event_clips_enabled" />
+                  <span>{{ text('Keep high-res event/manual clips', '保留高清事件/手动片段') }}</span>
+                </label>
+              </div>
+
+              @if (state.data.dvrRecordingStatus; as dvrStatus) {
+                <div class="readiness-status-grid dvr-status-grid">
+                  <section class="readiness-status-card" [ngClass]="dvrStatus.root_writable ? 'tone-good' : 'tone-warn'">
+                    <div class="detail-row-head">
+                      <strong>{{ text('Recording root', '录像目录') }}</strong>
+                      <span>{{ dvrStatus.root_writable ? text('writable', '可写') : text('check needed', '需检查') }}</span>
+                    </div>
+                    <p class="feature-copy"><code>{{ dvrStatus.settings.recording_root }}</code></p>
+                  </section>
+                  <section class="readiness-status-card" [ngClass]="dvrStatus.capacity.disk_budget_warning ? 'tone-warn' : 'tone-good'">
+                    <div class="detail-row-head">
+                      <strong>{{ text('Capacity', '容量') }}</strong>
+                      <span>{{ bytesLabel(dvrStatus.capacity.estimated_bytes_enabled_total) }}</span>
+                    </div>
+                    <p class="feature-copy">{{ dvrStatus.capacity.disk_budget_warning || text('Budget estimate is within the configured threshold or no disk budget is set.', '容量估算未超过预算，或未设置磁盘预算。') }}</p>
+                  </section>
+                  <section class="readiness-status-card">
+                    <div class="detail-row-head">
+                      <strong>{{ text('Index boundary', '索引边界') }}</strong>
+                      <span>RAG/VLM</span>
+                    </div>
+                    <p class="feature-copy">{{ text('DVR writes sidecars; existing knowledge index extracts keyframes and calls model_center VLM.', 'DVR 只写 sidecar；现有知识索引负责抽帧并调用 model_center VLM。') }}</p>
+                  </section>
+                </div>
+              }
+            </section>
+          }
+
           @if (state.data.devices?.length) {
             <div class="table-wrap device-table-wrap">
               <table class="data-table device-table">
@@ -1196,6 +1286,12 @@
                         <span class="cell-note">RTSP: {{ device.primary_stream?.url || device.profile?.rtsp_url ? text('configured', '已配置') : text('pending', '待配置') }}</span>
                         <span class="cell-note">{{ text('snapshot', '快照') }}: {{ device.snapshot_url || device.profile?.snapshot_url || device.capabilities?.snapshot ? 'ready' : text('fallback/pending', 'fallback/待配置') }}</span>
                         <span class="cell-note">{{ text('share links', '分享链接') }}: {{ activeShareLinks(device.device_id) }}</span>
+                        <span class="cell-note" [ngClass]="dvrRecording(device.device_id) ? 'tone-success' : dvrEnabled(device.device_id) ? 'tone-warn' : 'muted'">
+                          DVR: {{ dvrStatus(device.device_id)?.status || (dvrEnabled(device.device_id) ? text('enabled', '已启用') : text('stopped', '已停止')) }}
+                        </span>
+                        @if (dvrStatus(device.device_id)?.last_segment_path) {
+                          <span class="cell-note">{{ text('last segment', '最近分段') }}: {{ dvrStatus(device.device_id)?.last_segment_path }}</span>
+                        }
                         @if (rtspCheckResults[device.device_id]) {
                           <span class="cell-note" [ngClass]="rtspCheckResults[device.device_id].reachable ? 'tone-success' : 'tone-danger'">
                             RTSP {{ text('check', '检查') }}: {{ rtspCheckResults[device.device_id].reachable ? text('reachable', '可达') : text('failed', '失败') }}
@@ -1271,6 +1367,18 @@
                           <button type="button" class="action-button" [disabled]="isDeviceBusy(device.device_id, 'share')" (click)="requestCameraShareLink(device.device_id)">
                             {{ isDeviceBusy(device.device_id, 'share') ? text('Creating...', '创建中...') : text('Create share link', '创建分享链接') }}
                           </button>
+                          <a class="action-button" [href]="liveViewUrl(device.device_id)" target="_blank" rel="noopener">
+                            {{ text('Live view', '实时查看') }}
+                          </a>
+                          @if (dvrRecording(device.device_id)) {
+                            <button type="button" class="action-button" [disabled]="isDeviceBusy(device.device_id, 'dvr-stop')" (click)="requestDvrStop(device.device_id)">
+                              {{ isDeviceBusy(device.device_id, 'dvr-stop') ? text('Stopping...', '停止中...') : text('Stop DVR', '停止录像') }}
+                            </button>
+                          } @else {
+                            <button type="button" class="action-button" [disabled]="isDeviceBusy(device.device_id, 'dvr-start')" (click)="requestDvrStart(device.device_id)">
+                              {{ isDeviceBusy(device.device_id, 'dvr-start') ? text('Starting...', '启动中...') : text('Start DVR', '启动录像') }}
+                            </button>
+                          }
                           <button type="button" class="action-button" [disabled]="isDeviceBusy(device.device_id, 'validation')" (click)="requestDeviceValidation(device.device_id)">
                             {{ isDeviceBusy(device.device_id, 'validation') ? text('Validating...', '验收中...') : text('Run validation', '运行验收') }}
                           </button>
@@ -1281,6 +1389,38 @@
                 </tbody>
               </table>
             </div>
+          }
+
+          @if (state.data.dvrTimeline?.segments?.length) {
+            <section class="device-admin-block dvr-timeline-block">
+              <div class="section-head">
+                <div>
+                  <p class="content-label">{{ text('Recent DVR timeline', '最近 DVR 时间轴') }}</p>
+                  <p class="table-copy">{{ text('Replay opens through HarborBeacon preview/proxy URLs; raw RTSP addresses and device credentials stay hidden.', '回放通过 HarborBeacon 预览/代理 URL 打开；原始 RTSP 地址和设备凭据不暴露。') }}</p>
+                </div>
+              </div>
+              <div class="timeline-grid">
+                @for (segment of dvrTimeline().slice(0, 12); track segment.file_path) {
+                  <section class="timeline-item" [ngClass]="segment.indexed ? 'tone-good' : 'tone-warn'">
+                    <div class="detail-row-head">
+                      <strong>{{ segment.device_id }}</strong>
+                      <span>{{ segment.stream_kind }}</span>
+                    </div>
+                    <p>{{ formatUnix(segment.started_at) }} - {{ formatUnix(segment.ended_at) }}</p>
+                    <ul class="detail-meta">
+                      <li>{{ text('Size', '大小') }}: {{ bytesLabel(segment.size_bytes) }}</li>
+                      <li>{{ text('Sidecar', 'Sidecar') }}: {{ segment.indexed ? text('ready', '已就绪') : text('pending', '待生成') }}</li>
+                      <li>{{ text('Retain until', '保留至') }}: {{ formatUnix(segment.retention_expires_at) }}</li>
+                    </ul>
+                    @if (segment.replay_url) {
+                      <a class="action-button preview-link-button" [href]="segment.replay_url" target="_blank" rel="noopener">
+                        {{ text('Replay', '回放') }}
+                      </a>
+                    }
+                  </section>
+                }
+              </div>
+            </section>
           }
 
           @if (state.data.shareLinks?.length) {

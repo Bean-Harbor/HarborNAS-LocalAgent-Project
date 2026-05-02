@@ -23,6 +23,7 @@ use crate::runtime::admin_console::{
 use crate::runtime::discovery::{
     default_rtsp_paths, DiscoveryProtocol, DiscoveryRequest, DiscoveryService, RtspProbeRequest,
 };
+use crate::runtime::dvr::DvrRecordingSettings;
 use crate::runtime::media::{SnapshotCaptureRequest, SnapshotCaptureResult, SnapshotFormat};
 use crate::runtime::registry::{CameraDevice, DeviceRegistryStore, DeviceStatus, StreamTransport};
 
@@ -31,6 +32,7 @@ pub struct HubStateSnapshot {
     pub binding: AdminBindingState,
     pub defaults: AdminDefaults,
     pub bridge_provider: BridgeProviderConfig,
+    pub dvr: DvrRecordingSettings,
     pub delivery_policy: DeliveryPolicySummary,
     pub writable_root: String,
     pub current_principal_user_id: String,
@@ -139,6 +141,7 @@ impl CameraHubService {
             binding: enrich_binding_urls(state.binding, public_origin),
             defaults: state.defaults,
             bridge_provider: state.bridge_provider,
+            dvr: state.dvr,
             delivery_policy: delivery_policy_summary(),
             writable_root: harboros_writable_root(),
             current_principal_user_id: harboros_current_user_id(),
@@ -350,7 +353,9 @@ impl CameraHubService {
                 .cloned();
             let path_candidates = effective_rtsp_path_candidates(
                 &state.defaults.rtsp_paths,
-                existing.as_ref().and_then(|device| device.vendor.as_deref()),
+                existing
+                    .as_ref()
+                    .and_then(|device| device.vendor.as_deref()),
                 existing.as_ref().and_then(|device| device.model.as_deref()),
             );
             let probe_request = RtspProbeRequest {
@@ -511,8 +516,11 @@ impl CameraHubService {
                 .or_else(|| device.and_then(|item| item.model.clone()));
             let mut candidate_paths = candidate.rtsp_paths.clone();
             candidate_paths.extend(state.defaults.rtsp_paths.iter().cloned());
-            let rtsp_paths =
-                effective_rtsp_path_candidates(&candidate_paths, vendor.as_deref(), model.as_deref());
+            let rtsp_paths = effective_rtsp_path_candidates(
+                &candidate_paths,
+                vendor.as_deref(),
+                model.as_deref(),
+            );
 
             let base = match candidate.protocol {
                 DiscoveryProtocol::Onvif => "ONVIF",
@@ -913,8 +921,7 @@ mod tests {
     use super::{
         bridge_provider_status_from_gateway_response, build_mobile_setup_url,
         effective_rtsp_path_candidates, humanize_probe_error, looks_like_auth_error, merge_camera,
-        normalize_camera_metadata,
-        resolve_discovery_protocols,
+        normalize_camera_metadata, resolve_discovery_protocols,
     };
     use crate::connectors::im_gateway::{GatewayPlatformCapabilities, GatewayPlatformStatus};
     use crate::runtime::registry::{CameraDevice, StreamTransport};
@@ -953,7 +960,10 @@ mod tests {
         assert!(paths.contains(&"/stream2".to_string()));
         assert!(paths.contains(&"/live".to_string()));
         assert_eq!(
-            paths.iter().filter(|path| path.as_str() == "/stream1").count(),
+            paths
+                .iter()
+                .filter(|path| path.as_str() == "/stream1")
+                .count(),
             1
         );
     }

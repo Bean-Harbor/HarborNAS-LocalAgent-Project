@@ -8,6 +8,7 @@ import {
   DeviceCredentialsPayload,
   DeliverySurface,
   DiscoveryScanPayload,
+  DvrRecordingSettings,
   FilesBrowseResponse,
   KnowledgeIndexRunResponse,
   KnowledgeSearchRequestPayload,
@@ -69,6 +70,9 @@ import { PageStatePanelComponent } from '../shared/page-state-panel.component';
       (deviceRtspCheck)="checkDeviceRtsp($event.deviceId, $event.payload)"
       (cameraSnapshotRequested)="testCameraSnapshot($event)"
       (cameraShareLinkCreate)="createCameraShareLink($event)"
+      (dvrSettingsSave)="saveDvrRecordingSettings($event)"
+      (dvrRecordingStart)="startDvrRecording($event)"
+      (dvrRecordingStop)="stopDvrRecording($event)"
       (deviceValidationRun)="runDeviceValidation($event)"
       (shareLinkRevoke)="revokeShareLink($event)"
       (releaseReadinessRunRequested)="runReleaseReadiness()"
@@ -325,6 +329,32 @@ export class DeskPageComponent implements OnDestroy {
 
   protected createCameraShareLink(deviceId: string): void {
     this.runDeviceAction(`${deviceId}:share`, this.text('Share link created.', '分享链接已创建。'), () => this.api.createCameraShareLink(deviceId), deviceId);
+  }
+
+  protected saveDvrRecordingSettings(settings: DvrRecordingSettings): void {
+    this.runDeviceAction(
+      'dvr:settings',
+      this.text('DVR recording settings saved.', 'DVR 录像设置已保存。'),
+      () => this.api.saveDvrRecordingSettings(settings)
+    );
+  }
+
+  protected startDvrRecording(deviceId: string): void {
+    this.runDeviceAction(
+      `${deviceId}:dvr-start`,
+      this.text('DVR recording started.', 'DVR 录像已启动。'),
+      () => this.api.startDvrRecording(deviceId),
+      deviceId
+    );
+  }
+
+  protected stopDvrRecording(deviceId: string): void {
+    this.runDeviceAction(
+      `${deviceId}:dvr-stop`,
+      this.text('DVR recording stopped.', 'DVR 录像已停止。'),
+      () => this.api.stopDvrRecording(deviceId),
+      deviceId
+    );
   }
 
   protected runDeviceValidation(deviceId: string): void {

@@ -8,6 +8,9 @@ import {
   DeliverySurface,
   DeskPageModel,
   DiscoveryScanPayload,
+  DvrRecordingSettings,
+  DvrRecordingStatus,
+  DvrTimelineSegment,
   FilesBrowseResponse,
   KnowledgeSearchRequestPayload,
   KnowledgeSearchResponse,
@@ -86,6 +89,9 @@ export class PageStatePanelComponent {
   }>();
   @Output() readonly cameraSnapshotRequested = new EventEmitter<string>();
   @Output() readonly cameraShareLinkCreate = new EventEmitter<string>();
+  @Output() readonly dvrSettingsSave = new EventEmitter<DvrRecordingSettings>();
+  @Output() readonly dvrRecordingStart = new EventEmitter<string>();
+  @Output() readonly dvrRecordingStop = new EventEmitter<string>();
   @Output() readonly deviceValidationRun = new EventEmitter<string>();
   @Output() readonly shareLinkRevoke = new EventEmitter<string>();
   @Output() readonly releaseReadinessRunRequested = new EventEmitter<void>();
@@ -116,6 +122,7 @@ export class PageStatePanelComponent {
     port: null
   };
   protected deviceCredentialForms: Record<string, DeviceCredentialsPayload & { rtsp_paths_text?: string }> = {};
+  protected dvrForm: DvrRecordingSettings = this.defaultDvrForm();
   protected knowledgeIndexRoot = '';
   protected knowledgeSourceRootsText = '';
   protected knowledgeSourceRootEnabled: Record<string, boolean> = {};
@@ -162,6 +169,7 @@ export class PageStatePanelComponent {
     }
   ];
   private knowledgeFormKey = '';
+  private dvrFormKey = '';
 
   protected toneClass(tone: MetricTone): string {
     return `tone-${tone}`;
@@ -342,6 +350,39 @@ export class PageStatePanelComponent {
     this.deviceValidationRun.emit(deviceId);
   }
 
+  protected hydrateDvrForm(settings: DvrRecordingSettings | undefined): boolean {
+    if (!settings) {
+      return false;
+    }
+    const key = JSON.stringify(settings);
+    if (key !== this.dvrFormKey) {
+      this.dvrFormKey = key;
+      this.dvrForm = {
+        ...settings,
+        enabled_device_ids: [...(settings.enabled_device_ids ?? [])]
+      };
+    }
+    return true;
+  }
+
+  protected requestDvrSettingsSave(): void {
+    this.dvrSettingsSave.emit({
+      ...this.dvrForm,
+      recording_root: this.dvrForm.recording_root.trim(),
+      continuous_stream_path_hint: this.dvrForm.continuous_stream_path_hint.trim(),
+      high_res_stream_path_hint: this.dvrForm.high_res_stream_path_hint.trim(),
+      enabled_device_ids: [...(this.dvrForm.enabled_device_ids ?? [])]
+    });
+  }
+
+  protected requestDvrStart(deviceId: string): void {
+    this.dvrRecordingStart.emit(deviceId);
+  }
+
+  protected requestDvrStop(deviceId: string): void {
+    this.dvrRecordingStop.emit(deviceId);
+  }
+
   protected requestShareLinkRevoke(shareLinkId: string): void {
     this.shareLinkRevoke.emit(shareLinkId);
   }
@@ -485,7 +526,7 @@ export class PageStatePanelComponent {
       limit: 8,
       include_documents: true,
       include_images: true,
-      include_videos: false
+      include_videos: true
     });
   }
 
@@ -554,6 +595,35 @@ export class PageStatePanelComponent {
 
   protected deviceEvidence(deviceId: string): DeviceEvidencePanel | undefined {
     return this.state?.data.deviceEvidence?.[deviceId];
+  }
+
+  protected dvrStatus(deviceId: string): DvrRecordingStatus | undefined {
+    return this.state?.data.dvrRecordingStatus?.statuses?.find((status) => status.device_id === deviceId);
+  }
+
+  protected dvrTimeline(deviceId?: string): DvrTimelineSegment[] {
+    const segments = this.state?.data.dvrTimeline?.segments ?? [];
+    return deviceId ? segments.filter((segment) => segment.device_id === deviceId) : segments;
+  }
+
+  protected dvrEnabled(deviceId: string): boolean {
+    return Boolean(this.state?.data.dvrRecordingSettings?.enabled_device_ids?.includes(deviceId));
+  }
+
+  protected dvrRecording(deviceId: string): boolean {
+    return this.dvrStatus(deviceId)?.status === 'recording';
+  }
+
+  protected liveViewUrl(deviceId: string): string {
+    return this.dvrStatus(deviceId)?.live_mjpeg_url || `/api/cameras/${encodeURIComponent(deviceId)}/live.mjpeg`;
+  }
+
+  protected formatUnix(value: string | number | undefined | null): string {
+    const seconds = Number(value ?? 0);
+    if (!Number.isFinite(seconds) || seconds <= 0) {
+      return this.text('n/a', '暂无');
+    }
+    return new Date(seconds * 1000).toLocaleString();
   }
 
   protected featureStatusToneClass(status: FeatureAvailabilityStatus): string {
@@ -625,6 +695,25 @@ export class PageStatePanelComponent {
       unit += 1;
     }
     return `${current >= 10 || unit === 0 ? current.toFixed(0) : current.toFixed(1)} ${units[unit]}`;
+  }
+
+  private defaultDvrForm(): DvrRecordingSettings {
+    return {
+      recording_root: '',
+      retention_days: 7,
+      segment_seconds: 300,
+      continuous_recording_enabled: true,
+      low_bitrate_stream_preferred: true,
+      continuous_bitrate_mbps: 2,
+      high_res_event_clips_enabled: true,
+      high_res_event_clip_seconds: 30,
+      continuous_stream_path_hint: '/stream2',
+      high_res_stream_path_hint: '/stream1',
+      disk_budget_gb: null,
+      keyframe_count: 5,
+      keyframe_interval_seconds: 60,
+      enabled_device_ids: []
+    };
   }
 
   private pathList(value: string[] | string | undefined | null): string[] {
