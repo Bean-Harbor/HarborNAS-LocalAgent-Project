@@ -3,15 +3,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RELEASE_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-ENV_FILE="${HARBOR_ENV_FILE:-/etc/default/harborbeacon-agent-hub}"
+HARBORGATE_BIN="${RELEASE_ROOT}/harborgate/bin/harborgate"
 
-if [[ -f "${ENV_FILE}" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  . "${ENV_FILE}"
-  set +a
+if [[ ! -x "${HARBORGATE_BIN}" ]]; then
+  echo "HarborGate Rust binary is missing or not executable: ${HARBORGATE_BIN}" >&2
+  exit 127
 fi
 
-export PYTHONPATH="${RELEASE_ROOT}/harborgate/site-packages${PYTHONPATH:+:${PYTHONPATH}}"
 cd "${RELEASE_ROOT}"
-exec "${HARBORGATE_PYTHON_BIN:-python3}" -m im_agent.server "$@"
+exec "${HARBORGATE_BIN}" "$@"

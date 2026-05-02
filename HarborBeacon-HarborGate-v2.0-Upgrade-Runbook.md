@@ -35,12 +35,13 @@ At the start of each session:
 - Establish v2.0 contract authority.
 - Update HarborBeacon docs and tests to point at v2.0.
 - Add drift guards that expose remaining v1.5 active paths.
-- Do not implement `/api/turns` yet.
+- Do not expose the new turn ingress as the active HarborGate path yet.
 
 ### Phase 2: Beacon Turn Core
 
 - Add `TaskTurnEnvelope`.
-- Add `POST /api/turns`.
+- Add `POST /api/web/turns`, with `POST /api/turns` only as a deprecated
+  HarborBeacon compatibility alias.
 - Normalize turn identity around Beacon-owned `conversation.handle`.
 - Introduce `ActiveDialogueFrame` and `ConversationAct`.
 - Route `general.message` through active-frame policy before ordinary
@@ -70,7 +71,8 @@ At the start of each session:
 
 ### Phase 6: Post-RC2 GA And Local Runtime Proof
 
-- Keep `POST /api/turns` and response semantics frozen.
+- Keep `POST /api/web/turns` and response semantics frozen; keep
+  `POST /api/turns` only as a deprecated alias during the single-port cutover.
 - Promote RC2 toward GA only from merged mainline code and matching Gate
   artifacts.
 - Run the local model promotion benchmark on `.82` before claiming active local
@@ -122,7 +124,7 @@ Do not report a release-ready state while any drift guard still fails.
 
 ## 2026-04-26 Closeout
 
-- Completed: v2.0 turn core and active `/api/turns` ingress are implemented
+- Completed: v2.0 turn core and active `/api/web/turns` ingress are implemented
   locally; assistant task API tests now use turn envelopes; active
   Beacon/Gate defaults now use contract `2.0`; clarification feedback keeps a
   pending `conversation.clarify` active frame; clip-confirmation feedback now
@@ -131,20 +133,20 @@ Do not report a release-ready state while any drift guard still fails.
   tool intent; active-frame preserve replies now acknowledge social/affective
   turns before re-anchoring the pending frame; `.197` built
   `harbor-release-20260426-v20-affective-frame-r1.tar.gz`; `.182` is deployed
-  on that bundle and passes the direct v2 `/api/turns` affective-frame matrix
+  on that bundle and passes the direct v2 `/api/web/turns` affective-frame matrix
   through native-video playback hints.
 - Changed files: `src/runtime/task_api.rs`,
-  `src/bin/assistant_task_api.rs`, contract default sources/templates/tests,
+  turn API entrypoints, contract default sources/templates/tests,
   v2.0 observability docs, and
   `worklogs/2026-04-26-v20-upgrade.md`.
 - Tests run: `python -m pytest tests/contracts/test_im_v20_control_pack.py -q`,
-  release-packaging contract tests, `cargo test --bin assistant-task-api`,
+  release-packaging contract tests, unified HarborBeacon turn API tests,
   targeted general.message turn tests, targeted clip-confirmation frame tests,
   `cargo test`, `python -m pytest -q`, `git diff --check`, `gh pr checks 3`,
-  the `.182` direct `/api/turns` frame-first matrix after the
+  the `.182` direct `/api/web/turns` frame-first matrix after the
   clip-confirmation persistence fix, and the `.182` direct affective-frame
   matrix after the preserve-rendering fix.
-- Drift check: Beacon v2.0 guard passed; active assistant task API no longer
+- Drift check: Beacon v2.0 guard passed; active turn API no longer
   exposes the v1.5 task ingress; packaged env uses
   `IM_AGENT_CONTRACT_VERSION=2.0`; Gateway accepts contract `2.0` and rejects
   `1.5`.
@@ -157,7 +159,7 @@ Do not report a release-ready state while any drift guard still fails.
 
 - Completed: merged the Beacon, Gate, and WebUI release trains; installed RC2
   on `.82`; verified `/ui/harbordesk`, `/ui/harborbot`, knowledge
-  search/preview, and protected `POST /api/turns` content retrieval plus
+  search/preview, and protected `POST /api/web/turns` content retrieval plus
   local-first architecture explanation.
 - Artifact: `harbor-release-20260430-rc2-beacona5f6da0-gate57ff759.tar.gz`.
 - SHA256:

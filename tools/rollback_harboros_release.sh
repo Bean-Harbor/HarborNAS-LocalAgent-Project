@@ -19,13 +19,16 @@ ENV_FILE="/etc/default/harborbeacon-agent-hub"
 TARGET_VERSION=""
 SKIP_START=0
 CORE_SERVICES=(
+  harborbeacon.service
+  harborgate.service
+)
+LEGACY_SERVICES=(
   harbor-model-api.service
   assistant-task-api.service
   agent-hub-admin-api.service
-  harborgate.service
+  harbor-vlm-sidecar.service
+  harborgate-weixin-runner.service
 )
-OPTIONAL_WEIXIN_SERVICE="harborgate-weixin-runner.service"
-OPTIONAL_VLM_SERVICE="harbor-vlm-sidecar.service"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -137,13 +140,11 @@ fi
 
 if [[ "${SKIP_START}" -ne 1 ]]; then
   systemctl daemon-reload
+  for legacy_service in "${LEGACY_SERVICES[@]}"; do
+    systemctl disable --now "${legacy_service}" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/${legacy_service}"
+  done
   systemctl restart "${CORE_SERVICES[@]}"
-  if systemctl is-enabled "${OPTIONAL_WEIXIN_SERVICE}" >/dev/null 2>&1; then
-    systemctl restart "${OPTIONAL_WEIXIN_SERVICE}"
-  fi
-  if systemctl is-enabled "${OPTIONAL_VLM_SERVICE}" >/dev/null 2>&1; then
-    systemctl restart "${OPTIONAL_VLM_SERVICE}"
-  fi
 fi
 
 echo

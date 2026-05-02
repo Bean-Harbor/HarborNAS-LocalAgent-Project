@@ -137,6 +137,7 @@ pub fn build_checks(root: &Path) -> Vec<CheckResult> {
     checks.push(CheckResult {
         name: "v20-upgrade-control-pack:active-seam-coverage".to_string(),
         passed: [
+            "POST /api/web/turns",
             "POST /api/turns",
             "POST /api/notifications/deliveries",
             "GET /api/gateway/status",

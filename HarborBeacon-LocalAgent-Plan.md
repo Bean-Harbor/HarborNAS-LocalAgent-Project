@@ -9,7 +9,7 @@
 > 已验证 baseline：HarborBeacon `a5f6da0` + HarborGate `57ff759`
 > 已打包为 `.82` RC2
 > `20260430-rc2-beacona5f6da0-gate57ff759`，并通过 HarborDesk、HarborBot、knowledge search/preview、protected
-> `POST /api/turns` live smoke。
+> `POST /api/web/turns` live smoke，`/api/turns` 仅保留为 deprecated alias。
 >
 > 本文后续早期 v1.5 task-contract 描述保留为历史上下文；当前执行、验收与回滚以
 > `HarborBeacon-HarborGate-v2.0-Upgrade-Runbook.md` 和外部 v2.0 contract 为准。
@@ -35,13 +35,21 @@
 - 每天收工时，各 lane owner 负责各自仓库或职责线的 GitHub 同步；`harbor-architect` 负责跨 lane 的日终收口与是否可合并/可发布判断。
 - 每日同步默认模板见 `docs/daily/harbor-daily-sync-template.md`。
 
+## 0.5 模型架构决策（当前权威）
+
+- 模型是 HarborBeacon 的共享能力层，不是独立业务域；业务域仍按 HarborOS System Domain、Home Device Domain、IM Gateway 等边界治理。
+- 当前实现保持 local-first：本地 OpenAI-compatible endpoint 是默认路径，Candle / sidecar / Mistral 只是可替换 backend 或旁路候选，不再各自形成一套产品架构。
+- 云端只作为受控 fallback。第一版仅覆盖 `semantic.router` 与 `retrieval.answer`，不覆盖 AIoT 控制、HarborOS 命令、OCR、VLM、embedding 默认路径。
+- HarborDesk 的 `Models & Policies` 提供 `llm-cloud-siliconflow` preset，使用 OpenAI-compatible `https://api.siliconflow.cn/v1`；API key 作为 endpoint secret 保存，读回时必须 redacted，空 key 不覆盖已保存 secret。
+- 本地模型下载默认使用 Hugging Face mirror `https://hf-mirror.com`，优先级为 HarborDesk 输入 mirror -> `HF_ENDPOINT` -> 默认 mirror。
+
 ## 1. 项目目标
 
 为 HarborBeacon 构建一个 **混合计算智能体**，具备：
 - ✅ **多模态 RAG** - 支持文本、图像、音频、视频的检索增强生成
 - ✅ **智能任务编排** - 动态判断任务复杂度，选择最优执行路径
 - ✅ **本地优先策略** - 隐私优先，敏感任务不出本地
-- ✅ **云边协作** - 复杂任务脱敏后调用云模型
+- ✅ **受控云端 fallback** - semantic router / RAG answer 在策略放行后才调用云模型
 - ✅ **可观测性** - 任务流转过程完全可追溯
 
 当前 post-RC2 执行顺序:
@@ -66,7 +74,7 @@
 │  platform credentials / outbound delivery / attachment proxy │
 └──────────────────────┬───────────────────────────────────────┘
                        │  HTTP/JSON contract only
-                       │  POST /api/turns
+                       │  POST /api/web/turns
                        │  POST /api/notifications/deliveries
                        │  GET  /api/gateway/status (optional)
 ┌──────────────────────▼───────────────────────────────────────┐

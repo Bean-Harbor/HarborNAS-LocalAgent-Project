@@ -291,6 +291,7 @@ export interface LocalModelCatalogItem {
   repo_id?: string | null;
   revision?: string | null;
   file_policy?: string;
+  default_hf_endpoint?: string | null;
   runtime_profiles?: string[];
   expected_capabilities?: string[];
   acceptance_note?: string | null;
@@ -343,6 +344,7 @@ export interface StartLocalModelDownloadRequest {
   display_name?: string;
   provider_key?: string;
   target_path?: string | null;
+  hf_endpoint?: string | null;
   metadata?: Record<string, unknown>;
 }
 
@@ -629,10 +631,79 @@ export interface AdminDefaults {
   keyframe_interval_seconds?: number | null;
 }
 
+export interface DvrRecordingSettings {
+  recording_root: string;
+  retention_days: number;
+  segment_seconds: number;
+  continuous_recording_enabled: boolean;
+  low_bitrate_stream_preferred: boolean;
+  continuous_bitrate_mbps: number;
+  high_res_event_clips_enabled: boolean;
+  high_res_event_clip_seconds: number;
+  continuous_stream_path_hint: string;
+  high_res_stream_path_hint: string;
+  disk_budget_gb?: number | null;
+  keyframe_count: number;
+  keyframe_interval_seconds: number;
+  enabled_device_ids: string[];
+}
+
+export interface DvrCapacityEstimate {
+  camera_count: number;
+  enabled_camera_count: number;
+  retention_days: number;
+  bitrate_mbps: number;
+  estimated_bytes_per_camera: number;
+  estimated_bytes_enabled_total: number;
+  disk_budget_bytes?: number | null;
+  disk_budget_warning?: string | null;
+}
+
+export interface DvrRecordingStatus {
+  device_id: string;
+  status: string;
+  started_at?: string | null;
+  updated_at?: string | null;
+  stream_kind?: string;
+  last_segment_path?: string | null;
+  live_mjpeg_url?: string | null;
+  message?: string;
+}
+
+export interface DvrRecordingStatusResponse {
+  generated_at: string;
+  settings: DvrRecordingSettings;
+  capacity: DvrCapacityEstimate;
+  statuses: DvrRecordingStatus[];
+  root_exists: boolean;
+  root_writable: boolean;
+}
+
+export interface DvrTimelineSegment {
+  device_id: string;
+  file_path: string;
+  sidecar_path?: string | null;
+  stream_kind: string;
+  started_at: string;
+  ended_at: string;
+  duration_seconds: number;
+  retention_expires_at: string;
+  size_bytes: number;
+  replay_url?: string | null;
+  indexed: boolean;
+}
+
+export interface DvrTimelineResponse {
+  generated_at: string;
+  recording_root: string;
+  segments: DvrTimelineSegment[];
+}
+
 export interface AdminStateResponse {
   binding: AdminBindingState;
   defaults: AdminDefaults;
   bridge_provider: BridgeProviderConfig;
+  dvr?: DvrRecordingSettings;
   delivery_policy: DeliveryPolicySummary;
   writable_root?: string;
   current_principal_user_id?: string;
@@ -734,6 +805,9 @@ export interface KnowledgeSearchRequestPayload {
   include_documents?: boolean;
   include_images?: boolean;
   include_videos?: boolean;
+  camera_id?: string | null;
+  from?: string | null;
+  to?: string | null;
 }
 
 export interface KnowledgeSearchCitation {
@@ -1035,6 +1109,9 @@ export interface DeskPageModel {
   deviceCredentialStatuses?: DeviceCredentialStatus[];
   deviceEvidence?: Record<string, DeviceEvidencePanel>;
   shareLinks?: ShareLinkSummary[];
+  dvrRecordingSettings?: DvrRecordingSettings;
+  dvrRecordingStatus?: DvrRecordingStatusResponse;
+  dvrTimeline?: DvrTimelineResponse;
   modelEndpoints?: ModelEndpointRecord[];
   modelPolicies?: ModelRoutePolicyRecord[];
   knowledgeSettings?: KnowledgeSettings;

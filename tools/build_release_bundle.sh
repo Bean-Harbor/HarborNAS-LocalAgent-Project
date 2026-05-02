@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 HARBORGATE_REPO="${HARBORGATE_REPO:-$(cd "${REPO_ROOT}/../HarborGate" && pwd)}"
 HARBORDESK_DIST_SOURCE="${HARBORDESK_DIST_SOURCE:-}"
+HARBORGATE_RUST_BINARY="${HARBORGATE_RUST_BINARY:-}"
 OUT_DIR="${OUT_DIR:-${REPO_ROOT}/dist/release-bundles}"
 RUST_TARGET="${RUST_TARGET:-x86_64-unknown-linux-musl}"
 RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-stable}"
@@ -55,7 +56,6 @@ LINUX_PORTABILITY_EXPECTATION="${LINUX_PORTABILITY_EXPECTATION:-$(default_portab
 VERSION="${RELEASE_VERSION:-$(date -u +%Y%m%d-%H%M%S)-$(git_short_ref_or_snapshot "${REPO_ROOT}")}"
 BUNDLE_NAME="harbor-release-${VERSION}"
 BUNDLE_ROOT="${OUT_DIR}/${BUNDLE_NAME}"
-PYBUILD_VENV="${OUT_DIR}/.pybuild-${VERSION}"
 
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -69,6 +69,23 @@ require_directory() {
     echo "required directory not found: $1" >&2
     exit 1
   fi
+}
+
+resolve_harborgate_rust_binary() {
+  local candidate
+  if [[ -n "${HARBORGATE_RUST_BINARY}" && -f "${HARBORGATE_RUST_BINARY}" ]]; then
+    echo "${HARBORGATE_RUST_BINARY}"
+    return 0
+  fi
+  for candidate in \
+    "${HARBORGATE_REPO}/target/${RUST_TARGET}/release/harborgate" \
+    "${HARBORGATE_REPO}/target/release/harborgate"; do
+    if [[ -f "${candidate}" ]]; then
+      echo "${candidate}"
+      return 0
+    fi
+  done
+  return 1
 }
 
 append_path_front() {
@@ -121,6 +138,7 @@ build_rust_binaries() {
   local cargo_args=(
     --release
     --target "${RUST_TARGET}"
+    --bin harborbeacon-service
     --bin harbor-model-api
     --bin assistant-task-api
     --bin agent-hub-admin-api
@@ -132,6 +150,25 @@ build_rust_binaries() {
   else
     cargo build "${cargo_args[@]}"
   fi
+}
+
+build_harborgate_rust_binary() {
+  if [[ -n "${HARBORGATE_RUST_BINARY}" ]]; then
+    return 0
+  fi
+  local cargo_args=(
+    --release
+    --bin harborgate
+  )
+  (
+    cd "${HARBORGATE_REPO}"
+    prepare_builder_tool_path
+    if [[ "${RUST_TARGET}" == *-musl ]]; then
+      cargo zigbuild "${cargo_args[@]}" --target "${RUST_TARGET}"
+    else
+      cargo build "${cargo_args[@]}"
+    fi
+  )
 }
 
 assert_binary_linkage() {
@@ -194,11 +231,11 @@ else
 fi
 
 mkdir -p "${OUT_DIR}"
-rm -rf "${BUNDLE_ROOT}" "${PYBUILD_VENV}"
+rm -rf "${BUNDLE_ROOT}"
 mkdir -p \
   "${BUNDLE_ROOT}/bin" \
   "${BUNDLE_ROOT}/harbordesk/dist" \
-  "${BUNDLE_ROOT}/harborgate/site-packages" \
+  "${BUNDLE_ROOT}/harborgate/bin" \
   "${BUNDLE_ROOT}/install" \
   "${BUNDLE_ROOT}/templates"
 
@@ -211,7 +248,7 @@ echo "==> Building HarborBeacon release binaries (${RUST_TARGET}, ${RUST_LINKAGE
 )
 
 RUST_RELEASE_DIR="$(rust_release_dir)"
-for binary in harbor-model-api assistant-task-api agent-hub-admin-api validate-contract-schemas run-e2e-suite; do
+for binary in harborbeacon-service harbor-model-api assistant-task-api agent-hub-admin-api validate-contract-schemas run-e2e-suite; do
   assert_binary_linkage "${RUST_RELEASE_DIR}/${binary}"
 done
 
@@ -231,14 +268,23 @@ else
 fi
 
 echo
-echo "==> Vendoring HarborGate Python runtime"
-python3 -m venv "${PYBUILD_VENV}"
-"${PYBUILD_VENV}/bin/python" -m pip install --upgrade pip setuptools wheel
-"${PYBUILD_VENV}/bin/python" -m pip install --no-compile --target "${BUNDLE_ROOT}/harborgate/site-packages" "${HARBORGATE_REPO}"
-find "${BUNDLE_ROOT}/harborgate/site-packages" -type d -name "__pycache__" -prune -exec rm -rf {} +
+echo "==> Building HarborGate Rust runtime"
+build_harborgate_rust_binary
+HARBORGATE_RUST_BUNDLE_PATH=""
+if HARBORGATE_RUST_SOURCE="$(resolve_harborgate_rust_binary)"; then
+  assert_binary_linkage "${HARBORGATE_RUST_SOURCE}"
+  cp "${HARBORGATE_RUST_SOURCE}" "${BUNDLE_ROOT}/harborgate/bin/harborgate"
+  chmod 0755 "${BUNDLE_ROOT}/harborgate/bin/harborgate"
+  HARBORGATE_RUST_BUNDLE_PATH="harborgate/bin/harborgate"
+else
+  echo "HarborGate Rust binary is required for release bundle but was not found." >&2
+  echo "Build HarborGate first or set HARBORGATE_RUST_BINARY=/path/to/harborgate." >&2
+  exit 1
+fi
 
 echo
 echo "==> Assembling bundle layout"
+cp "${RUST_RELEASE_DIR}/harborbeacon-service" "${BUNDLE_ROOT}/bin/harborbeacon-service"
 cp "${RUST_RELEASE_DIR}/assistant-task-api" "${BUNDLE_ROOT}/bin/assistant-task-api"
 cp "${RUST_RELEASE_DIR}/agent-hub-admin-api" "${BUNDLE_ROOT}/bin/agent-hub-admin-api"
 cp "${RUST_RELEASE_DIR}/harbor-model-api" "${BUNDLE_ROOT}/bin/harbor-model-api"
@@ -286,7 +332,8 @@ python3 \
   "${RUST_LINKAGE}" \
   "${LINUX_PORTABILITY_EXPECTATION}" \
   "${INSTALL_ROOT_DEFAULT}" \
-  "${WRITABLE_ROOT_DEFAULT}" <<'PY'
+  "${WRITABLE_ROOT_DEFAULT}" \
+  "${HARBORGATE_RUST_BUNDLE_PATH}" <<'PY'
 import json
 import pathlib
 import sys
@@ -303,6 +350,7 @@ payload = {
             "linkage": sys.argv[7],
             "linux_portability_expectation": sys.argv[8],
             "binaries": [
+                "bin/harborbeacon-service",
                 "bin/harbor-model-api",
                 "bin/assistant-task-api",
                 "bin/agent-hub-admin-api",
@@ -310,6 +358,7 @@ payload = {
                 "bin/run-e2e-suite",
             ],
             "runtime_launchers": [
+                "templates/bin/run-harborbeacon-service",
                 "templates/bin/run-harbor-vlm-sidecar",
                 "templates/bin/harbor-vlm-sidecar",
             ],
@@ -319,12 +368,9 @@ payload = {
         },
         "harborgate": {
             "git_ref": sys.argv[5],
-            "site_packages": "harborgate/site-packages",
+            "rust_binary": sys.argv[11],
             "launchers": [
                 "templates/bin/harborgate",
-                "templates/bin/harborgate-weixin-runner",
-                "templates/bin/harborgate-weixin-login",
-                "templates/bin/harborgate-weixin-ingress-probe",
             ],
         },
     },
@@ -337,12 +383,8 @@ payload = {
             "templates/bin/harbor-agent-hub-helper",
         ],
         "service_names": [
-            "harbor-model-api.service",
-            "assistant-task-api.service",
-            "agent-hub-admin-api.service",
-            "harbor-vlm-sidecar.service",
+            "harborbeacon.service",
             "harborgate.service",
-            "harborgate-weixin-runner.service",
         ],
     },
 }
@@ -361,8 +403,6 @@ tar -C "${OUT_DIR}" -czf "${TARBALL_PATH}" "${BUNDLE_NAME}"
   cd "${OUT_DIR}"
   sha256sum "${BUNDLE_NAME}.tar.gz" > "${BUNDLE_NAME}.tar.gz.sha256"
 )
-
-rm -rf "${PYBUILD_VENV}"
 
 echo
 echo "Release bundle ready:"

@@ -28,7 +28,7 @@
 - `Tasks & Approvals`：高风险动作审批、任务结果、审计引用，清楚区分 interaction-linked replies 与 proactive delivery failures
 - `Devices & AIoT`：发现、手动录入、预览、分享链路、AIoT 设备治理
 - `HarborOS`：系统域控制边界、宿主机控制面、live/proof 区分明确的 summary block
-- `Models & Policies`：模型端点状态、endpoint kind/provider/test result、route policy、fallback order、以及 VLM first 的可运营操作位
+- `Models & Policies`：模型端点状态、SiliconFlow OpenAI-compatible fallback 配置、endpoint secret redaction 状态、route policy/fallback order、本地模型下载与 HF mirror 操作位
 - `System Settings`：真实 routing/gateway status 和显式 blocker，不展示推测性的部署元数据
 
 ## 4. 后端依赖约定
@@ -45,7 +45,8 @@
 - `IM Gateway` 的 Feishu / Weixin / queue / failure 信号必须来自后端投影；没有数据就显示空态或 blocker
 - `Account Management` 里的 proactive delivery default 以成员粒度展示，binding availability 只能反映后端提供的可绑定状态
 - `Tasks & Approvals` 里的回复与投递失败是不同信号源，前端不能把它们合并成单一“通知结果”
-- `Models & Policies` 必须把 endpoint status/test result/kind/provider/route policy/fallback order 放在同一页的清晰操作位里，而不是散落成静态说明
+- `Models & Policies` 必须把 endpoint status/test result/kind/provider/route policy/fallback order、SiliconFlow API key 输入、HF mirror URL 输入放在同一页的清晰操作位里，而不是散落成静态说明
+- HarborDesk 不把 cloud fallback 展示成默认架构；UI 文案必须保持 local-first，并明确云端只进入 `semantic.router` / `retrieval.answer` 的受控 fallback。
 
 ## 6. 共享能力
 

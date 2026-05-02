@@ -8,6 +8,7 @@ import {
   DeviceCredentialsPayload,
   DeliverySurface,
   DiscoveryScanPayload,
+  DvrRecordingSettings,
   FilesBrowseResponse,
   KnowledgeIndexRunResponse,
   KnowledgeSearchRequestPayload,
@@ -15,6 +16,7 @@ import {
   KnowledgeSettings,
   LocalModelCatalogItem,
   ManualDevicePayload,
+  ModelEndpointRecord,
   ModelEndpointTestResult,
   RtspCheckPayload,
   RtspCheckResult,
@@ -60,6 +62,7 @@ import { PageStatePanelComponent } from '../shared/page-state-panel.component';
       (notificationTargetDefaultChange)="setDefaultNotificationTarget($event)"
       (notificationTargetDelete)="deleteNotificationTarget($event)"
       (endpointTestRequested)="runEndpointTest($event)"
+      (cloudModelEndpointSaveRequested)="saveCloudModelEndpoint($event)"
       (deviceScanRequested)="scanDevices($event)"
       (manualDeviceAddRequested)="addManualDevice($event)"
       (defaultCameraChange)="setDefaultCamera($event)"
@@ -67,6 +70,9 @@ import { PageStatePanelComponent } from '../shared/page-state-panel.component';
       (deviceRtspCheck)="checkDeviceRtsp($event.deviceId, $event.payload)"
       (cameraSnapshotRequested)="testCameraSnapshot($event)"
       (cameraShareLinkCreate)="createCameraShareLink($event)"
+      (dvrSettingsSave)="saveDvrRecordingSettings($event)"
+      (dvrRecordingStart)="startDvrRecording($event)"
+      (dvrRecordingStop)="stopDvrRecording($event)"
       (deviceValidationRun)="runDeviceValidation($event)"
       (shareLinkRevoke)="revokeShareLink($event)"
       (releaseReadinessRunRequested)="runReleaseReadiness()"
@@ -241,6 +247,33 @@ export class DeskPageComponent implements OnDestroy {
       });
   }
 
+  protected saveCloudModelEndpoint(endpoint: ModelEndpointRecord): void {
+    const endpointId = endpoint.model_endpoint_id;
+    this.savingMemberId = endpointId;
+    this.saveError = null;
+    this.saveSuccess = null;
+    this.api
+      .saveModelEndpoint(endpoint)
+      .pipe(
+        tap(() => {
+          this.saveSuccess = this.text(
+            `Cloud model endpoint saved: ${endpointId}.`,
+            `云端模型端点已保存：${endpointId}。`
+          );
+          this.refresh$.next(Date.now());
+        }),
+        finalize(() => {
+          this.savingMemberId = null;
+        })
+      )
+      .subscribe({
+        error: (error: unknown) => {
+          this.saveError = this.errorMessage(error, this.text('Failed to save cloud model endpoint.', '保存云端模型端点失败。'));
+          this.saveSuccess = null;
+        }
+      });
+  }
+
   protected scanDevices(payload: DiscoveryScanPayload): void {
     this.runDeviceAction('scan', this.text('Discovery scan finished.', '发现扫描已完成。'), () => this.api.scanDevices(payload));
   }
@@ -296,6 +329,32 @@ export class DeskPageComponent implements OnDestroy {
 
   protected createCameraShareLink(deviceId: string): void {
     this.runDeviceAction(`${deviceId}:share`, this.text('Share link created.', '分享链接已创建。'), () => this.api.createCameraShareLink(deviceId), deviceId);
+  }
+
+  protected saveDvrRecordingSettings(settings: DvrRecordingSettings): void {
+    this.runDeviceAction(
+      'dvr:settings',
+      this.text('DVR recording settings saved.', 'DVR 录像设置已保存。'),
+      () => this.api.saveDvrRecordingSettings(settings)
+    );
+  }
+
+  protected startDvrRecording(deviceId: string): void {
+    this.runDeviceAction(
+      `${deviceId}:dvr-start`,
+      this.text('DVR recording started.', 'DVR 录像已启动。'),
+      () => this.api.startDvrRecording(deviceId),
+      deviceId
+    );
+  }
+
+  protected stopDvrRecording(deviceId: string): void {
+    this.runDeviceAction(
+      `${deviceId}:dvr-stop`,
+      this.text('DVR recording stopped.', 'DVR 录像已停止。'),
+      () => this.api.stopDvrRecording(deviceId),
+      deviceId
+    );
   }
 
   protected runDeviceValidation(deviceId: string): void {
@@ -418,18 +477,22 @@ export class DeskPageComponent implements OnDestroy {
       });
   }
 
-  protected startLocalModelDownload(model: LocalModelCatalogItem): void {
+  protected startLocalModelDownload(request: { model: LocalModelCatalogItem; hfEndpoint?: string | null }): void {
+    const model = request.model;
     const modelId = model.model_id;
+    const hfEndpoint = (request.hfEndpoint ?? model.default_hf_endpoint ?? '').trim() || null;
     const payload: StartLocalModelDownloadRequest = {
       model_id: modelId,
       display_name: model.display_name ?? model.label ?? modelId,
       provider_key: model.provider_key ?? model.provider ?? 'local',
       target_path: null,
+      hf_endpoint: hfEndpoint,
       metadata: {
         source_kind: model.source_kind ?? 'huggingface',
         repo_id: model.repo_id ?? model.model_id,
         revision: model.revision ?? 'main',
-        file_policy: model.file_policy ?? 'runtime_snapshot'
+        file_policy: model.file_policy ?? 'runtime_snapshot',
+        ...(hfEndpoint ? { hf_endpoint: hfEndpoint } : {})
       }
     };
     this.modelDownloadBusyId = modelId;

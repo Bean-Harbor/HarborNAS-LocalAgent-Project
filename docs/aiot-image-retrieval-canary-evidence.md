@@ -2,8 +2,8 @@
 
 ## What AIoT Produces
 
-- This evidence pack is VLM-first: it treats image, snapshot, and still-frame artifacts as the first-version input surface for HarborDesk retrieval, while continuous video remains pending.
-- release-v1 extends that same file-oriented evidence model to short clips, but retrieval still uses clip keyframes and sidecars rather than continuous-video understanding.
+- This evidence pack is VLM-first: it treats image, snapshot, still-frame, clip, and local DVR segment artifacts as the first-version input surface for HarborDesk retrieval.
+- release-v1 extends that same file-oriented evidence model to rolling video segments, but retrieval still uses keyframes and sidecars rather than a DVR-specific model chain.
 - a stable snapshot image path under `.harborbeacon/vision/snapshots/<device>-<timestamp>.jpg`
 - a stable JSON sidecar next to that image file
 - matching annotated image output under `.harborbeacon/vision/annotated/` when analysis produces one
@@ -62,9 +62,9 @@ primary citation candidate, and the annotated image as a secondary preview or
 derived citation candidate when present.
 
 For HarborDesk, this stays the first-version VLM input path: image, snapshot,
-and still-frame evidence are in scope, while continuous video stays a follow-up
-lane. Short clips are in scope as media artifacts with keyframe-derived
-retrieval evidence, not as full continuous-video semantics.
+still-frame, clip, and DVR segment evidence are in scope. Rolling video is
+represented as media artifacts with keyframe-derived retrieval evidence, not as
+a separate continuous-video model stack.
 
 ## Local Demo Path
 
@@ -92,7 +92,8 @@ behavior.
 
 - AIoT does not rank, score, or answer retrieval queries.
 - AIoT does not perform OCR, semantic search, or multimodal fusion.
-- AIoT does not own continuous video ingestion in this release.
+- AIoT owns DVR segment capture metadata, but does not own semantic video
+  retrieval or answer generation.
 - AIoT does not own the framework retrieval index.
 - AIoT does not decide which citation wins; it only emits stable candidates.
 - AIoT does not turn the caption or derived text into ranking logic.
@@ -109,11 +110,11 @@ Date: 2026-04-19
 Boundary proof:
 
 - the primary retrieval candidate is the persisted snapshot image plus its sidecar.
-- the first-version VLM input surface is image, snapshot, and still-frame content; continuous video remains follow-up work.
+- the first-version VLM input surface is image, snapshot, still-frame, clip, and DVR segment content with keyframe sidecars.
 - the annotated image stays a secondary preview or derived citation candidate.
 - `inspect` and `control` remain runtime-only and are not claimed by HarborOS executors or retrieval logic.
 - HarborOS does not own device control.
-- the evidence pack stays image-first and does not own ranking or semantic fusion.
+- the evidence pack stays media-first and does not own ranking or semantic fusion.
 
 Current risk signals:
 

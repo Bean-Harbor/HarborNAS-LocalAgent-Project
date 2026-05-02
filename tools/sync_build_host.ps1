@@ -313,7 +313,8 @@ try {
     Set-SFTPItem -SessionId $sftpSession.SessionId -Path $harborGateArchive.ArchivePath -Destination $remoteUploadDir -Force | Out-Null
 
     $remoteScript = @'
-set -euo pipefail
+set -eu
+set -o pipefail
 
 timestamp=__TIMESTAMP__
 keep_backup_count=__KEEP_BACKUPS__
@@ -391,14 +392,17 @@ activate_repo() {
 
   if [[ "$repo_name" == "HarborBeacon" ]]; then
     if [[ -d "$active_dir/tools" ]]; then
+      find "$active_dir/tools" -type f -name '*.sh' -exec sed -i 's/\r$//' {} +
       find "$active_dir/tools" -type f -name '*.sh' -exec chmod 755 {} +
     fi
     if [[ -d "$active_dir/scripts" ]]; then
+      find "$active_dir/scripts" -type f -name '*.sh' -exec sed -i 's/\r$//' {} +
       find "$active_dir/scripts" -type f -name '*.sh' -exec chmod 755 {} +
     fi
   fi
 
   if [[ "$repo_name" == "HarborGate" && -d "$active_dir/tools" ]]; then
+    find "$active_dir/tools" -type f -name '*.sh' -exec sed -i 's/\r$//' {} +
     find "$active_dir/tools" -type f -name '*.sh' -exec chmod 755 {} +
   fi
 
@@ -417,7 +421,7 @@ activate_repo() {
 }
 
 activate_repo "HarborBeacon" "$harbor_beacon_archive" "tools/bootstrap_release_builder.sh"
-activate_repo "HarborGate" "$harbor_gate_archive" "pyproject.toml"
+activate_repo "HarborGate" "$harbor_gate_archive" "rust/harborgate/Cargo.toml"
 
 if [[ ! -f "$src_root/HarborBeacon/tools/build_release_bundle.sh" ]]; then
   echo "Required file missing after activation: $src_root/HarborBeacon/tools/build_release_bundle.sh" >&2
@@ -428,22 +432,24 @@ echo "SYNC_TIMESTAMP_HARBORBEACON=$timestamp"
 echo "SYNC_TIMESTAMP_HARBORGATE=$timestamp"
 echo "SYNC_CHECK_BOOTSTRAP=present"
 echo "SYNC_CHECK_BUILD_RELEASE=present"
-echo "SYNC_CHECK_HARBORGATE_PYPROJECT=present"
+echo "SYNC_CHECK_HARBORGATE_CARGO=present"
 '@
 
     $remoteScript = $remoteScript.Replace("__TIMESTAMP__", (Convert-ToShellLiteral $timestamp))
     $remoteScript = $remoteScript.Replace("__KEEP_BACKUPS__", $KeepBackupCount.ToString())
     $remoteScript = $remoteScript.Replace("__HB_ARCHIVE__", (Convert-ToShellLiteral "$remoteUploadDir/$([IO.Path]::GetFileName($harborBeaconArchive.ArchivePath))"))
     $remoteScript = $remoteScript.Replace("__HG_ARCHIVE__", (Convert-ToShellLiteral "$remoteUploadDir/$([IO.Path]::GetFileName($harborGateArchive.ArchivePath))"))
+    $remoteScript = $remoteScript.Replace("`r`n", "`n").Replace("`r", "`n")
 
-    $remoteResult = Invoke-SSHCommand -SessionId $sshSession.SessionId -Command $remoteScript -TimeOut 1800
+    $remoteCommand = "bash -lc " + (Convert-ToShellLiteral $remoteScript)
+    $remoteResult = Invoke-SSHCommand -SessionId $sshSession.SessionId -Command $remoteCommand -TimeOut 1800
     if ($remoteResult.ExitStatus -ne 0) {
         $stderr = if ($remoteResult.Error) { $remoteResult.Error } else { $remoteResult.Output }
         throw "Remote sync failed on $($buildHostConfig.host)`n$($stderr -join [Environment]::NewLine)"
     }
 
     $summaryLines = @($remoteResult.Output | ForEach-Object { [string]$_ })
-    foreach ($requiredKey in @("SYNC_ACTIVE_HARBORBEACON", "SYNC_ACTIVE_HARBORGATE", "SYNC_CHECK_BOOTSTRAP", "SYNC_CHECK_BUILD_RELEASE", "SYNC_CHECK_HARBORGATE_PYPROJECT")) {
+    foreach ($requiredKey in @("SYNC_ACTIVE_HARBORBEACON", "SYNC_ACTIVE_HARBORGATE", "SYNC_CHECK_BOOTSTRAP", "SYNC_CHECK_BUILD_RELEASE", "SYNC_CHECK_HARBORGATE_CARGO")) {
         if (-not (Get-RemoteSummaryValue -Lines $summaryLines -Key $requiredKey)) {
             throw "Remote sync summary missing key: $requiredKey"
         }
@@ -455,8 +461,8 @@ echo "SYNC_CHECK_HARBORGATE_PYPROJECT=present"
     if ((Get-RemoteSummaryValue -Lines $summaryLines -Key "SYNC_CHECK_BUILD_RELEASE") -ne "present") {
         throw "HarborBeacon build_release_bundle.sh missing after sync."
     }
-    if ((Get-RemoteSummaryValue -Lines $summaryLines -Key "SYNC_CHECK_HARBORGATE_PYPROJECT") -ne "present") {
-        throw "HarborGate pyproject.toml missing after sync."
+    if ((Get-RemoteSummaryValue -Lines $summaryLines -Key "SYNC_CHECK_HARBORGATE_CARGO") -ne "present") {
+        throw "HarborGate Cargo.toml missing after sync."
     }
 
     Write-Host ""

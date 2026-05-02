@@ -37,6 +37,10 @@ name = "harbor-model-api"
 path = "src/bin/harbor-model-api.rs"
 
 [[bin]]
+name = "harborbeacon-service"
+path = "src/bin/harborbeacon_service.rs"
+
+[[bin]]
 name = "benchmark-local-model-backend"
 path = "src/bin/benchmark_local_model_backend.rs"
 

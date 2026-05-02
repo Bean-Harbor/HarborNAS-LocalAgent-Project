@@ -12,20 +12,11 @@ def test_release_packaging_scripts_and_templates_exist() -> None:
         "tools/install_harboros_release.sh",
         "tools/rollback_harboros_release.sh",
         "tools/release_templates/harborbeacon-agent-hub.env.template",
-        "tools/release_templates/bin/run-harbor-model-api",
-        "tools/release_templates/bin/run-harbor-vlm-sidecar",
-        "tools/release_templates/bin/run-assistant-task-api",
-        "tools/release_templates/bin/run-agent-hub-admin-api",
+        "tools/release_templates/bin/run-harborbeacon-service",
         "tools/release_templates/bin/harbor-agent-hub-helper",
-        "tools/release_templates/bin/harbor-vlm-sidecar",
         "tools/release_templates/bin/harborgate",
-        "tools/release_templates/bin/harborgate-weixin-runner",
-        "tools/release_templates/systemd/harbor-model-api.service.template",
-        "tools/release_templates/systemd/harbor-vlm-sidecar.service.template",
-        "tools/release_templates/systemd/assistant-task-api.service.template",
-        "tools/release_templates/systemd/agent-hub-admin-api.service.template",
+        "tools/release_templates/systemd/harborbeacon.service.template",
         "tools/release_templates/systemd/harborgate.service.template",
-        "tools/release_templates/systemd/harborgate-weixin-runner.service.template",
         "docs/harboros-release-packaging-runbook.md",
     ]
     missing = [path for path in required if not (ROOT / path).exists()]
@@ -44,16 +35,15 @@ def test_release_bundle_builder_covers_expected_artifacts() -> None:
         "cargo zigbuild",
         "cargo-zigbuild",
         "zig",
-        "harbor-model-api",
-        "harbor-vlm-sidecar",
-        "run-harbor-vlm-sidecar",
+        "harborbeacon-service",
+        "run-harborbeacon-service",
         "file",
-        "assistant-task-api",
-        "agent-hub-admin-api",
         "validate-contract-schemas",
         "run-e2e-suite",
         "frontend/harbordesk",
-        "harborgate/site-packages",
+        "build_harborgate_rust_binary",
+        "HARBORGATE_RUST_BINARY",
+        "harborgate/bin/harborgate",
         "manifest.json",
         '"helper_scripts"',
         "harbor-agent-hub-helper",
@@ -63,8 +53,13 @@ def test_release_bundle_builder_covers_expected_artifacts() -> None:
         "checksums.sha256",
         "harbor-release-",
         "tar -C",
+        '"harborbeacon.service"',
+        '"harborgate.service"',
     ]
     assert all(phrase in content for phrase in required_phrases)
+    assert "harborgate/site-packages" not in content
+    assert '"python_fallback"' not in content
+    assert '"runtime_selector_env"' not in content
 
 
 def test_harboros_installer_manages_release_layout_and_services() -> None:
@@ -82,19 +77,21 @@ def test_harboros_installer_manages_release_layout_and_services() -> None:
         "HARBOR_HARBOROS_WRITABLE_ROOT",
         "HARBOR_KNOWLEDGE_INDEX_ROOT",
         "HARBOR_RELEASE_INSTALL_ROOT",
-        "HARBOR_MODEL_API_BIND=127.0.0.1:4176",
-        "HARBOR_MODEL_API_BASE_URL=http://127.0.0.1:4176/v1",
+        "HARBOR_MODEL_API_BASE_URL=http://127.0.0.1:4174/api/inference/v1",
         "HARBOR_MODEL_API_TOKEN",
         "HARBOR_MODEL_API_BACKEND",
         "HARBOR_MODEL_API_UPSTREAM_BASE_URL",
         "HARBOR_VLM_SIDECAR_ENABLE",
-        "HARBOR_VLM_BIND=${EXISTING_VLM_BIND:-127.0.0.1:4196}",
+        "HARBOR_VLM_BIND",
         "HARBOR_VLM_MODEL_ID=${EXISTING_VLM_MODEL_ID:-HuggingFaceTB/SmolVLM-256M-Instruct}",
         "HARBOR_VLM_MODEL_PATH",
         "HARBOR_VLM_PYTHON",
         "HARBOR_MODEL_API_CANDLE_CHAT_MODEL_ID",
         "HARBOR_MODEL_API_CANDLE_EMBEDDING_MODEL_ID",
         "HARBOR_MODEL_API_CANDLE_CACHE_DIR",
+        "render_template \"${RELEASE_DIR}/templates/systemd/harborbeacon.service.template\"",
+        "harborbeacon.service",
+        "LEGACY_SERVICES",
         "assistant-task-api.service",
         "agent-hub-admin-api.service",
         "harbor-model-api.service",
@@ -109,14 +106,29 @@ def test_harboros_installer_manages_release_layout_and_services() -> None:
         "HARBOR_HARBOROS_USER",
         "WEIXIN_ACCOUNT_ID",
         "EXISTING_WRITABLE_ROOT",
+        "HARBOR_TASK_API_URL=http://127.0.0.1:4174",
+        "HARBORBEACON_WEB_API_URL=http://127.0.0.1:4174",
+        "HARBORBEACON_WEB_API_TOKEN",
         "HARBORBEACON_ADMIN_API_URL=http://127.0.0.1:4174",
         "HARBORBEACON_ADMIN_API_TOKEN",
         "IM_AGENT_CONTRACT_VERSION=2.0",
-        "waiting for QR login credentials",
+        "systemctl disable --now",
         "append_optional_env",
-        "installed, disabled until HARBOR_VLM_SIDECAR_ENABLE=1",
+        "Legacy units : disabled/removed",
     ]
     assert all(phrase in content for phrase in required_phrases)
+    assert "HARBORGATE_RUNTIME=" not in content
+    assert "HARBORGATE_RUST_BIN" not in content
+    assert "HARBORGATE_PYTHON_BIN" not in content
+    assert "CORE_SERVICES=(\n  harborbeacon.service\n  harborgate.service\n)" in content
+    for legacy_template in [
+        "harbor-model-api.service.template",
+        "harbor-vlm-sidecar.service.template",
+        "assistant-task-api.service.template",
+        "agent-hub-admin-api.service.template",
+        "harborgate-weixin-runner.service.template",
+    ]:
+        assert f"render_template \"${{RELEASE_DIR}}/templates/systemd/{legacy_template}\"" not in content
 
 
 def test_resident_stack_helper_exposes_status_health_and_logs() -> None:
@@ -125,13 +137,11 @@ def test_resident_stack_helper_exposes_status_health_and_logs() -> None:
         'subparsers.add_parser("status"',
         'subparsers.add_parser("health"',
         'subparsers.add_parser("logs"',
-        "harbor-model-api.service",
-        "assistant-task-api.service",
-        "agent-hub-admin-api.service",
-        "harbor-vlm-sidecar.service",
-        "vlm_sidecar",
+        "harborbeacon.service",
         "harborgate.service",
-        "harborgate-weixin-runner.service",
+        "HARBORBEACON_WEB_API_URL",
+        "api/inference/v1",
+        "inference_api",
         "/api/gateway/status",
         "X-Contract-Version",
         'DEFAULT_CONTRACT_VERSION = "2.0"',
@@ -153,13 +163,19 @@ def test_harboros_rollback_script_switches_current_release() -> None:
         "HARBOR_RELEASE_VERSION",
         "ln -sfn",
         "CORE_SERVICES",
+        "harborbeacon.service",
+        "harborgate.service",
+        "LEGACY_SERVICES",
         "harbor-model-api.service",
         "harbor-vlm-sidecar.service",
         "harborgate-weixin-runner.service",
         "systemctl restart \"${CORE_SERVICES[@]}\"",
-        "systemctl is-enabled",
+        "systemctl disable --now",
     ]
     assert all(phrase in content for phrase in required_phrases)
+    assert "--harborgate-runtime" not in content
+    assert "HARBORGATE_RUNTIME" not in content
+    assert "CORE_SERVICES=(\n  harborbeacon.service\n  harborgate.service\n)" in content
 
 
 def test_release_packaging_runbook_records_builder_target_and_install_shape() -> None:
@@ -168,27 +184,25 @@ def test_release_packaging_runbook_records_builder_target_and_install_shape() ->
         "192.168.3.223",
         "192.168.3.182",
         "HarborDesk Angular `dist`",
-        "HarborGate Python 运行包",
+        "HarborGate Rust binary",
         "不在机上执行 `cargo`、`rustc`、`node`、`npm` 或 `pip`",
         "bootstrap_release_builder.sh",
         "BOOTSTRAP_BUILDER_IF_NEEDED",
         "x86_64-unknown-linux-musl",
         "cargo-zigbuild",
         "zig",
-        "harbor-model-api.service",
-        "assistant-task-api.service",
-        "agent-hub-admin-api.service",
+        "harborbeacon.service",
         "harborgate.service",
-        "harborgate-weixin-runner.service",
         "/var/lib/harborbeacon-agent-ci",
         "/mnt/software/harborbeacon-agent-ci",
         "HARBOR_HARBOROS_WRITABLE_ROOT",
         "HARBOR_KNOWLEDGE_INDEX_ROOT",
         "HARBOR_RELEASE_VERSION",
+        "HARBORBEACON_WEB_API_URL=http://127.0.0.1:4174",
         "HARBORBEACON_ADMIN_API_URL=http://127.0.0.1:4174",
         "HarborGate admin sync 依赖 `:4174`",
-        "HARBOR_MODEL_API_BASE_URL=http://127.0.0.1:4176/v1",
-        "本地 OpenAI-compatible 模型服务",
+        "HARBOR_MODEL_API_BASE_URL=http://127.0.0.1:4174/api/inference/v1",
+        "HarborBeacon 单端口封装本地 OpenAI-compatible 模型服务",
         "harbor-agent-hub-helper status",
         "harbor-agent-hub-helper health",
         "harbor-agent-hub-helper logs gateway",
@@ -197,6 +211,6 @@ def test_release_packaging_runbook_records_builder_target_and_install_shape() ->
         "HARBOR_MODEL_API_CANDLE_EMBEDDING_MODEL_ID",
         "Qwen/Qwen3-1.7B",
         "jinaai/jina-embeddings-v2-base-zh",
-        "not configured, skipped",
+        "旧 unit 被 disable/remove",
     ]
     assert all(phrase in content for phrase in required_phrases)

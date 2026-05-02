@@ -3222,7 +3222,7 @@ function renderModelsPolicies() {
       `endpoint status/test result/kind/provider now have a real admin-plane home.`,
       `route policy and fallback order are editable in place and saved back to /api/models/policies.`,
       `runtime truth from 4176 can override stale llm/embedder projection without rewriting the stored admin state.`,
-      `VLM first stays limited to still images and snapshots; audio/video remains pending.`,
+      `VLM first now covers still images, snapshots, and DVR keyframe sidecars; audio transcript extraction remains pending.`,
     ];
     renderFeatureList(els.modelCenterNotes, notes, "Model Center notes pending.");
   }

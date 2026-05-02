@@ -62,7 +62,7 @@ use crate::runtime::knowledge::{
 use crate::runtime::media::{ClipCaptureRequest, ClipCaptureResult, SnapshotCaptureResult};
 use crate::runtime::model_center::{
     run_llm_text_with_state_and_options, run_ocr_with_state, run_vlm_summary_with_state,
-    LlmTextOptions,
+    LlmTextExecution, LlmTextOptions,
 };
 use crate::runtime::registry::ResolvedCameraTarget;
 use crate::runtime::remote_view;
@@ -2080,18 +2080,19 @@ impl TaskApiService {
             let router_started = Instant::now();
             let router_prompt =
                 build_general_message_router_prompt(request, &session_recap, pending_loop);
+            let router_options = LlmTextOptions {
+                purpose: Some("router".to_string()),
+                system_prompt: Some(build_general_message_router_system_prompt()),
+                temperature: Some(0.0),
+                max_tokens: Some(GENERAL_MESSAGE_ROUTER_MAX_TOKENS),
+                timeout: Some(Duration::from_millis(
+                    GENERAL_MESSAGE_ROUTER_BUDGET_MS.min(GENERAL_MESSAGE_TURN_BUDGET_MS),
+                )),
+            };
             let router_result = run_llm_text_with_state_and_options(
                 &router_prompt,
                 &admin_state.models,
-                &LlmTextOptions {
-                    purpose: Some("router".to_string()),
-                    system_prompt: Some(build_general_message_router_system_prompt()),
-                    temperature: Some(0.0),
-                    max_tokens: Some(GENERAL_MESSAGE_ROUTER_MAX_TOKENS),
-                    timeout: Some(Duration::from_millis(
-                        GENERAL_MESSAGE_ROUTER_BUDGET_MS.min(GENERAL_MESSAGE_TURN_BUDGET_MS),
-                    )),
-                },
+                &router_options,
             );
             trace.router_llm = true;
             trace.router_latency_ms = Some(router_started.elapsed().as_millis() as u64);
@@ -2117,6 +2118,46 @@ impl TaskApiService {
                     return Ok((plan, trace));
                 }
                 trace.fallback_reason = Some("router_invalid_label".to_string());
+                if llm_selected_endpoint_kind(&router_result) != Some("cloud") {
+                    if let Some(cloud_model_state) = cloud_only_llm_model_state_for_policy(
+                        &admin_state.models,
+                        "semantic.router",
+                    ) {
+                        let cloud_result = run_llm_text_with_state_and_options(
+                            &router_prompt,
+                            &cloud_model_state,
+                            &router_options,
+                        );
+                        if cloud_result.available {
+                            if let Some((kind, conversation_act)) =
+                                parse_general_message_router_decision(&cloud_result.text)
+                            {
+                                let mut plan = plan_from_router_decision(
+                                    kind,
+                                    conversation_act,
+                                    request,
+                                    selected_camera.as_deref(),
+                                    pending_loop,
+                                );
+                                trace.controller_stage = "router_cloud_fallback".to_string();
+                                trace.fallback_reason =
+                                    Some("router_invalid_label_cloud_retry".to_string());
+                                maybe_render_general_message_reply(
+                                    request,
+                                    pending_loop,
+                                    &admin_state.models,
+                                    &mut plan,
+                                    &mut trace,
+                                );
+                                return Ok((plan, trace));
+                            }
+                        }
+                        trace.fallback_reason = Some(format!(
+                            "router_invalid_label; cloud_retry={}",
+                            cloud_result.summary
+                        ));
+                    }
+                }
             } else {
                 trace.fallback_reason = Some(router_result.summary);
             }
@@ -3057,23 +3098,56 @@ impl TaskApiService {
                                 timeout: Some(Duration::from_millis(rag_answer_budget_ms())),
                             },
                         );
-                        model = json!({
-                            "available": llm_result.available,
-                            "status": llm_result.status,
-                            "summary": llm_result.summary,
-                            "provider_key": llm_result.provider_key,
-                            "model_endpoint_id": llm_result.model_endpoint_id,
-                        });
+                        model = llm_execution_model_json(&llm_result);
                         let generated = normalize_rag_answer_text(&llm_result.text);
                         if llm_result.available && !generated.is_empty() {
                             if rag_answer_has_citation_marker(&generated, citations.len()) {
                                 answer = generated;
                             } else {
-                                degraded_reason.get_or_insert_with(|| "uncited_answer".to_string());
-                                warnings.push(
-                                    "LLM 输出缺少可解析 citation 标记，已降级为引用片段摘要。"
-                                        .to_string(),
-                                );
+                                let mut answered_by_cloud = false;
+                                if llm_selected_endpoint_kind(&llm_result) != Some("cloud") {
+                                    if let Some(cloud_state) = cloud_only_llm_model_state_for_policy(
+                                        &model_state,
+                                        "retrieval.answer",
+                                    ) {
+                                        let cloud_result = run_llm_text_with_state_and_options(
+                                            &prompt,
+                                            &cloud_state,
+                                            &LlmTextOptions {
+                                                purpose: Some("rag.answer".to_string()),
+                                                system_prompt: Some(
+                                                    build_rag_answer_system_prompt(),
+                                                ),
+                                                temperature: Some(0.0),
+                                                max_tokens: Some(rag_answer_max_tokens()),
+                                                timeout: Some(Duration::from_millis(
+                                                    rag_answer_budget_ms(),
+                                                )),
+                                            },
+                                        );
+                                        model = llm_execution_model_json(&cloud_result);
+                                        let cloud_generated =
+                                            normalize_rag_answer_text(&cloud_result.text);
+                                        if cloud_result.available
+                                            && !cloud_generated.is_empty()
+                                            && rag_answer_has_citation_marker(
+                                                &cloud_generated,
+                                                citations.len(),
+                                            )
+                                        {
+                                            answer = cloud_generated;
+                                            answered_by_cloud = true;
+                                        }
+                                    }
+                                }
+                                if !answered_by_cloud {
+                                    degraded_reason
+                                        .get_or_insert_with(|| "uncited_answer".to_string());
+                                    warnings.push(
+                                        "LLM 输出缺少可解析 citation 标记，已降级为引用片段摘要。"
+                                            .to_string(),
+                                    );
+                                }
                             }
                         } else {
                             degraded_reason.get_or_insert_with(|| "llm_unavailable".to_string());
@@ -5864,6 +5938,77 @@ fn rag_answer_allowed_endpoint_kinds(
     }
 }
 
+fn llm_execution_model_json(result: &LlmTextExecution) -> Value {
+    json!({
+        "available": result.available,
+        "status": result.status,
+        "summary": result.summary,
+        "provider_key": result.provider_key,
+        "model_endpoint_id": result.model_endpoint_id,
+        "selected_endpoint": result.details.get("selected_endpoint").cloned().unwrap_or(Value::Null),
+        "attempted_endpoints": result.details.get("attempted_endpoints").cloned().unwrap_or_else(|| json!([])),
+        "fallback_reason": result.details.get("fallback_reason").cloned().unwrap_or(Value::Null),
+        "fallback_used": result.details.get("fallback_used").cloned().unwrap_or(Value::Bool(false)),
+    })
+}
+
+fn llm_selected_endpoint_kind(result: &LlmTextExecution) -> Option<&str> {
+    result
+        .details
+        .get("selected_endpoint_kind")
+        .and_then(Value::as_str)
+}
+
+fn cloud_only_llm_model_state_for_policy(
+    model_state: &AdminModelCenterState,
+    route_policy_id: &str,
+) -> Option<AdminModelCenterState> {
+    let policy_allows_cloud = model_state.route_policies.iter().any(|policy| {
+        policy.route_policy_id == route_policy_id
+            && policy.status.eq_ignore_ascii_case("active")
+            && policy.privacy_level != PrivacyLevel::StrictLocal
+            && policy
+                .fallback_order
+                .iter()
+                .any(|kind| kind.eq_ignore_ascii_case("cloud"))
+    });
+    if !policy_allows_cloud {
+        return None;
+    }
+
+    let mut cloud_state = model_state.clone();
+    cloud_state.endpoints.retain(|endpoint| {
+        endpoint.model_kind == ModelKind::Llm
+            && endpoint.endpoint_kind == ModelEndpointKind::Cloud
+            && endpoint.status != ModelEndpointStatus::Disabled
+    });
+    if cloud_state.endpoints.is_empty() {
+        return None;
+    }
+    for policy in &mut cloud_state.route_policies {
+        if policy.route_policy_id == route_policy_id {
+            policy.fallback_order = vec!["cloud".to_string()];
+        }
+    }
+    Some(cloud_state)
+}
+
+fn llm_model_state_without_cloud(model_state: &AdminModelCenterState) -> AdminModelCenterState {
+    let mut local_state = model_state.clone();
+    local_state
+        .endpoints
+        .retain(|endpoint| endpoint.endpoint_kind != ModelEndpointKind::Cloud);
+    for policy in &mut local_state.route_policies {
+        policy
+            .fallback_order
+            .retain(|kind| !kind.eq_ignore_ascii_case("cloud"));
+        if policy.fallback_order.is_empty() {
+            policy.fallback_order = vec!["local".to_string(), "sidecar".to_string()];
+        }
+    }
+    local_state
+}
+
 fn rag_answer_next_actions(response: &KnowledgeSearchResponse, degraded: bool) -> Vec<String> {
     let mut actions = Vec::new();
     if !response.reply_pack.citations.is_empty() {
@@ -7892,9 +8037,10 @@ fn maybe_render_general_message_reply(
     let started = Instant::now();
     let prompt =
         build_general_message_renderer_prompt(request, pending_loop, plan, default_text.as_str());
+    let render_model_state = llm_model_state_without_cloud(model_state);
     let render_result = run_llm_text_with_state_and_options(
         &prompt,
-        model_state,
+        &render_model_state,
         &LlmTextOptions {
             purpose: Some("renderer".to_string()),
             system_prompt: Some(build_general_message_renderer_system_prompt()),
@@ -8062,13 +8208,7 @@ fn general_message_requests_local_first_architecture_summary(raw_text: &str) -> 
     let mentions_policy_or_fallback = matches_any(
         &normalized,
         &[
-            "fallback",
-            "回退",
-            "云端",
-            "privacy",
-            "resource",
-            "policy",
-            "策略",
+            "fallback", "回退", "云端", "privacy", "resource", "policy", "策略",
         ],
     );
     let mentions_local_first = matches_any(
@@ -13822,9 +13962,7 @@ mod tests {
             .as_str()
             .expect("source scope path");
         assert_eq!(
-            actual_scope
-                .strip_prefix("\\\\?\\")
-                .unwrap_or(actual_scope),
+            actual_scope.strip_prefix("\\\\?\\").unwrap_or(actual_scope),
             expected_scope
                 .strip_prefix("\\\\?\\")
                 .unwrap_or(expected_scope.as_str())

@@ -4,6 +4,7 @@ pub mod access_control;
 pub mod admin_console;
 pub mod automation;
 pub mod discovery;
+pub mod dvr;
 pub mod events;
 pub mod hub;
 pub mod knowledge;

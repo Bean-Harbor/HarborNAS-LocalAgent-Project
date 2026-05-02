@@ -8,6 +8,9 @@ import {
   DeliverySurface,
   DeskPageModel,
   DiscoveryScanPayload,
+  DvrRecordingSettings,
+  DvrRecordingStatus,
+  DvrTimelineSegment,
   FilesBrowseResponse,
   KnowledgeSearchRequestPayload,
   KnowledgeSearchResponse,
@@ -18,6 +21,7 @@ import {
   LocalModelDownloadStatusResponse,
   ManualDevicePayload,
   MetricTone,
+  ModelEndpointRecord,
   ModelEndpointTestResult,
   PageState,
   RagPrivacyLevel,
@@ -71,6 +75,7 @@ export class PageStatePanelComponent {
   @Output() readonly notificationTargetDefaultChange = new EventEmitter<string>();
   @Output() readonly notificationTargetDelete = new EventEmitter<string>();
   @Output() readonly endpointTestRequested = new EventEmitter<string>();
+  @Output() readonly cloudModelEndpointSaveRequested = new EventEmitter<ModelEndpointRecord>();
   @Output() readonly deviceScanRequested = new EventEmitter<DiscoveryScanPayload>();
   @Output() readonly manualDeviceAddRequested = new EventEmitter<ManualDevicePayload>();
   @Output() readonly defaultCameraChange = new EventEmitter<string>();
@@ -84,13 +89,19 @@ export class PageStatePanelComponent {
   }>();
   @Output() readonly cameraSnapshotRequested = new EventEmitter<string>();
   @Output() readonly cameraShareLinkCreate = new EventEmitter<string>();
+  @Output() readonly dvrSettingsSave = new EventEmitter<DvrRecordingSettings>();
+  @Output() readonly dvrRecordingStart = new EventEmitter<string>();
+  @Output() readonly dvrRecordingStop = new EventEmitter<string>();
   @Output() readonly deviceValidationRun = new EventEmitter<string>();
   @Output() readonly shareLinkRevoke = new EventEmitter<string>();
   @Output() readonly releaseReadinessRunRequested = new EventEmitter<void>();
   @Output() readonly knowledgeSettingsSave = new EventEmitter<KnowledgeSettings>();
   @Output() readonly knowledgeIndexRunRequested = new EventEmitter<void>();
   @Output() readonly knowledgeIndexJobCancelRequested = new EventEmitter<string>();
-  @Output() readonly localModelDownloadRequested = new EventEmitter<LocalModelCatalogItem>();
+  @Output() readonly localModelDownloadRequested = new EventEmitter<{
+    model: LocalModelCatalogItem;
+    hfEndpoint?: string | null;
+  }>();
   @Output() readonly localModelDownloadCancelRequested = new EventEmitter<string>();
   @Output() readonly filesBrowseRequested = new EventEmitter<string | null>();
   @Output() readonly knowledgeSearchRequested = new EventEmitter<KnowledgeSearchRequestPayload>();
@@ -111,6 +122,7 @@ export class PageStatePanelComponent {
     port: null
   };
   protected deviceCredentialForms: Record<string, DeviceCredentialsPayload & { rtsp_paths_text?: string }> = {};
+  protected dvrForm: DvrRecordingSettings = this.defaultDvrForm();
   protected knowledgeIndexRoot = '';
   protected knowledgeSourceRootsText = '';
   protected knowledgeSourceRootEnabled: Record<string, boolean> = {};
@@ -157,6 +169,7 @@ export class PageStatePanelComponent {
     }
   ];
   private knowledgeFormKey = '';
+  private dvrFormKey = '';
 
   protected toneClass(tone: MetricTone): string {
     return `tone-${tone}`;
@@ -206,6 +219,62 @@ export class PageStatePanelComponent {
 
   protected requestEndpointTest(modelEndpointId: string): void {
     this.endpointTestRequested.emit(modelEndpointId);
+  }
+
+  protected siliconFlowEndpoint(): ModelEndpointRecord | null {
+    return (
+      this.state?.data.modelEndpoints?.find(
+        (endpoint) => endpoint.model_endpoint_id === 'llm-cloud-siliconflow'
+      ) ?? null
+    );
+  }
+
+  protected metadataString(endpoint: ModelEndpointRecord | null | undefined, key: string): string {
+    const value = endpoint?.metadata?.[key];
+    return typeof value === 'string' ? value : '';
+  }
+
+  protected metadataBoolean(endpoint: ModelEndpointRecord | null | undefined, key: string): boolean {
+    return endpoint?.metadata?.[key] === true;
+  }
+
+  protected requestCloudModelEndpointSave(
+    baseUrl: string,
+    modelName: string,
+    apiKey: string,
+    enabled: boolean
+  ): void {
+    const existing = this.siliconFlowEndpoint();
+    const normalizedBaseUrl = baseUrl.trim() || 'https://api.siliconflow.cn/v1';
+    const normalizedModel = modelName.trim() || 'deepseek-ai/DeepSeek-V4-Flash';
+    this.cloudModelEndpointSaveRequested.emit({
+      model_endpoint_id: 'llm-cloud-siliconflow',
+      workspace_id: existing?.workspace_id ?? 'home-1',
+      provider_account_id: existing?.provider_account_id ?? null,
+      model_kind: 'llm',
+      endpoint_kind: 'cloud',
+      provider_key: 'openai_compatible',
+      model_name: normalizedModel,
+      capability_tags: existing?.capability_tags?.length
+        ? existing.capability_tags
+        : ['chat', 'cloud_fallback', 'openai_compatible'],
+      cost_policy: existing?.cost_policy ?? {
+        cost_hint: 'cloud_metered',
+        provider: 'siliconflow'
+      },
+      status: enabled ? 'active' : 'disabled',
+      metadata: {
+        ...(existing?.metadata ?? {}),
+        builtin: true,
+        provider_label: 'SiliconFlow',
+        base_url: normalizedBaseUrl,
+        healthz_url: `${normalizedBaseUrl.replace(/\/$/, '')}/models`,
+        model: normalizedModel,
+        api_key: apiKey.trim(),
+        fallback_scope: ['semantic.router', 'retrieval.answer'],
+        secret_redaction: 'endpoint_metadata'
+      }
+    });
   }
 
   protected requestNotificationTargetDefaultChange(targetId: string): void {
@@ -279,6 +348,39 @@ export class PageStatePanelComponent {
 
   protected requestDeviceValidation(deviceId: string): void {
     this.deviceValidationRun.emit(deviceId);
+  }
+
+  protected hydrateDvrForm(settings: DvrRecordingSettings | undefined): boolean {
+    if (!settings) {
+      return false;
+    }
+    const key = JSON.stringify(settings);
+    if (key !== this.dvrFormKey) {
+      this.dvrFormKey = key;
+      this.dvrForm = {
+        ...settings,
+        enabled_device_ids: [...(settings.enabled_device_ids ?? [])]
+      };
+    }
+    return true;
+  }
+
+  protected requestDvrSettingsSave(): void {
+    this.dvrSettingsSave.emit({
+      ...this.dvrForm,
+      recording_root: this.dvrForm.recording_root.trim(),
+      continuous_stream_path_hint: this.dvrForm.continuous_stream_path_hint.trim(),
+      high_res_stream_path_hint: this.dvrForm.high_res_stream_path_hint.trim(),
+      enabled_device_ids: [...(this.dvrForm.enabled_device_ids ?? [])]
+    });
+  }
+
+  protected requestDvrStart(deviceId: string): void {
+    this.dvrRecordingStart.emit(deviceId);
+  }
+
+  protected requestDvrStop(deviceId: string): void {
+    this.dvrRecordingStop.emit(deviceId);
   }
 
   protected requestShareLinkRevoke(shareLinkId: string): void {
@@ -355,8 +457,11 @@ export class PageStatePanelComponent {
     this.knowledgeIndexJobCancelRequested.emit(jobId);
   }
 
-  protected requestLocalModelDownload(model: LocalModelCatalogItem): void {
-    this.localModelDownloadRequested.emit(model);
+  protected requestLocalModelDownload(model: LocalModelCatalogItem, hfEndpoint?: string | null): void {
+    this.localModelDownloadRequested.emit({
+      model,
+      hfEndpoint: (hfEndpoint ?? model.default_hf_endpoint ?? '').trim() || null
+    });
   }
 
   protected requestLocalModelDownloadCancel(jobId: string): void {
@@ -383,6 +488,10 @@ export class PageStatePanelComponent {
 
   protected canCancelLocalModelDownload(status: string | undefined | null): boolean {
     return ['queued', 'running', 'downloading'].includes(String(status ?? '').trim().toLowerCase());
+  }
+
+  protected defaultHfEndpoint(model: LocalModelCatalogItem): string {
+    return model.default_hf_endpoint || 'https://hf-mirror.com';
   }
 
   protected modelDownloadToneClass(status: string | undefined | null): string {
@@ -417,7 +526,7 @@ export class PageStatePanelComponent {
       limit: 8,
       include_documents: true,
       include_images: true,
-      include_videos: false
+      include_videos: true
     });
   }
 
@@ -486,6 +595,35 @@ export class PageStatePanelComponent {
 
   protected deviceEvidence(deviceId: string): DeviceEvidencePanel | undefined {
     return this.state?.data.deviceEvidence?.[deviceId];
+  }
+
+  protected dvrStatus(deviceId: string): DvrRecordingStatus | undefined {
+    return this.state?.data.dvrRecordingStatus?.statuses?.find((status) => status.device_id === deviceId);
+  }
+
+  protected dvrTimeline(deviceId?: string): DvrTimelineSegment[] {
+    const segments = this.state?.data.dvrTimeline?.segments ?? [];
+    return deviceId ? segments.filter((segment) => segment.device_id === deviceId) : segments;
+  }
+
+  protected dvrEnabled(deviceId: string): boolean {
+    return Boolean(this.state?.data.dvrRecordingSettings?.enabled_device_ids?.includes(deviceId));
+  }
+
+  protected dvrRecording(deviceId: string): boolean {
+    return this.dvrStatus(deviceId)?.status === 'recording';
+  }
+
+  protected liveViewUrl(deviceId: string): string {
+    return this.dvrStatus(deviceId)?.live_mjpeg_url || `/api/cameras/${encodeURIComponent(deviceId)}/live.mjpeg`;
+  }
+
+  protected formatUnix(value: string | number | undefined | null): string {
+    const seconds = Number(value ?? 0);
+    if (!Number.isFinite(seconds) || seconds <= 0) {
+      return this.text('n/a', '暂无');
+    }
+    return new Date(seconds * 1000).toLocaleString();
   }
 
   protected featureStatusToneClass(status: FeatureAvailabilityStatus): string {
@@ -557,6 +695,25 @@ export class PageStatePanelComponent {
       unit += 1;
     }
     return `${current >= 10 || unit === 0 ? current.toFixed(0) : current.toFixed(1)} ${units[unit]}`;
+  }
+
+  private defaultDvrForm(): DvrRecordingSettings {
+    return {
+      recording_root: '',
+      retention_days: 7,
+      segment_seconds: 300,
+      continuous_recording_enabled: true,
+      low_bitrate_stream_preferred: true,
+      continuous_bitrate_mbps: 2,
+      high_res_event_clips_enabled: true,
+      high_res_event_clip_seconds: 30,
+      continuous_stream_path_hint: '/stream2',
+      high_res_stream_path_hint: '/stream1',
+      disk_budget_gb: null,
+      keyframe_count: 5,
+      keyframe_interval_seconds: 60,
+      enabled_device_ids: []
+    };
   }
 
   private pathList(value: string[] | string | undefined | null): string[] {

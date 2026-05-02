@@ -10,7 +10,9 @@ task requests to conversation turns.
 
 Cutover is allowed only when all are true:
 
-- HarborGate sends `POST /api/turns` for inbound IM turns.
+- HarborGate sends `POST /api/web/turns` for inbound IM turns.
+- `POST /api/turns` appears only as the deprecated HarborBeacon single-port
+  compatibility alias.
 - Active service-to-service requests use `X-Contract-Version: 2.0`.
 - No active HarborGate path posts `/api/tasks`.
 - HarborBeacon notification intents still target

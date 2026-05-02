@@ -1,6 +1,6 @@
 [Unit]
-Description=HarborGate IM Gateway
-After=network-online.target harborbeacon.service
+Description=HarborBeacon Unified API
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -8,7 +8,7 @@ Type=simple
 User=__SERVICE_USER__
 WorkingDirectory=__INSTALL_ROOT__/current
 EnvironmentFile=-__ENV_FILE__
-ExecStart=__INSTALL_ROOT__/current/templates/bin/harborgate
+ExecStart=__INSTALL_ROOT__/current/templates/bin/run-harborbeacon-service
 Restart=always
 RestartSec=3
 
